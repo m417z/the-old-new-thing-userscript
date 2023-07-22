@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Old New Thing comments
 // @namespace    https://m417z.com/
-// @version      1.1.1
+// @version      1.1.2
 // @description  Shows archived comments for old pages of The Old New Thing, fixes old links
 // @author       m417z
 // @match        https://devblogs.microsoft.com/oldnewthing/*
@@ -13,15 +13,17 @@
 (function() {
     'use strict';
 
-    const params = new URLSearchParams(window.location.search);
-    const postId = params.get('p');
-    if (postId && postId.match(/^[0-9]+$/) && parseInt(postId, 10) < 100635) {
-        loadComments().catch(error => alert(error.message));
-    }
+    loadComments().catch(error => alert(error.message));
 
     fixLinks(document.body);
 
     async function loadComments() {
+        const params = new URLSearchParams(window.location.search);
+        const postId = params.get('p');
+        if (!postId?.match(/^[0-9]+$/) || parseInt(postId, 10) > 100635) {
+            return;
+        }
+
         const url = `https://m417z.com/the-old-new-thing-userscript/comments/${postId}.htm`;
         const response = await fetch(url);
         if (!response.ok) {
@@ -39,6 +41,7 @@
 
             #comments > .commenttable {
                 width: 100%;
+                overflow-wrap: anywhere;
             }
 
             #comments ol.comment-list {
@@ -58,6 +61,10 @@
                 background-color: #f1f1f1;
                 padding: 0px 8px;
                 border: 1px solid #000;
+            }
+
+            #comments ol.comment-list > li.comment ol.children > li.comment {
+                list-style-type: none;
             }
         </style>`;
 
