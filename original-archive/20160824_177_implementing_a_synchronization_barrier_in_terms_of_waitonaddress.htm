@@ -1,0 +1,405 @@
+<html>
+<head>
+<title>Implementing a synchronization barrier in terms of WaitOnAddress</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Implementing a synchronization barrier in terms of WaitOnAddress</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 24, 2016 / year-entry #178</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Kicking the tires by building another kind of tire.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<!-- backref: WaitOnAddress lets you create a synchronization object out of any data variable, even a byte -->
+Last time</a>,
+I promised to reimplement existing
+synchronization objects in terms of
+<code>Wait&shy;On&shy;Address</code>.
+Note that these are academic exercises
+rather than recommendations,
+because you should probably just use
+the existing synchronization objects
+instead of trying to roll your own.
+(Also, because the existing synchronization
+objects are optimized for their special cases.)
+</p>
+<p>
+Today, let's implement the synchronization barrier.
+We won't implement the part that lets you customize
+how the synchronization barrier waits, though,
+since that's not really relevant to the exercise.
+(Allowing customization of the wait is left as
+the proverbial exercise for the reader.)
+</p>
+<pre>
+struct ALTBARRIER
+{
+  LONG TotalThreads;
+  LONG WaitingThreads;
+  LONG Unique;
+};
+
+void InitializeAltBarrier(
+    ALTBARRIER* Barrier,
+    LONG TotalThreads)
+{
+    Barrier-&gt;TotalThreads = TotalThreads;
+    Barrier-&gt;WaitingThreads = 0;
+    Barrier-&gt;Unique = 0;
+}
+</pre>
+<p>
+The alternate synchronization barrier keeps track of
+these things:
+</p>
+<ul>
+<li>The total number of threads participating in the barrier.
+    When this many threads enter the barrier, the barrier
+    releases all the waiting threads.</p>
+<li>The number of threads waiting in the barrier.
+<li>A unique number that changes for each barrier wait cycle.
+    This is how waiting threads detect that they have been released.
+</ul>
+<pre>
+BOOL EnterAltBarrier(
+    ALTBARRIER* Barrier)
+{
+  LONG Unique = InterlockedCompareExchangeAcquire(
+                         &amp;Barrier-&gt;Unique, -1, -1);
+  LONG WaitingThreads = InterlockedIncrement(&amp;Barrier-&gt;WaitingThreads);
+
+  if (WaitingThreads &lt; Barrier-&gt;TotalThreads) {
+    while (Barrier-&gt;Unique == Unique) {
+       WaitOnAddress(&amp;Barrier-&gt;Unique,
+                     &amp;Unique, sizeof(Unique), INFINITE);
+    }
+    return FALSE;
+  } else if (WaitingThreads == Barrier-&gt;TotalThreads) {
+    Barrier-&gt;WaitingThreads = 0;
+    InterlockedIncrementRelease(&amp;Barrier-&gt;Unique);
+    WakeByAddressAll(&amp;Barrier-&gt;Unique);
+    return TRUE;
+  } else {
+    // The caller entered too many times.
+    FatalError();
+  }
+}
+</pre>
+<p>
+Let's look at how
+<code>Enter&shy;Alt&shy;Barrier</code> works:
+</p>
+<p>
+Right off the bat, it captures the current barrier wait cycle number.
+This is important, because the wait cycle number may change
+while the method is running, and we want to use the
+wait cycle number at the time the function was called.
+To ensure we don't get a stale barrier wait cycle number,
+we use an interlocked function, and we use the trick of
+performing an <code>Interlocked&shy;Compare&shy;Exchange</code>
+which tries to exchange a value with itself (which is a nop),
+and using an unlikely value to try to avoid generating a write.
+</p>
+<p>
+We add ourselves to the count of waiting threads.
+If we are not the last thread, then we wait on
+the barrier's wait cycle number until it changes to a value
+different from the wait cycle number at the time we
+entered the barrier.
+It's important that we captured the wait cycle number
+<i>before</i> incrementing the waiting thread count,
+because our increment may have been enough to cause
+some other thread to decide that the barrier requirements
+have been met, and it might have incremented the wait cycle
+number while we were still in the process of getting
+ready to wait.
+</p>
+<p>
+We keep waiting until the wait cycle number changes.
+This means that the previous wait cycle is complete.
+The rule for synchronization barriers is that exactly
+one thread returns <code>TRUE</code>;
+our barrier will have the thread that causes the waiting
+thread count to hit <code>Total&shy;Threads</code>
+be the one to return <code>TRUE</code>.
+All the other threads return <code>FALSE</code>.
+</p>
+<p>
+If the waiting through count reaches
+<code>Total&shy;Threads</code>,
+then that means that the currently wait cycle is complete.
+We atomically increment the wait cycle number,
+and then
+use
+<code>Wake&shy;By&shy;Address&shy;All</code>
+to
+ask that everybody waiting for the wait cycle
+number to change be woken.
+</p>
+<p>
+Using a 32-bit value for our wait cycle number
+means that a thread could be stuck in the
+scheduler for 4 billion barrier wait cycles,
+and when it finally gets a chance to run,
+it will still see that the wait cycle number has
+changed,
+because we don't recycle wait cycle numbers
+until 4 billion have passed.&sup1;
+</p>
+<p>
+We use
+<code>Interlocked&shy;Increment&shy;Release</code>
+to
+ensure that the assignment of
+<code>Waiting&shy;Threads = 0</code> is visible
+to other processors before we increment the
+wait cycle number.
+</p>
+<p>
+The last case is if the number of threads in
+the barrier exceeds the total number allowed.
+If this happens, then there is a bug in the caller,
+because the caller promised that it wouldn't send
+more than <code>Total&shy;Threads</code> threads
+into the barrier at a time.
+</p>
+<p>
+One interesting side effect of this alternate implementation
+is that it doesn't have the
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161">
+causality limitation of the real synchronization barrier</a>.
+Once the barrier releases its threads, new threads can enter
+the barrier even before the old threads exit.
+This works because even if the old threads get stuck in the
+scheduler for a long time,
+when they finally get a chance to run, they will see that the
+wait cycle number has changed, and they will know that their
+wait is over.&sup2;
+</p>
+<p>
+Next time, we'll demonstrate
+<code>Wake&shy;By&shy;Address&shy;Single</code>.
+</p>
+<p>
+&sup1;If you are super-paranoid, then you could use
+a 64-bit counter for the wait cycle number.
+That gives you 18 pentillion barrier wait cycles.
+This means that even if you had a 4GHz processor
+entering the barrier every cycle,
+it would have to be locked out of the barrier for
+136 years before the possibility that the wait
+cycle counter would get reused.
+Of course,
+if you have a thread waiting 136 years to be scheduled,
+then you have a bigger problem than a synchronization barrier
+getting stuck.
+</p>
+<p>
+&sup2;You might say that the system implementation of
+synchronization barriers has just a single bit for the
+"cycle number".
+If a thread gets stuck in the scheduler for two cycles,
+then it will not realize that it's supposed to have woken.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1262005">
+				<div id="div-comment-1262005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262005">
+			August 24, 2016 at 7:42 am</a>		</div>
+
+		<p>Shouldn&#8217;t the while condition be &#8220;while (Barrier-&gt;Unique == Unique)&#8221;?</p>
+<p>Also, don&#8217;t we have a race condition here?  Suppose thread 1 enters the barrier and decides it needs to wait, but before it can call WaitOnAddress, thread 2 enters the barrier and calls WakeByAddressAll.  Now thread 1 calls WaitOnAddress and is stuck unless we have a spurious wake up or the or the barrier threads are released again (which probably won&#8217;t happen due to the stuck thread).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1262015">
+				<div id="div-comment-1262015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262015">
+			August 24, 2016 at 7:47 am</a>		</div>
+
+		<p>Thanks for the bug fix to the loop. But the race condition is solved because thread 2 will also increment the Unique, so thread 1&#8217;s late WaitOnAddress will return immediately because the Unique does not match the captured value.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1262055">
+				<div id="div-comment-1262055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262055">
+			August 24, 2016 at 8:22 am</a>		</div>
+
+		<p>I see.  But that pushes the problem into WaitOnAddress.  How are these functions implemented?  Do they basically just wrap a condition variable?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1262105">
+				<div id="div-comment-1262105" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Caron</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262105">
+			August 24, 2016 at 10:13 am</a>		</div>
+
+		<p>Note that WaitOnAddress accepts a variable to designate the &#8220;undesirable&#8221; value, in this case &amp;Unique. All it has to do is compare the value at the Waited On Address to the value provided, and go &#8220;oh, I guess we&#8217;re already done.&#8221; It doesn&#8217;t seem super crazy.</p>
+<p>The only time this might be a problem is if 4 billion cycles pass before WaitOnAddress is called, but as noted in the article, that is rather unlikely.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1262056">
+				<div id="div-comment-1262056" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">R Samuel Klatchko</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262056">
+			August 24, 2016 at 8:42 am</a>		</div>
+
+		<p>There&#8217;s a bug that allows more than TotalThreads to come in without being detected due to the fact that you don&#8217;t reset WaitingThreads to 0 and increment Unique atomically.</p>
+<p>Assume that TotalThreads-1 have come when another thread comes in, executes the statement &#8220;Barrier-&gt;WaitingThreads = 0;&#8221; and the scheduler than deschedules the thread. On that same CPU the schedulers chooses a new thread which enters EnterAltBarrier &#8211; is still has the old Unique and WaitingThreads of 0 so it incorrectly becomes part of the group.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1262075">
+				<div id="div-comment-1262075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262075">
+			August 24, 2016 at 9:31 am</a>		</div>
+
+		<p>The only way that would happen is if the caller sent another thread into the barrier before the existing threads were released from the barrier, which would be a bug in the caller for sending too many threads into the barrier.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1262065">
+				<div id="div-comment-1262065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262065">
+			August 24, 2016 at 9:00 am</a>		</div>
+
+		<p>&gt;¹If you are super-paranoid, then you could use a 64-bit counter for the wait cycle number. That gives you 18 pentillion barrier<br />
+&gt; wait cycles. This means that even if you had a 4GHz processor entering the barrier every cycle, it would have to be locked out<br />
+&gt; of the barrier for 136 years before the possibility that the wait cycle counter would get reused. </p>
+<p>/// TODO: Change this for compatibility with Intel Quantum CPUs</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1262125">
+				<div id="div-comment-1262125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262125">
+			August 24, 2016 at 10:58 am</a>		</div>
+
+		<p>//// TODO: Make practical quantum computers &#8211; this will be more difficult than the hype lets on</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1262435">
+				<div id="div-comment-1262435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160824-00/?p=94155#comment-1262435">
+			August 28, 2016 at 2:52 am</a>		</div>
+
+		<p>The following line seems really, really suspect:<br />
+    while (Barrier-&gt;Unique == Unique) {</p>
+<p>we&#8217;re doing a non atomic read with no ordering or visibility guarantees here, while another thread is writing to the same variable (atomically but that does us no good here). This is undefined behavior in C++. </p>
+<p>Practically speaking the compiler does not know enough about WaitOnAddress to break the code and x86 with its strong memory model won&#8217;t either, but still for this to be correct it&#8217;d require an acquire read.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

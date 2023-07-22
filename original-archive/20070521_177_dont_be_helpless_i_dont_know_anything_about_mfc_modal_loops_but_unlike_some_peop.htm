@@ -1,0 +1,645 @@
+<html>
+<head>
+<title>Don't be helpless: I don't know anything about MFC modal loops, but unlike some people, I'm not afraid to find out</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Don&#8217;t be helpless: I don&#8217;t know anything about MFC modal loops, but unlike some people, I&#8217;m not afraid to find out</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 21, 2007 / year-entry #178</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>24</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Commenter Tom Grelinger asks via the Suggestion Box: If I have a modal CDialog that is visible and usable to the user. Let's say I receive an event somewhere else in the program and I call DestroyWindow on the modal CDialog from within the event. I notice that the OnDestroy is called on the CDialog,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/oldnewthing/pages/407234.aspx#430296">
+Commenter Tom Grelinger asks via the Suggestion Box</a>:
+</p>
+<blockquote CLASS=q><p>
+If I have a modal CDialog that is visible and usable to the user.
+Let's say I receive an event somewhere else in the program
+and I call DestroyWindow on the modal CDialog from within the event.
+I notice that the OnDestroy is called on the CDialog,
+but DoModal never exits until a WM_QUIT is posted to the modal's message pump.
+What are the pitfalls to this?
+Unfortunately, there is really no way to avoid this situation.
+</p>
+</blockquote>
+<p>
+I'm not sure what the question is, actually.
+The question as stated is "What are the pitfalls to this?"
+but he answered that in his own question:
+The pitfall is that "DoModal never exits until a <code>WM_QUIT</code> is
+posted to the modal dialog's message pump."
+</p>
+<p>
+I'm going to assume that the question really is,
+"Why doesn't destroying the window work?"
+with the follow-up question,
+"What is the correct way to dismiss a modal dialog?"
+</p>
+<p>
+The first problem with this question is that it assumes that I know
+what a <code>CDialog</code> is.
+From its name, I'm going to assume that this
+is an MFC class for managing a dialog box.
+But you don't even have to know that to answer the first
+reformulated question operating only from Win32 principles:
+<code>DestroyWindow</code> is not how you exit a modal dialog.
+You exit a modal dialog with <code>EndDialog</code>.
+The <code>DestroyWindow</code> technique is for <i>modeless</i>
+dialogs.
+</p>
+<p>
+But let's look at the question another way,
+which is my point for today:
+You have the MFC source code.
+Don't be afraid to read it.
+Especially since I don't use MFC personally;
+I don't even know the basic principles of application design with MFC.
+I work in straight Win32.
+As a result,
+I don't know the answer off the top of my
+head, but fifteen minutes reading the MFC source code quickly reveals
+the reason why destroying the window doesn't work.
+</p>
+<p>
+Watch me as I go and find out the answer.
+It's nothing you can't already do yourself.
+</p>
+<p>
+The
+<code>CDialog::DoModal</code> method
+calls <code>CWnd::RunModalLoop</code> to run the dialog loop.
+If you look at <code>CWnd::RunModalLoop</code>,
+you can see the conditions under which it will exit the modal loop.
+Here's the code with irrelevant details deleted.
+(They're irrelevant because they have nothing to do with how the
+modal loop exits.)
+</p>
+<pre>
+int CWnd::RunModalLoop(DWORD dwFlags)
+{
+    ... preparatory work ...
+
+    // acquire and dispatch messages until the modal state is done
+    for (;;)
+    {
+        ... code that doesn't break out of the loop ...
+
+        // phase2: pump messages while available
+        do
+        {
+            // pump message, but quit on WM_QUIT
+            if (!AfxGetThread()-&gt;PumpMessage())
+            {
+                AfxPostQuitMessage(0);
+                return -1;
+            }
+
+            ... other code that doesn't break out of the loop ...
+
+            if (!ContinueModal())
+                goto ExitModal;
+
+            ... other code that doesn't break the loop ...
+        }  while (::PeekMessage(pMsg, NULL, NULL, NULL, PM_NOREMOVE))
+    }
+
+ExitModal:
+    m_nFlags &amp;= ~(WF_MODALLOOP|WF_CONTINUEMODAL);
+    return m_nModalResult;
+}
+</pre>
+<p>
+There are only two ways out of this loop.
+The first is the receipt of a <code>WM_QUIT</code> message.
+The second is if <code>CWnd::ContinueModal</code> decides that
+the modal loop is finished.
+The commenter already mentioned the quit message aspect to the
+modal loop, so that just leaves <code>CWnd::ContinueModal</code>.
+</p>
+<p>
+The <code>CWnd::ContinueModal</code> method is very simple:
+</p>
+<pre>
+BOOL CWnd::ContinueModal()
+{
+    return m_nFlags &amp; WF_CONTINUEMODAL;
+}
+</pre>
+<p>
+Therefore, the only other way the loop can exit is if somebody
+clears the <code>WF_CONTINUEMODAL</code> flag.
+A little grepping shows that there are only three places where this
+flag is cleared.
+One is in <code>CPropertyPage</code>, which is a derived class
+of <code>CDialog</code> and therefore isn't relevant here.
+(I'll ignore <code>CPropertyPage</code> in future searches.)
+The second is in the line above right after the label
+<code>ExitModal</code>.
+And the third is this method:
+</p>
+<pre>
+void CWnd::EndModalLoop(int nResult)
+{
+    // this result will be returned from CWnd::RunModalLoop
+    m_nModalResult = nResult;
+
+    // make sure a message goes through to exit the modal loop
+    if (m_nFlags &amp; WF_CONTINUEMODAL)
+    {
+        m_nFlags &amp;= ~WF_CONTINUEMODAL;
+        PostMessage(WM_NULL);
+    }
+}
+</pre>
+<p>
+This method is called in only one place:
+</p>
+<pre>
+void CDialog::EndDialog(int nResult)
+{
+    if (m_nFlags &amp; (WF_MODALLOOP|WF_CONTINUEMODAL))
+        EndModalLoop(nResult);
+
+    ::EndDialog(m_hWnd, nResult);
+}
+</pre>
+<p>
+Following the money one last step,
+the <code>CDialog::EndDialog</code> method is called
+from four places in <code>CDialog</code>.
+It's called from <code>CDialog::HandleInitDialog</code> and
+<code>CDialog::InitDialog</cODE> if some catastrophic error
+occurs during dialog initialization.
+And it's called from <code>CDialog::OnOK</code>
+and <code>CDialog::OnCancel</code> in response to the
+user clicking the OK or Cancel buttons.
+</p>
+<p>
+Notice that the <code>CDialog::EndDialog</code> method is not
+called when somebody forcibly destroys the dialog from
+the outside.
+</p>
+<p>
+That's why destroying the dialog window doesn't break the modal loop.
+If you want to break out of the modal loop, your only choices are
+to post a quit message or call <code>CWnd::EndModalLoop</code>,
+either directly or indirectly (via <code>CDialog::EndDialog</code>,
+for example).
+</p>
+<p>
+Notice that the MFC modal loop obeys the convention on quit messages
+by re-posting the quit message when it breaks out of the modal loop.
+(Though it really should have posted the <code>wParam</code> from
+the quit message rather than just posting zero.)
+</p>
+<p>
+The workaround therefore is not to destroy the dialog with
+<code>DestroyWindow</code> (something you should have known
+not to do <i>a priori</i> since that's not how you exit
+modal dialog boxes) but rather by calling
+<code>CDialog::EndDialog</code>, passing a result code that
+lets the caller of <code>CDialog::DoModal</code> know that
+the dialog box exited under unusual circumstances.
+</p>
+<p>
+This took me fifteen minutes to research and a little over an hour to
+write up.
+All this work to answer a question that you should have been able
+to answer yourself with a little elbow grease.
+You're a smart person.
+Have confidence in yourself.
+You can do it.
+I know you can.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (24)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-506203">
+				<div id="div-comment-506203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506203">
+			May 21, 2007 at 10:15 am</a>		</div>
+
+		<p>One might add that the MFC Reference (help) for the CDialog class states, &quot;A modal dialog box closes automatically when the user presses the OK or Cancel buttons or when your code calls the EndDialog member function.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506213">
+				<div id="div-comment-506213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506213">
+			May 21, 2007 at 10:25 am</a>		</div>
+
+		<p>Oops, point being that reading the help answers the question without the need to dive into the source code. &nbsp;It not only tells you to call EndDialog but also directs you toward the OnOk and OnCancel member functions with a whack from a pretty strong cluestick.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506223">
+				<div id="div-comment-506223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">johnf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506223">
+			May 21, 2007 at 10:31 am</a>		</div>
+
+		<p>Your story beautifully illustrates the need for Microsoft to release the .NET source to Windows Forms and the BCL.</p>
+<p>Makes debugging and troubleshooting a ton more productive.</p>
+<div class="post">[<i>I thought it illustrated the opposite. Even with the source code, this person couldn&#8217;t be bothered. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506313">
+				<div id="div-comment-506313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">El Guapo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506313">
+			May 21, 2007 at 1:00 pm</a>		</div>
+
+		<p>I thought you beautifully illustrated the point that we don&#8217;t need to do research when other people are willing to do it for us, and even blog about it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506323">
+				<div id="div-comment-506323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://gregbeech.com/blogs/tech' rel='external nofollow' class='url'>Greg Beech</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506323">
+			May 21, 2007 at 1:14 pm</a>		</div>
+
+		<p>It illustrates the point well &#8211; so many people just act helpless and immediately want help without even doing the basics to research the problem. People seem to think I have a psychic ability to solve problems and find out the cause of error messages, when in fact a lot of the time I simply have a non-psychic ability to copy and paste the error message into google then read the top few most likely looking results.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506343">
+				<div id="div-comment-506343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Josh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506343">
+			May 21, 2007 at 1:58 pm</a>		</div>
+
+		<p>Ok, this is totally unrelated to the topic at hand, but I was wondering: Why &quot;for (;;)&quot; instead of &quot;while (true)&quot;? Because it&#8217;s less characters to type? Optimizes differently? Personal preference?</p>
+<p>I see it a fair bit in the code referenced here, and google isn&#8217;t exactly helpful in this arena (all the search engines I tried appear to strip out non-alphanumeric text)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506353">
+				<div id="div-comment-506353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stanlo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506353">
+			May 21, 2007 at 2:18 pm</a>		</div>
+
+		<p>while(true) is a constant expression. How is it ever supposed to get out???????? It is a mystery (to the compiler).</p>
+<p>You get a warning sometimes, while for(;;) will not give a warning.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506363">
+				<div id="div-comment-506363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rob</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506363">
+			May 21, 2007 at 2:42 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; so many people just act helpless
+</p></blockquote>
+<p>I, for one, just acted helpless back &nbsp;in the day. I also often &nbsp;&quot;cargo-culted&quot; (something didn&#8217;t work for some bug I didn&#8217;t understood, so I don&#8217;t use that something anymore because I believe it&#8217;s something which simply doesn&#8217;t work or things like that).</p>
+<p>What changed me was a sum of experience and gained self-esteem.</p>
+<p>Help from colleagues and boss was a key factor in this, between other factors.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506383">
+				<div id="div-comment-506383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506383">
+			May 21, 2007 at 2:45 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; Why &quot;for (;;)&quot; instead of &quot;while (true)&quot; ?
+</p></blockquote>
+<p>Heck!</p>
+<p>because what you get with</p>
+<p>#define ever_and_ever (;;)</p>
+<p>is better than what you&#8217;d get with</p>
+<p>#define the_hell_is_not_cold (true)</p>
+<p>even if the latter is correct on a logical point of view :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506443">
+				<div id="div-comment-506443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://quay.wordpress.com/2007/05/21/sometimes-you-just-need-to-read-the-code-rtfc/' rel='external nofollow' class='url'>Sometimes you just need to read the code (RTFC) &laquo; More Ramblings from a Los Angeles Programmer</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506443">
+			May 21, 2007 at 3:26 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://quay.wordpress.com/2007/05/21/sometimes-you-just-need-to-read-the-code-rtfc/" rel="nofollow">http://quay.wordpress.com/2007/05/21/sometimes-you-just-need-to-read-the-code-rtfc/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506503">
+				<div id="div-comment-506503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506503">
+			May 21, 2007 at 4:22 pm</a>		</div>
+
+		<p>&lt;i&gt;while(true) is a constant expression. How is it ever supposed to get out????????&lt;/i&gt;</p>
+<p>break or return will do the job admirably.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick odd alt thread-odd thread-alt depth-1" id="comment-506263">
+				<div id="div-comment-506263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506263">
+			May 21, 2007 at 12:09 pm</a>		</div>
+
+		<p>johnf: Reflector gives you Windows Forms (the Microsoft-supplied .NET Framework DLLs are _not_ obfuscated), while for the BCL and the runtime, there&#8217;s the Shared Source CLI (Rotor). You can use Reflector on the BCL as well, of course, but SSCLI has the original comments in.</p>
+<p>You cannot of course copy that code yourself, but you can understand what it&#8217;s doing.</p>
+<p>I&#8217;m pretty sure the subject of this article is dealt with in every MFC text *ever*. If you&#8217;re not comfortable just grepping (or other tool of your choice) the MFC source, there&#8217;s a book called &quot;MFC Internals&quot; by Scot Wingo and George Shepherd which will guide you through it. It&#8217;s &#8216;out of date&#8217; in that it targets MFC 4.0, but the architecture hasn&#8217;t actually changed all that much in 10 years.</p>
+<p>MFC&#8217;s dialogs are actually a little odd in that an MFC &#8216;modal&#8217; dialog is actually a modeless Win32 dialog. There&#8217;s some very good reason for this which I&#8217;ve forgotten (and I can&#8217;t be bothered to dig out the book I mentioned above to look it up).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506583">
+				<div id="div-comment-506583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Merus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506583">
+			May 21, 2007 at 8:21 pm</a>		</div>
+
+		<p>What would be really poetic is if the guy who submitted the question turned out to be a nitpicker.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506603">
+				<div id="div-comment-506603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506603">
+			May 21, 2007 at 8:47 pm</a>		</div>
+
+		<blockquote><p>
+  The CDialog::DoModal method calls</p>
+<p>  CWnd::RunModalLoop to run the dialog loop. If</p>
+<p>  you look at CWnd::RunModalLoop, you can see</p>
+<p>  the conditions under which it will exit the</p>
+<p>  modal loop.
+</p></blockquote>
+<p>Nish half-agrees. &nbsp;CDialog::DoModal calls CWnd::RunModalLoop to run the dialog loop, and there are conditions under which it will exit this NON-MODAL dialog loop.</p>
+<p><a rel="nofollow" target="_new" href="http://www.voidnish.com/articles/ShowArticle.aspx?code=notmodaldialogs" rel="nofollow">http://www.voidnish.com/articles/ShowArticle.aspx?code=notmodaldialogs</a></p>
+<p>I haven&#8217;t done enough testing, but have the impression that the non-modality of MFC pseudo-modal dialogs is the reason why WM_CLOSE can be received by an MFC application where a corresponding plain Win32 application never gets the WM_CLOSE (turning the Win32 app into a &quot;not responding&quot; app).</p>
+<blockquote><p>
+  Even with the source code, this person</p>
+<p>  couldn&#8217;t be bothered.
+</p></blockquote>
+<p>Maybe that, or maybe he didn&#8217;t know that there&#8217;s an option to install it during Visual Studio installation. &nbsp;Meanwhile there are other people who well could be bothered, who have found some parts of the source readable, who agree with johnf&#8217;s opinion.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506663">
+				<div id="div-comment-506663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">name not required</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506663">
+			May 22, 2007 at 4:03 am</a>		</div>
+
+		<p>&quot;I thought it illustrated the opposite. Even with the source code, this person couldn&#8217;t be bothered&quot;</p>
+<p>&#8216;This person&#8217; is a person who could not be bothered. Therefore, since they are persons, no other persons can be bothered either.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506673">
+				<div id="div-comment-506673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AndyB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506673">
+			May 22, 2007 at 4:42 am</a>		</div>
+
+		<p>&#8220;I thought it illustrated the opposite. Even with the source code, this person couldn&#8217;t be bothered&#8221;</p>
+<p>Yes, but that&#8217;s one lazy person. If MS hadn&#8217;t released the source for MFC, then you&#8217;d be getting a lot more questions like this from people who otherwise would have looked for themselves.</p>
+<p>I don&#8217;t know if this blog entry is about people who cannot be bothered to help themselves, or about the fact that the information is there so you can help yourself.</p>
+<div class="post">[<i>It&#8217;s about people who can&#8217;t be bothered. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-506693">
+				<div id="div-comment-506693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506693">
+			May 22, 2007 at 6:02 am</a>		</div>
+
+		<p>The information is there &#8211; have you not tried Reflector?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506703">
+				<div id="div-comment-506703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zooba</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506703">
+			May 22, 2007 at 6:05 am</a>		</div>
+
+		<p>Nice to see a real life example of where [url=&quot;<a rel="nofollow" target="_new" href="http://www.byteclub.net/blog/zooba/?p=55&quot;" rel="nofollow"></a><a href="http://www.byteclub.net/blog/zooba/?p=55&#038;quot" rel="nofollow">http://www.byteclub.net/blog/zooba/?p=55&#038;quot</a>;]goto is better than break or continue[/url].</p>
+<p>Source code to Windows Forms would be nice, if only so Go To Definition went somewhere interesting. The documentation tends to be good enough for .NET while the source for MFC is basically required to solve many issues. I prefer plain old Win32 API calls to MFC.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506733">
+				<div id="div-comment-506733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zooba</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506733">
+			May 22, 2007 at 8:07 am</a>		</div>
+
+		<p>Huh. So much for BBCode being supported (from the Help page linked at the top)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506743">
+				<div id="div-comment-506743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bobbie The Programmer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506743">
+			May 22, 2007 at 9:30 am</a>		</div>
+
+		<p>The very first Google result for &quot;Destroy CDialog modal&quot; has this information also.</p>
+<p>Not to slag the person who posted the question, I&#8217;ve made similar mistakes and I suspect most of us have.</p>
+<p>But the real point of the article is not &quot;How to use search engines to answer questions&quot; but &quot;How to use source code to answer questions&quot;, with the answer, &quot;It&#8217;s really not that hard.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-506763">
+				<div id="div-comment-506763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AndyAsh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506763">
+			May 22, 2007 at 9:54 am</a>		</div>
+
+		<blockquote><p>
+  &gt; The documentation tends to be good enough for .NET while the source for MFC is basically required to solve many issues. I prefer plain old Win32 API calls to MFC.
+</p></blockquote>
+<p>I agree with you, but I&#8217;d have thought that an API where you are called, is always going to be way more complex to program, than one where you do all the calling. It&#8217;s all part of the idea of encapsulation, and black vs white boxes.</p>
+<p>Clearly there are practical constraints in what can be achieved if one goes bonkers and says, &quot;I&#8217;ll only implement a call based API&quot; or vice versa.</p>
+<p>At the end of the day, you&#8217;re a very lucky person, if you never write code that is called in somebody elses context.</p>
+<p>I&#8217;ve never used .NET, what is it? :)</p>
+<p>I never liked MFC, because it led me up the path to nowhere so, so, many times. Win32 never, ever, has.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-506713">
+				<div id="div-comment-506713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Niki</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-506713">
+			May 22, 2007 at 6:20 am</a>		</div>
+
+		<p>&gt; The information is there &#8211; have you not tried Reflector?</p>
+<p>Part of the information is there, but with all the comments and local variable names gone, it&#8217;s a lot harder to understand than it has to be.</p>
+<p>Take the Dialog example above: In MFC, you could just put a breakpoint on DoModal, step into it, and see what it does, in your program, look at the values of all local variables, you can see which branch it takes, see values of local variables and everything. All you have to do is hit F11 a few times. With .NET, this is _a lot_ harder, especially if you have to look into ROTOR.</p>
+<p>BTW: I&#8217;d really like to understand why MS *didn&#8217;t* release the .NET source code. They&#8217;ve released MFC, ATL in the past, so what&#8217;s the big deal about .NET? Are they afraid someone might steal their intellectual property? Then why didn&#8217;t they obfuscate?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-507153">
+				<div id="div-comment-507153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-507153">
+			May 22, 2007 at 7:41 pm</a>		</div>
+
+		<p>My instinct tells me the answer is so simple&#8230;. it&#8217;s a dialog, send a message that dismisses a dialog the way a user would, like WM_COMMAND and IDOK/IDCANCEL or WM_CLOSE.</p>
+<p>why indeed would DestroyWindow be used to dismiss a modal dialog</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-507493">
+				<div id="div-comment-507493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jules</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070521-00/?p=26783#comment-507493">
+			May 23, 2007 at 1:40 pm</a>		</div>
+
+		<p>Jumping into source is a last resort for figuring out why something doesn&#8217;t work, but I&#8217;ll agree it&#8217;s a useful approach. &nbsp; The only way I figured out why my window creation code was crashing and burning when I called CreateWindowEx with an extended style of WS_EX_MDICHILD was by reading the Wine source code, for instance. &nbsp;I note that the strange behaviour is documented now. &nbsp;It definitely wasn&#8217;t when I was working on this.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

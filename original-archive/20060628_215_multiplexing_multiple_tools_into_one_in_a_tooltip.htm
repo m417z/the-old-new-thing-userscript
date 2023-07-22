@@ -1,0 +1,430 @@
+<html>
+<head>
+<title>Multiplexing multiple tools into one in a tooltip</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Multiplexing multiple tools into one in a tooltip</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 28, 2006 / year-entry #216</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The tooltip control lets you set multiple "tools" (regions of the owner window) for it to monitor. This is very convenient when the number of tools is manageably small and they don't move around much. For example, the toolbar control creates a tool for each button. But if you have hundreds or thousands of screen...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The tooltip control lets you set multiple "tools"
+(regions of the owner window) for it to monitor.
+This is very convenient when the number of tools is
+manageably small and they don't move around much.
+For example, the toolbar control creates a tool for
+each button.
+But if you have hundreds or thousands of screen elements
+with tooltips,
+creating a tool for each one can be quite a lot of work,
+especially if the items move around a lot.
+For example, the listview control does not create a
+separate tool for each listview item,
+since a listview can have thousands of items,
+and scrolling the view results in the items moving around.
+Updating the tool information whenever the listview
+control scrolls would be extremely slow,
+and the work would be out of proportion to the benefit.
+(Updating thousands of tools on the off chance the user
+hovers over one of them doesn't really sit well on the
+cost/benefit scale.)
+</p>
+<p>
+Instead of creating a tool for each item,
+you can instead multiplex all the tools into one,
+updating that one tool dynamically to be the one
+corresponding to the element the user is currently interacting with.
+We'll start with
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2003/07/23/54576.aspx">
+a fresh scratch program</a>
+and create a few items
+which we want to give tooltips for.
+</p>
+<pre>
+<font COLOR=blue>int g_cItems = 10;
+int g_cyItem = 20;
+int g_cxItem = 200;
+
+BOOL
+GetItemRect(int iItem, RECT *prc)
+{
+ SetRect(prc, 0, g_cyItem * iItem,
+         g_cxItem, g_cyItem * (iItem + 1));
+ return iItem &gt;= 0 &amp;&amp; iItem &lt; g_cItems;
+}
+
+int
+ItemHitTest(int x, int y)
+{
+ if (x &lt; 0 || x &gt; g_cxItem) return -1;
+ if (y &lt; 0 || y &gt; g_cItems * g_cyItem) return -1;
+ return y / g_cyItem;
+}</font>
+
+void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+ <font COLOR=blue>COLORREF clrSave = GetBkColor(pps-&gt;hdc);
+ for (int iItem = 0; iItem &lt; g_cItems; iItem++) {
+  RECT rc;
+  GetItemRect(iItem, &amp;rc);
+  COLORREF clr = RGB((iItem &amp; 1) ? 0x7F : 0,
+                     (iItem &amp; 2) ? 0x7F : 0,
+                     (iItem &amp; 4) ? 0x7F : 0);
+  if (iItem &amp; 8) clr *= 2;
+  SetBkColor(pps-&gt;hdc, clr);
+  ExtTextOut(pps-&gt;hdc, rc.left, rc.top,
+             ETO_OPAQUE, &amp;rc, TEXT(""), 0, NULL);
+ }
+ SetBkColor(pps-&gt;hdc, clrSave);</font>
+}
+</pre>
+<p>
+We merely paint a few colored bands.
+To make things more interesting, you can add scroll bars.
+I leave you to deal with that yourself,
+since it would be distracting from the point here,
+although it would also make the sample a bit more realistic.
+</p>
+<p>
+Next, we create a tooltip control and instead of
+creating a tool for each element, we create only one.
+For starters, it's an empty tool with no rectangle.
+The <code>g_iItemTip</code> variable tells us which item
+this tooltip is standing in for at any particular moment;
+we use <code>-1</code> as a sentinel indicating that the tooltip
+is not active.
+</p>
+<pre>
+<font COLOR=blue>HWND g_hwndTT;
+int g_iItemTip;</font>
+
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ <font COLOR=blue>g_hwndTT = CreateWindowEx(WS_EX_TRANSPARENT, TOOLTIPS_CLASS, NULL,
+                           TTS_NOPREFIX,
+                           0, 0, 0, 0,
+                           hwnd, NULL, g_hinst, NULL);
+ if (!g_hwndTT) return FALSE;
+
+ g_iItemTip = -1;
+ TOOLINFO ti = { sizeof(ti) };
+ ti.uFlags = TTF_TRANSPARENT;
+ ti.hwnd = hwnd;
+ ti.uId = 0;
+ ti.lpszText = TEXT("Placeholder tooltip");
+ SetRectEmpty(&ti.rect);
+ SendMessage(g_hwndTT, TTM_ADDTOOL, 0, (LPARAM)&ti);</font>
+ return TRUE;
+}
+</pre>
+<p>
+You may have noticed that we do not use the <code>TTF_SUBCLASS</code>
+flag in our tool.
+We'll see why later.
+</p>
+<p>
+The single tool for the tooltip covers our entire client rectangle.
+We maintain this property as the window resizes.
+</p>
+<pre>
+void
+OnSize(HWND hwnd, UINT state, int cx, int cy)
+{
+ <font COLOR=blue>TOOLINFO ti = { sizeof(ti) };
+ ti.hwnd = hwnd;
+ ti.uId = 0;
+ GetClientRect(hwnd, &ti.rect);
+ SendMessage(g_hwndTT, TTM_NEWTOOLRECT, 0, (LPARAM)&amp;ti);</font>
+}
+</pre>
+<p>
+We need to keep the <code>g_iItemTip</code> up to date
+so we know which item our tooltip is standing for at any
+particular moment.
+That is done by the <code>UpdateTooltip</code> function:
+</p>
+<pre>
+<font COLOR=blue>void
+UpdateTooltip(int x, int y)
+{
+ int iItemOld = g_iItemTip;
+ g_iItemTip = ItemHitTest(x, y);
+ if (iItemOld != g_iItemTip) {
+   SendMessage(g_hwndTT, TTM_POP, 0, 0);
+ }
+}</font>
+</pre>
+<p>
+To update the tooltip, we check
+whether the mouse is over the same item as it was last time.
+If not, then we update our "Which item is under the mouse now?"
+variable and pop the old bubble (if any).
+And we always relay the message to the tooltip so it can do its
+tooltip thing.
+This function also explains why we did not use the
+<code>TTF_SUBCLASS</code> flag when we created our tool:
+We need to do some processing before the tooltip.
+If we had allowed the tooltip to subclass, then it would
+process the mouse message first,
+which means that our <code>TTM_POP</code>  would have popped
+the new updated tooltip instead of the stale
+old tooltip.
+</p>
+<p>
+This <code>UpdateTooltip</code> function is very important.
+It must be called any time the mouse may be hovering over
+a different item.
+This could be because the mouse moved or because the items
+under the mouse changed positions.
+I don't have any scrolling in this example, but if I did,
+then you would see a call to
+<code>UpdateTooltip</code>
+whenever we updated the scroll origin point
+because the act of scrolling may have moved the item
+that was under the mouse.
+(Failing to maintain mouse state after a scrolling operation
+is a common programming oversight.)
+Furthermore, if items were added or deleted dynamically,
+then a call to <code>UpdateTooltip</code> would have
+to be made once an item was added or deleted
+because the added or deleted item might be the one
+under the mouse.
+</p>
+<p>
+The easy one to take care of is the mouse motion:
+</p>
+<pre>
+<font COLOR=blue>void
+RelayEvent(HWND hwnd, UINT uiMsg, WPARAM wParam, LPARAM lParam)
+{
+ UpdateTooltip(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+ MSG msg;
+ msg.hwnd = hwnd;
+ msg.message = uiMsg;
+ msg.wParam = wParam;
+ msg.lParam = lParam;
+ SendMessage(g_hwndTT, TTM_RELAYEVENT, 0, (LPARAM)&amp;msg);
+}</font>
+
+LRESULT CALLBACK
+WndProc(HWND hwnd, UINT uiMsg, WPARAM wParam, LPARAM lParam)
+{
+ <font COLOR=blue>if ((uiMsg &gt;= WM_MOUSEFIRST &amp;&amp; uiMsg &lt;= WM_MOUSELAST) ||
+     uiMsg == WM_NCMOUSEMOVE) {
+  RelayEvent(hwnd, uiMsg, wParam, lParam);
+ }</font>
+
+ switch (uiMsg) {
+  ... as before ...
+}
+</pre>
+<p>
+If we get a mouse message, then the
+<code>RelayEvent</code> message updates our tooltip state
+and then relays the message to the tooltip.
+See the discussion above for the importance of doing this
+in the right order.
+</p>
+<p>
+You can run the program now.
+Observe that the program acts as if each colored band has
+its own tooltip,
+even though there is really only one tooltip that we
+keep recycling.
+</p>
+<p>
+We're still not done.
+The tooltip text is the same for each item,
+which is unrealistic for a real program.
+We'll address this next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-396403">
+				<div id="div-comment-396403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anders</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-396403">
+			June 29, 2006 at 5:06 am</a>		</div>
+
+		<p>Don&#8217;t know why this blog is so light on comments lately, summer might have something to do with it I don&#8217;t know, but I still read it every day, so keep up the good work Raymond</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-396413">
+				<div id="div-comment-396413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bvleur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-396413">
+			June 29, 2006 at 6:05 am</a>		</div>
+
+		<p>I guess Raymond can check the number of readers without them having to comment (if he even cares about his popularity). I&#8217;m reading and enjoying this blog every day just to learn some nice details about windows although I actually never write code a this level. </p>
+<p>The tiny details makes this interesting (as the concept is really easy) like: </p>
+<p>1. Why do you draw the color bands with empty text and not some kind FillRectangle function? </p>
+<p>2. Why does the tools rect change and is bigger than all of your items? I expected it to be set to the size of all your items (so just (0, 0, g_cxItem, g_cItems &amp; g_cyItem)). </p>
+<p>3. How does the tooltip disappear now that you won&#8217;t relay a mouse message that it&#8217;s outside of the item-rect? (It will POP because of itemTip becoming -1, but it will reappear as it&#8217;s still in the client-rect right?) </p>
+<p>4. You say you can&#8217;t subclass because you would POP the new tooltip. How could there have been a new tooltip if you haven&#8217;t changed the tool you&#8217;re over? Could you have sent a POPUP when UpdateTooltip detects you&#8217;re over a new item to make the new bubble appear as soon as you&#8217;re over a new item?</p>
+<div CLASS=post>[<i>(1)&nbsp;I&#8217;ll talk more about using ExtTextOut for solid fills later. (2)&nbsp;Using a tighter tool rectangle just re-creates the problem we&#8217;re trying to solve! (3)&nbsp;Run the program and find out. (4a)&nbsp;By &#8220;the new tooltip&#8221; I mean &#8220;the tooltip with the new text&#8221;. (4b)&nbsp;That would be a change in behavior. There would be no tooltip delay. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-396423">
+				<div id="div-comment-396423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-396423">
+			June 29, 2006 at 7:27 am</a>		</div>
+
+		<p>I&#8217;m still observing the same effects: </p>
+<p>Even without TTS_NOANIMATE, sometimes the tooltip is drawn without animation and border (at least I believe it&#8217;s a tooltip since it&#8217;s yellow). And with that flag, it&#8217;s always without animation and border. But whenever it&#8217;s drawn without border, the window is clipped to the parent (when I resize the partent window). </p>
+<p>Is it possible to eliminate animation and still have tooltip that is not clipped? The real &#8220;big&#8221; apps (i.e. IE :) ) don&#8217;t have such problems.</p>
+<div CLASS=post>[<i>Maybe you disabled tooltip animations in the control panel? I don&#8217;t know. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-396433">
+				<div id="div-comment-396433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Filteau</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-396433">
+			June 29, 2006 at 9:11 am</a>		</div>
+
+		<p>Why are you creating the tooltip with WS_EX_TRANSPARENT and not WS_EX_TOPMOST ?</p>
+<div CLASS=post>[<i>Try it without WS_EX_TRANSPARENT. And there&#8217;s no need to be WS_EX_TOPMOST here. One thing that bugs me is topmost windows that don&#8217;t need to be. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-396443">
+				<div id="div-comment-396443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KiwiBlue</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-396443">
+			June 29, 2006 at 9:16 am</a>		</div>
+
+		<p>bvleur: ExtTextOut is faster than creating brush and passing it to FillRect (MFC uses it for its CDC::FillSolidRect method). I vaguely remember reading that it&#8217;s also faster than MoveTo/LineTo for horizontal/vertical lines.</p>
+<p>Not that it should matter in such simple app anyway :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-396743">
+				<div id="div-comment-396743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-396743">
+			July 3, 2006 at 12:07 am</a>		</div>
+
+		<blockquote><p>
+  And there&#8217;s no need to be WS_EX_TOPMOST<br />
+  <br />&gt; here. One thing that bugs me is topmost<br />
+  <br />&gt; windows that don&#8217;t need to be. -Raymond]</p>
+<p>Today for me, buttons in the task bar are showing tooltips more topmost than the task bar itself. &nbsp;Last week for me, buttons in the task bar were showing tooltips more than half obscured by the task bar itself. &nbsp;I did not change any settings and did not receive any Windows Updates during this time. &nbsp;How can we figure out if tooltip windows need WS_EX_TOPMOST or not, and how can we figure out if WS_EX_TOPMOST will even work for them or not?
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-480973">
+				<div id="div-comment-480973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.antcassidy.com/code/?p=23' rel='external nofollow' class='url'>Code &raquo; Blog Archive &raquo; GOTCHA: Tooltips in ActiveX controls in Word, IE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-480973">
+			March 11, 2007 at 4:11 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.antcassidy.com/code/?p=23" rel="nofollow">http://www.antcassidy.com/code/?p=23</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-543513">
+				<div id="div-comment-543513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.deez.info/sengelha/blog/2007/08/28/owner-drawn-tooltips/' rel='external nofollow' class='url'>Steven Engelhardt &raquo; Blog Archive &raquo; Owner-Drawn Tooltips</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060628-05/?p=30703#comment-543513">
+			August 28, 2007 at 12:55 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.deez.info/sengelha/blog/2007/08/28/owner-drawn-tooltips/" rel="nofollow">http://www.deez.info/sengelha/blog/2007/08/28/owner-drawn-tooltips/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

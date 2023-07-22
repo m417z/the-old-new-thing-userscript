@@ -1,0 +1,315 @@
+<html>
+<head>
+<title>Debugging a GDI resource leak: Case study</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Debugging a GDI resource leak: Case study</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 19, 2017 / year-entry #119</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170519-00/?p=96195</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">If it leaked once, it'll leak again.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+I was asked to help debug a problem.
+A program was leaking GDI bitmaps like crazy,
+and after a while, the GDI resource handle count reached 9,999,
+at which point GDI said,
+"That's it, I'm cutting you off."
+</p>
+<p>
+The problem isn't discovered until after the limit has been
+reached.
+</p>
+<p>
+To debug this, I'm gong to use different
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20050815-11/?p=34583">
+poor man's way of identifying memory leaks</a>.
+We begin the story with a GDI handle that has been
+identified as leaked:
+<code>0x13054e2f</code>.
+My first step is to get some basic information about
+this GDI object by simulating a call to
+<code>Get&shy;Object</code>.
+</p>
+<pre>
+0:061&gt; .dvalloc 1
+Allocated 1000 bytes starting at 00000000`03610000
+</pre>
+<p>
+First, I allocated some memory that I can use to
+hold the <code>BITMAP</code> structure.
+</p>
+<pre>
+ntdll!DbgBreakPoint:
+00007ffb`65ef7570 int     3
+0:061&gt; t
+ntdll!DbgBreakPoint:
+00007ffb`65ef7571 ret
+0:061&gt; r rip=gdi32!GetObjectW
+0:061&gt; r r8=0x00000000`03610000
+0:061&gt; r rdx=0x68
+0:061&gt; r rcx=0x13054e2f
+0:061&gt; r
+GDI32!GetObjectW:
+00007ff9`9658e2f0 mov     qword ptr [rsp+8],rbx
+</pre>
+<p>
+Next, I
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20151016-00/?p=91341">
+simulate a call to the
+<code>Get&shy;ObjectW</code> function</a>&sup1;
+by setting up the inbound parameter registers:
+<code>rcx</code> is the GDI object we are geting information about,
+<code>rdx</code> is the size of the output buffer,
+<code>r8</code> is the output buffer itself (which we just allocated).
+</p>
+<p>
+I'm pulling a super-sneaky trick here.
+Normally, we reserve shadow space for the
+outbound call,
+and then simulate the <code>call</cODE>
+instruction by pushing the return address on the stack.
+But we didn't do any of that here.
+We just moved <code>rip</code> directly to the function
+we wanted to call.
+But I can skip those steps because
+I stepped to the <code>ret</code> instruction.
+This means that the stack is already set up the way it
+would be immediately upon entry to the function.
+We are reusing the stack frame of the
+<code>Dbg&shy;Break&shy;Point</code> function!
+We are reusing the shadow space provided by the caller,
+and we are taking advantage of the proper stack alignment
+established by the caller.
+</p>
+<pre>
+0:061&gt; gu
+ntdll!DbgUiRemoteBreakin+0x34:
+00007ff9`9730f4f4 jmp     ntdll!DbgUiRemoteBreakin+0x36 (00007ff9`9730f4f6)
+0:061&gt; r
+rax=0000000000000020 rbx=00007ff99730f4c0 rcx=00007ff9965b877a
+rdx=0000000000000000 rsi=0000000000000000 rdi=0000000000000000
+rip=00007ff99730f4f4 rsp=0000000007a7f7e0 rbp=0000000000000000
+ r8=0000000007a7f7a8  r9=0000000000000000 r10=0000000000000000
+r11=0000000000000206 r12=0000000000000000 r13=0000000000000000
+r14=0000000000000000 r15=0000000000000000
+iopl=0         nv up ei pl nz na pe nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000202
+ntdll!DbgUiRemoteBreakin+0x34:
+00007ff9`9730f4f4 jmp     ntdll!DbgUiRemoteBreakin+0x36 (00007ff9`9730f4f6)
+0:061&gt; dd 0x00000000`03610000 L8
+00000000`03610000  00000000 00000010 00000010 00000002
+00000000`03610010  00010001 fffff901 00000000 00000000
+0:061&gt; dt contoso!BITMAP 0x00000000`03610000
+   +0x000 bmType           : 0n0
+   +0x004 bmWidth          : 0n16
+   +0x008 bmHeight         : 0n16
+   +0x00c bmWidthBytes     : 0n2
+   +0x010 bmPlanes         : 1
+   +0x012 bmBitsPixel      : 1
+   +0x018 bmBits           : (null)
+</pre>
+<p>
+I run the <code>Get&shy;ObjectW</code> function with the
+<code>gu</code> command, which means
+"go until the current function returns".
+When it returns, I verify that the call succeeded
+(by checking the return value in <code>rax</code>),
+and the dump the <code>BITMAP</code> structure.
+</p>
+<p>
+This tells me that I have a 16&times;16 monochrome bitmap.
+Monochrome bitmaps are rarely-used in Windows nowadays.
+One place you'll see them is in icons,
+since an icon consists of two bitmaps:
+A monochrome mask and a color image.
+</p>
+<p>
+So let's assume that
+we're leaking the mask of an icon.
+These things come out of two functions:
+<code>Get&shy;Icon&shy;Info</code> and
+<code>Get&shy;Icon&shy;Info&shy;Ex</code>,
+so I set breakpoints on both.
+(Actually three functions since
+<code>Get&shy;Icon&shy;Info&shy;Ex</code>
+has both Unicode and ANSI variations.)
+</p>
+<pre>
+0:061&gt; bp user32!geticoninfo
+0:061&gt; bp user32!geticoninfoexw
+0:061&gt; bp user32!geticoninfoexa
+0:061&gt; g
+</pre>
+<p>
+The breakpoint hits pretty quickly.
+</p>
+<pre>
+Breakpoint 0 hit
+USER32!GetIconInfo:
+00007ff9`96cf1dd0 sub     rsp,38h
+0:005&gt; kc3
+Call Site
+USER32!GetIconInfo
+contoso!CNotificationIcon::IsIconCorrectSize+0x42
+contoso!CNotificationIcon::Modify::__l6::
+    &lt;lambda_5a5c6bde8a112e005a026c6f34886eee&gt;::operator()+0x1f
+</pre>
+<p>
+Going back to the source code for
+<code>Is&shy;Icon&shy;Correct&shy;Size</code>
+confirms that this function calls
+<code>Get&shy;Icon&shy;Info</code>
+(presumably to get the size of the icon)
+and forgets to delete the two bitmaps.
+</p>
+<p>
+Root cause identified.
+The fix is to delete those bitmaps.
+</p>
+<p>
+Forgetting to delete the bitmaps
+that come out of the <code>Get&shy;Icon&shy;Info</cODE>
+family of functions is a common mistake.
+</p>
+<p>
+&sup1;
+The <code>ntsd</code> debugger doesn't have
+a C compiler built-in,
+so we have to build these things manually.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-iboyd even thread-even depth-1" id="comment-1296935">
+				<div id="div-comment-1296935" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/IanBoyd' rel='external nofollow' class='url'>IanBoyd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170519-00/?p=96195#comment-1296935">
+			May 19, 2017 at 8:10 am</a>		</div>
+
+		<p>I was dealing with <a href=http://stackoverflow.com/q/41382501/12597 rel="nofollow">leaking up to the 10,000 GDI handle limit a few months ago</a>. My trick was to detour the various GDI object creation function (e.g. CreateFont, CreatePen, CreateBrush, CreateBitmap) and the corresponding destroy functions (e.g. DeleteObject, DestroyIcon), and match up that everything created was also destroyed. Anything that wasn&#8217;t: log it on application shutdown.</p>
+<p>Very quickly found the HFONT being leaking during custom paint of a control.</p>
+<p>&gt; Forgetting to delete the bitmaps that come out of the Get­Icon­Info family of functions is a common mistake.</p>
+<p>Excuse me one moment. I have to go do a thing over there with some stuff.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1296975">
+				<div id="div-comment-1296975" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://aloiskraus.wordpress.com/' rel='external nofollow' class='url'>Alois Kraus</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170519-00/?p=96195#comment-1296975">
+			May 19, 2017 at 3:40 pm</a>		</div>
+
+		<p>I normally use also some hooking to find out what is beeing leaked. But first I would try to find which GDI objects are actually leaked with a Windbg script which also works with memory dumps: <a href="https://aloiskraus.wordpress.com/2016/06/25/show-gdi-handles-by-type-in-windbg/" rel="nofollow">https://aloiskraus.wordpress.com/2016/06/25/show-gdi-handles-by-type-in-windbg/</a><br />
+EasyHook and ETW are a powerful combination if you have myriads of function calls to track and you want to find only the call stacks which are actually leaking something: <a href="http://geekswithblogs.net/akraus1/archive/2016/01/30/172079.aspx" rel="nofollow">http://geekswithblogs.net/akraus1/archive/2016/01/30/172079.aspx</a> This contains an example for CreateWindow which can easily be extended to some other method you are after.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1296995">
+				<div id="div-comment-1296995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170519-00/?p=96195#comment-1296995">
+			May 20, 2017 at 3:50 am</a>		</div>
+
+		<p>Or if you happen have symbols for a function with the same signature as GetObjectW then you can use your &#8220;stupid&#8221; debugger trick.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1297016">
+				<div id="div-comment-1297016" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://the-sz.com/products/bear/' rel='external nofollow' class='url'>The SZ</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170519-00/?p=96195#comment-1297016">
+			May 22, 2017 at 12:33 am</a>		</div>
+
+		<p>You can use Bear from <a href="http://the-sz.com/products/bear/" rel="nofollow">http://the-sz.com/products/bear/</a> to see the bitmaps visually&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1297556">
+				<div id="div-comment-1297556" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170519-00/?p=96195#comment-1297556">
+			May 24, 2017 at 8:19 pm</a>		</div>
+
+		<p>There are also tools to view the leaked GDI resources (I have one called GDILeaks/GDIUsage.exe; I don&#8217;t remember where I got it; I think it&#8217;s mentioned at <a href="https://blogs.msdn.microsoft.com/dsui_team/2013/04/23/debugging-a-gdi-resource-leak/" rel="nofollow">https://blogs.msdn.microsoft.com/dsui_team/2013/04/23/debugging-a-gdi-resource-leak/</a> , but the link there is broken).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

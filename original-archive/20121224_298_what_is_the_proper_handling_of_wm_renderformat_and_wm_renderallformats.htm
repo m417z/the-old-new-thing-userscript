@@ -1,0 +1,353 @@
+<html>
+<head>
+<title>What is the proper handling of WM_RENDERFORMAT and WM_RENDERALLFORMATS?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What is the proper handling of WM_RENDERFORMAT and WM_RENDERALLFORMATS?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 24, 2012 / year-entry #299</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20121224-00/?p=5763</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Jeremy points out that the documentation for Set­Clipboard­Data says that the clipboard owner must not call Open­Clipboard when responding to the WM_RENDER­FORMAT and WM_RENDER­ALL­FORMATS messages. On the other hand, the documentation for WM_RENDER­ALL­FORMATS says that the owner must call Open­Clipboard and Empty­Clipboard. Which is it? It's none of them! Let's start with WM_RENDER­FORMAT. The reference...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Jeremy points out that the documentation for
+<code>Set&shy;Clipboard&shy;Data</code> says that the clipboard
+owner must not call <code>Open&shy;Clipboard</code> when responding
+to the
+<code>WM_<wbr>RENDER&shy;FORMAT</code> and
+<code>WM_<wbr>RENDER&shy;ALL&shy;FORMATS</code> messages.
+On the other hand, the documentation for
+<code>WM_<wbr>RENDER&shy;ALL&shy;FORMATS</code> says that
+the owner must call <code>Open&shy;Clipboard</code> and
+<code>Empty&shy;Clipboard</code>.
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/07/20/10040074.aspx#10040446">
+Which is it</a>?
+</p>
+<p>
+It's none of them!
+</p>
+<p>
+Let's start with <code>WM_<wbr>RENDER&shy;FORMAT</code>.
+The reference implementation for a
+<code>WM_<wbr>RENDER&shy;FORMAT</code> handler goes like this,
+with all error handling deleted for expository purposes:
+</p>
+<pre>
+case WM_RENDERFORMAT:
+ CLIPFORMAT cf = (CLIPFORMAT)wParam;
+ hData = GenerateFormat(cf);
+ SetClipboardData(cf, hData);
+ return 0;
+</pre>
+<p>
+In response to
+<code>WM_<wbr>RENDER&shy;FORMAT</code>,
+you simply place the format on the clipboard.
+No opening is required.
+In fact, attempting to open will <i>fail</i> because
+the clipboard is already open:
+It has been opened by the application whose call to
+<code>Get&shy;Clipboard&shy;Data</code> triggered
+the delay-render!
+</p>
+<p>
+Next comes
+<code>WM_<wbr>RENDER&shy;ALL&shy;FORMATS</code>.
+The original reference implementation goes like this,
+again with error checking deleted:
+</p>
+<pre>
+// code in italics is wrong -- see discussion below
+case WM_RENDERALLFORMATS:
+ <i>OpenClipboard(hwnd);
+ SendMessage(hwnd, WM_RENDERFORMAT, CF_FORMAT1, 0);
+ SendMessage(hwnd, WM_RENDERFORMAT, CF_FORMAT2, 0);
+ CloseClipboard();</i>
+ return 0;
+</pre>
+<p>
+In response to
+<code>WM_<wbr>RENDER&shy;ALL&shy;FORMATS</code>,
+you open the clipboard,
+then render all your formats into it,
+and then close the clipboard.
+And one to render your formats is simply to send yourself
+a fake <code>WM_<wbr>RENDER&shy;FORMAT</code> message,
+which gets the code in the earlier code block to generate
+the format and place it on the clipboard.
+</p>
+<p>
+So you see that everybody is wrong!
+</p>
+<p>
+The
+<code>WM_<wbr>RENDER&shy;ALL&shy;FORMATS</code> handler
+<i>does</i> call
+<code>Open&shy;Clipboard</code>&mdash;if you tried it without the
+<code>Open&shy;Clipboard</code> call,
+you'd notice that the data never made it to the clipboard&mdash;and
+it <i>doesn't</i> call <code>Empty&shy;Clipboard</code>.
+(If you did, you'd notice that the
+<code>Empty&shy;Clipboard</code> would have wiped out your
+non-delay-rendered data!)
+</p>
+<p>
+Where did I get these reference implementations from?
+I got them from the <i>Windows 3.1 SDK</i>.
+(And that explains the bug; read on.)
+</p>
+<p>
+In real life, you probably would also listen for the
+<code>WM_<wbr>DESTROY&shy;CLIPBOARD</code> message so you would
+know that you are no longer the clipboard owner, in which case
+you wouldn't bother rendering anything.
+</p>
+<p>
+I haven't written code in a while, so let's write some code.
+Start with our
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/07/23/54576.aspx">
+scratch program</a>
+and make these changes.
+We'll start by writing it incorrectly:
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ <font COLOR=blue>if (OpenClipboard(hwnd)) {
+  EmptyClipboard();
+  SetClipboardData(CF_UNICODETEXT, NULL);
+  CloseClipboard();
+ }</font>
+ return TRUE;
+}
+
+<font COLOR=blue>
+const WCHAR c_szText[] = L"hello";
+
+HANDLE
+OnRenderFormat(HWND hwnd, UINT fmt)
+{
+ if (fmt == CF_UNICODETEXT)
+ {
+  HGLOBAL hglob;
+  if (SUCCEEDED(<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2008/03/11/8080077.aspx">CreateHGlobalFromBlob</a>(
+                            c_szText, sizeof(c_szText),
+                            GMEM_MOVEABLE, &amp;hglob))) {
+   if (!SetClipboardData(fmt, hglob)) GlobalFree(hglob);
+  }
+ }
+ return 0;
+}
+
+void
+OnRenderAllFormats(HWND hwnd)
+{
+ if (OpenClipboard(hwnd)) {
+  <i>OnRenderFormat(hwnd, CF_UNICODETEXT);</i>
+  CloseClipboard();
+ }
+}
+
+    HANDLE_MSG(hwnd, WM_RENDERFORMAT, OnRenderFormat);
+    HANDLE_MSG(hwnd, WM_RENDERALLFORMATS, OnRenderAllFormats);</font>
+</pre>
+<p>
+This program puts delay-rendered text on the clipboard
+<a HREf="http://blogs.msdn.com/b/oldnewthing/archive/2010/05/10/10009448.aspx">
+when it starts up</a>,
+When the request for text arrives, we just return the word
+<tt>hello</tt>.
+If we are asked to render all our formats, we render all our formats
+by calling our internal function once for each format we support.
+(All one of them.)
+</p>
+<p>
+There's a tiny race condition in that implementation above,
+though.
+What if somebody takes ownership of the clipboard
+<i>while you're trying to render all your formats</i>?
+Let's force the race condition.
+Set a breakpoint on the <code>On&shy;Render&shy;All&shy;Formats</code>
+function,
+run the program, and close the window.
+The breakpoint will hit.
+</p>
+<p>
+Switch away from the debugger and open Notepad.
+Type <tt>123</tt> into Notepad, then select it and
+type <kbd>Ctrl</kbd>+<kbd>C</kbd> to copy it to the clipboard.
+</p>
+<p>
+Notepad will hang for a while, since the window manager is trying
+to send a
+<code>WM_<wbr>DESTROY&shy;CLIPBOARD</code> message to
+tell the previous clipboard owner that it is no longer responsible
+for the data on the clipboard.
+Let the call time out,
+at which point Notepad will wake back up and put <tt>123</tt>
+text on the clipboard.
+Now resume execution of the scratch program,
+so that it puts the Unicode word <tt>hello</tt> onto the clipboard.
+</p>
+<p>
+Okay, go back to Notepad and hit <kbd>Ctrl</kbd>+<kbd>V</kbd>.
+Look, it pasted <tt>hello</tt> instead of <tt>123</tt>.
+Oops, our delay-rendering program destroyed the clipboard
+as it exited.
+If the application had put something more complicated on the clipboard,
+then our scratch program would have created a mishmash of old and new data.
+</p>
+<p>
+To protect against this race condition, make the following
+small change:
+</p>
+<pre>
+void
+OnRenderAllFormats(HWND hwnd)
+{
+ if (OpenClipboard(hwnd)) {
+  <font COLOR=blue>if (GetClipboardOwner() == hwnd) {</font>
+    OnRenderFormat(hwnd, CF_UNICODETEXT);
+  <font COLOR=blue>}</font>
+  CloseClipboard();
+ }
+}
+</pre>
+<p>
+After opening the clipboard, we check if we are still the
+window responsible for the clipboard contents.
+Only if so do we render our delay-rendered formats.
+</p>
+<p>
+<b>Exercise</b>: Why is the <code>Get&shy;Clipboard&shy;Owner</code>
+test done <i>after</i> the <code>Open&shy;Clipboard</code>?
+Wouldn't it be better to bail out quickly if we are not the clipboard
+owner and avoid opening the clipboard in the first place?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1028183">
+				<div id="div-comment-1028183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pinwing</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121224-00/?p=5763#comment-1028183">
+			December 24, 2012 at 7:23 am</a>		</div>
+
+		<p>I guess that after calling GetClipboardOwner, some other application could have opened the clipboard, become the new owner and closed the clipboard, before we get to OpenClipboard call.</p>
+<p>Which means that the OpenClipboard call will succeed (since the clipboard was closed by the other application), but we are not the owner anymore (oops?).</p>
+<p><!-- 
+
+<p>BTW, your reference implementation of WM_RENDERALLFORMATS wrongly uses "case WM_RENDERFORMAT". --></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1028193">
+				<div id="div-comment-1028193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121224-00/?p=5763#comment-1028193">
+			December 24, 2012 at 2:49 pm</a>		</div>
+
+		<p>You made me grep if CreateHGlobalFromBlob is finally arrived in the Windows API, though!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1028313">
+				<div id="div-comment-1028313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121224-00/?p=5763#comment-1028313">
+			December 25, 2012 at 12:25 pm</a>		</div>
+
+		<p>Wait, the clipboard has a timeout? I&#39;m forever accidentally (WinDbg interprets a right-click as a paste, presumably something to do with the rich text control it uses?) pasting from the debuggee into the debugger, which as you can imagine doesn&#39;t work too well&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-davebacher odd alt thread-odd thread-alt depth-1" id="comment-1028583">
+				<div id="div-comment-1028583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dave+Bacher' rel='external nofollow' class='url'>Dave Bacher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121224-00/?p=5763#comment-1028583">
+			December 26, 2012 at 10:29 am</a>		</div>
+
+		<p>Many Windows apps use MVC, and use either a flag or a list to select nodes in the model by reference. &nbsp;Pasting, then, walks the list.</p>
+<p>If you have read consistency, you can pin the version of the data, and so your copy and paste is consistent. &nbsp;That could be on MVVM, for example, having a separate clipboard View Model and building it at the copy time. &nbsp;Or on MVC, you could make your objects generational or w/e. &nbsp;The point is that if your traversal is consistent, every time, then you&#39;re correct that the Empty is optional.</p>
+<p>However, if the traversal is not consistent &#8212; and that is the case for the vast majority of apps on the Windows platform &#8212; then for render all formats you really have to empty out first, then render each format in turn. &nbsp;The reason being it is more important that the renders be consistent with one another than that the routine returns faster.</p>
+<p>It isn&#39;t the server app that gets a choice here &#8212; its the client. &nbsp;If someone goes to paste special, and it shows different data, they&#39;re going to blame the client app &#8212; not the server. &nbsp;They&#39;re not going to go &quot;oh, fabrikam screwed up copy.&quot; &nbsp;It&#39;ll be &quot;stupid word, can&#39;t even paste correctly.&quot;</p>
+<p>Because they&#39;ll notice the difference when they&#39;re in some other app pasting.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

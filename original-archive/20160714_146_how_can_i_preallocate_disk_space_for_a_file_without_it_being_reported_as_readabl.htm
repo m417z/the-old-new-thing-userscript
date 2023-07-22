@@ -1,0 +1,463 @@
+<html>
+<head>
+<title>How can I preallocate disk space for a file without it being reported as readable?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I preallocate disk space for a file without it being reported as readable?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 14, 2016 / year-entry #147</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>18</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Set the file allocation information.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer wanted to create a file with the following properties:
+</p>
+<ul>
+<li>The file has a known maximum size.
+    (The file is a log file, and when the log file gets full,
+    the program closes the log file and creates a new one.)</p>
+<li>Disk space for the log file should be preallocated up to
+    the maximum size.</p>
+<li>Aside from the fact that disk space for the maximum size has
+    been preallocated,
+    the file should behave like a normal file:
+    Code that reads the log file should be able to read up to
+    the last written byte, but if they try to read past the
+    last written byte, they should get "end of file reached".
+</ul>
+<p>
+The last requirement exists because there are third party tools
+that read the log files,
+and those tools are just going to use traditional file I/O to access
+the log file.
+</p>
+<p>
+The customer suggested an analogy:
+"If we were operating on <code>std::vector</code>,
+then what I'm looking for is 
+<code>vector.reserve()</code> to expand the vector's
+capacity, and
+<code>vector.push_back()</code> to append entries.
+Code that iterates over the vector or
+reads the <code>vector.size()</code> see only the vector
+elements that have been pushed onto the vector."
+</p>
+<p>
+The file system team responded with this solution:
+</p>
+<p>
+Use
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/aa365539(v=vs.85).aspx">
+the
+<code>Set&shy;File&shy;Information&shy;By&shy;Handle</code>
+function</a>,
+passing function code
+<code>File&shy;Allocation&shy;Info</code>
+and
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/aa364214(v=vs.85).aspx">
+a
+<code>FILE_<wbr>ALLOCATION_<wbr>INFO</code>
+structure</a>.
+"Note that this will decrease fragmentation,
+but because each write is still updating the file size
+there will still be synchronization and
+metadata overhead caused at each append."
+</p>
+<p>
+The effect of setting the file allocation info
+lasts only as long as you keep the file handle open.
+When you close the file handle, all the preallocated space
+that you didn't use will be freed.
+</p>
+<p>
+Here goes a Little Program.
+Remember, Little Programs do little to no error checking.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+
+int __cdecl main(int argc, char** argv)
+{
+  auto h = CreateFile(L"test.txt", GENERIC_ALL,
+    FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+    FILE_ATTRIBUTE_NORMAL, nullptr);
+  FILE_ALLOCATION_INFO info;
+  info.AllocationSize.QuadPart =
+    1024LL * 1024LL * 1024LL * 100; // 100<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">GB</a>
+  SetFileInformationByHandle(h, FileAllocationInfo,
+    &amp;info, sizeof(info));
+  for (int i = 0; i &lt; 10; i++) {
+    DWORD written;
+    WriteFile(h, "hello\r\n", 7, &amp;written, nullptr);
+    Sleep(5000);
+  }
+  CloseHandle(h);
+  return 0;
+}
+</pre>
+<p>
+This program creates a file and preallocates 100GB of disk space for it.
+It then writes to the file very slowly.
+While the program is running, you can do a
+<code>type test.txt</code> to read the contents of the file,
+and it will print only the contents that were written.
+Watch the free disk space on the drive,
+and you'll see that it drops by 100GB while the program is running,
+and then most of the disk space comes back when the program exits.
+</p>
+<p>
+The preallocated disk space is also released when you call
+<code>Set&shy;End&shy;Of&shy;File</code>.
+</p>
+<p>
+There's a special gotcha about setting the file allocation info:
+If you set the file allocation info to a nonzero value,
+then the file contents will be forced into nonresident data,
+<a HREF="https://blogs.technet.microsoft.com/askcore/2009/10/16/the-four-stages-of-ntfs-file-growth/">
+even if it would have fit inside the MFT</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (18)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1256106">
+				<div id="div-comment-1256106" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matteo Italia</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256106">
+			July 14, 2016 at 10:21 am</a>		</div>
+
+		<p>Given that a file is more like an std::deque than an std::vector (data is allocated in biggish chunks and is never copied around) it&#8217;s not really clear what kind of performance advantage they are after by preallocating everything; after all, deque itself doesn&#8217;t have a reserve method because it&#8217;s mostly useless. Even the additional locality shouldn&#8217;t matter much, given that a log is normally append only (and is read sequentially). Maybe the customer had some mistaken idea about the inner workings of the file system?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1256165">
+				<div id="div-comment-1256165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256165">
+			July 14, 2016 at 12:06 pm</a>		</div>
+
+		<p>I see two reasons they may want to do this:<br />
+1) you get fail on open (well, failure around the time the Open happens) rather than fail on write<br />
+2) you get to reserve your space up front, making sure that no other user of the volume can take of the space you need (again working to prevent fail on write).  It&#8217;s like sending someone into the movie theatre early to reserve 8 seats before anyone else arrives.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-dwalker-wk even depth-3 parent" id="comment-1256235">
+				<div id="div-comment-1256235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256235">
+			July 15, 2016 at 7:28 am</a>		</div>
+
+		<p>But&#8230; but.. let&#8217;s say the disk only had 50GB of space left.  Which is better:  To write 50GB of log, and then fail, or to fail when trying to create a 100 GB log file?  In the second choice, nothing gets logged and the program might not even start.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1256255">
+				<div id="div-comment-1256255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256255">
+			July 15, 2016 at 7:41 am</a>		</div>
+
+		<p>In that case, in a program bigger than a &#8220;little program&#8221;, you have a second failure path that creates a smaller log file.  In that log file, you write &#8220;Couldn&#8217;t create Log file &#8211; Quitting&#8221; (or, you steal as much space as makes sense and pre-allocate a smaller log).  The idea is to reduce the likelihood of a fail-on-write-to-the-log as much as you can.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1256385">
+				<div id="div-comment-1256385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256385">
+			July 16, 2016 at 9:02 pm</a>		</div>
+
+		<p>Logging is a particularly good example of this pattern because it is a cross-cutting concern.  A well-written application is likely to perform logging calls at many different layers of abstraction and in many different contexts.  It is not practical to correctly handle a logging failure at every one of these call sites, so most sane logging frameworks just swallow logging errors silently (with perhaps a message to stderr, if you&#8217;re lucky).  In this regard it is much like how many garbage-collected languages handle throwing finalizers: you can&#8217;t clean up from a failed cleanup, nor is the application in a good position to decide what to do about it, so just ignore it and destroy the object anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt thread-odd thread-alt depth-1 parent" id="comment-1256115">
+				<div id="div-comment-1256115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256115">
+			July 14, 2016 at 10:45 am</a>		</div>
+
+		<p>What are those &#8220;LL&#8221; in front of 1024? What do they do?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1256126">
+				<div id="div-comment-1256126" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">TimothyB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256126">
+			July 14, 2016 at 11:27 am</a>		</div>
+
+		<p>It&#8217;s a C++ number suffix to say that the constant is a long long.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1256135">
+				<div id="div-comment-1256135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt Denham</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256135">
+			July 14, 2016 at 11:37 am</a>		</div>
+
+		<p>It indicates that they&#8217;re of type &#8220;long long&#8221;, which is important here mostly to ensure that the multiplication ends up with the correct type (if it stayed in a 32-bit type, it&#8217;d end up as 0 instead since 100GB = 0 modulo 2^32).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1256145">
+				<div id="div-comment-1256145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Steve</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256145">
+			July 14, 2016 at 11:55 am</a>		</div>
+
+		<p>LL indicates that the integer literal should be treated as type &#8220;long long&#8221;.</p>
+<p><a href="http://en.cppreference.com/w/cpp/language/integer_literal" rel="nofollow">http://en.cppreference.com/w/cpp/language/integer_literal</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1256155">
+				<div id="div-comment-1256155" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256155">
+			July 14, 2016 at 12:01 pm</a>		</div>
+
+		<p>From <a href="https://msdn.microsoft.com/en-us/library/c70dax92.aspx" rel="nofollow">https://msdn.microsoft.com/en-us/library/c70dax92.aspx</a><br />
+To specify an unsigned type, use either the u or U suffix. To specify a long type, use either the l or L suffix. To specify a 64-bit integral type, use the LL, or ll suffix.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command even depth-3 parent" id="comment-1256215">
+				<div id="div-comment-1256215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256215">
+			July 15, 2016 at 7:12 am</a>		</div>
+
+		<p>Thanks for the collective answers. :)</p>
+<p>Why can&#8217;t the compiler decide that the way .NET Framework interpreter and Delphi compiler do? Is this some sort of power-developer feature?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1256245">
+				<div id="div-comment-1256245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256245">
+			July 15, 2016 at 7:37 am</a>		</div>
+
+		<p>Well, things like C++, C# and Delphi are different languages.<br />
+auto myint = 0;<br />
+auto mylong = 0L;<br />
+auto myreallylong = 0LL;<br />
+Create two 32-bit numbers (one an int and the other a long) and a 64-bit &#8220;long long&#8221; in MS C++ (remember, C++ does not specify the bit length of it&#8217;s types).  In C#:<br />
+var myint = 0;<br />
+var mylong = 0L;<br />
+specify 32 and 64-bit integers (in the .NET world, the bit-length of integral types is part of the standard).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command even depth-5" id="comment-1256257">
+				<div id="div-comment-1256257" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256257">
+			July 15, 2016 at 8:35 am</a>		</div>
+
+		<p>In way, I was asking why &#8220;C++ does not specify the bit length of it’s types&#8221;? But I guess you implied the answer: The same reason that Wright brothers&#8217; plane didn&#8217;t have jet engine. So, thanks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4 parent" id="comment-1256315">
+				<div id="div-comment-1256315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wear</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256315">
+			July 15, 2016 at 3:28 pm</a>		</div>
+
+		<p>.NET actually has the same issue.</p>
+<p>long l =  1024 * 1024 * 1024 * 100; -&gt; &#8220;Error	CS0220: The operation overflows at compile time in checked mode&#8221;<br />
+Dim l As Long = 1024 * 1024 * 1024 * 100 -&gt; &#8220;Error BC30439: Constant expression not representable in type &#8216;Integer'&#8221;</p>
+<p>The compiler treats the literals as int32s and preforms int32*int32 multiplication on them which overflows. If you add the L suffix everything works because now the literals are all int64s and you are performing int64*int64 multiplication.</p>
+<p>long l =  1024L * 1024L * 1024L * 100L;<br />
+Dim l As Long = 1024L * 1024L * 1024L * 100L</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command even depth-5" id="comment-1256365">
+				<div id="div-comment-1256365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256365">
+			July 16, 2016 at 8:25 am</a>		</div>
+
+		<p>Yes. Interesting how I never run into this on .NET: I never had to manually allocate a very large number to my variables during my career.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt depth-5" id="comment-1256415">
+				<div id="div-comment-1256415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256415">
+			July 17, 2016 at 8:04 pm</a>		</div>
+
+		<p>Actually, you might need the suffix to declare constants for use in Interop too.</p>
+<p>Taking example for a recent support case in MSDN forum:<br />
+Public Enum ACCESS_MASK As UInteger<br />
+   &#8216;&#8230;<br />
+   GENERIC_READ = &amp;H80000000UI<br />
+   &#8216;&#8230;<br />
+End Enum</p>
+<p>Try take away &#8220;UI&#8221; at the end and see if it can compile.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1256185">
+				<div id="div-comment-1256185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256185">
+			July 14, 2016 at 8:53 pm</a>		</div>
+
+		<p>Reserve disk space with this one weird trick!</p>
+<p>(Sorry, couldn&#8217;t help myself. Looks like quite a neat solution actually.)</p>
+<p>I agree with Brian: it&#8217;s not a bad thing to make sure you have space to write to your log file. If something goes wrong and the disk fills up, at least you can write &#8216;couldn&#8217;t generate output, disk full&#8217; to your log file. Yes, you&#8217;d probably find out from disk usage monitoring, but having it in the log can save time troubleshooting, particularly if it&#8217;s only a brief condition &#8211; for instance if your app cleans up a large output file after a failed write.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fjeldse odd alt thread-odd thread-alt depth-1" id="comment-1256275">
+				<div id="div-comment-1256275" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Erik+F' rel='external nofollow' class='url'>Erik F</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160714-00/?p=93875#comment-1256275">
+			July 15, 2016 at 10:34 am</a>		</div>
+
+		<p>This seems similar to fallocate() on Linux, which I have used a couple of times to achieve the same sort of result. File transfer programs don&#8217;t seem to use it but I think that this method would be handy when you are copying a large file because you can guarantee beforehand that the copy won&#8217;t fail due to lack of space on the destination. I&#8217;m sure there&#8217;s a good reason but off the top of my head I can&#8217;t think of what that might be.</p>
+<p>The documentation for SetFileInformationByHandle() seems to imply that not all file systems support all features: is there any documented guidance regarding what common file systems support which information class?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

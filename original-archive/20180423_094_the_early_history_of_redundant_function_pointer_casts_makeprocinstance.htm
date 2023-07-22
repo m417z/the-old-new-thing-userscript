@@ -1,0 +1,453 @@
+<html>
+<head>
+<title>The early history of redundant function pointer casts: MakeProcInstance</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The early history of redundant function pointer casts: MakeProcInstance</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 23, 2018 / year-entry #94</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The generic function pointer.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+If you
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/05/06/10161590.aspx#10161846">
+look through old code</a>,
+you see a lot of
+redundant function pointer casts.
+(If you're writing new code,
+you should get rid of as many function pointer casts as possible,
+because
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/05/06/10161590.aspx#10161846">
+a function pointer cast is a bug waiting to happen</a>.)
+Why does old code have so many redundant function pointer casts?
+</p>
+<p>
+Because back in the old days, they weren't redundant.
+</p>
+<p>
+In the days of 16-bit Windows,
+function prologues were required to take very specific forms
+in order to make
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/06/29/10325295.aspx">
+stack walking</a> work,
+and stack walking was necessary in order to simulate an MMU
+on a CPU that didn't have one.
+</p>
+<p>
+Another rule for prologues has to do with state management.
+The full prologue for a far function looks like this:
+</p>
+<pre>
+    mov     ax, ds
+    nop
+    inc     bp
+    push    bp
+    mov     bp, sp
+    push    ds
+    mov     ds, ax
+</pre>
+<p>
+Before we can dig into those instructions, we need to know a bit about
+how code segments worked in real-mode 16-bit Windows.
+In real-mode 16-bit Windows, there was a single address space for all applications
+because the CPU had no concept of per-process address spaces.
+The kernel simulated separate address spaces by managing <i>instances</i>.
+The instance (represented by an <i>instance handle</i>)
+specified the location of the data segment the code should operate on.
+If you have two copies of a program running,
+the code is shared, but each program has its own data.
+The instance handle tells you where that data is.
+</p>
+<p>
+And the instance handle is kept in the <code>ds</code> register.
+</p>
+<p>
+Therefore, it is essential that every function have its <code>ds</code>
+register set to the instance handle that describes where the code
+should find its data.
+You can think of it as a "global <code>this</code> pointer for the process."
+</p>
+<p>
+Okay, so let's look at the function prologue again.
+First, it copies <code>ds</code> to <code>ax</code> via a two-byte
+<code>mov ax, ds</code> instruction.
+Then there is a <code>nop</code>.
+This pads the prologue size to three bytes.
+</p>
+<p>
+The next four instructions build the stack frame:
+The <code>inc bp</code>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/03/16/10141735.aspx">
+marks the stack frame as a far frame</a>.
+The <code>push bp</code> and <code>mov bp, sp</code>
+build the <code>bp</code> chain.
+And
+the
+<code>push ds</code> saves the original <code>ds</code> register,
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/06/29/10325295.aspx">
+which also provides breathing room for
+return address patching</a>.
+</p>
+<p>
+And then we move <code>ax</code> back into <code>ds</code>.
+The instance handle just took a little tour of the <code>ax</code>
+register and then returned back home.
+What was the point of that?
+</p>
+<p>
+Recall that in 16-bit Windows,
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/06/22/10322767.aspx">
+every far function called from another segment was listed
+in the module's Entry Table</a>.
+</p>
+<p>
+When a far function is placed in the exported function table,
+the loader patches the first three bytes of the function
+to three <code>nop</code> instructions.
+Non-exported functions remain unchanged.
+This means that non-exported functions do the redundant
+<code>ds</code> rigamarole.
+It's a little extra work, but it's ultimately harmless.
+</p>
+<p>
+The effect of patching out the initial <code>mov ax, ds</code>
+is that the function ends up doing this:
+</p>
+<ul>
+<li>Build a far stack frame,
+    which includes saving the original <code>ds</code>.</p>
+<li>Set <code>ds</code> to whatever was passed in the <code>ax</code> register.
+</ul>
+<p>
+The second step means that the code, when it executes,
+operates on the data associated with the handle passed in the <code>ax</code>
+register.
+</p>
+<p>
+Okay, great, but this means that you can't call an exported function
+directly,
+because it will set the <code>ds</code> register to whatever
+value is passed in the <code>ax</code> register.
+Since the <code>ax</code> register is not part of the calling convention,
+its value is garbage.
+</p>
+<p>
+But that's okay.
+We made things worse so we can make them better.
+</p>
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20080207-00/?p=23533">
+The <code>Make&shy;Proc&shy;Instance</code> function</a>
+creates a stub function that loads the <code>ax</code> register
+with the instance handle you provide,
+and then jumps to the function you provide.
+Really.
+That's all it did.
+(When you're done, you call <code>Free&shy;Proc&shy;Instance</code>
+to free the memory back to the system.)
+</p>
+<p>
+This stub function was known as
+a <i>procedure instance thunk</i>,
+or a <i>proc instance</i> for short.
+Hence the name <code>Make&shy;Proc&shy;Instance</code>.
+</p>
+<p>
+Okay, finally the punch line.
+The <code>Make&shy;Proc&shy;Instance</code> function didn't care
+what kind of function pointer you passed it.
+Whatever you passed in, it returned the same kind of pointer back out,
+because all the stub did was twiddle the <code>ax</code> register
+and then jump to the real function.
+The parameters on the stack didn't change,
+the cleanup convention didn't change,
+nothing else changed.
+</p>
+<p>
+The <code>Make&shy;Proc&shy;Instance</code> function was
+declared as returning a <code>FARPROC</code>,
+which is a typedef for a far function that takes no parameters
+and returns nothing.
+The parameters and return value are irrelevant;
+it just had to be <i>something</i>.
+</p>
+<p>
+But what this means is that when you take your function,
+like a window enumeration callback,
+and create a procedure instance for it,
+the thing you get back has been type-erased to a generic
+function pointer.
+To make it useful again, you need to cast it back to what it
+was originally.
+</p>
+<p>
+For example, if what you passed was a <code>WNDENUMPROC</code>,
+then you need to cast the procedure instance back to a
+<code>WNDENUMPROC</code>.
+If you passed a <code>TIMERPROC</code>, then you need to cast
+the procedure instance back to a <code>TIMERPROC</code>.
+You could anachronistically express this as
+</p>
+<pre>
+template&lt;typename R, typename ...Args&gt;
+auto MakeProcInstanceT(R (FAR *func)(Args...), HINSTANCE inst)
+{
+  return (decltype(func))MakeProcInstance((FARPROC)func, inst);
+}
+</pre>
+<p>
+Of course, you didn't have this fancy template deduction
+in 1983-era C,
+so you had to cast the return value manually.
+</p>
+<p>
+And that brings us to today.
+Even though
+<code>Make&shy;Proc&shy;Instance</code> has been obsolete
+for decades,
+some people imprinted on the
+"gotta cast your function pointers to get them to compile"
+pattern,
+either because they wrote code when the cast was required
+and fell into the habit, or
+or (more likely) they learned from code that was written
+by someone who inherited this habit from somebody else.
+And yes, this inherited folk wisdom
+<a HREF="https://msdn.microsoft.com/ms644996">
+can even be found in MSDN</a>.
+</p>
+<p>
+The redundant function pointer cast is now a type of folklore,
+passed down from developer to developer,
+even though it's no longer needed
+and in fact
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723">
+will mask problems
+caused by mismatched prototypes</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1 parent" id="comment-1333915">
+				<div id="div-comment-1333915" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1333915">
+			April 23, 2018 at 7:29 am</a>		</div>
+
+		<p>The cast should have been a part of the function signature.</p>
+<p>Quick, to the time machine so we can have:</p>
+<p>#if _WIN32<br />
+#ifdef __cplusplus<br />
+template&lt;class T&gt; inline T MakeProcInstanceHelper(T func, HINSTANCE inst) { return func; }<br />
+#define MakeProcInstance(functype,func,inst) MakeProcInstanceHelper((func),(inst))<br />
+#else<br />
+#define MakeProcInstance(functype,func,inst) ((inst),(func))<br />
+#endif<br />
+#else<br />
+#define MakeProcInstance(functype,func,inst) ( (functype) RealMakeProcInstance((func,(inst)) )<br />
+#endif</p>
+<p>(The c++ version will verify that the cast is correct so porting back to 16-bit would be painless for codebases supporting both)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1333945">
+				<div id="div-comment-1333945" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1333945">
+			April 23, 2018 at 8:35 am</a>		</div>
+
+		<p>Try this way:</p>
+<p>$ git clone timestream<br />
+$ git branch makeprocinstnace3 `git log &#8211;after &#8220;1981-12-07&#8221; &#8211;pretty oneline | head -n 1 | sed &#8216;s/ .*//&#8217;`<br />
+$ git patch &lt; makeprocinstance3.patch<br />
+$ git commit -m &quot;safe MkaeProcInstance casts&quot;<br />
+$ git checkout master<br />
+$ tar -cf &#8211; .git | ssh scp155 tar -xf &#8211; \&amp;\&amp; git merge -r resove-propigate-changes \&amp;\&amp; tar -cf &#8211; .git | tar -xf &#8211;<br />
+$ git push timestream</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks even depth-2" id="comment-1333955">
+				<div id="div-comment-1333955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1333955">
+			April 23, 2018 at 10:07 am</a>		</div>
+
+		<p>Well, that came out almost readable. It is supposed to be MakeProcInstanceHelper&lt;functype&gt;((func),(inst)) of course.</p>
+<p>Raymond, are we supposed to use code and/or pre tags for code here? I can never remember.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1333975">
+				<div id="div-comment-1333975" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1333975">
+			April 23, 2018 at 12:48 pm</a>		</div>
+
+		<p>When, oh when, will that time machine be ready? Not only we could avoid 11-S, the Haiti earthquake and the Japan tsunami. Above all, we could fix all those Win16 wrinkles that are carried onto Win32 and Win64&#8230;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1333995">
+				<div id="div-comment-1333995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1333995">
+			April 24, 2018 at 2:42 am</a>		</div>
+
+		<p>It really doesn&#8217;t matter when the time machine will be ready&#8230;ask me again last week.</p>
+<p>Any parameter will fit any function if you hit it hard enough with the cast-hammer!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1334015">
+				<div id="div-comment-1334015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1334015">
+			April 24, 2018 at 3:23 am</a>		</div>
+
+		<p>Why bother when the time machine can prevent MakeProcInstance from being created?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1334045">
+				<div id="div-comment-1334045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1334045">
+			April 24, 2018 at 9:01 am</a>		</div>
+
+		<p>DS=SS does not appear to be required for Win16 executables; it was just required for Win16 C executables. So MakeProcInstance is merely rare not non-extant.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1334135">
+				<div id="div-comment-1334135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1334135">
+			April 25, 2018 at 3:34 am</a>		</div>
+
+		<p>I&#8217;m not convinced that that&#8217;s a scenario in which MakeProcInstance would have been useful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip even thread-odd thread-alt depth-1" id="comment-1333925">
+				<div id="div-comment-1333925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1333925">
+			April 23, 2018 at 7:41 am</a>		</div>
+
+		<p>This post was really interesting, I have always wondered where these function casts came from and why they persisted so much.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-even depth-1" id="comment-1334335">
+				<div id="div-comment-1334335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180423-00/?p=98575#comment-1334335">
+			April 25, 2018 at 4:17 pm</a>		</div>
+
+		<p>I think older K&amp;R C would let you call any FARPROC with any arguments without any casts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,1224 @@
+<html>
+<head>
+<title>The wrong way of benchmarking the most efficient integer comparison function</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The wrong way of benchmarking the most efficient integer comparison function</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 17, 2017 / year-entry #254</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>43</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Missing the forest for the blade of grass.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+On StackOverflow, there's a question about
+<a HREF="https://stackoverflow.com/q/10996418/902497">
+the most efficient way to compare two integers and produce
+a result suitable for a comparison function</a>,
+where a negative value means that the first value is smaller
+than the second,
+a positive value means that the first value is greater than the second,
+and zero means that they are equal.
+</p>
+<p>
+There was much microbenchmarking of various options,
+ranging from the straightforward
+</p>
+<pre>
+int compare1(int a, int b)
+{
+    if (a &lt; b) return -1;
+    if (a &gt; b) return 1;
+    return 0;
+}
+</pre>
+<p>
+to the clever
+</p>
+<pre>
+int compare2(int a, int b)
+{
+    return (a &gt; b) - (a &lt; b);
+}
+</pre>
+<p>
+to the hybrid
+</p>
+<pre>
+int compare3(int a, int b)
+{
+    return (a &lt; b) ? -1 : (a &gt; b);
+}
+</pre>
+<p>
+to inline assembly
+</p>
+<pre>
+int compare4(int a, int b)
+{
+    __asm__ __volatile__ (
+        "sub %1, %0 \n\t"
+        "jno 1f \n\t"
+        "cmc \n\t"
+        "rcr %0 \n\t"
+        "1: "
+    : "+r"(a)
+    : "r"(b)
+    : "cc");
+    return a;
+}
+</pre>
+<p>
+The benchmark pitted the comparison functions against each other
+by comparing random pairs of numbers and adding up the results
+to prevent the code from being optimized out.
+</p>
+<p>
+But here's the thing:
+Adding up the results is completely unrealistic.
+</p>
+<p>
+There are no meaningful semantics that could be applied to a sum
+of numbers for which only the sign is significant.
+No program that uses a comparison function will add the results.
+The only thing you can do with the result is compare it against
+zero and take one of three actions based on the sign.
+</p>
+<p>
+Adding up all the results means that you're not using the function
+in a realistic way,
+which means that your benchmark isn't realistic.
+</p>
+<p>
+Let's try to fix that.
+Here's my alternative test:
+</p>
+<pre>
+// Looks for "key" in sorted range [first, last) using the
+// specified comparison function. Returns iterator to found item,
+// or last if not found.
+
+template&lt;typename It, typename T, typename Comp&gt;
+It binarySearch(It first, It last, const T&amp; key, Comp compare)
+{
+ // invariant: if key exists, it is in the range [first, first+length)
+ // This binary search avoids the <a HREF="https://research.googleblog.com/2006/06/extra-extra-read-all-about-it-nearly.html">integer overflow problem</a>
+ // by operating on lengths rather than ranges.
+ auto length = last - first;
+ while (length &gt; 0) {
+  auto step = length / 2;
+  It it = first + step;
+  auto result = compare(*it, key);
+  if (result &lt; 0) {
+   first = it + 1;
+   length -= step + 1;
+  } else if (result == 0) {
+   return it;
+  } else {
+   length = step;
+  }
+ }
+ return last;
+}
+
+int main(int argc, char **argv)
+{
+ // initialize the array with sorted even numbers
+ int a[8192];
+ for (int i = 0; i &lt; 8192; i++) a[i] = i * 2;
+
+ for (int iterations = 0; iterations &lt; 1000; iterations++) {
+  int correct = 0;
+  for (int j = -1; j &lt; 16383; j++) {
+   auto it = binarySearch(a, a+8192, j, COMPARE);
+   if (j &lt; 0 || j &gt; 16382 || j % 2) correct += it == a+8192;
+   else correct += it == a + (j / 2);
+  }
+  // if correct != 16384, then we have a bug somewhere
+  if (correct != 16384) return 1;
+ }
+ return 0;
+}
+</pre>
+</p>
+<p>
+Let's look at the code generation for the various comparison functions.
+I used
+<a HREF="https://gcc.godbolt.org/">gcc.godbolt.org</a>
+with x86-64 gcc 7.2 and optimization <code>-O3</code>.
+</p>
+<p>
+If we try <code>compare1</code>, then the binary search looks like this:
+</p>
+<pre>
+    ; on entry, esi is the value to search for
+
+    lea rdi, [rsp-120]          ; rdi = first
+    mov edx, 8192               ; edx = length
+    jmp .L9
+.L25:                           ; was greater than
+    mov rdx, rax                ; length = step
+    test rdx, rdx               ; while (length &gt; 0)
+    jle .L19
+.L9:
+    mov rax, rdx                ;
+    sar rax, 1                  ; eax = step = length / 2
+    lea rcx, [rdi+rax*4]        ; it = first + step
+
+    <font COLOR="blue">; result = compare(*it, key), and then test the result
+    cmp dword ptr [rcx], esi    ; compare(*it, key)
+    jl .L11                     ; if less than
+    jne .L25                    ; if not equal (therefore if greater than)</font>
+    ... return value in rcx     ; if equal, answer is in rcx
+
+.L11:                           ; was less than
+    add rax, 1                  ; step + 1
+    lea rdi, [rcx+4]            ; first = it + 1
+    sub rdx, rax                ; length -= step + 1
+    test rdx, rdx               ; while (length &gt; 0)
+    jg .L9
+.L19:
+    lea rcx, [rsp+32648]        ; rcx = last
+    ... return value in rcx
+</pre>
+<p>
+<b>Exercise</b>: Why is <code>rsp - 120</code> the start of the array?
+</p>
+<p>
+Observe that despite using the lamest, least-optimized comparison
+function, we got the comparison-and-test
+code that is much what we would have
+written if we had done it in assembly language ourselves:
+We compare the two values, and then follow up with two branches
+based on the same shared flags.
+The comparison is still there, but the calculation and testing
+of the return value are gone.
+</p>
+<p>
+In other words, not only was <code>compare1</code> optimized down
+to one <code>cmp</code>
+instruction, but it also managed to delete instructions
+from the <code>binarySearch</code> function too.
+It had a net cost of negative instructions!
+</p>
+<p>
+What happened here?
+How did the compiler manage to optimize out all our code and
+leave us with the shortest possible assembly language equivalent?
+</p>
+<p>
+Simple: First, the compiler did some constant propagation.
+After inlining the <code>compare1</code> function, the compiler saw this:
+</p>
+<pre>
+    int result;
+    if (*it &lt; key) result = -1;
+    else if (*it &gt; key) result = 1;
+    else result = 0;
+    if (result &lt; 0) {
+      ... less than ...
+    } else if (result == 0) {
+      ... equal to ...
+    } else {
+      ... greater than ...
+    }
+</pre>
+<p>
+The compiler realized that it already knew whether constants were
+greater than, less than, or equal to zero,
+so it could remove the test against <code>result</code>
+and jump straight to the answer:
+</p>
+<pre>
+    int result;
+    if (*it &lt; key) { result = -1; <font COLOR="blue">goto less_than;</font> }
+    else if (*it &gt; key) { result = 1; <font COLOR="blue">goto greater_than;</font> }
+    else { result = 0; <font COLOR="blue">goto equal_to;</font> }
+    if (result &lt; 0) {
+less_than:
+      ... less than ...
+    } else if (result == 0) {
+equal_to:
+      ... equal to ...
+    } else {
+greater_than:
+      ... greater than ...
+    }
+</pre>
+<p>
+And then it saw that all of the tests against <code>result</code>
+were unreachable code, so it deleted them.
+</p>
+<pre>
+    int result;
+    if (*it &lt; key) { result = -1; <font COLOR="blue">goto less_than;</font> }
+    else if (*it &gt; key) { result = 1; <font COLOR="blue">goto greater_than;</font> }
+    else { result = 0; <font COLOR="blue">goto equal_to;</font> }
+
+less_than:
+      ... less than ...
+      <font COLOR="blue">goto done;</font>
+
+equal_to:
+      ... equal to ...
+      <font COLOR="blue">goto done;</font>
+
+greater_than:
+      ... greater than ...
+<font COLOR="blue">done:</font>
+</pre>
+<p>That then left <code>result</code> as a write-only variable,
+so it too could be deleted:
+</p>
+<pre>
+    if (*it &lt; key) { <font COLOR="blue">goto less_than;</font> }
+    else if (*it &gt; key) { <font COLOR="blue">goto greater_than;</font> }
+    else { <font COLOR="blue">goto equal_to;</font> }
+
+less_than:
+      ... less than ...
+      <font COLOR="blue">goto done;</font>
+
+equal_to:
+      ... equal to ...
+      <font COLOR="blue">goto done;</font>
+
+greater_than:
+      ... greater than ...
+<font COLOR="blue">done:</font>
+</pre>
+<p>
+Which is equivalent to the code we wanted all along:
+</p>
+<pre>
+    if (*it &lt; key) {
+      ... less than ...
+    } else if (*it &gt; key) {
+      ... greater than ...
+    } else {
+      ... equal to ...
+    }
+</pre>
+<p>
+The last optimization is realizing that
+the test in the <code>else if</code>
+could use the flags left over by the <code>if</code>,
+so all that was left was the conditional jump.
+</p>
+<p>
+Some very straightforward optimizations took our very unoptimized
+(but easy-to-analyze) code and turned it into something much
+more efficient.
+</p>
+<p>
+On the other hand, let's look at what happens with, say, the
+second comparison function:
+</p>
+<pre>
+    ; on entry, edi is the value to search for
+
+    lea r9, [rsp-120]           ; r9 = first
+    mov ecx, 8192               ; ecx = length
+    jmp .L9
+.L11:                           ;
+    <font COLOR="blue">test eax, eax               ; result == 0?
+    je .L10                     ; Y: found it</font>
+                                ; was greater than
+    mov rcx, rdx                ; length = step
+    test rcx, rcx               ; while (length &gt; 0)
+    jle .L19
+.L9:
+    mov rdx, rcx
+    <font COLOR="blue">xor eax, eax                ; return value of compare2</font>
+    sar rdx, 1                  ; rdx = step = length / 2
+    lea r8, [r9+rdx*4]          ; it = first + step
+
+    <font COLOR="blue">; result = compare(*it, key), and then test the result
+    mov esi, dword ptr [r8]     ; esi = *it
+    cmp esi, edi                ; compare *it with key
+    setl sil                    ; sil = 1 if less than
+    setg al                     ; al  = 1 if greater than
+                                ; eax = 1 if greater than
+    movzx esi, sil              ; esi = 1 if less than
+    sub eax, esi                ; result = (greater than) - (less than)
+    cmp eax, -1                 ; less than zero?
+    jne .L11                    ; N: Try zero or positive</font>
+
+                                ; was less than
+    add rdx, 1                  ; step + 1
+    lea r9, [r8+4]              ; first = it + 1
+    sub rcx, rdx                ; length -= step + 1
+    test rcx, rcx               ; while (length &gt; 0)
+    jg .L9
+.L19:
+    lea r8, [rsp+32648]         ; r8 = last
+.L10:
+    ... return value in r8
+</pre>
+<p>
+The second comparison function <code>compare2</code> uses
+the relational comparison operators to generate
+exactly 0 or 1.
+This is a clever way of generating <code>-1</code>, <code>0</code>,
+or <code>+1</code>,
+but unfortunately,  that was not our goal in the grand scheme of things.
+It was merely a step toward that goal.
+The way that <code>compare2</code> calculates the result is too
+complicated for the optimizer to understand,
+so it just does its best at calculating the formal return value from
+<code>compare2</code> and testing its sign.
+(The compiler does realize that the only possible negative value is
+<code>-1</code>, but that's not enough insight to let it optimize the
+entire expression away.)
+</p>
+<p>
+If we try <code>compare3</code>,
+we get this:
+</p>
+<pre>
+    ; on entry, esi is the value to search for
+
+    lea rdi, [rsp-120]          ; rdi = first
+    mov ecx, 8192               ; ecx = length
+    jmp .L12
+.L28:                           ; was greater than
+    mov rcx, rax                ; length = step
+.L12:
+    mov rax, rcx
+    sar rax, 1                  ; rax = step = length / 2
+    lea rdx, [rdi+rax*4]        ; it = first + step
+
+    <font COLOR="blue">; result = compare(*it, key), and then test the result
+    cmp dword ptr [rdx], esi    ; compare(*it, key)
+    jl .L14                     ; if less than
+    jle .L13                    ; if less than or equal (therefore equal)</font>
+
+    ; "length" is in eax now
+.L15:                           ; was greater than
+    test eax, eax               ; length == 0?
+    jg .L28                     ; N: continue looping
+    lea rdx, [rsp+32648]        ; rdx = last
+.L13:
+    ... return value in rdx
+
+.L14:                           ; was less than
+    add rax, 1                  ; step + 1
+    lea rdi, [rdx+4]            ; first = it + 1
+    sub rcx, rax                ; length -= step + 1
+    mov rax, rcx                ; rax = length
+    jmp .L15
+</pre>
+<p>
+The compiler was able to understand this version of the comparison
+function:
+It observed that if <code>a &lt; b</code>, then the
+result of <code>compare3</code> is always negative,
+so it jumped straight to the less-than case.
+Otherwise, it observed that the result was zero if
+<code>a</code> is not greater than <code>b</code>
+and jumped straight to that case too.
+The compiler did have some room for improvement with the
+placement of the basic blocks,
+since there is an unconditional jump in the inner loop,
+but overall it did a pretty good job.
+</p>
+<p>
+The last case is the inline assembly with <code>compare4</code>.
+As you might expect, the compiler had the most trouble with this.
+</p>
+<pre>
+    ; on entry, edi is the value to search for
+
+    lea r8, [rsp-120]           ; r8 = first
+    mov ecx, 8192               ; ecx = length
+    jmp .L12
+.L14:                           ; zero or positive
+    <font color="blue">je .L13                     ; zero - done</font>
+                                ; was greater than
+    mov rcx, rdx                ; length = step
+    test rcx, rcx               ; while (length &gt; 0)
+    jle .L22
+.L12:
+    mov rdx, rcx
+    sar rdx, 1                  ; rdx = step = length / 2
+    lea rsi, [r8+rdx*4]         ; it = first + step
+
+    <font COLOR="blue">; result = compare(*it, key), and then test the result
+    mov eax, dword ptr [rsi]    ; eax = *it
+    sub eax, edi
+    jno 1f
+    cmc
+    rcr eax, 1
+1:
+    test eax, eax               ; less than zero?
+    jne .L14                    ; N: Try zero or positive</font>
+
+                                ; was less than
+    add rdx, 1                  ; step + 1
+    lea r8, [rsi+4]             ; first = it + 1
+    sub rcx, rdx                ; length -= step + 1
+    test rcx, rcx               ; while (length &gt; 0)
+    jg .L12
+.L22:
+    lea rsi, [rsp+32648]        ; rsi = last
+.L13:
+    ... return value in rsi
+</pre>
+<p>
+This is pretty much the same as <code>compare2</code>:
+The compiler has no insight at all into the inline assembly,
+so it just dumps it into the code like a black box,
+and then once control exits the black box,
+it checks the sign in a fairly efficient way.
+But it had no real optimization opportunities because
+you can't really optimize inline assembly.
+</p>
+<p>
+The conclusion of all this is that optimizing the instruction count
+in your finely-tuned comparison function is a fun little
+exercise, but it doesn't necessarily translate into real-world
+improvements.
+In our case, we focused on optimizing the code that encodes the
+result of the comparison without regard for how the caller is
+going to decode that result.
+The contract between the two functions is that one function needs
+to package some result, and the other function needs to unpack it.
+But we discovered that the more obtusely we wrote the code for
+the packing side,
+the less likely the compiler would be able to see how to
+optimize out the entire hassle of packing and unpacking in the first place.
+In the specific case of comparison functions, it means that you
+may want to
+return <code>+1</code>, <code>0</code>, and <code>-1</code> explicitly
+rather than calculating those values in a fancy way,
+because it turns out
+compilers are really good at optimizing "compare a constant with zero".
+</p>
+<p>
+You have to see how your attempted optimizations fit into the bigger picture
+because you may have hyper-optimized one part of the solution
+to the point that it prevents deeper optimizations in
+other parts of the solution.
+</p>
+<p>
+<b>Bonus chatter</b>:
+If the comparison
+function is not inlined, then all of these optimization
+opportunities disappear.
+But I personally wouldn't worry about it too much,
+because if the comparison function is not inlined,
+then the entire operation is going to be dominated by
+the function call overhead:
+Setting up the registers for the call,
+making the call,
+returning from the call,
+testing the result,
+and most importantly,
+the lost register optimization opportunities
+not only because
+the compiler loses opportunities to enregister values
+across the call,
+but also because the compiler has to protect against the
+possibility that the comparison function will mutate global
+state and consequently create aliasing issues.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (43)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1316045">
+				<div id="div-comment-1316045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316045">
+			November 17, 2017 at 7:07 am</a>		</div>
+
+		<p>Once again, turns out readable code means good (and efficient) code. While I have no insight on how compilers evolved (nor I have used any pre-2010 compilers), this kind of an optimization might have made sense 10 years ago, back when optimizers weren&#8217;t as smart as nowadays?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1316075">
+				<div id="div-comment-1316075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mr Cranky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316075">
+			November 17, 2017 at 7:42 am</a>		</div>
+
+		<p>Seems to me the obvious way to code this is:</p>
+<p>int compare0(int a, int b)<br />
+{<br />
+    return (a-b);<br />
+}</p>
+<p>Awfully long discussion that boils down to Dr. Knuth&#8217;s long-standing axiom that the root of all evil is premature optimization.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1316165">
+				<div id="div-comment-1316165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316165">
+			November 17, 2017 at 10:14 am</a>		</div>
+
+		<p>And then it returns the wrong value for <code>compare0(-1610612736, 1610612736)</code>.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1316226">
+				<div id="div-comment-1316226" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316226">
+			November 17, 2017 at 1:02 pm</a>		</div>
+
+		<p>Given that <code>int</code> can be a <code>short int</code>, the call is wrong to begin with. Really, the function is safe if you know of the range limitations.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-4" id="comment-1316255">
+				<div id="div-comment-1316255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316255">
+			November 17, 2017 at 3:50 pm</a>		</div>
+
+		<p>Okay, let me rephrase it then: It returns the wrong value for <code>compare0(INT_MIN, INT_MAX)</code>.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1316415">
+				<div id="div-comment-1316415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Viila</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316415">
+			November 19, 2017 at 5:24 pm</a>		</div>
+
+		<p>I wonder how the corrected version<br />
+int64_t compare64(int32_t a, int32_t b)<br />
+{<br />
+    return int64_t(a) &#8211; int64_t(b);<br />
+}<br />
+compares to the others, especially if compiled as x64 instead of x86.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1316435">
+				<div id="div-comment-1316435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316435">
+			November 19, 2017 at 7:20 pm</a>		</div>
+
+		<p>It probably doesn&#8217;t work. The prototype returns int.</p>
+<p>I can make it execute in zero cycles if it doesn&#8217;t have to work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4 parent" id="comment-1316485">
+				<div id="div-comment-1316485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316485">
+			November 20, 2017 at 10:04 am</a>		</div>
+
+		<p>No need to ask. Type it into gcc.godbolt.org and find out! (Note that gcc.godbolt.org doesn&#8217;t support 32-bit compilers so the extra cost of 64-bit arithmetic on 32-bit systems is not visible there.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1316545">
+				<div id="div-comment-1316545" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Viila</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316545">
+			November 20, 2017 at 1:47 pm</a>		</div>
+
+		<p>I can, but I&#8217;m afraid I don&#8217;t know how to properly interpret the results because I don&#8217;t speak x86/x64 assembly.</p>
+<p>(Joshua, the prototype was templated and the return value was assigned into an &#8216;auto&#8217; variable, so it wouldn&#8217;t be truncated either. It should work.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1316585">
+				<div id="div-comment-1316585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316585">
+			November 20, 2017 at 6:41 pm</a>		</div>
+
+		<p>If you look at the assembly results, you can hover over the instructions (or right-click and choose &#8220;View asm doc&#8221;) and you&#8217;ll get a brief synopsis of what the instruction does. Also, you can click on &#8220;Show optimization output (clang only)&#8221; to see what choices the optimizer made for each line of code (gcc has a similar option.) If you grok ARM(32/64), AVR, MIPS(32/64), MSP430, or PPC better, those compilers are available too, as well as a couple of other compilers (MSVC++, elicc, icc, and Zapcc). It&#8217;s pretty cool: I wish I had this when I first started out learning programming!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1316505">
+				<div id="div-comment-1316505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316505">
+			November 20, 2017 at 10:43 am</a>		</div>
+
+		<p>I had a friend in college who wrote, as part of his first programming course, a version of a factorial program.  If the caller passed in a number greater than around, or whatever would result in integer overflow, it would return 0 and print out &#8220;I only work with small, non-negative integers.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-thundercat odd alt depth-2" id="comment-1316285">
+				<div id="div-comment-1316285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ben+Adams' rel='external nofollow' class='url'>Ben Adams</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316285">
+			November 17, 2017 at 6:06 pm</a>		</div>
+
+		<p>&#8220;premature optimization is the root of all evil&#8221;</p>
+<p>Is very out of context; full quote is:</p>
+<p>&#8220;Programmers waste enormous amounts of time thinking about, or worrying about, the speed of noncritical parts of their programs, and these attempts at efficiency actually have a strong negative impact when debugging and maintenance are considered. We should forget about small efficiencies, say about 97% of the time: premature optimization is the root of all evil. Yet we should not pass up our opportunities in that critical 3%.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1316095">
+				<div id="div-comment-1316095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">creaothceann</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316095">
+			November 17, 2017 at 8:02 am</a>		</div>
+
+		<p>&#8220;@Raymond I’m forced to agree.&#8221;</p>
+<p>Heh.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle odd alt thread-odd thread-alt depth-1" id="comment-1316105">
+				<div id="div-comment-1316105" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316105">
+			November 17, 2017 at 8:09 am</a>		</div>
+
+		<p>The dangers of being too clever.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1316115">
+				<div id="div-comment-1316115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pmbAustin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316115">
+			November 17, 2017 at 8:47 am</a>		</div>
+
+		<p>As compilers get smarter, the sins of &#8220;premature optimization&#8221; have worse and worse consequences.</p>
+<p>Always write the code to be understood by some human being that comes after you and has to maintain it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1316146">
+				<div id="div-comment-1316146" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316146">
+			November 17, 2017 at 9:29 am</a>		</div>
+
+		<p>Seriously. Let the compiler did its job and you do -your- job: writing maintainable code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1316117">
+				<div id="div-comment-1316117" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://tedspence.com/' rel='external nofollow' class='url'>Ted Spence</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316117">
+			November 17, 2017 at 8:59 am</a>		</div>
+
+		<p>Somebody once had a quote about &#8220;Premature Optimization&#8221;.  I&#8217;m not sure who it was, maybe someone famous. /s</p>
+<p>Also: we tend to spend many times more hours reading our code rather than writing it.  If you optimize for readability, chances are you have a simpler bit of code, and the compiler will be able to do more optimizations.</p>
+<p>If you write the world&#8217;s most clever code, chances are the poor intern who tries to fix a bug six years later will have trouble, and the compiler won&#8217;t like it either.</p>
+<p>Also: I had not seen this compiler explorer website before ( <a href="https://gcc.godbolt.org/" rel="nofollow">https://gcc.godbolt.org/</a> ).  This is the greatest thing since compiled bread.  If only I still wrote c++!  I sometimes regret switching to C# and leaving the world of pointer math and insane templates behind.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-wndsks odd alt depth-2" id="comment-1316267">
+				<div id="div-comment-1316267" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316267">
+			November 17, 2017 at 4:28 pm</a>		</div>
+
+		<p>He recently did a talk about it @ cppcon <a href="https://www.youtube.com/watch?v=bSkpMdDe4g4" rel="nofollow">https://www.youtube.com/watch?v=bSkpMdDe4g4</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1316335">
+				<div id="div-comment-1316335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316335">
+			November 18, 2017 at 9:46 am</a>		</div>
+
+		<p>Premature optimisation is subjective, one person thought it was the right and someone else said it was done too early. We assume the person who comes along and says it was premature optimisation, but maybe at the time it was the right thing to do. Or it&#8217;s not, who knows.</p>
+<p>I&#8217;ve been optimising some 30 year old 6502 code, does that count as premature or not?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip odd alt depth-3 parent" id="comment-1316445">
+				<div id="div-comment-1316445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316445">
+			November 19, 2017 at 11:55 pm</a>		</div>
+
+		<p>I always see the term premature optimisation as quite objective.<br />
+What it means is an attempt at manual optimisation before you know if what you are intending to optimise is really the bottle neck. So any time you look at code and think &#8220;that looks slow&#8221; then it is likely premature.<br />
+So basically if you have tested and timed and after all this you find that you are in a certain code path a lot and that is causing you a lot of slow down, then that is the code that you should optimise.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1316506">
+				<div id="div-comment-1316506" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://tedspence.com/' rel='external nofollow' class='url'>Ted Spence</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316506">
+			November 20, 2017 at 10:51 am</a>		</div>
+
+		<p>Agreed &#8211; everything is subjective until you measure it!</p>
+<p>Shorthand: Write code that is easy to read until you have a measurement.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1316125">
+				<div id="div-comment-1316125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316125">
+			November 17, 2017 at 9:12 am</a>		</div>
+
+		<p>&gt; But it had no real optimization opportunities because you can&#8217;t really optimize inline assembly.</p>
+<p>At first I found this confusing, but then I realized why: Inline assembly cannot be decompiled into an intermediate representation, because it does not follow the semantics of the C abstract machine.  Even assuming you have a really good decompiler available, you cannot apply as-if rule transformations to decompiled inline assembly.  You might end up altering the meaning of the assembly in ways that the C standard does not consider &#8220;observable behavior,&#8221; but which nonetheless leave the CPU or other components in a different state from what the programmer expected.  While this might be legal because asm is implementation-defined, it is obviously unhelpful to the point that the average user would call it a bug.  So the compiler is obligated to treat the assembly as a black box, as Raymond says.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1316175">
+				<div id="div-comment-1316175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul Topping</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316175">
+			November 17, 2017 at 10:14 am</a>		</div>
+
+		<p>It is possible to optimize inline assembler but there&#8217;s not much reason a C/C++ compiler would provide that functionality. The inline assembler feature exists solely to allow the programmer to specify an instruction sequence exactly and expects the compiler not to change it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1316236">
+				<div id="div-comment-1316236" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316236">
+			November 17, 2017 at 1:32 pm</a>		</div>
+
+		<p>Correct. The only purpose left for asm blocks is to give the compiler information it cannot possibly have.</p>
+<p>About half the asm blocks I see don&#8217;t have any assembler code in them, just compiler hints (hey compiler, this empty asm block modifies this local variable).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1316967">
+				<div id="div-comment-1316967" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316967">
+			November 24, 2017 at 4:49 am</a>		</div>
+
+		<p>The whole point of inline assembly is for when you want to do something the compiler doesn&#8217;t allow.</p>
+<p>Perhaps you are using an assembly instruction the compiler doesn&#8217;t allow.  For example: CPUID, when it first came out.</p>
+<p>Or perhaps you have some heavily-optimized code that you&#8217;ve written taking into account caches and things that the compiler isn&#8217;t smart enough to optimize on its own.</p>
+<p>Or perhaps you&#8217;re doing something really weird where you need exact control over the instructions.  For example, a popular open-source kernel has a copy-from-userspace macro that uses inline assembly, and emits special exception-handling instructions so that a segfault during the copy can be handled specially.  Another example: detecting 386 vs 486 processor by emitting instructions that get processed differently on the two processors.  A third example: An open source memory debugging tool runs a program in a sort-of-VM, with JIT compilation to add checks to all memory accesses, and it has a magic sequence of instructions that do nothing useful on a normal CPU but that precise sequence of instructions are detected by the JIT and allow you to pass information to the memory debugger.</p>
+<p>In ALL of those cases, there&#8217;s nothing sensible or helpful that the compiler&#8217;s optimizer can do, and if it touches the code at all then it&#8217;s likely to break it.  So compilers do not try to &#8220;optimize&#8221; inline assembly, and this is the correct behaviour.</p>
+<p>In the cases where the compiler&#8217;s optimizer could do something useful, such as writing SSE code, then the opcodes are understood and supported by the compiler.  In those cases, if you want the compiler to optimize for you, you could and should be using compiler intrinsics instead.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1316186">
+				<div id="div-comment-1316186" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul Topping</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316186">
+			November 17, 2017 at 10:21 am</a>		</div>
+
+		<p>Good post! As you point out at the end, while modern compilers do a wonderful job of optimization, far beyond what most programmers would come up with given limited time and imagination, there are still reasons for programmers to look at what the compiler generated in order to do further optimization but the task has changed. Instead of trying to improve on the compiler&#8217;s code generation, the programmer should look for things that the source code implicitly asks to be computed and remove those that are not needed to achieve the program&#8217;s purpose. Perhaps some future compiler could output suggestions along this line.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1316195">
+				<div id="div-comment-1316195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316195">
+			November 17, 2017 at 10:56 am</a>		</div>
+
+		<p>I tried pasting your code into Compiler Explorer, but got different disassembly. Did you use any options other than -O3?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1316215">
+				<div id="div-comment-1316215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316215">
+			November 17, 2017 at 11:13 am</a>		</div>
+
+		<p>Hm, the output is slightly different for <code>compare1</code> now. The conclusions still stand, though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1316245">
+				<div id="div-comment-1316245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pm100</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316245">
+			November 17, 2017 at 1:48 pm</a>		</div>
+
+		<p>This discussion completely ignores what happens once the CPU gets hold of it. CPU effectively runs another optimizer on the code , but at run time. I was surprised that you didnt actually time the execution, rather than just reading the generated code. I totally agree that people are fixated on &#8216;less lines means faster&#8217;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1316295">
+				<div id="div-comment-1316295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316295">
+			November 17, 2017 at 6:12 pm</a>		</div>
+
+		<p>The object code for the different methods is very different. You can assume that three instructions will execute faster than nine instructions, so compare1 and compare3 will be faster without doubt. This can be false if something goes wrong (i.e., unexpected cache fail or pipeline flush), but in that case, any optimization is futile.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1316305">
+				<div id="div-comment-1316305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dmitry</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316305">
+			November 17, 2017 at 10:08 pm</a>		</div>
+
+		<p>You can&#8217;t. You once could but not these days. Modern processors do a lot of runtime optimizations. Three instructions might generally show worse results than nine equivalent instructions due to pipelining issues (instructions pairing, for example). Besides, I once saw a (synthetic) test where a floating-point instruction in a separate procedure turned out to be faster when timed than the same instruction inlined (the call cost turned out to be negative) with processors of one major CPU vendor and slightly slower on processors of another one, even though the name of the second vendor was shorter than that of the first :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1316325">
+				<div id="div-comment-1316325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316325">
+			November 18, 2017 at 9:43 am</a>		</div>
+
+		<p>&gt;You can assume that three instructions will execute faster than nine instructions</p>
+<p>You can assume that, but that might not be a correct assumption. It would be nice if you could see the timing for each different cpu, but it&#8217;s a huge amount of work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1316425">
+				<div id="div-comment-1316425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316425">
+			November 19, 2017 at 6:05 pm</a>		</div>
+
+		<p>I&#8217;d agree in case of a smaller difference (i.e., four/five instructions versus three). But in the case of nine to three, you&#8217;d have to go to the most extreme case for the nine instructions to be faster (nine simple register-to-register instructions without memory access which translate into a single micro-op each versus three register-to-memory with complex addressing modes which can translate to three or four micro-ops each).</p>
+<p>Both compare1 and compare3 are a memory (register indirect, without indexing) to register compare (two micro-ops) and two conditional branches (one micro-op each). A total of four micro-ops. I can&#8217;t imagine how a processor can optimize at run time nine instructions in less than four micro-ops, when the compiler hasn&#8217;t been able to do the same at compile time.</p>
+<p>You can argue about out-of-order execution, pipeline stalls and the like. But when you take into account that compare1 is a strict subset of compare2 (in other words, compare2 contains all three compare1 instructions plus six additional ones), it&#8217;s difficult to imagine a case where the longer sequence is less probable to get stalled.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1316955">
+				<div id="div-comment-1316955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Patrick</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316955">
+			November 24, 2017 at 2:02 am</a>		</div>
+
+		<p>You can most definitely not assume that.</p>
+<p>Comparisions actually being one of the most common cases nowadays since conditional jumps can really screw with branch prediction if the pattern isn&#8217;t, well, predictable. In this case I don&#8217;t think it really matters unless you can do the entire operation the comparision is used for without conditional branching, but there are some cases where it definitely does.</p>
+<p>For example, binary searches perform much worse than you&#8217;d expect from just looking at the instructions themselves, since by definition they branch in the worst possible pattern (0.5/0.5 taken/not taken).<br />
+A linear search is actually faster for N &lt; surprisingly large number &#8211; rule of thumb says around 8 or 10 depending on who you ask.</p>
+<p>And for some other, more traditional, examples: x86 has quite a few &#039;big&#039; instructions that are actually slower than just doing the same thing on your own. The real classic here being LOOP, which no performance-aware assembly language programmer or compiler has ever used. Even last time I benched it on a modern system it was significantly slower than the equivalent DEC + JNZ (roughly 2x). I suppose the modern CPUs could very well optimize it to be just as fast but there&#039;s no need to because of this.<br />
+(And DEC is in turn slower than SUB reg,1 on modern CPUs because of a historical design mistake which gives DEC a dependency on a flag which SUB lacks&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1316265">
+				<div id="div-comment-1316265" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bender</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316265">
+			November 17, 2017 at 3:59 pm</a>		</div>
+
+		<p>For future posts you can use <a href="http://quick-bench.com/" rel="nofollow">http://quick-bench.com/</a> for quick comparisons</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1316306">
+				<div id="div-comment-1316306" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bram Speeckaert</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316306">
+			November 18, 2017 at 5:37 am</a>		</div>
+
+		<p>The -120 comes from GCC taking advantage of the 128-byte red zone. The AMD64 ABI guarantees that the 128 bytes beyond whatever rsp points to will never get modified by interrupt handlers, so it&#8217;s okay to grow the stack pointer by slightly less than you actually need and just make the array start in that memory region.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1316316">
+				<div id="div-comment-1316316" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316316">
+			November 18, 2017 at 9:41 am</a>		</div>
+
+		<p>&#8220;with x86-64 gcc 7.2 and optimization -O3.&#8221;</p>
+<p>wait, what? godbolt supports msvc too, so why did you show us the result of gcc????</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1316345">
+				<div id="div-comment-1316345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316345">
+			November 18, 2017 at 10:43 am</a>		</div>
+
+		<p>Yeesh, I poke my head out of the bubble and you tell me to get back in the bubble. It&#8217;s not like this issue applies only to Microsoft compilers.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1316365">
+				<div id="div-comment-1316365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316365">
+			November 18, 2017 at 7:43 pm</a>		</div>
+
+		<p>I agree. Yeesh.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1316385">
+				<div id="div-comment-1316385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316385">
+			November 19, 2017 at 8:58 am</a>		</div>
+
+		<p>My faux surprise was a fishing attempt in case there was some interesting news that you wouldn&#8217;t answer a direct question about.</p>
+<p>You can stay out of the bubble :D</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1316466">
+				<div id="div-comment-1316466" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316466">
+			November 20, 2017 at 2:22 am</a>		</div>
+
+		<p>I can already see the clickbait headline :<br />
+&#8220;Breaking news &#8211; MSVC might be replaced by gcc, a Microsoft lead architect says.&#8221;</p>
+<p>(Oh God, what have I done&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1316386">
+				<div id="div-comment-1316386" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316386">
+			November 19, 2017 at 9:54 am</a>		</div>
+
+		<p>Why not? Almost every compiler does things differently, and it&#8217;s instructive to see what the differences are (and why they&#8217;re done that way.) For example, it appears that clang prefers cmov instructions, which is a potential speed boost but is a problem if you have to support pre-P6 processors.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1316396">
+				<div id="div-comment-1316396" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171117-00/?p=97416#comment-1316396">
+			November 19, 2017 at 10:11 am</a>		</div>
+
+		<p>My immediate thought was &#8220;if it isn&#8217;t inlined, the cost is dwarfed by stack operations.&#8221;  I&#8217;m not specifically (C++ or C99, and let&#8217;s be honest, that&#8217;s the level of language we&#8217;re talking here) bothered about offering up a comparison function that &#8220;possibly&#8221; mutates global state.  Well, I would be, if the compiler in question doesn&#8217;t respect the <b>const</b> qualifier.  But then I&#8217;d have other worries&#8230;</p>
+<p>I love this post.  I like the argument that &#8220;if you&#8217;re going to think about optimisation, think very carefully about it,&#8221; which is actually Knuth&#8217;s corollary.  May I also recommend Joe Duffy&#8217;s thoughts on the matter to your readers?</p>
+<p>joeduffyblog.com/2010/09/06/the-premature-optimization-is-evil-myth/</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

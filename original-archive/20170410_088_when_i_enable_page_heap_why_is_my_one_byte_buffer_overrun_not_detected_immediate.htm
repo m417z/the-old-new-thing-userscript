@@ -1,0 +1,476 @@
+<html>
+<head>
+<title>When I enable page heap, why is my one-byte buffer overrun not detected immediately?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>When I enable page heap, why is my one-byte buffer overrun not detected immediately?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 10, 2017 / year-entry #89</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">I thought that was the point of page heap.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Page Heap is a mode of the heap manager&sup1; that can be
+enabled by the Debugging Tools for Windows.
+When enabled, each memory allocation is placed
+at the end of a dedicated page,
+and the page that follows is left invalid.
+That way, if you overrun the allocation,
+you will crash with an access violation because
+you are reaching into the next (invalid) page.&sup2;
+When the memory is freed, the entire page is decommitted,
+so that any use-after-free bugs will result in an access
+violation.
+(Eventually, the heap manager will reuse the address space.)
+</p>
+<p>
+A customer noted that when they enabled page heap,
+the crash did not occur on their one-byte buffer overrun.
+They were able to overrun the buffer by 13 bytes before
+the crash occurred.
+"We thought full page heap was supposed to catch
+buffer overruns immediately."
+</p>
+<p>
+Page heap places the allocation as close
+to the end of the page as it can,
+but it may not able to push it right up to the edge
+because the heap
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20121115-00/?p=6083">
+is contractually obligated to respect the
+<code>MEMORY_<wbr>ALLOCATION_<wbr>ALIGNMENT</code></a>.
+Without these alignment guarantees,
+the heap would be much harder to use because every
+allocation would have to be manually aligned
+to the desired boundary.
+(In practice, nearly all data structures have nontrivial
+alignment requirements, because they will almost always
+contain at least one member that is larger than a byte.)
+</p>
+<p>
+On 64-bit systems, the allocation alignment is 16,
+which means that <code>Heap&shy;Alloc</code> promises
+to return a value that is evenly divisibly by 16.
+This contractual obligation means that if you make an
+allocation request for 3 bytes on a 64-bit system,
+then the allocation will be placed at an address of the form
+<code>xxxxxxxx`xxxxFFF0</code>,
+with three bytes of actual data
+and 13 padding bytes.
+</p>
+<p>
+That's where the 13 bytes of slop are coming from.
+The heap manager cannot give you a pointer of the form
+<code>xxxxxxxx`xxxxFFFD</code>,
+because that would violate the alignment contract.
+However, the heap manager does put canary bytes
+in those extra 13 bytes, and when you free or reallocate
+the memory block, the heap manager verifies that the
+canary bytes have not been tampered with.
+So the write overrun is detected eventually.
+</p>
+<p>
+If you want to break the alignment contract and
+make the memory go right up to the edge,
+you can ask for <code>/unaligned /full</code>.
+Note, however, that handing back unaligned memory
+is likely to result in other problems,
+because one of
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20060320-13/?p=31853">
+the ground rules of programming</a>
+is that in the absence of explicit permission to the contrary,
+pointers must be properly aligned.
+The consequences of breaking this rule vary depending on how
+strictly your platform enforces alignment.
+The code might take alignment faults.
+Or the code might simply operate on the wrong memory.
+The x86 architecture is mostly alignment-forgiving,
+but there are still places
+(such as interlocked operations and SIMD instructions)
+where alignment is still important.
+</p>
+<p>
+&sup1;
+I'm using the definite article on "the heap manager"
+because I'm referring to the system-provided heap manager.
+The one that you are using when you call functions like
+<code>Heap&shy;Alloc</code>.
+If your program uses a custom heap library,
+then the page heap settings have no effect on that
+custom heap library.
+(This sounds obvious, but sometimes customers expect
+the page heap settings to somehow be able to alter
+the behavior of code it didn't write.)
+</p>
+<p>
+&sup2;
+Formally, this model is known as "full page heap".
+There's also a "standard page heap" which places
+canary bytes after the end of each allocation.
+When you free or reallocate the memory, the heap manager checks
+whether the canary bytes have been tampered with;
+if so, then it informs you of a heap buffer overrun.
+I don't know why they call this "standard page heap"
+because there are no pages involved.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1291795">
+				<div id="div-comment-1291795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Smithers</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291795">
+			April 10, 2017 at 8:19 am</a>		</div>
+
+		<p>&#8220;Note, however, that handing back unaligned memory is likely to result in other problems,&#8221;<br />
+I doubt this is as likely as you imply, as I would expect the alignment requirement of nearly all allocations would be a factor of their size. One could, in theory, allocate 3 bytes, then treat the first two bytes as a 16-bit integer and the third as an 8-bit, causing a problem, but I doubt this is common. More likely someone would create a C-style struct Foo { int16_t x, int8_t y } and then allocate sizeof(struct Foo) bytes; since the structure&#8217;s size gets rounded up to 4[1] (as otherwise arrays would not align), the resulting allocation at &#8230;FFFC is sufficiently aligned for the structure.</p>
+<p>As for &#8220;standard page heap&#8221;, I assume because the allocation is made from a &#8220;standard page&#8221; (i.e. one that could be shared with other allocations)?</p>
+<p>[1]Assuming no meddling with #pragma pack. My predecessor left too many of those behind for me to make such assumption lightly.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1291805">
+				<div id="div-comment-1291805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291805">
+			April 10, 2017 at 8:25 am</a>		</div>
+
+		<p>Indeed; I have noted that if the structure is not being padded by the compiler, allocating an array would surely cause alignment disasters.</p>
+<p>Since this does not happen, we may normally assume that allocating an array works correctly for oddly-sized structs. In fact the linux equivalent of this does indeed put the last byte of odd sizes at the end of the page and therefore returns an odd pointer in such cases.</p>
+<p>I suppose this is slightly more likely to break in that it will break on an unpadded struct for which arrays cannot be allocated, but that must be rare.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1291815">
+				<div id="div-comment-1291815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Torsten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291815">
+			April 10, 2017 at 8:32 am</a>		</div>
+
+		<p>Consider the pattern of the variable size structure:</p>
+<p>struct s {<br />
+  __m128 vector;<br />
+  size_t numBytes;<br />
+  byte payload[0];<br />
+}</p>
+<p>This structure requires 16 byte alignment but can have any length, including odd ones. The heap manager has no way of knowing whether any given allocation is intended for something like that.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1291865">
+				<div id="div-comment-1291865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291865">
+			April 10, 2017 at 1:00 pm</a>		</div>
+
+		<p>As of C99, the size of the structure is &#8220;as if the [zero-length] array member were omitted except that it may have more trailing padding than the omission would imply.&#8221;  So the compiler can add padding if it likes, but otherwise the member is ignored.</p>
+<p>(Before C99, this was a non-standard feature, so who knows what will happen.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1291885">
+				<div id="div-comment-1291885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291885">
+			April 10, 2017 at 5:34 pm</a>		</div>
+
+		<p>I suspect the dead giveaway bus error told you this application was not compatible. You never used this in production anyway so no matter.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1291945">
+				<div id="div-comment-1291945" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stuart</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291945">
+			April 11, 2017 at 7:40 am</a>		</div>
+
+		<p>Does that mean that C99 doesn&#8217;t require a trailing zero-length array to be aligned to its own type? So that given, say,</p>
+<p>struct v {<br />
+byte length;<br />
+double entries[0];<br />
+}</p>
+<p>it&#8217;d be legal for sizeof(struct v) and alignof(struct v) to be 1?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ranta even depth-2" id="comment-1291835">
+				<div id="div-comment-1291835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ranta' rel='external nofollow' class='url'>ranta</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291835">
+			April 10, 2017 at 9:04 am</a>		</div>
+
+		<p>The alignment could be a problem with a structure that ends with an ANYSIZE_ARRAY, like SP_DEVICE_INTERFACE_DETAIL_DATA. That structure starts with a DWORD member, and applications first call SetupDiGetDeviceInterfaceDetail to get *RequiredSize = the number of bytes that you need to allocate for the structure, but number might not be a multiple of sizeof(DWORD).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1291837">
+				<div id="div-comment-1291837" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AsmGuru62</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291837">
+			April 10, 2017 at 9:30 am</a>		</div>
+
+		<p>There are issues with HeapValidate() also.<br />
+On small overruns &#8211; it will report a block as OK in Released code.<br />
+Custom heap with alignment and exact allocation sizes is a way to go.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1291845">
+				<div id="div-comment-1291845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rw</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291845">
+			April 10, 2017 at 9:53 am</a>		</div>
+
+		<p>Shouldn&#8217;t it be a three-byte buffer that must be overrun by 13 bytes to get detected?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong odd alt depth-2" id="comment-1291895">
+				<div id="div-comment-1291895" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291895">
+			April 10, 2017 at 7:19 pm</a>		</div>
+
+		<p>It&#8217;ll be detected &#8220;when you free or reallocate the memory block&#8221;. Add checking on every write operation will probably slow your code to unacceptable level that you just want to turn it off.</p>
+<p>That said, I wonder if there can be option that makes the heap manager to allocation 16 byte aligned memory, but report address from the tail side of allocated block minus requested allocation size. Of course the heap manager would have to remember the reported address and translate to actual starting address when free/reallocation of the pointer occurs in this mode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-koldude even thread-odd thread-alt depth-1 parent" id="comment-1291855">
+				<div id="div-comment-1291855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291855">
+			April 10, 2017 at 12:56 pm</a>		</div>
+
+		<p>While this is a useful tool I honestly think it would be better for VC++ to support AddressSanitizer. The heap cookie system it uses is an excellent way of finding these sorts of bugs and doesn&#8217;t require an access violation to work.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1291875">
+				<div id="div-comment-1291875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291875">
+			April 10, 2017 at 4:00 pm</a>		</div>
+
+		<p>The nice thing about PageHeap is that you can turn it on retroactively for any binary. No recompilation needed. Recompilation may alter behavior enough to make the problem go away! And the bug might be in a component you didn&#8217;t compile, or in a component not written in C++.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1291905">
+				<div id="div-comment-1291905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael Yang</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1291905">
+			April 10, 2017 at 7:23 pm</a>		</div>
+
+		<p>&#8220;canary bytes&#8221; protection does not help on kernel pool overrun detection, correct?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1292005">
+				<div id="div-comment-1292005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sense</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1292005">
+			April 11, 2017 at 1:43 pm</a>		</div>
+
+		<p>Just the thing I was researching last week!:<br />
+Is there any way to enable pageheap in the middle of the running application? Or only for some of allocations?<br />
+It seems it should be possible, as pageheap can be enabled only for allocations of a specific dll. But I&#8217;m unable to find a way to control it at will.<br />
+I need this, because enabling pageheap from the start of my app exhausts 32bit address space completely, but I need tracking a bug in a specific part of the app.</p>
+<p>Anyone knows of a way?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong even depth-2 parent" id="comment-1292095">
+				<div id="div-comment-1292095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1292095">
+			April 12, 2017 at 3:03 am</a>		</div>
+
+		<p><a href="http://stackoverflow.com/questions/4714349/gflags-full-heap-enabling-with-dlls-doesnt-work" rel="nofollow">http://stackoverflow.com/questions/4714349/gflags-full-heap-enabling-with-dlls-doesnt-work</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1292235">
+				<div id="div-comment-1292235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sense</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1292235">
+			April 12, 2017 at 1:06 pm</a>		</div>
+
+		<p>Tnx for the link. I&#8217;d seen it.<br />
+ It states its possible to enable pageheap per dll; But I want to enable pageheap only for some allocations in the main exe, not per dll. For eg. some way to enable/disable it by calling a function.<br />
+As it is possible to be enabled per dll, I think it should be possible to enable at will. Right?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong even depth-4" id="comment-1292296">
+				<div id="div-comment-1292296" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1292296">
+			April 12, 2017 at 9:30 pm</a>		</div>
+
+		<p>I don&#8217;t know&#8230; I&#8217;m not familiar with C++, but maybe you can create a macro that on debug will replace your memory allocation with &#8220;memory allocation round up to the next page size&#8221; then set the memory on next page with page guard?</p>
+<p>You&#8217;ll need to write macro for each memory allocation/free function, and things can break if the arguments of those functions changes in future.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4" id="comment-1292306">
+				<div id="div-comment-1292306" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1292306">
+			April 13, 2017 at 1:12 am</a>		</div>
+
+		<p>You&#8217;re misunderstanding how this system works,  the SO answer is trying to explain exactly that (if you think about it, that&#8217;s also the only way this system can work).</p>
+<p>You can turn the heap flag on per DLL that actually uses HeapAlloc. Since all your dlls presumably use malloc or new they all call into a single dll to allocate memory, so whatever setting exists for that dll is relevant. </p>
+<p>Which also suggests the solution: You&#8217;ll have to use a separate heap for your interesting dlls. This is error prone and requires that the application plays along but doable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1292055">
+				<div id="div-comment-1292055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ismo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170410-00/?p=95935#comment-1292055">
+			April 11, 2017 at 9:14 pm</a>		</div>
+
+		<p>Any way to query how much padding after the reserved block there is to the page break ? Perhaps one should tweak all reservations to be 16 bytes ( or some other boundary) and in own code bump the pointer up if possible ( like character buffer, it can be aligned at one byte precision). </p>
+<p>Or just use _aligned_malloc,</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

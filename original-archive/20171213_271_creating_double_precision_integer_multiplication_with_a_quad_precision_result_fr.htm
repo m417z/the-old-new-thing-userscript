@@ -1,0 +1,499 @@
+<html>
+<head>
+<title>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result using intrinsics (part 1)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result using intrinsics (part 1)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 13, 2017 / year-entry #272</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>11</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Once more with intrinsics.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Some time ago, I derived how to
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453">
+create double-precision integer multiplication with
+a quad-precision result
+from single-precision multiplication
+with a double-precision result</a>,
+but I expressed it in assembly language.
+This time, I'll express it in C using intrinsics.
+</p>
+<p>
+Using intrinsics rather than inline assembly language is slightly
+more portable, since all the compiler toolchains that implement
+the intrinsics agree on what the intrinsics mean.
+They
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20171102-00/?p=97335">
+disagree on the members of a <code>__m128i</code></a>,
+but at least they agree on the intrinsics.
+</p>
+<p>
+First, a straightforward translation of the assembly language
+code to intrinsics:
+</p>
+<pre>
+__m128i Multiply64x64To128(uint64_t x, uint64_t y)
+{
+    // movq xmm0, x         // xmm0 = { 0, 0, A, B } = { *, *, A, B }
+    auto x00AB = _mm_loadl_epi64((__m128i*) &amp;x);
+
+    // movq xmm1, y         // xmm1 = { 0, 0, C, D } = { *, *, C, D }
+    auto x00CD = _mm_loadl_epi64((__m128i*) &amp;y);
+
+    // punpckldq xmm0, xmm0 // xmm0 = { A, A, B, B } = { *, A, *, B }
+    auto xAABB = _mm_unpacklo_epi32(x00AB, x00AB);
+
+    // punpckldq xmm1, xmm1 // xmm1 = { C, C, D, D } = { *, C, *, D }
+    auto xCCDD = _mm_unpacklo_epi32(x00CD, x00CD);
+
+    // pshufd xmm2, xmm1, _MM_SHUFFLE(1, 0, 3, 2)
+    //                      // xmm2 = { D, D, C, C } = { *, D, *, C }
+    auto xDDCC = _mm_shuffle_epi32(xCCDD, _MM_SHUFFLE(1, 0, 3, 2));
+
+    // pmuludq xmm1, xmm0 // xmm1 = { AC, BD } // provisional result
+    auto result = _mm_mul_epu32(xAABB, xCCDD);
+
+    // pmuludq xmm2, xmm0 // xmm2 = { AD, BC } // cross-terms
+    auto crossterms = _mm_mul_epu32(xAABB, xDDCC);
+
+    // mov    eax, crossterms[0]
+    // add    result[4], eax
+    auto carry = _addcarry_u32(0,
+                               result.m128i_u32[1],
+                               crossterms.m128i_u32[0],
+                               &amp;result.m128i_u32[1]);
+
+    // mov    edx, crossterms[4] // edx:eax = BC
+    // adc    result[8], edx
+    carry = _addcarry_u32(carry,
+                          result.m128i_u32[2],
+                          crossterms.m128i_u32[1],
+                          &amp;result.m128i_u32[2]);
+
+    // adc    result[12], 0      // add the first cross-term
+    _addcarry_u32(carry,
+                  result.m128i_u32[3],
+                  0,
+                  &amp;result.m128i_u32[3]);
+
+    // mov    eax, crossterms[8]
+    // add    result[4], eax
+    carry = _addcarry_u32(0,
+                          result.m128i_u32[1],
+                          crossterms.m128i_u32[2],
+                          &amp;result.m128i_u32[1]);
+
+    // mov    edx, crossterms[12] // edx:eax = AD
+    // adc    result[8], edx
+    carry = _addcarry_u32(carry,
+                          result.m128i_u32[2],
+                          crossterms.m128i_u32[3],
+                          &amp;result.m128i_u32[2]);
+
+    // adc    result[12], 0      // add the second cross-term
+    _addcarry_u32(carry,
+                  result.m128i_u32[3],
+                  0,
+                  &amp;result.m128i_u32[3]);
+
+    return result;
+}
+</pre>
+<p>
+The Microsoft Visual Studio compiler produces the following:
+</p>
+<pre>
+    ; standard function prologue
+        push     ebp
+        mov      ebp, esp
+        and      esp, -16   ; room for _result on the stack
+        sub      esp, 24
+
+    ; load up x and y
+        movq     xmm1, QWORD PTR _y$[ebp]
+        movq     xmm2, QWORD PTR _x$[ebp]
+
+    ; duplicate x
+        punpckldq xmm1, xmm1
+
+    ; make another copy of the duplicated x
+        movaps   xmm0, xmm1
+
+    ; duplicate y
+        punpckldq xmm2, xmm2
+
+    ; multiply main terms, result in xmm0
+        pmuludq xmm0, xmm2
+
+    ; shuffle and multiply cross terms, cross-terms in xmm1
+        pshufd   xmm1, xmm1, 141
+        pmuludq xmm1, xmm2
+
+    ; Now the adjustments for cross-terms
+
+    ; save a register
+        push     esi
+
+    ; save result to memory
+        movaps   XMMWORD PTR _result$[esp+32], xmm0
+
+    ; load up result[2] into esi and result[3] into ecx
+        mov      esi, DWORD PTR _result$[esp+40]
+        mov      ecx, DWORD PTR _result$[esp+44]
+
+    ; load result[1] into edx by shifting
+        psrldq   xmm0, 4
+        movd     edx, xmm0
+
+    ; xmm0 holds cross-terms
+        movaps   xmm0, xmm1
+
+    ; load crossterms[0] into eax
+        movd     eax, xmm1
+
+    ; prepare to load crossterms[1] into eax by shifting
+        psrldq   xmm0, 4
+
+    ; add crossterms[0] to result[1]
+        add      edx, eax
+
+    ; load crossterms[1] into eax
+        movd     eax, xmm0
+
+    ; xmm0 holds cross-terms (again)
+        movaps   xmm0, xmm1
+
+    ; prepare to load crossterms[3] into eax by shifting
+        psrldq   xmm1, 12
+
+    ; prepare to load crossterms[2] into eax by shifting
+        psrldq   xmm0, 8
+
+    ; add crossterms[1] to result[2], with carry
+        adc      esi, eax
+
+    ; load crossterms[2] into eax
+        movd     eax, xmm0
+
+    ; propagate carry into result[3]
+        adc      ecx, 0
+
+    ; add crossterms[2] to result[1]
+        add      edx, eax
+
+    ; load crossterms[3] into eax
+        movd     eax, xmm1
+
+    ; save final result[1]
+        mov      DWORD PTR _result$[esp+36], edx
+
+    ; add crossterms[3] to result[2]
+        adc      esi, eax
+
+    ; save final result[2]
+        mov      DWORD PTR _result$[esp+40], esi
+
+    ; propagate carry into result[3]
+        adc      ecx, 0
+
+    ; save final result[3]
+        mov      DWORD PTR _result$[esp+44], ecx
+
+    ; load final result
+        movaps   xmm0, XMMWORD PTR _result$[esp+32]
+
+    ; clean up stack and return
+        pop      esi
+        mov      esp, ebp
+        pop      ebp
+        ret
+</pre>
+<p>
+I was impressed that the compiler was able to convert
+our direct accesses to the internal members of the <code>__m128i</code>
+into corresponding shifts and extractions.
+(Since this code was compiled with only SSE2 support,
+the compiler could not use the <code>pextrd</code> instruction
+to do the extraction.)
+</p>
+<p>
+Even with this very lame conversion, the compiler
+does quite a good job of optimiznig the code.
+The opening instructions match our handwritten assembly
+almost exactly;
+the second half doesn't match as well,
+but that's because the compiler was able to replace
+many of our memory accesses with register accesses.
+</p>
+<p>
+The compiler was able to optimize our inline assembly!
+</p>
+<p>
+We'll take this as inspiration for trying to get rid of all
+the memory accesses.
+The story continues next time.
+</p>
+<p>
+<b>Bonus chatter</b>:
+In the three years since I wrote the original article,
+nobody picked up on the fact that I got the parameters to
+<code>_MM_SHUFFLE</code> wrong.
+</p>
+<p>
+<b>Bonus bonus chatter</b>:
+I could have reduced the dependency chain a bit by tweaking
+the calculation of <code>xDDCC</code>:
+</p>
+<pre>
+    // pshufd xmm2, xmm1, _MM_SHUFFLE(0, 0, 1, 1);
+    //                      // xmm2 = { D, D, C, C } = { *, D, *, C }
+    auto xDDCC = _mm_shuffle_epi32(x00CD, _MM_SHUFFLE(0, 0, 1, 1));
+
+    // punpckldq xmm1, xmm1 // xmm1 = { C, C, D, D } = { *, C, *, D }
+    auto xCCDD = _mm_unpacklo_epi32(x00CD, x00CD);
+</pre>
+<p>
+Basing the calculation of <code>xDDCC</code> on
+<code>x00CD</code> rather than <code>0xCCDD</code> removes
+one instruction from the dependency chain.
+</p>
+<p>
+<b>Bonus bonus bonus chatter</b>:
+I chose to use <code>punpckldq</code> instead of
+<code>pshufd</code> to calculate <code>xCCDD</code>
+because <code>punpckldq</code> encodes one byte shorter.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (11)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20171213-00/?p=97575#respond" style="display:none;">Cancel reply</a></small></h3>			<form action="https://blogs.msdn.microsoft.com/oldnewthing/wp-comments-post.php" method="post" id="commentform" class="comment-form">
+				<p class="comment-form-comment"><textarea id="comment" name="comment" cols="45" rows="4" aria-required="true"></textarea></p><p class="comment-form-author"><label for="author">Name <span class="required">*</span></label> <input id="author" name="author" type="text" value="" size="30" maxlength="245" aria-required='true' required='required' /></p>
+<p class="comment-form-email"><label for="email">Email <span class="required">*</span></label> <input id="email" name="email" type="text" value="" size="30" maxlength="100" aria-describedby="email-notes" aria-required='true' required='required' /></p>
+<p class="comment-form-url"><label for="url">Website</label> <input id="url" name="url" type="text" value="" size="30" maxlength="200" /></p>
+<p class="form-submit"><input name="submit" type="submit" id="submit" class="submit btn btn-default" value="Post Comment" /> <input type='hidden' name='comment_post_ID' value='97575' id='comment_post_ID' />
+<input type='hidden' name='comment_parent' id='comment_parent' value='0' />
+</p><p style="display: none;"><input type="hidden" id="akismet_comment_nonce" name="akismet_comment_nonce" value="fc3339a146" /></p><p style="display: none;"><input type="hidden" id="ak_js" name="ak_js" value="246"/></p>			</form>
+			</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1317796">
+				<div id="div-comment-1317796" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317796">
+			December 13, 2017 at 7:38 am</a>		</div>
+
+		<p>&#8221; nobody picked up on the fact that I got the parameters to _MM_SHUFFLE wrong.&#8221;</p>
+<p>Probably because it&#8217;s extra work having to go look the documentation up.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317796#respond' onclick='return addComment.moveForm( "div-comment-1317796", "1317796", "respond", "97575" )' aria-label='Reply to Rick C'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1317805">
+				<div id="div-comment-1317805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317805">
+			December 13, 2017 at 9:06 am</a>		</div>
+
+		<p>I didn&#8217;t pick up on the wrong parameters, either. Of course, I just come here for the free cookies and interesting stories (history, jargon speak, and the occasional non-computer ones).</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317805#respond' onclick='return addComment.moveForm( "div-comment-1317805", "1317805", "respond", "97575" )' aria-label='Reply to Martin'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle even thread-even depth-1 parent" id="comment-1317815">
+				<div id="div-comment-1317815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317815">
+			December 13, 2017 at 11:22 am</a>		</div>
+
+		<p>I am still trying to parse the title of this article with limited success.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317815#respond' onclick='return addComment.moveForm( "div-comment-1317815", "1317815", "respond", "97575" )' aria-label='Reply to MNGoldenEagle'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1317825">
+				<div id="div-comment-1317825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tanveer Badar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317825">
+			December 13, 2017 at 12:03 pm</a>		</div>
+
+		<p>You too?</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317825#respond' onclick='return addComment.moveForm( "div-comment-1317825", "1317825", "respond", "97575" )' aria-label='Reply to Tanveer Badar'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1317835">
+				<div id="div-comment-1317835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://deleted' rel='external nofollow' class='url'>Pierre B.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317835">
+			December 13, 2017 at 1:10 pm</a>		</div>
+
+		<p>I&#8217;m pretty sure it&#8217;s intentional and Raymond did it for the lols, here&#8217;s the decryption:</p>
+<p>1. Given a multiplication op that:<br />
+   1a. Takes two single-precision integers<br />
+   1b. Result in a double-precision integer</p>
+<p>2. Create a multiplication op that:<br />
+   1a. Takes two double-precision integers<br />
+   1b. Result in a quad-precision integer</p>
+<p>3. Using only intrinsics.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317835#respond' onclick='return addComment.moveForm( "div-comment-1317835", "1317835", "respond", "97575" )' aria-label='Reply to Pierre B.'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mngoldeneagle odd alt depth-4" id="comment-1317845">
+				<div id="div-comment-1317845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317845">
+			December 13, 2017 at 1:39 pm</a>		</div>
+
+		<p>Huzzah!  That clears it up.</p>
+<p>Have an internet cookie.  It&#8217;s on the house.  No, you can&#8217;t opt out.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317845#respond' onclick='return addComment.moveForm( "div-comment-1317845", "1317845", "respond", "97575" )' aria-label='Reply to MNGoldenEagle'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-4 parent" id="comment-1317855">
+				<div id="div-comment-1317855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317855">
+			December 13, 2017 at 3:10 pm</a>		</div>
+
+		<p>It wasn&#8217;t for lols. What would you have titled it? Okay, maybe &#8220;Using intrinsics to create double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result (part 1)&#8221; would have been better.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317855#respond' onclick='return addComment.moveForm( "div-comment-1317855", "1317855", "respond", "97575" )' aria-label='Reply to Raymond Chen - MSFT'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1317875">
+				<div id="div-comment-1317875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317875">
+			December 14, 2017 at 5:09 am</a>		</div>
+
+		<p>That is still way too long, you have to think of modern readership. I recommend &#8220;The Top 10 Reasons Why Weight Loss Programs Don&#8217;t Work (And Integer Multiplication)&#8221;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1317886">
+				<div id="div-comment-1317886" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://deleted' rel='external nofollow' class='url'>Pierre B.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317886">
+			December 14, 2017 at 8:46 am</a>		</div>
+
+		<p>You don&#8217;t need to sell the full product in the title.</p>
+<p>&#8220;Creating a wider multiplication operator using intrinsics&#8221; is short enough. Let the meat be in the text. I&#8217;m no SEO expert though. It may turn out that having a longer title helps with the search ranks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-5" id="comment-1317896">
+				<div id="div-comment-1317896" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317896">
+			December 14, 2017 at 12:07 pm</a>		</div>
+
+		<p>The blog server has a requirement that no two blog entries have the same title, so I try to make the title specific enough that I won&#8217;t try to reuse it in the future for a related issue. (For example, maybe in the future I need to build a different type of wide multiplication using intrinsics.) Also, I put all the words in there so I can find the article myself. Because this was a real problem I had to solve.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-4" id="comment-1317885">
+				<div id="div-comment-1317885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575#comment-1317885">
+			December 14, 2017 at 7:20 am</a>		</div>
+
+		<p>I had to spend a while parsing it too.  It helps being old enough to remember that on 8-bit processors, you had to do the same kind of thing to get 16-bit results from arithmetic operations on 8-bit numbers.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575&#038;replytocom=1317885#respond' onclick='return addComment.moveForm( "div-comment-1317885", "1317885", "respond", "97575" )' aria-label='Reply to Rick C'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

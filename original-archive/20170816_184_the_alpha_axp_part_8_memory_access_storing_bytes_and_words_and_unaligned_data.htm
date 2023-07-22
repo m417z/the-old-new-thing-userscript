@@ -1,0 +1,744 @@
+<html>
+<head>
+<title>The Alpha AXP, part 8: Memory access, storing bytes and words and unaligned data</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Alpha AXP, part 8: Memory access, storing bytes and words and unaligned data</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 16, 2017 / year-entry #185</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>29</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Those little pieces.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Storing a byte and word requires a series of three operations:
+Read the original data, modify the original data to incorporate
+the byte or word, then write the modified data back to memory.
+</p>
+<p>
+To assist with the modification are two groups of instructions
+known as insertion and masking.
+</p>
+<pre>
+    INSBL   Ra, Rb/#b, Rc  ; Rc =  (uint8_t)Ra &lt;&lt; (Rb/#b * 8 % 64)
+    INSWL   Ra, Rb/#b, Rc  ; Rc = (uint16_t)Ra &lt;&lt; (Rb/#b * 8 % 64)
+    INSLL   Ra, Rb/#b, Rc  ; Rc = (uint32_t)Ra &lt;&lt; (Rb/#b * 8 % 64)
+    INSQL   Ra, Rb/#b, Rc  ; Rc = (uint64_t)Ra &lt;&lt; (Rb/#b * 8 % 64)
+
+    INSWH   Ra, Rb/#b, Rc  ; Rc = (uint16_t)Ra &gt;&gt; ((64 - Rb/#b * 8) % 64)
+    INSLH   Ra, Rb/#b, Rc  ; Rc = (uint32_t)Ra &gt;&gt; ((64 - Rb/#b * 8) % 64)
+    INSQH   Ra, Rb/#b, Rc  ; Rc = (uint64_t)Ra &gt;&gt; ((64 - Rb/#b * 8) % 64)
+</pre>
+<p>
+These are the inverse of the extraction instructions.
+Instead of extracting data from a 128-bit value,
+they move the data into position within a 128-bit value.
+For example, here's a diagram of inserting the long <code>FGHI</code>
+into a 128-bit value:
+</p>
+<pre>
+    high part  low part
+    --------- ---------
+    0000 0FGH           -- INSLH
+              I000 0000 -- INSLL
+</pre>
+<p>
+The last piece of the puzzle is the masking instructions.
+</p>
+<pre>
+    MSKBL   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~( (uint8_t)~0 &lt;&lt; (Rb/#b * 8 % 64))
+    MSKWL   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~((uint16_t)~0 &lt;&lt; (Rb/#b * 8 % 64))
+    MSKWL   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~((uint32_t)~0 &lt;&lt; (Rb/#b * 8 % 64))
+    MSKWL   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~((uint64_t)~0 &lt;&lt; (Rb/#b * 8 % 64))
+
+    MSKWH   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~((uint16_t)~0 &gt;&gt; ((64 - Rb/#b * 8) % 64))
+    MSKWH   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~((uint32_t)~0 &gt;&gt; ((64 - Rb/#b * 8) % 64))
+    MSKWH   Ra, Rb/#b, Rc  ; Rc = Ra &amp; ~((uint64_t)~0 &gt;&gt; ((64 - Rb/#b * 8) % 64))
+</pre>
+<p>
+These instructions zero out the bytes of a 128-bit value
+that are about to be replaced by an insertion.
+</p>
+<p>
+For example,
+here's how the masking of a long would work:
+</p>
+<pre>
+    high part  low part
+    --------- ---------
+    ABCD EFGH IJKL MNOP -- 16-byte value
+          ^^^ ^         -- 4 bytes to be inserted here
+    ABCD E000           -- MSKLH
+              0JKL MNOP -- MSKLL
+</pre>
+<p>
+Putting the pieces together, we see that in order to replace
+a long in the middle of a 128-bit value, you would use
+the insertion instructions to place the new value in
+the correct position,
+the masking instructions to zero out the bits that used
+to be there,
+and then "or" the pieces together.
+</p>
+<pre>
+    ; store an unaligned long in t1 to (t0)
+    ; first read the 128-bit value currently in memory
+    LDQ_U   t2,3(t0)                    ; t2 = yyyy yyyD
+    LDQ_U   t5,(t0)                     ; t5 =           CBAx xxxx
+
+    ; build the values to insert
+    INSLH   t1,t0,t4                    ; t4 = 0000 000d
+    INSLL   t1,t0,t3                    ; t3 =           cba0 0000
+
+    ; mask out the values to be replaced
+    MSKLH   t2,t0,t2                    ; t2 = yyyy yyy0
+    MSKLL   t5,t0,t5                    ; t5 =           000x xxxx
+
+    ; "or" the new values into place
+    BIS     t2,t4,t2                    ; t2 = yyyy yyyd
+    BIS     t5,t3,t5                    ; t5 =           cbax xxxx
+
+    ; and write the results back out
+    STQ_U   t2,3(t0)                    ; must store high then low
+    STQ_U   t5,(t0)                     ; in case there was no straddling
+</pre>
+<p>
+Extending this pattern to quads and words is left as an exercise.
+</p>
+<p>
+Notice that in the case where <var>t0</var> does not straddle
+two quads,
+we perform two reads from the same location, and two writes to
+the same location.
+Let's walk through what happens:
+</p>
+<pre>
+    ; first read the 128-bit value currently in memory
+    ; (which is really the same 64-bit value twice)
+    LDQ_U   t2,3(t0)                    ; t2 = yyDC BAxx
+    LDQ_U   t5,(t0)                     ; t5 = yyDC BAxx
+
+    ; build the values to insert
+    INSLH   t1,t0,t4                    ; t4 = 00dc ba00
+    INSLL   t1,t0,t3                    ; t3 = 0000 0000
+
+    ; mask out the values to be replaced
+    MSKLH   t2,t0,t2                    ; t2 = yy00 00xx
+    MSKLL   t5,t0,t5                    ; t5 = yyDC BAxx
+
+    ; "or" the new values into place
+    BIS     t2,t4,t2                    ; t2 = yydc baxx
+    BIS     t5,t3,t5                    ; t5 = yyDC BAxx
+
+    ; and write the results back out
+    STQ_U   t2,3(t0)                    ; write same value back
+    STQ_U   t5,(t0)                     ; write updated value
+</pre>
+<p>
+This highlights some of the weird memory effects of the Alpha AXP.
+If another thread snuck in and modified the memory at
+<var>t0 &amp; ~7</var>, those changes would be reverted
+at the first <code>STQ_U</code>, and then the updated value
+gets written next.
+This means that the value changes from
+<code>yyyyDCBAxx</code> to
+<code>zzzzDCBAww</code>,
+and then back to
+<code>yyyyDCBAxx</code>,
+and then finally to
+<code>yyyydcbaxx</code>.
+The value changes, and then appears to change back to the old
+value,
+before finally being updated to a new (sort-of) value.
+</p>
+<p>
+We'll learn more about the Alpha AXP memory model later.
+</p>
+<p>
+In the case where you are writing a word and you know that it is
+aligned, then you can avoid having to deal with the 128-bit value
+and operate within a 64-bit value (because an aligned word will
+never straddle two quads).
+</p>
+<pre>
+    ; store an aligned word in t1 to (t0)
+    ; first read the 64-bit value currently in memory
+    LDQ_U   t5,(t0)                     t5 = yyBA xxxx
+
+    ; build the value to insert
+    INSWL   t1,t0,t3                    t3 = 00ba 0000
+
+    ; mask out the values to be replaced
+    MSKWL   t5,t0,t5                    t5 = yy00 xxxx
+
+    ; "or" the new values into place
+    BIS     t5,t3,t5                    t5 = yyba xxxx
+
+    ; and write the results back out
+    STQ_U   t5,(t0)
+</pre>
+<p>
+Okay, but what about bytes?
+Well, bytes can never be misaligned, so we always go through
+the "known aligned" shortcut.
+</p>
+<pre>
+    ; store a byte in t1 to (t0)
+    ; first read the 64-bit value currently in memory
+    LDQ_U   t5,(t0)                     t5 = yyyA xxxx
+
+    ; build the value to insert
+    INSBL   t1,t0,t3                    t3 = 000a 0000
+
+    ; mask out the values to be replaced
+    MSKBL   t5,t0,t5                    t5 = yyy0 xxxx
+
+    ; "or" the new values into place
+    BIS     t5,t3,t5                    t5 = yyya xxxx
+
+    ; and write the results back out
+    STQ_U   t5,(t0)
+</pre>
+<p>
+Dealing with unaligned memory on the Alpha AXP is very annoying.
+Notice that updates to words and bytes, even aligned words,
+is not atomic.
+We read the entire quad from memory,
+perform some register calculations,
+and then write the entire quad back out.
+If somebody made a change to another byte within the quad,
+we will wipe out that change when we complete our
+word or byte update.
+</p>
+<p>
+Next time, we'll look at atomic memory operations.
+</p>
+<p>
+<b>Bonus chatter</b>:
+There is one more pair of instructions which operate
+on the bytes within a register:
+<code>ZAP</code> and <code>ZAPNOT</code>.
+</p>
+<pre>
+    ZAP     Ra, Rb/#b, Rc  ; Rc = Ra after zeroing the bytes selected by Rb/#b
+    ZAPNOT  Ra, Rb/#b, Rc  ; Rc = Ra after zeroing the bytes selected by ~Rb/#b
+</pre>
+<p>
+The <code>ZAP</code> and <code>ZAPNOT</code> instructions
+treat the low-order 8 bits of the second parameter as references
+to the corresponding bytes of the <var>Ra</var> register:
+Bit <var>n</var> of <var>Rb</var>/#b corresponds to bits
+<var>N</var> &times; 8 through
+<var>N</var> &times; 8 + 7.
+The <code>ZAP</code> instruction sets the byte to zero if
+the corresponding bit is set;
+the <code>ZAPNOT</code> instruction sets the byte to zero if
+the corresponding bit is clear.
+The other 56 bits of the second parameter are ignored.
+</p>
+<p>
+For example, <code>ZAP v0, #128, v0</code>
+clears the top byte of <var>v0</var>,
+and <code>ZAPNOT v0, #128, v0</code>
+clears all but the top byte of <var>v0</var>.
+(For some reason, I had trouble remembering which way is which.
+My trick was to
+pretend that the <code>ZAPNOT</code> instruction is called
+<code>KEEP</code>.)
+</p>
+<p>
+As a special case,
+these instructions provide a handy way to zero-extend a register.
+</p>
+<pre>
+    ZAPNOT  Ra, #1, Rc  ; zero-extend byte from Ra to Rc
+    ZAPNOT  Ra, #3, Rc  ; zero-extend word from Ra to Rc
+    ZAPNOT  Ra, #15, Rc ; zero-extend long from Ra to Rc
+</pre>
+<p>
+Note that in the last case, zero-extending a negative long
+will result in a 32-bit value in non-canonical form.
+But you hopefully were expecting that;
+if you want to sign-extend the value (in order to ensure
+a value in canonical form),
+you would have done <code>ADDL Ra, #0, Rc</code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (29)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1306576">
+				<div id="div-comment-1306576" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306576">
+			August 16, 2017 at 7:11 am</a>		</div>
+
+		<p>Thus, in many common operations (updating a byte or a word in an array &#8211; or a string), pure RISC machines take up to five instructions where a CISC machine would do it in just one. Of course, if you are processing a string (or an array), you can batch the updates and save some instructions (i.e., if you write all of a quad&#8217;s eight bytes, you only have to execute one store, and if you don&#8217;t mind the original contents, you save the load). I wonder what the performance hit is.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1306585">
+				<div id="div-comment-1306585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matthew Vincent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306585">
+			August 16, 2017 at 7:27 am</a>		</div>
+
+		<p>The whole point of a RISC architecture is to reduce the cost of an instruction so that they take less clock cycles, and hence in a given number of clock cycles you can do more. CISC instruction sets tend to be converted to micro ops internally, which would more closely mimic a RISC architecture.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1306626">
+				<div id="div-comment-1306626" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306626">
+			August 16, 2017 at 10:54 am</a>		</div>
+
+		<p>But the high number of code bytes a RISC cpu needs to perform even very simple operations occupy valuable memory bandwidth (and cache). The CPU and the memory and the caches should mainly process or transfer application data, not micro-operations.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1306636">
+				<div id="div-comment-1306636" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306636">
+			August 16, 2017 at 11:59 am</a>		</div>
+
+		<p>Yes, I know what means the difference between &#8220;C&#8221; and &#8220;R&#8221; :-) . But as Someone said, storing a single byte or aligned word can take up to six operations (address calculation, loading, masking the original value, rotating the byte/word to match its destination, logical OR and storing) and three temporary registers (address, temporary value, and rotated byte/word). Of course, unaligned accesses will be more expensive.</p>
+<p>Classic RISC machines typically had about twice the execution units than CISC machines of the same era (nowadays, with the Intel Core series spotting six integer execution units, I doubt it would be true, but we are talking about late 90s machines, right?). And yes, I talk about micro-instruction units, but such units in CISC processors are able to handle unaligned byte/word access, so you can execute a complex load/store in two micro-instructions (address calculation and actual load/store), instead of the three-to-six it would take in a RISC machine.</p>
+<p>So the question remains: are byte and word accesses so scarce that this performance hit in RISC processors isn&#8217;t critical? My guess is that it depends on the software mix. But if an architecture&#8217;s performance heavily depends on the kind of software executed, maybe it can not be called general-purpose&#8230;</p>
+<p>Anyway, we live in a post-RISC world, where classical CISC and RISC machines do not exist anymore, and they are very alike, apart from the instruction encoding and the (non)existence of a micro-instruction translating unit (also, Windows and Unix are more similar than many people would like you to believe, but that&#8217;s a different matter). So today, all of this is moot.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1306676">
+				<div id="div-comment-1306676" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306676">
+			August 16, 2017 at 3:33 pm</a>		</div>
+
+		<p>This is all Alpha-specific. Outside of some special-purpose DSP instruction sets I can&#8217;t off the top of my head think of any other instruction set that does not support byte or half-word memory accesses. And as Raymond mentioned in one of the earlier posts, even the later Alpha models added them (starting with the 21164A, according to Wikipedia).</p>
+<p>Still, although the Alpha ISA seems kind of ugly and inelegant compared to eg. MIPS64, it was very fast at the kinds of code it was designed to run. Unaligned accesses being slow is not a problem if you don&#8217;t have unaligned data!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4 parent" id="comment-1306686">
+				<div id="div-comment-1306686" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306686">
+			August 17, 2017 at 1:09 am</a>		</div>
+
+		<p>Remember, for comparison, that the DEC Alpha 21064 (the first AXP chip) was in volume release in September 1992 at 150 MHz. For comparison, the Pentium 66 MHz wasn&#8217;t released until March 1993; by this point the Alpha had been released in a 200 MHz version &#8211; so the Alpha had a clock speed advantage as well as being dual-issue superscalar. The two put together meant that the Alpha was executing three to six instructions for every instruction a Pentium issued, depending on whether your code could use both U and V pipelines on the Pentium, or just U.</p>
+<p>That, in turn, meant that for pure memory access (no compute), the Alpha was no slower than the Pentium (while it took 6 instructions, it executed those 6 in the same time frame it took the Pentium to execute 1), but when compute was required, the Alpha was much faster.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1306687">
+				<div id="div-comment-1306687" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306687">
+			August 17, 2017 at 2:00 am</a>		</div>
+
+		<p>Outside of pure mathematical applications (and SPEC runs), this does not buy the RISC CPUs that much. Higher nominal clock, but the same (or worse or much worse) throughput (exhibit A: Itanium).<br />
+No web server, no word processor, no compiler, JIT compiler or interpreter, not even graphical computations is well handled by the AXP instructions set as represented so far, because of its glourious inability to perform simple memory operations. No (countable) constants as operands, no full addresses (or large enough offsets) as operands , only one single addressing mode, nothing to make string operations (that is, double-byte or single-byte arrays) performant? Thats dumb, but for sure, not very advanced.</p>
+<p>For example, if they really wanted to use 32-bit op codes ONLY, they could at least have designed an operation to load constants/addresses like this: Its (a) an unconditional jump over the next two 32-bit words, and (b) also a PC-relative load operation which loaded this two 32-bit words in a register. This way, they could have stayed &#8220;pure RISC&#8221;, but would allow much saner handling of constants with more than a few bits.</p>
+<p>Silicon is cheap. There is no reason to not use it to make the CPU more efficient.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1306696">
+				<div id="div-comment-1306696" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306696">
+			August 17, 2017 at 6:42 am</a>		</div>
+
+		<p>I think you&#8217;ll find the cost of silicon was somewhat higher in 1992. Web servers also weren&#8217;t that much of a consideration back then.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1306705">
+				<div id="div-comment-1306705" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306705">
+			August 17, 2017 at 7:02 am</a>		</div>
+
+		<p>According to Wikipedia, the original EV4 had 1.68 millions transistors in 1992, whereas the original Pentium had 3,1 million in 1993. DEC could have spent over a million transistors more to make the design somewhat less restricted, and therefore much more suitable for general-purpose applications.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1306715">
+				<div id="div-comment-1306715" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306715">
+			August 17, 2017 at 7:04 am</a>		</div>
+
+		<p>Itanium is much more recent than Alpha, and suffered because it had neither an IPC advantage nor a clock speed advantage over its contemporary x86 chips. When the Itanium shipped in 2001, it clocked at 800 MHz, to the 1.13 GHz that Pentium III had at the time.</p>
+<p>In contrast, the first 150 MHz Alpha chips were competing against 50 MHz 486-DX2 chips, and could execute two instructions per clock to the 486&#8217;s single IPC limit, for 6 times the instruction throughput of the 486. Thus, it didn&#8217;t matter that for memory access, the Alpha needed 6 times the instructions &#8211; it was executing 6 times as many instructions per second as the 486 could. By the time the Pentium arrived, the Alpha was enough faster that it could maintain the same ratio of instructions per second.</p>
+<p>Context is everything, and at the time the Alpha was released, it was considerably faster than contemporary CISC CPUs; even if you hit its glass jaw (sub-word accesses), it was as fast as its contemporaries, while if you avoided that, it was faster.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1306725">
+				<div id="div-comment-1306725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306725">
+			August 17, 2017 at 8:29 am</a>		</div>
+
+		<p>One thing is clear: the soundest defenses of the Alpha in this thread say that in context, the original Alpha was no slower than the original Pentium. To me, this means that, even when running at a far greater clock speed, the Alpha was comparable to the Pentium (back then, the best performant CISC processor &#8211; the 68060 would arrive later and with severe clock speed limits). Of course, contesting the best CISC processor of the time (and being a year ahead of it) is no small feat!</p>
+<p>I&#8217;m in no way attacking the Alpha or the RISC architecture (after all, every x86 processor after the Pentium Pro is basically a RISC one with an instruction translation unit in front of it!). I&#8217;m just trying to look at the RISC vs. CISC claims of the 90s from the perspective that years give us.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1306735">
+				<div id="div-comment-1306735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306735">
+			August 17, 2017 at 9:41 am</a>		</div>
+
+		<p>Stronger than just &#8220;no slower than&#8221;; if you constructed an artificial benchmark to slow the Alpha down, you could force it down to Pentium speeds. If you ran real code, it could be as much as 6x faster.</p>
+<p>Indeed, the Alpha was so much faster than contemporary x86 (Pentium, Pentium Pro) that the Alpha running DEC FX!32 could execute real x86 applications at the equivalent of an x86 at 40% of the Alpha&#8217;s clock speed. Because the Alpha was clocking much higher than its contemporary x86 competitors, this meant that it was a faster system overall (when FX!32 first arrived, Alphas were typically clocking 6x a Pentium, making FX!32 and an Alpha 1.6 times the speed of the x86 when running x86 code &#8211; it wasn&#8217;t until the Pentium II in 1997 that a native x86 processor was faster at running x86 code than an Alpha with FX!32).</p>
+<p>It&#8217;s fun to speculate on what the world would look like if DEC had done one of two things differently:</p>
+<p> 1. Released a version of FX!32 that lets you mix x86 and Alpha code in an &#8220;Alpha&#8221; application.<br />
+ 2. Instead of using ARM&#8217;s ISA to demonstrate that the Alpha design techniques scaled to low power as well as high performance (StrongARM), they&#8217;d used Alpha&#8217;s ISA in a low power, decent performance chip.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1306745">
+				<div id="div-comment-1306745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Klimax</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306745">
+			August 17, 2017 at 11:32 am</a>		</div>
+
+		<p>I&#8217;d like to see those benchmarks. Got any references to back up those performance claims?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1306785">
+				<div id="div-comment-1306785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306785">
+			August 18, 2017 at 1:54 am</a>		</div>
+
+		<p>@Klimax See, for example, <a href="http://www.realworldtech.com/x86-translation/3/" rel="nofollow">http://www.realworldtech.com/x86-translation/3/</a> which claims a higher performance delta than I did; they found 50% to 70% of Alpha clock speed when running x86 code, whereas the figures I&#8217;ve got in my notes from 1998 say about 40% of Alpha clockspeed (probably because the P-II was a faster chip than the PPro.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-5" id="comment-1306827">
+				<div id="div-comment-1306827" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306827">
+			August 18, 2017 at 8:01 am</a>		</div>
+
+		<p>&#8220;(a) an unconditional jump over the next two 32-bit words, and (b) also a PC-relative load operation which loaded this two 32-bit words in a register.&#8221; I still don&#8217;t see what the advantage is. The above sequence requires 3 longs to encode. (The unconditional jump, the PC-relative load, and the 32-bit value.) The same operation in the existing instruction set requires 3 longs to encode in the worst case and 2 instructions in the common case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1306896">
+				<div id="div-comment-1306896" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Klimax</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306896">
+			August 20, 2017 at 11:30 pm</a>		</div>
+
+		<p>@Simon Farnsworth<br />
+Thanks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1307445">
+				<div id="div-comment-1307445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1307445">
+			August 28, 2017 at 1:23 am</a>		</div>
+
+		<p>&#8220;It’s fun to speculate on what the world would look like if DEC had done one of two things differently:&#8221;</p>
+<p>The Intel/DEC settlement is probably their biggest downfall. Intel violates DEC patents, Intel settles by agreeing to buy StrongARM from DEC. Just how poisonous was StrongARM to DEC?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1306665">
+				<div id="div-comment-1306665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306665">
+			August 16, 2017 at 1:54 pm</a>		</div>
+
+		<p>Do not generalize from Alpha to all of RISC! Other RISC ISAs (including AFAIK later versions of Alpha) do have instructions to read or write a single byte or word. What&#8217;s less common is unaligned read/write, but even then some RISC ISAs do have instructions for unaligned read/write.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1306587">
+				<div id="div-comment-1306587" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matthew Vincent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306587">
+			August 16, 2017 at 7:31 am</a>		</div>
+
+		<p>Raymond, keep up the good work. I loved your series on the Itanium.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1306595">
+				<div id="div-comment-1306595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306595">
+			August 16, 2017 at 9:24 am</a>		</div>
+
+		<p>The first thing that comes to mind is atomic_t for getting the size integer that can be written atomically.</p>
+<p>The second thing that comes to mind is processing UTF-16 strings on Alpha sucks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1306615">
+				<div id="div-comment-1306615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306615">
+			August 16, 2017 at 10:28 am</a>		</div>
+
+		<p>I feel compelled to link this: <a href="https://www.google.com/url?q=https://www.cs.princeton.edu/courses/archive/fall10/cos375/Byte-case.pdf&#038;sa=U&#038;ved=0ahUKEwieypGeo9zVAhXMzFQKHV3iAQgQFggLMAA&#038;usg=AFQjCNFYGhr47fkRAdwu8xsD5n95NtoW0A" rel="nofollow">https://www.google.com/url?q=https://www.cs.princeton.edu/courses/archive/fall10/cos375/Byte-case.pdf&#038;sa=U&#038;ved=0ahUKEwieypGeo9zVAhXMzFQKHV3iAQgQFggLMAA&#038;usg=AFQjCNFYGhr47fkRAdwu8xsD5n95NtoW0A</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1306625">
+				<div id="div-comment-1306625" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306625">
+			August 16, 2017 at 10:28 am</a>		</div>
+
+		<p>Wow I sure should have edited that link before posting it&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1306635">
+				<div id="div-comment-1306635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306635">
+			August 16, 2017 at 11:34 am</a>		</div>
+
+		<p><a href="https://www.cs.princeton.edu/courses/archive/fall10/cos375/Byte-case.pdf" rel="nofollow">https://www.cs.princeton.edu/courses/archive/fall10/cos375/Byte-case.pdf</a></p>
+<p>Interesting reading. And, if you remove the file from the URL, you get to the course&#8217;s main page, where you can find more interesting texts about computer architecture under the &#8220;Enrichment links&#8221; heading, at the bottom of the page.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle odd alt thread-even depth-1 parent" id="comment-1306646">
+				<div id="div-comment-1306646" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306646">
+			August 16, 2017 at 12:35 pm</a>		</div>
+
+		<p>Makes me glad that for the only RISC architecture I&#8217;ve worked with (MIPS) storing unaligned data is easy, since it has instructions that handle it all for you.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mngoldeneagle even depth-2 parent" id="comment-1306655">
+				<div id="div-comment-1306655" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306655">
+			August 16, 2017 at 1:47 pm</a>		</div>
+
+		<p>Hmm&#8230; now that I think on it, you still had to be 16-bit aligned I believe, but it had opcodes for writing 8-bit, 16-bit, 32-bit, or 64-bit values, so it was still simpler to perform the writes.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1306675">
+				<div id="div-comment-1306675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306675">
+			August 16, 2017 at 3:25 pm</a>		</div>
+
+		<p>MIPS requires data to be naturally aligned, but has some special instructions (Load/Store Word Left/Right) to assist with handling unaligned data. These instructions were somewhat infamous as they were covered by patents which MIPS used to block unlicensed instruction set implementations.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1306677">
+				<div id="div-comment-1306677" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306677">
+			August 16, 2017 at 3:43 pm</a>		</div>
+
+		<p>I guess that should read &#8220;required&#8221;, since MIPSr6 supports misaligned memory accesses for normal loads and stores, and removes the unaligned memory access instructions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1306695">
+				<div id="div-comment-1306695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1306695">
+			August 17, 2017 at 3:49 am</a>		</div>
+
+		<p>Why would you want to zero-extend a negative long? I always associate zero-extending with unsigned integers. (Mind you, I&#8217;m still unclear as to this canonical form concept; is it just the case that there are a parallel set of instructions that include an additional sign-extension step as opposed to having a sign-extension instruction for when you need it, or is there something more to it?)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1307595">
+				<div id="div-comment-1307595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825#comment-1307595">
+			August 30, 2017 at 3:30 am</a>		</div>
+
+		<p>So, the answer to my parenthetical is that the Alpha AXP only has 64-bit comparison instructions; performing signed 64-bit compares on sign-extended 32-bit values obviously gives the same result as signed 32-bit compares but conveniently performing unsigned 64-bit compares on sign-extended 32-bit values also gives the same result as unsigned 32-bit compares.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

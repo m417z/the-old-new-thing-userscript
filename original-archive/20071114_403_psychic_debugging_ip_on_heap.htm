@@ -1,0 +1,803 @@
+<html>
+<head>
+<title>Psychic debugging: IP on heap</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Psychic debugging: IP on heap</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 14, 2007 / year-entry #404</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>43</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Somebody asked the shell team to look at this crash in a context menu shell extension. IP_ON_HEAP: 003996d0 ChildEBP RetAddr 00b2e1d8 68f79ca6 0x3996d0 00b2e1f4 7713a7bd ATL::CWindowImplBaseT< ATL::CWindow,ATL::CWinTraits<2147483648,0> > ::StartWindowProc+0x43 00b2e220 77134be0 USER32!InternalCallWinProc+0x23 00b2e298 7713a967 USER32!UserCallWinProcCheckWow+0xe0 ... eax=68f79c63 ebx=00000000 ecx=00cade10 edx=7770df14 esi=002796d0 edi=000603cc eip=002796d0 esp=00cade4c ebp=00cade90 iopl=0 nv up ei pl nz na pe nc cs=001b...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Somebody asked the shell team to look at this crash in a
+context menu shell extension.
+</p>
+<pre>
+IP_ON_HEAP:  003996d0
+
+ChildEBP RetAddr
+00b2e1d8 68f79ca6 0x3996d0
+00b2e1f4 7713a7bd ATL::CWindowImplBaseT&lt;
+                           ATL::CWindow,ATL::CWinTraits&lt;2147483648,0&gt; &gt;
+                     ::StartWindowProc+0x43
+00b2e220 77134be0 USER32!InternalCallWinProc+0x23
+00b2e298 7713a967 USER32!UserCallWinProcCheckWow+0xe0
+...
+
+eax=68f79c63 ebx=00000000 ecx=00cade10 edx=7770df14 esi=002796d0 edi=000603cc 
+eip=002796d0 esp=00cade4c ebp=00cade90 iopl=0         nv up ei pl nz na pe nc 
+cs=001b  ss=0023  ds=0023  es=0023  fs=003b  gs=0000             efl=00010206 
+002796d0 c744240444bafb68 mov     dword ptr [esp+4],68fbba44
+</pre>
+<p>
+You should be able to determine the cause instantly.
+</p>
+<p>
+I replied,
+</p>
+<blockquote CLASS=m><p>
+This shell extension is using a non-DEP-aware version of ATL.
+They need to upgrade to ATL&nbsp;8 or disable DEP.
+</p>
+</blockquote>
+<p>
+This was totally obvious to me, but the person who asked the
+question met it with stunned amazement.
+I guess the person forgot that older versions of
+ATL are notorious DEP violators.
+You see a DEP violation, you see that it's coming from ATL,
+and bingo, you have your answer.
+When DEP was first introduced, the base team sent out mail
+to the entire Windows division saying,
+"Okay, folks, we're turning it on.
+You're going to see a lot of application compatibility problems,
+especially this ATL one."
+</p>
+<p>
+Psychic powers sometimes just means having a good memory.
+</p>
+<p>
+Even if you forgot that information, it's still totally obvious
+once you look at the scenario and understand what it's trying to do.
+</p>
+<p>
+The fault is <code>IP_ON_HEAP</code> which is precisely
+what DEP protects against.
+The next question is why IP ended up on the heap.
+Was it a mistake or intentional?
+</p>
+<p>
+Look at the circumstances surrounding the faulting instruction again.
+The faulting instruction is the window procedure for a window,
+and the action is storing a constant into the stack.
+The symbols of the caller tell us that it's some code in ATL,
+and you can even go look up the source code yourself:
+</p>
+<pre>
+template &lt;class TBase, class TWinTraits&gt;
+LRESULT CALLBACK CWindowImplBaseT&lt; TBase, TWinTraits &gt;
+  ::StartWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    CWindowImplBaseT&lt; TBase, TWinTraits &gt;* pThis =
+              (CWindowImplBaseT&lt; TBase, TWinTraits &gt;*)
+                  _AtlWinModule.ExtractCreateWndData();
+    pThis-&gt;m_hWnd = hWnd; 
+    pThis-&gt;m_thunk.Init(pThis-&gt;GetWindowProc(), pThis); 
+    WNDPROC pProc = pThis-&gt;m_thunk.GetWNDPROC(); 
+    ::SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)pProc);
+    return pProc(hWnd, uMsg, wParam, lParam);
+} 
+</pre>
+<p>
+Is <code>pProc</code> corrupted and we're jumping to a random
+address on the heap?
+Or was this intentional?</p>
+<p>
+<p>
+ATL is clearly generating code on the fly (the window procedure
+thunk), and it is in execution of the thunk that we encounter
+the DEP exception.
+</p>
+<p>
+Now, you didn't need to have the ATL source code to realize that
+this is what's going on.
+It is a very common pattern in framework libraries to put
+a C++ wrapper around window procedures.
+Since C++ functions have a hidden <code>this</code> parameter,
+the wrappers need to sneak that parameter in somehow,
+and one common technique is to generate some code on the fly
+that sets up the hidden <code>this</code> parameter before
+calling the C++ function.
+The value at <code>[esp+4]</code> is the window handle,
+something that can be recovered from the <code>this</code>
+pointer, so it's a handly thing to replace with <code>this</code>
+before jumping to the real C++ function.
+</p>
+<p>
+The address being stored as the <code>this</code> parameter is
+<code>68fbba44</code>,
+which is inside the DLL in question.
+(You can tell this because the return address,
+which points to the ATL thunk code, is at
+<code>68f79ca6</code> which is in the same neighborhood
+as the mystery pointer.)
+Therefore, this is almost certainly an ATL thunk for a static C++ object.
+</p>
+<p>
+In other words, this is extremely unlikely be a jump to a random address.
+The code at the address looks too good.
+It's probably jumping there intentionally,
+and the fact that it's coming from a window procedure thunk
+confirms it.
+</p>
+<p>
+But our tale is not over yet.
+The plot thickens.
+We'll continue next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (43)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-567003">
+				<div id="div-comment-567003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bryan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567003">
+			November 14, 2007 at 10:45 am</a>		</div>
+
+		<p>Here&#8217;s to looking forward to your next installment of this series.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567013">
+				<div id="div-comment-567013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Greg D</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567013">
+			November 14, 2007 at 10:58 am</a>		</div>
+
+		<p>This is the kind of stuff that they never taught you in school. . .</p>
+<p>I like to think that I&#8217;d have reached the same conclusion, but I imagine it would have taken me somewhat longer to do so.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567023">
+				<div id="div-comment-567023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">RUF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567023">
+			November 14, 2007 at 11:18 am</a>		</div>
+
+		<p>For the next episode i would like to know your opinion about that kind of hacks in the code</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567033">
+				<div id="div-comment-567033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://jaspax.com' rel='external nofollow' class='url'>JS Bangs</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567033">
+			November 14, 2007 at 11:20 am</a>		</div>
+
+		<p>This is one of those posts that I initially read with total bewilderment, having no idea what DEP and IP_ON_HEAP meant. I was about to move on to something else when my brain suddenly connected DEP to Data Execution Prevention&#8230; which means that IP_ON_HEAP must be Instruction Pointer On Heap. And now the whole article makes sense.</p>
+<p>Maybe this will help someone else who doesn&#8217;t use those abbreviations on a regular basis.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567043">
+				<div id="div-comment-567043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skywing</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567043">
+			November 14, 2007 at 11:29 am</a>		</div>
+
+		<p>Hmm &#8211; it&#8217;s my understanding that by default, there is emulation support for old style atlthunks enabled ( <a rel="nofollow" target="_new" href="http://msdn2.microsoft.com/en-us/library/bb736299.aspx" rel="nofollow">http://msdn2.microsoft.com/en-us/library/bb736299.aspx</a> ). &nbsp;I do recall something about it being inadvertently disabled in Vista RTM, though.</p>
+<p>Did this predate the atlthunk emulation hack, or was the system booted with /noexecute=alwayson ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567053">
+				<div id="div-comment-567053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.starkeith.net/coredump/' rel='external nofollow' class='url'>Keithius</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567053">
+			November 14, 2007 at 11:33 am</a>		</div>
+
+		<p>-&gt; JS Bangs</p>
+<p>Yes, that does help. I was similarly mystified until you made the connection from DEP to Data Execution Prevention. Thank you!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567063">
+				<div id="div-comment-567063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Erik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567063">
+			November 14, 2007 at 11:40 am</a>		</div>
+
+		<p>&#8220;You should be able to determine the cause instantly.&#8221;</p>
+<p>OK, smartypants. &nbsp;I realize this is a Win32 blog and therefore covers many topics beyond my knowledge as a .NET programmer. &nbsp;However, statements like that turn me off. &nbsp;I like to read your blog to learn about the inner workings of the Windows platform. &nbsp;I could do without the cockiness.</p>
+<div class="post">[<i>I think knowing the reasons for IP being on the heap is one of the basic things you need to know when you&#8217;re doing any unmanaged programming (not just Win32). You need to know how the CPU works because in the unmanaged world, there&#8217;s nobody between you and the CPU. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567073">
+				<div id="div-comment-567073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://dotnoted.spaces.live.com' rel='external nofollow' class='url'>codekaizen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567073">
+			November 14, 2007 at 11:53 am</a>		</div>
+
+		<p>Whoa, Erik &#8211;</p>
+<p>Consider dialing back the edginess a bit. When we only get text, the usual side-band channels of information, like tone, facial-expression and shared setting, are missing. You have to fill them in. I&#8217;ve found it more pleasant to imagine these in a way which conduces to my continual learning and improvement.</p>
+<p>I, for one, enjoy a good didactic tone when the subject is obviously mastered by the author. It&#8217;s just a rhetorical device, and to me it communicates an encouraging poke to wake up and think. When mixed with the right amount of caffeine, it does a fair bit to shift me into high gear in the morning. I started only knowing .Net, too, but after a few years of interpreting Raymond as expecting me to know more, I now do, and am better for it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567083">
+				<div id="div-comment-567083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567083">
+			November 14, 2007 at 12:05 pm</a>		</div>
+
+		<p>&quot;I, for one, enjoy a good didactic tone when the subject is obviously mastered by the author. It&#8217;s just a rhetorical device, and to me it communicates an encouraging poke to wake up and think.&quot;</p>
+<p>I second that. As a .net programmer that only briefly has to touch win32, I read the blog to learn. When Raymond says &quot;It Should Be obvious&quot; &nbsp;it&#8217;s a challenge. &nbsp;It says to me The Answer is on the page and i ask myself &quot;Can I find it?&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567093">
+				<div id="div-comment-567093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt Green</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567093">
+			November 14, 2007 at 12:09 pm</a>		</div>
+
+		<p>It&#8217;s a damn shame that we need to resort to hacks like this in order to properly wrap Win32. Thankfully, almost all of the newer APIs have a context parameter that can be associated with objects.</p>
+<p>How does ATL8 fix this, anyway?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567103">
+				<div id="div-comment-567103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567103">
+			November 14, 2007 at 12:33 pm</a>		</div>
+
+		<p>ALT8 fixes the problem by using PAGE_EXECUTE_READWRITE when allocating the thunk block with VirtualAlloc.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567113">
+				<div id="div-comment-567113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AsmGuru62</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567113">
+			November 14, 2007 at 12:44 pm</a>		</div>
+
+		<p>There is no need to wrap WndProc &#8211; can be done perfectly with GetWindowLong() and then calling virtual message routing method.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567123">
+				<div id="div-comment-567123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt Green</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567123">
+			November 14, 2007 at 1:40 pm</a>		</div>
+
+		<p>I&#8217;m fairly certain that some messages are missed with that method, AsmGuru62. Specifically, the pre-create messages.</p>
+<div class=post>[<i>Windows doesn&#8217;t have any &#8220;pre-create&#8221; messages. How could it? How can you deliver a message to a window that doesn&#8217;t exist yet? Maybe you&#8217;re thinking of something else. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567133">
+				<div id="div-comment-567133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ugh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567133">
+			November 14, 2007 at 2:13 pm</a>		</div>
+
+		<p>&quot;ALT8 fixes the problem by using PAGE_EXECUTE_READWRITE when allocating the thunk block with VirtualAlloc.&quot;</p>
+<p>Eeeek. Does that mean a heap overwrite or buffer overflow into the thunk block could result in &quot;remote code execution&quot;? Which is what DEP is supposed to protect against?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567143">
+				<div id="div-comment-567143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">name required</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567143">
+			November 14, 2007 at 2:28 pm</a>		</div>
+
+		<p>&#8220;There is no need to wrap WndProc &#8211; can be done perfectly with GetWindowLong() and then calling virtual message routing method.&#8221;</p>
+<p>Except when you need to wrap the window which is based on existing class, using GetWindowLong slots already.</p>
+<div class=post>[<i>Isn&#8217;t that why C++ has derived classes? If you&#8217;re talking about Win32 subclassing, then there&#8217;s GetProp. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567153">
+				<div id="div-comment-567153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Erik Madsen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567153">
+			November 14, 2007 at 2:41 pm</a>		</div>
+
+		<p>&#8220;Consider dialing back the edginess a bit.&#8221;</p>
+<p>Mine was simply a comment on tone. &nbsp;The statement &#8220;This was totally obvious to me, but the person who asked the question met it with stunned amazement&#8221; seemed gratuitous to me. &nbsp;It serves only to show Raymond&#8217;s superiority over his colleague. &nbsp;Why do I need to know this? &nbsp;Whereas I do need to know the reasons for IP being on the heap, as Raymond pointed out in his response.</p>
+<p>All things considered, I do enjoy reading this blog. &nbsp;I feel I learn something each morning.</p>
+<div class=post>[<i>It really should be obvious to an experienced programmer. And I&#8217;m assuming an audience of experienced programmers. It says right there what the problem is: IP_ON_HEAP. And it&#8217;s clear that it was on purpose rather than accidental once you look at the stack trace. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567163">
+				<div id="div-comment-567163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567163">
+			November 14, 2007 at 3:06 pm</a>		</div>
+
+		<p>I got to the point reading &quot;This was totally obvious to me, but the person who asked the question met it with stunned amazement,&quot; and thought for sure that it was going to continue with the asking person getting all indignant that you figured out what they were using, that you were reverse engineering their program and intellectual property, etc.</p>
+<p>(I&#8217;ve never done any ATL programming, and didn&#8217;t know what IP_ON_HEAP meant until this sentence &quot;The fault is IP_ON_HEAP which is precisely what DEP protects against.&quot;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567173">
+				<div id="div-comment-567173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567173">
+			November 14, 2007 at 3:18 pm</a>		</div>
+
+		<p>I see no issue. &nbsp;I didn&#8217;t know it either, Raymond felt that I should, so now I do.</p>
+<p>Result.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567183">
+				<div id="div-comment-567183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://cornbreadshome.spaces.live.com/' rel='external nofollow' class='url'>Andy</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567183">
+			November 14, 2007 at 3:23 pm</a>		</div>
+
+		<p>It&#8217;s posts like this that are why I love to read this blog so much. Bits of info that you could get no where else in an almost tutorial like form but with more personality than a regular tutorial. I can hardly wait for the second half.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567193">
+				<div id="div-comment-567193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">name required</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567193">
+			November 14, 2007 at 3:25 pm</a>		</div>
+
+		<p>I was referring to Win32 class, and to AsmGuru62&#8217;s suggestion to use GetWindowLong to avoid thunking.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567213">
+				<div id="div-comment-567213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">movl</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567213">
+			November 14, 2007 at 4:09 pm</a>		</div>
+
+		<p>Evan: seconded, that&#8217;s what gave it all away. But especially the registers dump is pretty baffling.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567233">
+				<div id="div-comment-567233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567233">
+			November 14, 2007 at 5:02 pm</a>		</div>
+
+		<p>[Windows doesn&#8217;t have any &quot;pre-create&quot; messages.]</p>
+<p>I think he&#8217;s referring to those messages sent before CreateWindow returns, which won&#8217;t get subclassed if you SetWindowLongPtr afterwards.</p>
+<p>Presumably the thunks avoid having to store pThis as window words or properties?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567243">
+				<div id="div-comment-567243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Worf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567243">
+			November 15, 2007 at 1:17 am</a>		</div>
+
+		<p>Amazingly, I guessed what the issue was, and was half-right (I figured DEP easily enough &#8211; Windows CE&#8217;s x86 Emulator is incompatible with DEP on a multiprocessor system (but OK on single processor). IP_ON_HEAP had me scratching my head (IP address? Wha?), until I realized it meant &quot;Instruction Pointer&quot; (to which I usually call PC &#8211; program counter).</p>
+<p>Alas, I do not know ATL, so that baffled me.</p>
+<p>All you .NET developers &#8211; I&#8217;m on the other side of the fence. I know Win32, but the C stuff only. ATL, MFC, COM, OLE, etc baffle me as well. (Last time I coded a GUI, it was all done using CreateWindow &#8211; no resource files, no resource editor or other fancy goodies.)</p>
+<p>But I enjoy this blog, for it appeals to me &#8211; the low-level stuff of Windows. And, no matter how far away you go, sometimes you end up in the muck (like this ATL example &#8211; it helps to understand what&#8217;s really happening behind that pretty face).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567263">
+				<div id="div-comment-567263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frederik Slijkerman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567263">
+			November 15, 2007 at 3:19 am</a>		</div>
+
+		<p>By the way, is a thunk much faster than retrieving the &#8216;this&#8217; pointer with GetWindowLongPtr(hwnd, GWLP_USERDATA) ? &nbsp;(Assuming that you have stored that previously.)</p>
+<p>Or are there other benefits? Because the GWLP method seems to be much easier to me&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567273">
+				<div id="div-comment-567273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567273">
+			November 15, 2007 at 3:24 am</a>		</div>
+
+		<p>I, too, thought about IP address, and expected a pshychic &quot;0x0100a8c0 = 192.168.0.1&quot; or something.</p>
+<p>BTW, identification of this could&#8217;ve been easily added to the debugger &#8211; &quot;if IP_ON_HEAP and the stack looks like X then say something about ATL&quot;. That would&#8217;ve moved this class of incidents from &quot;psychic debugging by gurus&quot; to a simple &quot;read the helpful debugger output&quot;. I think Application Verifier had somehting like that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567283">
+				<div id="div-comment-567283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.werpachowscy.net/roman/' rel='external nofollow' class='url'>Roman Werpachowski</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567283">
+			November 15, 2007 at 4:40 am</a>		</div>
+
+		<p>OP: &#8220;Since C++ functions have a hidden this parameter&#8221;</p>
+<p>Umm, not all of them. Just the class methods.</p>
+<div class="post">[<i>I bet you miss the nitpicker&#8217;s corner. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-567293">
+				<div id="div-comment-567293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567293">
+			November 15, 2007 at 5:53 am</a>		</div>
+
+		<p>Roman Werpachowski: You must be new here&#8230;</p>
+<p>No wait, it&#8217;s probably me that&#8217;s new here, if I didn&#8217;t expect a comment like that&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567303">
+				<div id="div-comment-567303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Name required</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567303">
+			November 15, 2007 at 6:36 am</a>		</div>
+
+		<p>Well you know what, in a dozen years of C++ Windows programming the total number of times I&#8217;ve needed to know the reasons for IP being on the heap is exactly:</p>
+<div class="post">[<i>Wow, you&#8217;ve never invoked a virtual method on an object that has already been deleted. I wish I were as awesome as you. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567313">
+				<div id="div-comment-567313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ace</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567313">
+			November 15, 2007 at 9:35 am</a>		</div>
+
+		<p>I know how CPU and messages in Windows work, but I&#8217;d still be grateful if somebody can explain: why is the thunking in ATL necessary &#8212; which problem is actually solved by it, that can&#8217;t be solved otherwise?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567323">
+				<div id="div-comment-567323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://jasonhaley.com/blog/archive/2007/11/15/140798.aspx' rel='external nofollow' class='url'>Jason Haley</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567323">
+			November 15, 2007 at 9:47 am</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567343">
+				<div id="div-comment-567343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2007/11/15/6234771.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567343">
+			November 15, 2007 at 10:10 am</a>		</div>
+
+		<p>Why did that IP_ON_HEAP problem show up all of a sudden?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567363">
+				<div id="div-comment-567363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.csdn.net/arcoolgg' rel='external nofollow' class='url'>nick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567363">
+			November 15, 2007 at 10:23 am</a>		</div>
+
+		<p>guys, consider the performance.</p>
+<p>of course, you can store the &quot;this&quot; pointer in window user data. but that end up with calling GetWindowLong() repeatedly. don&#8217;t forget the thousands of message a window proc would process.</p>
+<p>there&#8217;s a wonderful article on this topic in codeproject, but I forget where it is.</p>
+<p>raymond, could you tell more about thunk emulation in the next post of the series?</p>
+<p>I have ever come across a bug.</p>
+<p>the program is based on ATL3. it does run in a DEP enabled PC, the main window shows up. but when calling a function in a dll which creates a new window, the program crashes at that moment.</p>
+<p>the main window created successfully is because, i suppose, the thunk emulation. what confused me is why the window created in DLL is out of luck? or did i miss anything?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567433">
+				<div id="div-comment-567433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AsmGuru62</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567433">
+			November 15, 2007 at 12:45 pm</a>		</div>
+
+		<p>GetWindowLong() should be rather quick &#8211; it is just an accessing the data via offset, of course HWND must be also verified&#8230; still it should be OK to call it every time WndProc is entered. I have it in my library for a lot of years and I did not see any slowdowns.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567523">
+				<div id="div-comment-567523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt Green</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567523">
+			November 15, 2007 at 2:40 pm</a>		</div>
+
+		<p>Yeah I was thinking of WM_NCCREATE (I always think of it as the &#8220;pre-WM_CREATE&#8221; message), and I don&#8217;t think the GetWindowLong() method works for those. Of course, you don&#8217;t need to use WM_NCCREATE too often.</p>
+<div class=post>[<i>Naturally, the first message does the SetWindowLong. Somebody has to do the Set after all. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567573">
+				<div id="div-comment-567573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/ericgu/archive/2007/11/15/psychic-debugging.aspx' rel='external nofollow' class='url'>Eric Gunnerson's C# Compendium</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567573">
+			November 15, 2007 at 4:46 pm</a>		</div>
+
+		<p>Ray wrote a post entitled &quot; Psychic Debuggin: IP on heap &quot;, where he talks about somebody being amazed</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567583">
+				<div id="div-comment-567583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Amateur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567583">
+			November 15, 2007 at 4:49 pm</a>		</div>
+
+		<p>Can someone make a summary what ATL is? I&#8217;m not a programmer, but encounter this very often.</p>
+<div class=post>[<i><a href="http://blogs.msdn.com/oldnewthing/archive/2007/05/21/2757223.aspx" rel="nofollow">Don&#8217;t be helpless</a>. <a href="http://search.live.com/results.aspx?q=atl" rel="nofollow">Live Search</a>. <a href="http://www.google.com/search?q=atl" rel="nofollow">Google</a>. <a href="http://search.yahoo.com/searchp=atl" rel="nofollow">Yahoo</a>. All of them answer your question on the first page of results. I write for an advanced audience. (Whether I actually&nbsp;<u>have</u> an advanced audience is open to debate.) If you&#8217;re a beginner, you may want to unsubscribe and switch to a blog that&#8217;s more suited to your experience. Don&#8217;t worry. When you become an advanced programmer, this article will still be here for you. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567683">
+				<div id="div-comment-567683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AsmGuru62</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567683">
+			November 15, 2007 at 7:25 pm</a>		</div>
+
+		<p>I pass &#8216;this&#8217; with WM_CREATE (lParam points to it in its first DWORD). Not sure what can be done with WM_NCCREATE, which cannot be done with WM_CREATE&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-567763">
+				<div id="div-comment-567763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">olde farthe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567763">
+			November 16, 2007 at 3:08 am</a>		</div>
+
+		<p>&quot;Whether I actually have an advanced audience is open to debate.&quot;</p>
+<p>I wish I was as famous as Raymond, so that I could have a blog, insult my readers, and get away with it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-567913">
+				<div id="div-comment-567913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-567913">
+			November 16, 2007 at 1:02 pm</a>		</div>
+
+		<p>Personally, I love the tone here. This blog makes me smile almost every day, and that&#8217;s worth the price of admission by itself.</p>
+<p>Sarcasm and snarky comments wake up my brain and make the post memorable, improving my chances of remembering the technical details as well.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-568153">
+				<div id="div-comment-568153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MadQ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-568153">
+			November 18, 2007 at 7:23 am</a>		</div>
+
+		<p>@Matt Green, AsmGuru62: for overlapped windows, the very first message is actually WM_GETMINMAXINFO. Actually, I think it might be for all windows that don&#8217;t have the WS_CHILD style, but I&#8217;m too lazy right now to write something to find out for sure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-568163">
+				<div id="div-comment-568163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Name required</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-568163">
+			November 19, 2007 at 3:50 am</a>		</div>
+
+		<p>&quot;I wish I were as awesome as you&quot;</p>
+<p>Don&#8217;t clap, just throw money.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-568873">
+				<div id="div-comment-568873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sidebar Willy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-568873">
+			November 21, 2007 at 2:06 am</a>		</div>
+
+		<p>&quot;I pass &#8216;this&#8217; with WM_CREATE (lParam points to it in its first DWORD). Not sure what can be done with WM_NCCREATE, which cannot be done with WM_CREATE&#8230;&quot;</p>
+<p>The old Scratch program uses WM_NCCREATE: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2005/04/22/410773.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2005/04/22/410773.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-579993">
+				<div id="div-comment-579993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.microsoft.co.il/blogs/sasha/archive/2007/12/21/dep-nxcompat-net-2-0-sp1.aspx' rel='external nofollow' class='url'>All Your Base Are Belong To Us</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20071114-00/?p=24523#comment-579993">
+			December 21, 2007 at 3:38 pm</a>		</div>
+
+		<p>Yesterday I had an interesting case that I thought of sharing, even though there&amp;#39;s nothing very new</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

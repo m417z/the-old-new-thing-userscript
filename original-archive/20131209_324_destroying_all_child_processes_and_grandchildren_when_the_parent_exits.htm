@@ -1,0 +1,406 @@
+<html>
+<head>
+<title>Destroying all child processes (and grandchildren) when the parent exits</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Destroying all child processes (and grandchildren) when the parent exits</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 9, 2013 / year-entry #325</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today's Little Program launches a child process and then just hangs around. If you terminate the parent process, then all the children (and grandchildren and great-grandchildren, you get the idea) are also terminated. The tool for this is the Job Object. Specifically, we mark the job as "kill on job close" which causes all processes...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today's Little Program
+launches a child process
+and then just hangs around.
+If you terminate the parent process,
+then all the children (and grandchildren and
+great-grandchildren, you get the idea)
+are also terminated.
+</p>
+<p>
+The tool for this is the
+<a HREF="http://msdn.microsoft.com/en-us/library/windows/desktop/ms684161(v=vs.85).aspx">
+Job Object</a>.
+Specifically, we mark the job as
+"kill on job close"
+which causes all processes in the job to be terminated
+when the last handle to the job is closed.
+</p>
+<p>
+We must therefore be careful not to allow this handle to be inherited,
+because that would create another handle that needs to be closed before
+the job is terminated.
+And of course we need to be careful not to close the handle unless we
+really do want to terminate the job.
+</p>
+<pre>
+#define STRICT
+#include &lt;windows.h&gt;
+
+BOOL CreateProcessInJob(
+    HANDLE hJob,
+    LPCTSTR lpApplicationName,
+    LPTSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCTSTR lpCurrentDirectory,
+    LPSTARTUPINFO lpStartupInfo,
+    LPPROCESS_INFORMATION ppi)
+{
+    BOOL fRc = CreateProcess(
+        lpApplicationName,
+        lpCommandLine,
+        lpProcessAttributes,
+        lpThreadAttributes,
+        bInheritHandles,
+        dwCreationFlags | CREATE_SUSPENDED,
+        lpEnvironment,
+        lpCurrentDirectory,
+        lpStartupInfo,
+        ppi);
+    if (fRc) {
+        fRc = AssignProcessToJobObject(hJob, ppi-&gt;hProcess);
+        if (fRc &amp;&amp; !(dwCreationFlags &amp; CREATE_SUSPENDED)) {
+            fRc = ResumeThread(ppi-&gt;hThread) != (DWORD)-1;
+        }
+        if (!fRc) {
+            TerminateProcess(ppi-&gt;hProcess, 0);
+            CloseHandle(ppi-&gt;hProcess);
+            CloseHandle(ppi-&gt;hThread);
+            ppi-&gt;hProcess = ppi-&gt;hThread = nullptr;
+        }
+    }
+    return fRc;
+}
+</pre>
+<p>
+The
+<code>Create&shy;Process&shy;In&shy;Job</code> function
+simply creates a process suspended, adds it to a job,
+and then resumes the process if the original caller
+asked for a running process.
+</p>
+<p>
+Let's take it for a spin.
+</p>
+<pre>
+int __cdecl main(int, char **)
+{
+ HANDLE hJob = CreateJobObject(nullptr, nullptr);
+
+ JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = { };
+ info.BasicLimitInformation.LimitFlags =
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+ SetInformationJobObject(hJob,
+       JobObjectExtendedLimitInformation,
+       &amp;info, sizeof(info));
+ STARTUPINFO si = { sizeof(si) };
+ PROCESS_INFORMATION pi;
+ char <a HREf="http://blogs.msdn.com/b/oldnewthing/archive/2009/06/01/9673254.aspx">szCommandLine</a>[] = "taskmgr.exe";
+ if (CreateProcessInJob(hJob,
+     "C:\\Windows\\System32\\taskmgr.exe",
+     szCommandLine,
+     nullptr, nullptr, FALSE, 0,
+     nullptr, nullptr, &amp;si, &amp;pi)) {
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+ }
+ Sleep(30 * 1000);
+ CloseHandle(hJob);
+ return 0;
+}
+</pre>
+<p>
+After creating the job object,
+we set the "kill children on close"
+flag on the job.
+Then we launch Task Manager into the job
+and give you 30 seconds to 
+do your business.
+After that, it's "Time's up, you lose!"
+and Task Manager and any processes you launched from Task Manager
+will go away.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1093583">
+				<div id="div-comment-1093583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093583">
+			December 9, 2013 at 7:20 am</a>		</div>
+
+		<p>The problem with job objects is when a parent process outside your control (Add/Remove programs etc) has already put you in a job. One way out of this is to spawn a copy of yourself detached from the job (Assuming the job is OK with detaching). Nested job support came too late and the implementation is not optimal&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1093623">
+				<div id="div-comment-1093623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Eugene</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093623">
+			December 9, 2013 at 8:07 am</a>		</div>
+
+		<p>1) What if parent process is terminated after it called CreateProcess, but before AssignProcessToJobObject?</p>
+<p>2) What if parent process was put into a job (e.g. by UAC, run as, debugger etc)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman even thread-even depth-1" id="comment-1093653">
+				<div id="div-comment-1093653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093653">
+			December 9, 2013 at 8:24 am</a>		</div>
+
+		<p>I know it&#39;s &quot;just a Little Program&quot;, but hard coding the path to taskmanager instead of using SHGetSpecialFolder(,,CSIDL_SYSTEM,) seems to go against the grain of what you often complain about in your blog&#8230;</p>
+<div class="post">[<em>Had-coded paths is one of the explicit things that Little Programs are allowed to do because of their nature. The point is to let the idea shine through. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1093693">
+				<div id="div-comment-1093693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093693">
+			December 9, 2013 at 10:04 am</a>		</div>
+
+		<p>@Eugene 1) Then you end up with a never got started half-initialized process that sticks around until logoff. If the design/job usage allows for it then you can add yourself to the job before spawning children&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1093703">
+				<div id="div-comment-1093703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093703">
+			December 9, 2013 at 11:01 am</a>		</div>
+
+		<p>The fact that #2 is so common in Windows now makes use of jobs an iffy idea to use. Nevermind the fact that that the use of jobs in these places are to solve the problems about children that outlive their parents in the first place. There really needs to be a way to wait for the entire process tree to terminate that can be written recursively (that is, starting such a wait can be done while somebody is waiting for you), and this backported as far back as Windows 7 (Windows XP didn&#39;t use jobs all over the place so the application can use them at will).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1093783">
+				<div id="div-comment-1093783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joker_vD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093783">
+			December 9, 2013 at 9:59 pm</a>		</div>
+
+		<p>&quot;2) What if parent process was put into a job (e.g. by UAC, run as, debugger etc)?&quot;</p>
+<p>Then there will be nested jobs. Duh. Really, Microsoft engineers are not *that* stupid and/or ignorant.</p>
+<p>But yeah, this method is as straight-forward as performing tonsillectomy through the anus, honestly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1093803">
+				<div id="div-comment-1093803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">q</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093803">
+			December 9, 2013 at 11:16 pm</a>		</div>
+
+		<p>@Joker_vD</p>
+<p>By your inference they *were* &quot;that stupid and/or ignorant&quot;, because nested jobs were introduced only in Windows 8.</p>
+<p>MSDN:</p>
+<p>Windows 7, Windows Server 2008 R2, Windows XP with SP3, Windows Server 2008, Windows Vista, and Windows Server 2003: &nbsp;The process must not already be assigned to a job; if it is, the function fails with ERROR_ACCESS_DENIED. This behavior changed starting in Windows 8 and Windows Server 2012.</p>
+<p>Try to know what you are talking about before snarking.</p>
+<p>And this method would have been just fine, only if not for this little issue of nested jobs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt thread-odd thread-alt depth-1" id="comment-1093903">
+				<div id="div-comment-1093903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093903">
+			December 10, 2013 at 5:25 pm</a>		</div>
+
+		<p>So, basically, this article is suggesting a method that is not guaranteed to work on versions of Windows that matter? Sad&#8230;</p>
+<div class="post">[<em>But it most likely works well enough down to Windows 2000. Or do you need to support NT 4.0 too? -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1093943">
+				<div id="div-comment-1093943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Aqua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1093943">
+			December 11, 2013 at 5:25 am</a>		</div>
+
+		<p>Another vote for the &#39;doesn&#39;t actually work&#39; camp.</p>
+<p>I wanted to use this a while ago but as others have pointed out, Program Compatibility Assistant, Terminal Services, etc. all use job objects under the hood, resulting in rather poor compatibility. It seems to also depend on whether a program is started from a CMD prompt or by Explorer (presumably in one or the other case the parent process is already attached to a job).</p>
+<p>This was on Windows XP SP3 and Windows Server 2003 R2, mind. I can only imagine that problems are even worse on NT 6.. :-(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1094003">
+				<div id="div-comment-1094003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1094003">
+			December 11, 2013 at 10:02 am</a>		</div>
+
+		<p>[But it most likely works well enough down to Windows 2000. Or do you need to support NT 4.0 too? -Raymond]</p>
+<p>Works on 2000. Works on XP. Breaks on Vista. Breaks on 7. Works on 8. Works on 8.1.</p>
+<p>Probably what&#39;s getting to people is breaks on 7. This is due to high likelihood of the current process being in a job sooner or later but lack of nested jobs.</p>
+<div class="post">[<em>You can probably salvage it on Vista and Windows 7 by asking that the child process break away from the parent process&#39;s job. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1094033">
+				<div id="div-comment-1094033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1094033">
+			December 11, 2013 at 10:40 am</a>		</div>
+
+		<p>[You can probably salvage it on Vista and Windows 7 by asking that the child process break away from the parent process&#39;s job. -Raymond]</p>
+<p>As skSdnW pointed out, you need to add yourself to the job to avoid a race condition.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1094043">
+				<div id="div-comment-1094043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1094043">
+			December 11, 2013 at 11:12 am</a>		</div>
+
+		<p>Aqua: On my Win7 box, the only job objects are ones used for this purpose: low-integrity IE or Word processes that will exit as soon as their parent is terminated. I just made a remote desktop session to a Server 2008R2 machine, and it has no job objects. In my experience this is a perfectly cromulent technique.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1094093">
+				<div id="div-comment-1094093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1094093">
+			December 11, 2013 at 3:27 pm</a>		</div>
+
+		<p>Another problem with the job implementation is that there is no way to atomically create a child process and put it into a job. &nbsp;There is always some window between CreateProcessW and AssignProcessToJobObject within which if you are terminated, you will have an unterminated suspended zombie child.</p>
+<p>A future version of Windows ought to let you put a job object handle into a process attribute list for STARTUPINFOEXW.</p>
+<p>Regarding the note with SHGetSpecialFolderW&#8230; &nbsp;The biggest problem with SHGetSpecialFolderW are the out-of-memory errors you get for your 32-bit users because of the truly massive shell32.dll you have to load in order to call SHGetSpecialFolderW. &nbsp;With the type of application I write, the 12 MB of address space consumed by shell32.dll is severely expensive for one API call. &nbsp;It&#39;s the last one in shell32.dll we&#39;re trying to get rid of, somehow&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1094113">
+				<div id="div-comment-1094113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1094113">
+			December 11, 2013 at 3:44 pm</a>		</div>
+
+		<p>@Myria: That one&#39;s a good candidate for invoking out-of-process.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1094703">
+				<div id="div-comment-1094703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bruno</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131209-00/?p=2433#comment-1094703">
+			December 14, 2013 at 8:49 am</a>		</div>
+
+		<p>A child process can escape the job even when normal break away is forbidden by creating a grandchildren process that&#39;s actually the child of explorer.exe or another third party process.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

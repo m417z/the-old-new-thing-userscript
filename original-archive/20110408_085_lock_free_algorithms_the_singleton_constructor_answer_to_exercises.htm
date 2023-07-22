@@ -1,0 +1,372 @@
+<html>
+<head>
+<title>Lock-free algorithms: The singleton constructor (answer to exercises)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock-free algorithms: The singleton constructor (answer to exercises)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 8, 2011 / year-entry #86</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110408-00/?p=10993</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A few days ago, I asked you to make an existing class multithread-safe. The class caches objects called SINGLETON­INFO which are indexed by a 32-bit ID. The cache is implemented as an array that dynamically resizes as more items are added to it. A naïve multithreaded version might use a slim reader-writer lock with shared...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx">
+A few days ago</a>,
+I asked you to make an existing class multithread-safe.
+The class caches objects called <code>SINGLETON&shy;INFO</code>
+which are indexed by a 32-bit ID.
+The cache is implemented as an array that dynamically resizes as
+more items are added to it.
+A na&iuml;ve multithreaded version might use a slim reader-writer lock
+with shared access on reads, exclusive access on writes,
+and mixed access on the treacherous
+"create if it doesn't already exist" path.
+</p>
+<p>
+Let's see.
+First of all, the function doesn't allocate the memory for the cache
+until somebody actually tries to look something up.
+But duh, that's the whole point of the class: To look up things!
+The only time this lazy-initialization actually provides a benefit is
+if somebody creates a <code>Singleton&shy;Manager</code>,
+<i>calls no methods on it</i>,
+and then destroys it.
+</p>
+<p>
+This doesn't happen in practice, and even if it did,
+it's certainly not a scenario we're going to optimize for.
+Get rid of the lazy-initialization of the cache; it makes multithreading
+unnecessarily complicated.
+</p>
+<p>
+Second, since the only way an <code>ITEM&shy;CONTROLLER</code> can
+get into the cache is via the <code>SINGLETON&shy;INFO</code>,
+if a <code>Singleton&shy;Manager</code> is told,
+"Here are 30 item IDs and their corresponding controller creation
+functions,"
+then the cache can never hold more than 30 items.
+If you only know how to create 30 items, and you never create
+more than one copy of each item, then you're never going to create
+more than 30 items.
+</p>
+<p>
+Therefore, instead of managing a dynamically-growing array,
+we can allocate a fixed-size array at construction
+of length equal to the number of <code>SINGLETON&shy;INFO</code> elements.
+This avoids having to lock around the code that reallocates the array.
+Since the array length is in the range 30&ndash;50, we don't have
+the problem of allocating megabytes of memory to track just a few objects.
+In the worst case, we allocate a 50-element cache.
+</p>
+<p>
+Next, we can store each <code>ITEM&shy;CONTROLLER</code> in the same
+position in the cache array as it exists in the <code>SINGLETON&shy;INFO</code>
+array.
+</p>
+<p>
+With these simplifications, we see that we don't need to do any
+locking or complicated duplicate-detection.
+After locating the ID in the <code>SINGLETON&shy;INFO</code> array,
+look at the corresponding entry in the cache array
+and perform a singleton initialization there.
+</p>
+<pre>
+struct ITEMCONTROLLER;
+struct SINGLETONINFO {
+ DWORD dwId;
+ ITEMCONTROLLER *(*pfnCreateController)();
+};
+
+class SingletonManager {
+public:
+ // rgsi is an array that describes how to create the objects.
+ // It's a static array, with csi in the range 20 to 50.
+ SingletonManager(const SINGLETONINFO *rgsi, UINT csi)
+               : m_rgsi(rgsi), m_csi(csi),
+                 m_rgpic(new ITEMCONTROLLER*[csi]) { }
+ ~SingletonManager() { ... }
+ ITEMCONTROLLER *Lookup(DWORD dwId);
+
+private:
+ const SINGLETONINFO *m_rgsi;
+ int m_csi;
+
+ // Array that describes objects we've created
+ // runs parallel to m_rgsi
+ ITEMCONTROLLER *m_pic;
+};
+
+ITEMCONTROLLER *SingletonManager::Lookup(DWORD dwId)
+{
+ int i;
+
+ // Convert ID to index
+ for (i = 0; i < m_csi; i++) {
+  if (m_rgsi[i].dwId == dwId)
+   break;
+ }
+ if (i >= m_csi) return NULL; // not something we know about
+
+ // Singleton constructor pattern
+ if (!m_rgpic[i]) {
+  ITEMCONTROLLER *pic = m_rgsi[i].pfnCreateController();
+  if (!pic) return NULL;
+  if (InterlockedCompareExchangePointerRelease(
+          &amp;reinterpret_cast&lt;PVOID&amp;&gt;(m_rgpic[i]),
+          pic, NULL) != 0) {
+   delete pic; // lost the race - destroy the redundant copy
+  }
+ }
+ MemoryBarrier();
+ return m_rgpic[i];
+}
+</m_csi;></pre>
+<p>
+<b>Comments on proposed solutions</b>:
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx#10150544">
+Gabe pointed out</a>
+that the reallocation was a sticking point
+which made a lock-free implementation difficult if not impossible.
+Credit to him for recognizing the problem.
+</p>
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx#10150881">
+Thorsten proposed using a linked list instead of an array</a>
+to avoid the reallocation problem.
+</p>
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx#10150587">
+Ray Trent reminded us of the C++ function-local static technique</a>,
+which works if it's what you need, but it has its own problems,
+such as lack of thread-safety (up until perhaps two weeks ago),
+and the fact that it doesn't generalize to a solution
+to the exercise.
+The not-thread-safe-ness of C++ static initialization was called out
+as a <i>feature</i> in early versions of the C++ language specification
+(to permit recursive initialization).
+This was revised in the ISO version of C++, which declared
+that if control enters a function which is in the middle of
+initializing its statics,
+the behavior is <i>undefined</i>.
+I don't know what C++0x has to say about the subject,
+but seeing as the standard
+<a HREF="http://herbsutter.com/2011/03/25/we-have-fdis-trip-report-march-2011-c-standards-meeting/">
+was approved only two weeks ago</a>
+and hasn't even been formally published yet,
+it seems premature to expect all compilers to conform to any
+new multi-threading semantics.
+</p>
+<p>
+Note that the function-local static technique works only if you want a
+process-wide singleton.
+If you need a singleton with a tighter scope (say, "one object per thread"
+or "one object per transaction"), then the function-local static technique will
+not work.
+Which after all was the point of the SingletonManager class:
+To manage singletons relative to its own scope, not globally.
+If you had wanted global singletons, then you wouldn't need a singleton
+manager; you would just have each object manage its own singleton.
+</p>
+<p>
+To elaborate:
+Suppose you have an object with a bunch of components.
+Most clients don't use all the components, so you want to lazy-create
+those components.
+Say, each <code>Transaction</code> can have an error log file,
+but you don't want
+to create the error log file until an error occurs.
+On the other hand, you want all the errors for a single transaction
+to go into the same log file.
+</p>
+<pre>
+class LogFile : public ITEMCONTROLLER
+{
+public:
+  static ITEMCONTROLLER *Create() { return new LogFile(); }
+};
+
+const SINGLETONINFO c_rgsiTransactions[] = {
+  { LOGFILE_ID, LogFile::Create };
+};
+
+class Transaction
+{
+public:
+  Transaction()
+    : m_singletons(c_rgsiTransactions,
+                   ARRAYSIZE(c_rgsiTransactions))
+  { }
+
+  void LogError(blah blah)
+  {
+    LogFile *plog = static_cast&lt;LogFile*&gt;
+                        (m_singletons.Lookup(LOGFILE_ID));
+    if (plog) plog->Log(blah blah);
+  }
+private:
+  SingletonManager m_singletons;
+};
+</pre>
+<p>
+The singleton manager makes sure that each transaction has at most one
+log file.
+But we can't use the function-local static technique in
+<code>LogFile::Create</code>,
+because we want multiple log files in general, just a singleton log file
+per transaction.
+If we had used the function-local static technique in
+<code>LogFile::Create</code>, then all errors would have been logged
+into a giant log file instead of a separate log file per transaction.
+</p>
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx#10150669">
+Scott tried to update the singleton atomically</a>
+but forgot about the thread safety of the reallocation,
+and the solution had its own holes too.
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx#10150678">
+Alex Grigoriev's solution is the classic back-off-and-retry algorithm</a>
+modulo forgetting to protect against reallocation.
+</p>
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx#10150680">
+nksingh was the first to observe that the reallocation could be removed</a>,
+and effectively came up with the solution presented here.
+(But missed the further optimization that the <code>dwId</code> member
+was redundant.)
+He also recommended using the InitOnce functions,
+which is something I too recommend.
+We'll look at the InitOnce functions
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/08/10151258.aspx">
+in a separate article</a>
+since this one is getting kind of long.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-906473">
+				<div id="div-comment-906473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Thomas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-00/?p=10993#comment-906473">
+			April 8, 2011 at 10:29 am</a>		</div>
+
+		<p>There&#39;s a typo in your post: you&#39;ve not escaped the angle brackets on the static_cast (this means the &quot;logfile*&quot; doesn&#39;t appear when viewing your post, and for added fun breaks livejournal&#39;s RSS parser).</p>
+<div class="post">[<i>Fixed. Thanks. This is what happens when I write an article the night before rather than letting it age for 18 months. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906523">
+				<div id="div-comment-906523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Thorsten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-00/?p=10993#comment-906523">
+			April 9, 2011 at 12:39 am</a>		</div>
+
+		<p>My solution was obviously unnecessary complex for this particular problem. The reason for that was that I simple posted the solution I implemented for a similar but not identical problem. The major differences in my case are:</p>
+<ul>
+<li>
+<p>there is not just one &quot;singleton manager&quot;, instead I basically got one per object instance in the process</p>
+</li>
+<li>
+<p>in the overwhelming majority of cases it&#39;s not actually going to be used, so it shouldn&#39;t preallocated anything</p>
+</li>
+<li>
+<p>it is not know ahead of time how many or what type of singletons are going to be used</p>
+</li>
+</ul>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906583">
+				<div id="div-comment-906583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GWO</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-00/?p=10993#comment-906583">
+			April 11, 2011 at 1:59 am</a>		</div>
+
+		<p>There is an orthogonal question, the answer to which I have no idea about. &nbsp;Under what circumstances is the lock-free version of the singleton manager more performant than one which wraps access inside a critical section?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906693">
+				<div id="div-comment-906693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-00/?p=10993#comment-906693">
+			April 11, 2011 at 10:43 am</a>		</div>
+
+		<p>Ahh, I fell prey to the old trap of coming up with an answer to the problem as stated without asking &quot;what are you really trying to do?&quot;. To be fair, this use of the word &quot;singleton&quot; is fairly non-standard.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

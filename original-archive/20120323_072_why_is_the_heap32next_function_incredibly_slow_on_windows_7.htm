@@ -1,0 +1,313 @@
+<html>
+<head>
+<title>Why is the Heap32Next function incredibly slow on Windows 7?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why is the Heap32Next function incredibly slow on Windows 7?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 23, 2012 / year-entry #73</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer observed that the Heap32Function runs much slower on Windows 7 compared to previous versions of Windows. What happened? Set the wayback machine to 1992. The product is Windows 3.1. One of the new components available in Windows 3.1 went by the name TOOLHELP. It let you snoop around the low-level guts of the Windows 3.1 kernel, and...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>A customer observed that the <code>Heap32Function</code> runs much slower on Windows&nbsp;7 compared to previous versions of Windows. What happened?</p>
+<p> Set the wayback machine to 1992. The product is Windows&nbsp;3.1. One of the new components available in Windows&nbsp;3.1 went by the name <code>TOOLHELP</code>. It let you snoop around the low-level guts of the Windows&nbsp;3.1 kernel, and the feature that is relevant here is walking the heaps. Since Windows&nbsp;3.1 was a cooperatively multitasking system, you could ensure that the heap was stable during your calls to <code>Heap&shy;First</code> and <code>Heap&shy;Next</code> by the simple process of not yielding control. </p>
+<p> Mind you, ToolHelp was not part of the kernel itself. It was bolted onto the side. As I recall, ToolHelp arrived late on the scene, and the kernel folks didn't want to destabilize the kernel with any ToolHelp-related changes, so all the work done by ToolHelp was done "from the outside". </p>
+<p> Windows&nbsp;95 introduced 32-bit versions of the ToolHelp functions. I'm not sure why. </p>
+<p> Where was I? Oh right, <code>Heap32&shy;Next</code>. </p>
+<p> In the 32-bit version of ToolHelp, you could walk the heap of a process by calling <code>Heap32&shy;First</code> and <code>Heap32&shy;Next</code>. As implemented in Windows&nbsp;95, the <code>Heap32&shy;First</code> function allocated some memory to keep track of the state of the heap walk and stored it in the <code>HEAPENTRY32.dwResvd</code> field. The <code>Heap32&shy;Next</code> used this state to find the next heap block, and it finally freed the memory when the end of the heap was reached (and <code>Heap32&shy;Next</code> returned <code>FALSE</code>). This means that if you call <code>Heap32&shy;First</code> and do not walk the heap to completion but rather abandon the walk partway through, you leaked some memory. Unlike functions like <code>Find&shy;First&shy;File</code> which have an explicit <code>Find&shy;Close</code> function to indicate that you are done with the enumeration (and allow the operating system to free the tracking state), there was no corresponding <code>Heap32&shy;Close</code> function. The only way to free the memory was to walk the heap to the end. The Windows&nbsp;95 implementation also didn't handle the case that the heap changed while you were walking it. </p>
+<p> But since the toolhelp library was intended for diagnostic purposes anyway (I mean, it's right there in the name: <i>tool help</i>), these weren't considered serious problems. Your debugging plug-in might use it to walk the heap looking for memory leaks, but you wouldn't deploy it in production, right? </p>
+<p> The Windows&nbsp;NT folks didn't like that there was a memory leak built into the design. Since there was no way to ensure that the memory allocated by <code>Heap32&shy;First</code> was freed in the event the application wanted to abandon the heap walk, their solution was simply to free all allocated memory before returning from <code>Heap32&shy;First</code> and <code>Heap32&shy;Next</code>. If an application asks to walk the heap, the <code>Heap32&shy;First</code> takes a snapshot of the heap, returns the first heap block, then frees the snapshot. When the application calls <code>Heap32&shy;Next</code>, it takes a snapshot of the heap, returns the second heap block, then frees the snapshot. On the second call to <code>Heap32&shy;Next</code>, it takes a snapshot of the heap, returns the third heap block, then frees the snapshot. You get the idea. </p>
+<p> As a result, walking the heap via <code>Heap32&shy;First</code>/<code>Heap32&shy;Next</code> is an <i>O</i>(<i>n</i>&sup2;) operation. </p>
+<p> So why did this become slower in Windows&nbsp;7? </p>
+<p> Prior to Windows&nbsp;7, the snapshot was taken in a fixed-size buffer that held information for around a quarter million heap entries. As a result, there was a hard limit on the worst-case cost of walking the heap via the toolhelp functions. In Windows&nbsp;7, this hard limit was lifted because there were <a href="http://technet.microsoft.com/en-us/sysinternals/dd535533.aspx"> some diagnostic tools</a> which were bumping into this limit. The kernel folks decided that it was better to have the functions be slow but correct rather than fast and incomplete. Since the limit was lifted, so too was the cap on the worst-case cost of walking the heap with <code>Heap32&shy;First</code>/<code>Heap32&shy;Next</code>. </p>
+<p> Toolhelp was designed back in the days of co-operative multitasking and hasn't aged well. At this point, he's sort of this unwanted distant relative in the kernel. Nobody actually likes him, but when he shows up at the family reunion, you have to let him in. </p>
+<p> By the way, the recommended way to walk the contents of the heap is to use the <code>Heap&shy;Walk</code> function. The <code>Heap&shy;Walk</code> function does not suffer from this problem; enumerating the entire heap via repeated calls to <code>Heap&shy;Walk</code> has total running time proportional to the number of heap blocks. Note that <code>Heap&shy;Walk</code> can only enumerate heap blocks from the current process. If you're doing cross-process heap walking for diagnostic purposes, then you're stuck with <code>Heap32&shy;First</code>/<code>Heap32&shy;Next</code>, but since you're just doing it for diagnostic purposes, correctness should be more important to you than performance. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-974173">
+				<div id="div-comment-974173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">No One</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974173">
+			March 23, 2012 at 7:38 am</a>		</div>
+
+		<p>And this, children, is how thousands of terrible programmers learned about a new, very powerful hammer with which they will drive all sorts of nail-like things. &nbsp;Screws, staples, buses, they all will be hit with this hammer to be pounded into the timber-framed houses of doom that Raymond will be stuck debugging years into the future. &nbsp;I can&#39;t wait until 2020 or so when this entry is referenced in one of those terrible-things-customers-have-done-that-are-now-stuck-in-backcompat-world entries.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-974183">
+				<div id="div-comment-974183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974183">
+			March 23, 2012 at 7:43 am</a>		</div>
+
+		<p>&quot;As I recall, ToolHelp arrived late on the scene, and the kernel folks didn&#39;t want to destabilize the kernel with any ToolHelp-related changes, so all the work done by ToolHelp was done &quot;from the outside&quot;. &quot;</p>
+<p>Also, ToolHelp had to be installable on top of Win3.0.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-974193">
+				<div id="div-comment-974193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974193">
+			March 23, 2012 at 7:46 am</a>		</div>
+
+		<p>Why didn&#39;t the NT folks just add a Heap32Close function that you should call if you intend to abandon the heap walk? &nbsp;Sure, older programs would still leak, but there&#39;s no change in behavior there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-974213">
+				<div id="div-comment-974213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974213">
+			March 23, 2012 at 8:07 am</a>		</div>
+
+		<p>Is that functionality for taking a snapshot of the heap exposed in any way? &nbsp;If it were, then a debugging tool could just take its own snapshot of another process&#39;s heap and walk it on its own and not worry about concurrent modification problems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-974223">
+				<div id="div-comment-974223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974223">
+			March 23, 2012 at 8:16 am</a>		</div>
+
+		<p>@Adam Rosenfield: It&#39;s called CreateRemoteThread and you get all the horror that comes with it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-974243">
+				<div id="div-comment-974243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">chentiangemalc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974243">
+			March 23, 2012 at 9:44 am</a>		</div>
+
+		<p>@brian ..because this solution fixed existing apps as well, no change to coding practice, seems better solution. Also this free memory change didn&#39;t cause the significant performance hit on win7, it was the lifting of heap entry limit.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jamesnt even thread-even depth-1" id="comment-974293">
+				<div id="div-comment-974293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/JamesNT' rel='external nofollow' class='url'>JamesNT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974293">
+			March 23, 2012 at 10:37 am</a>		</div>
+
+		<p>@No One:</p>
+<p>Of course Raymond will be complaining about this in circa 2020. &nbsp;No matter what MS does to add safeguards into Windows, no one can protect bad programmers from themselves. &nbsp;Sooner or later, the end user has to take some responsibility.</p>
+<p>JamesNT</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-974313">
+				<div id="div-comment-974313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">No One</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974313">
+			March 23, 2012 at 11:09 am</a>		</div>
+
+		<p>@JamesNT: Agreed. &nbsp;I was trying to be very tongue-in-cheek but often sound far too genuine for my own good.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-974323">
+				<div id="div-comment-974323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andre</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974323">
+			March 23, 2012 at 12:50 pm</a>		</div>
+
+		<p>A fun side story here would be about how toolhelp&#39;s code that was designed to enumerate heaps actually had a heap-trashing bug in it. &nbsp;Slightly ironic.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-974343">
+				<div id="div-comment-974343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974343">
+			March 23, 2012 at 5:54 pm</a>		</div>
+
+		<p>@JamesNT and @No One:</p>
+<p>In 2020 i doubt Microsoft will even exists. At the pace Google is pushing Android around and at the pace Apple is making sure the future of hardware is in it&#39;s hands through all smart devices and iPads is inventing the old &#39;80&#39;s liant IBM-PC+Microsoft for hardware/software will disappear. Same way Cyrix left the stage of hardware. Same way Netscape left the stage of software. Remember those companies? How big and innovative and cheap their products were? Well AMD killed Cyrix by dropping the prices and Microsoft killed Netscape by offering IE for free. Same way Microsoft/Intel/IBM PC compatible will get killed by Google and Apple. In 2020 we will read blogs about Android 15 and iOS 25, not about Windows 12.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-974353">
+				<div id="div-comment-974353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">LurkerAU</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974353">
+			March 23, 2012 at 6:04 pm</a>		</div>
+
+		<p>@Danny</p>
+<p>When are you people going to get a life? You&#39;ve been saying this every day for nearly 20 years. Don&#39;t you EVER get tired of being wrong?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-974403">
+				<div id="div-comment-974403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/maf6_4000_cornell.edu/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>maf6@cornell.edu</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974403">
+			March 24, 2012 at 6:24 pm</a>		</div>
+
+		<p>Raymond:</p>
+<p>As it turns out, Heap32Next in Windows 7 has a deadlock as well: &nbsp;please see <a rel="nofollow" target="_new" href="http://social.msdn.microsoft.com/Forums/en-US/windbg/thread/1f5765fd-c77d-44c4-95d3-a9e9d233f553" rel="nofollow">social.msdn.microsoft.com/&#8230;/1f5765fd-c77d-44c4-95d3-a9e9d233f553</a> for details.</p>
+<p>This matters because everyone&#39;s favorite cross-platform crypto library, OpenSSL, calls the toolhelp functions to generate entropy. &nbsp;Yeah, don&#39;t ask.</p>
+<p>So is there any way you might find someone to take ownership of this issue, and perhaps fix it?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-974413">
+				<div id="div-comment-974413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974413">
+			March 25, 2012 at 2:23 am</a>		</div>
+
+		<p>@LurkerAU</p>
+<p>Have you even read my comment? 20 years ago Google didn&#39;t even exists. Or Android for that matter. So who&#39;s those &quot;people&quot; that you refer to?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-974443">
+				<div id="div-comment-974443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974443">
+			March 25, 2012 at 12:09 pm</a>		</div>
+
+		<p>Hm. My bad &#8211; Heap32ListFirst!=Heap32First on <em>big</em> windows and doesnt use CreateToolhelp32Snapshot, while on CE both uses it.</p>
+<p>PS Too much entropy in Win32 API ;(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-974423">
+				<div id="div-comment-974423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-974423">
+			March 25, 2012 at 10:16 am</a>		</div>
+
+		<p>If reasources&#39;re allocated by Heap32First and free in some (last) Heap32Next &#8211; what purpose of calling CreateToolhelp32Snapshot before using of that APIs and CloseHandle afterwards ?..</p>
+<p>I&#39;ll answer on this partially :)</p>
+<p>CreateToolhelp32Snapshot actually creates filemapping object that is &#39;filled&#39; by snapshot information that later queried by *32First *32Next APIs, so resources actually freed by final CloseHandle that closes that filemapping. And filemapping&#39;s size was not fixed, instead, fixed size _temporary_ buffer was used to pre-collect information that later was copied into that filemapping and released. So there was no memory leak (while caller called CloseHandle finally). </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-975183">
+				<div id="div-comment-975183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">i want to see that fight</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120323-00/?p=8023#comment-975183">
+			March 28, 2012 at 1:26 pm</a>		</div>
+
+		<p>Raymond is calling out Russinovich. Who will win ?</p>
+<p>I bet on Raymond. Russinovich have gotten quite timid, sadly, since he joined microsoft :(</p>
+<p>Russinovich, micosofts new old ***.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

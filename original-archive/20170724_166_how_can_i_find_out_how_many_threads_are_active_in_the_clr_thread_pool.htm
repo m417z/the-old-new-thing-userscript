@@ -1,0 +1,464 @@
+<html>
+<head>
+<title>How can I find out how many threads are active in the CLR thread pool?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I find out how many threads are active in the CLR thread pool?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 24, 2017 / year-entry #167</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>18</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Let's answer the question, but then look at the scenario.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was looking for a way to determine programmatically
+how many threads are active in the CLR thread pool.
+</p>
+<p>
+There is no method that returns this information directly,
+but you can
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090804-00/?p=17233">
+snap two blocks together</a>:&sup1;
+</p>
+<pre>
+int max, max2;
+ThreadPool.GetMaxThreads(out max, out max2);
+int available, available2;
+ThreadPool.GetAvailableThreads(out available, out available2);
+int running = max - available;
+</pre>
+<p>
+But even though we answered the question,
+we don't know what the customer's problem is.
+The customer was kind enough to explain:
+</p>
+<blockquote CLASS="q"><p>
+We have an issue where we exhaust the thread pool,
+causing our latency to skyrocket.
+We are investigating possible mitigations,
+and
+knowing when we are close to saturating the thread pool
+would tell us when we need to take more drastic measures.
+The thread pool threads are not CPU-bound;
+they are blocked on SQL queries.
+We have a long-term plan to use <code>async</code>/<code>await</code>,
+but that is a large change to our code base that will take time
+to implement,
+so we're looking for short-term mitigations to buy ourselves
+some time.
+</p>
+</blockquote>
+<p>
+A colleague pointed out that if your thread pool threads
+are all blocked on SQL queries against the same server,
+then adding more threads won't help because the bottleneck
+is not the thread pool.
+The bottleneck is the SQL server.
+Any new thread pool threads you add will eventually block
+on SQL queries to the same unresponsive server.
+</p>
+<p>
+Now,
+if your workload consists entirely of work items that access
+the database,
+then the database is your bottleneck,
+and there's not much you can do on the client to make it go faster.
+But
+if your workload is a mix of work items that access the database
+and work items that don't access the database,
+then you at least don't want the non-database work items to be blocked
+behind database work items.
+</p>
+<p>
+If this were a Win32 application,
+you could create a second thread pool and queue
+database work items to that thread pool.
+Non-database work items go to the default thread pool.
+When the second thread pool runs out of threads,
+it stalls the processing of other database work items,
+but the non-database work items are not affected
+because they are running on a different thread pool.
+</p>
+<p>
+But the CLR doesn't let you create a second thread pool,
+so your database work items and
+non-database work items have to learn to live in harmony.
+</p>
+<p>
+Rewriting the code to be "<code>async</code> all the way
+down"
+may not be practical in the short term,
+but you could make it <code>async</code> at the top.
+Suppose your database work item looks like this:
+</p>
+<pre>
+ThreadPool.QueueUserWorkItem(() =&gt;
+{
+  DoDatabaseStuff(x, y, z);
+  MoreDatabaseStuff(1, 2, 3);
+});
+</pre>
+<p>
+Add a single <code>async</code> at the top:
+</p>
+<pre>
+ThreadPool.QueueUserWorkItem(<font COLOR="blue">async</font> () =&gt;
+{
+  <font COLOR="blue">using (await AccessToken.AcquireAsync()) {</font>
+    DoDatabaseStuff(x, y, z);
+    MoreDatabaseStuff(1, 2, 3);
+  <font COLOR="blue">}</font>
+});
+</pre>
+<p>
+The purpose of the
+<code>Access&shy;Token</code>
+class
+is to control how many threads are doing database stuff.
+We put it in a <code>using</code> so that it will be
+<code>Dispose</code>d when control exits the block.
+This ensures that we don't leak tokens.
+</p>
+<p>
+Since the <code>Acquire&shy;Async</code> method is async,
+it means that work items do not consume a thread while they
+are waiting for a token.
+By controlling the number of tokens,
+you can control how many thread pool threads are doing database
+work.
+In particular, you can make sure that database work items
+don't monopolize the thread pool threads,
+leaving enough thread pool threads for your non-database
+work items.
+</p>
+<p>
+&sup1;
+<a HREF="https://blogs.msdn.microsoft.com/maoni/">
+Maoni Stephens</a>
+pointed out that there's also
+a managed debugging library called
+<a HREF="https://github.com/Microsoft/clrmd/">
+ClrMD</a>
+which gives you a lot of information about the thread pool.
+You may want to start with the
+<a HREF="https://github.com/Microsoft/clrmd/blob/master/src/Microsoft.Diagnostics.Runtime/ClrThread.cs">
+ClrThread</a>
+class.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (18)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1303336">
+				<div id="div-comment-1303336" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Haim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303336">
+			July 24, 2017 at 7:34 am</a>		</div>
+
+		<p>I think the first thing people should learn when they are introduced to multi-threading programing is that asynchronous IO != IO on another thread.<br />
+so many problems could have been solved before they even came to being.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-practicalvb odd alt thread-odd thread-alt depth-1 parent" id="comment-1303345">
+				<div id="div-comment-1303345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Rising' rel='external nofollow' class='url'>Rising</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303345">
+			July 24, 2017 at 7:40 am</a>		</div>
+
+		<p>Raymond, will you be showing us the code for the AccessToken class?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1303405">
+				<div id="div-comment-1303405" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303405">
+			July 24, 2017 at 10:15 am</a>		</div>
+
+		<p>I leave that as a simple exercise.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1303447">
+				<div id="div-comment-1303447" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303447">
+			July 24, 2017 at 2:26 pm</a>		</div>
+
+		<p>The implementation is basically a wrapper around a SemaphoreSlim with the AcquireAsync returning preferably a struct that implements IDisposable.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1303506">
+				<div id="div-comment-1303506" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marco</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303506">
+			July 25, 2017 at 2:23 am</a>		</div>
+
+		<p>As interfaces usually cause the struct values to be boxed, it is worth noting that the IDisposable.Dispose() is a special case in Microsoft&#8217;s implementation.</p>
+<p>&#8220;A call to IDisposable.Dispose on a struct is generated as a constrained virtual call, which most of the time does NOT box the value. A constrained virtual call on a value type only boxes the value if the virtual method is NOT implemented by the type. The only circumstances under which a virtual method can be unimplemented by the value type is when the method is, say, ToString, and implemented by the base class, System.ValueType.&#8221;</p>
+<p>See: <a href="https://stackoverflow.com/questions/2412981/if-my-struct-implements-idisposable-will-it-be-boxed-when-used-in-a-using-statem" rel="nofollow">https://stackoverflow.com/questions/2412981/if-my-struct-implements-idisposable-will-it-be-boxed-when-used-in-a-using-statem</a><br />
+See also: <a href="https://ericlippert.com/2011/03/14/to-box-or-not-to-box/" rel="nofollow">https://ericlippert.com/2011/03/14/to-box-or-not-to-box/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1303465">
+				<div id="div-comment-1303465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Koopa</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303465">
+			July 24, 2017 at 4:37 pm</a>		</div>
+
+		<p>Isn&#8217;t it in referencesource anyway?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1303355">
+				<div id="div-comment-1303355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303355">
+			July 24, 2017 at 8:12 am</a>		</div>
+
+		<p>There are third-party managed thread-pool classes floating around on the internet.  We used one when we had radically different response requirements for a particular set of activities.  We left the out-of-box thread pool to do regular work, but we dispatched our &#8220;special&#8221; work to the other pool.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1303375">
+				<div id="div-comment-1303375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua Schaeffer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303375">
+			July 24, 2017 at 8:39 am</a>		</div>
+
+		<p>I had to create a quick-and-dirty thread pool because the .NET thread pool was throttling new creation at one thread per half second while I was stuck calling blocking I/O that someone else wrote. The whole program start would lock up and I&#8217;d look like a lazy idiot. That thing really is a stinking turd worthy of contempt for the embarrassment it caused me. .NET Core replaced the guts with WinRT but you can&#8217;t create new thread pools with WinRT. You have to go custom or you have to P/Invoke the Vista thread pool. It does work now, really well.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-msn even depth-3" id="comment-1303395">
+				<div id="div-comment-1303395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/poizan42' rel='external nofollow' class='url'>poizan42</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303395">
+			July 24, 2017 at 9:55 am</a>		</div>
+
+		<p>Why are you abusing the thread pool in the first place? The whole point of it is to execute short tasks. If you need to keep spawning new threads then spawn a new thread instead of abusing the thread pool.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1303435">
+				<div id="div-comment-1303435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303435">
+			July 24, 2017 at 1:27 pm</a>		</div>
+
+		<p>Why are P/Invoking to make a thread pool? Thread.Create() yours to do with what you please.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1303365">
+				<div id="div-comment-1303365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303365">
+			July 24, 2017 at 8:24 am</a>		</div>
+
+		<p>I assume sql server isn&#8217;t single treaded an can execute multiple, long-running, queries in parallell. A server (vm or physical) usually has s lot of cores, sometimes it might even be hard to saturate all with meaningful work load. Multiple parallell calls from a cliant might actually increase performance, as long as the sql server isn&#8217;t overloaded.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-andycadley2 odd alt depth-2" id="comment-1303485">
+				<div id="div-comment-1303485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/AndyCadley' rel='external nofollow' class='url'>AndyCadley</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303485">
+			July 24, 2017 at 8:48 pm</a>		</div>
+
+		<p>Raymond&#8217;s suggestion of &#8220;async at the top&#8221; can probably help prevent saturation from the top level, but I&#8217;d suspect query tuning could probably help fix it from the bottom too.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1303486">
+				<div id="div-comment-1303486" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303486">
+			July 24, 2017 at 11:56 pm</a>		</div>
+
+		<p>If all of the queries are similar/identical, you might just be adding more lock contention by parallelizing the activity, rather than achieving performance gains.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1303385">
+				<div id="div-comment-1303385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Fred</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303385">
+			July 24, 2017 at 8:42 am</a>		</div>
+
+		<p>Man, the link at the top is textbook thermonuclear social skills. More posts should have that tag.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1303496">
+				<div id="div-comment-1303496" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://paulomorgado.net/' rel='external nofollow' class='url'>Paulo Morgado</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303496">
+			July 25, 2017 at 2:05 am</a>		</div>
+
+		<p>I wonder what Stephen Toub (<a href="https://social.msdn.microsoft.com/profile/Stephen+Toub+-+MSFT" rel="nofollow">https://social.msdn.microsoft.com/profile/Stephen+Toub+-+MSFT</a>) and Stephen Cleary (<a href="http://blog.stephencleary.com/" rel="nofollow">http://blog.stephencleary.com/</a>) would say about that suggestion. What&#8217;s the benefit of the state machine here?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1304146">
+				<div id="div-comment-1304146" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.solsoftsolutions.com' rel='external nofollow' class='url'>Mark S</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1304146">
+			July 28, 2017 at 10:49 am</a>		</div>
+
+		<p>About the suggestion to use &#8216;async&#8217;?  The key to understand is that async I/O is a different animal that isn&#8217;t consuming threads in the normal way. See this post, for example: <a href="https://blog.stephencleary.com/2013/11/there-is-no-thread.html" rel="nofollow">https://blog.stephencleary.com/2013/11/there-is-no-thread.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1303516">
+				<div id="div-comment-1303516" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">M</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303516">
+			July 25, 2017 at 5:28 am</a>		</div>
+
+		<p>I understand that this article is probably more about async, but why not use normal threads for the Database requests? (dedicated database threads seems to be one of MSDN-text-book examples of when NOT to use the .NET thread pool)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1303747">
+				<div id="div-comment-1303747" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://aloiskraus.wordpress.com/' rel='external nofollow' class='url'>Alois Kraus</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170724-00/?p=96675#comment-1303747">
+			July 25, 2017 at 1:17 pm</a>		</div>
+
+		<p>An alternative is that you start your SQL queries as long running tasks which will never exhaust the threadpool because TPL will simply create a new thread for each long running task. I guess the customer is already having some way to control the number of concurrent SQL queries to not overwhelm the database. </p>
+<p>            Task.Factory.StartNew( () =&gt; {  Sql &#8230; }, TaskCreationOptions.LongRunning);</p>
+<p>This will &#8220;waste&#8221; a new thread but since the latency this construct is in the region of 0.1ms it is for slow SQL queries a non issue. The superior ThreadPool task enqueue performance plays in this case no role and you can do old fashioned manual thread creation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

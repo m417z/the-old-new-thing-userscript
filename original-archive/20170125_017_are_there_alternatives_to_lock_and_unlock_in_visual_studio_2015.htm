@@ -1,0 +1,397 @@
+<html>
+<head>
+<title>Are there alternatives to _lock and _unlock in Visual Studio 2015?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Are there alternatives to _lock and _unlock in Visual Studio 2015?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 25, 2017 / year-entry #18</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">This is unlikely to work.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was using the <code>_lock</code> and
+<code>_unlock</code> functions in the C runtime library
+to take internal locks in order to avoid deadlocking
+with a thread they were suspending.
+They included this demonstration program:
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;process.h&gt;
+#include &lt;stdio.h&gt;
+
+unsigned int __stdcall ThreadFunc(void *);
+
+#define _HEAP_LOCK 4    /* lock for heap allocator routines */
+
+extern "C" void _lock(int);
+extern "C" void _unlock(int);
+
+int __cdecl main(int, char**)
+{
+  HANDLE hThread = (HANDLE)_beginthreadex(NULL, 0,
+      ThreadFunc, NULL, 0, NULL);
+
+  for (;;) {
+    printf(".");
+    _lock(_HEAP_LOCK);
+    SuspendThread(hThread);
+    _unlock(_HEAP_LOCK); 
+    void *p = malloc(8);
+    free(p);
+    ResumeThread(hThread);
+  }
+  return 0;
+}
+
+unsigned int __stdcall ThreadFunc(void *)
+{
+  for (;;) {
+    void *p = malloc(8);
+    free(p);
+  }
+}
+</pre>
+<p>
+This sample program starts a worker thread that continuously
+allocates and frees memory from the heap. The main thread
+is in a loop that suspends the worker thread, and then tries
+to allocate memory from the heap while the worker is suspended.
+</p>
+<p>
+Normally, this would be a problem
+if the worker thread happens to be in the
+middle of a heap operation, then the main thread will deadlock
+because it wants the heap lock, but the heap lock is owned by
+the worker thread, which is suspended.
+</p>
+<p>
+The program addresses the problem by explicitly taking
+the heap lock before suspending the thread. That way, we are sure
+that the thread does not hold the heap lock before we suspend it.
+The definition of the magic number that represents the heap lock
+comes from the internal
+<code>mtdll.h</code> header file that comes with the C runtime
+source code.
+</p>
+<p>
+The customer found that the version of the Visual C++ compiler
+that comes with Visual Studio 2015 no longer has the
+<code>_lock</code> and <code>_unlock</code> functions.
+As a result, their program doesn't compile any more.
+How can they suspend the thread without deadlocking on the heap?
+</p>
+<p>
+The customer liaison pointed the customer to
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20031209-00/?p=41573">
+this article</a>
+and suggested to the customer that they use
+other synchronization mechanisms instead of
+<code>Suspend&shy;Thread</code>.
+The customer responded that they are developing a simulator for
+their product,
+and they need to suspend a thread as accurately as possible,
+so they need to use the
+<code>Suspend&shy;Thread</code> function.
+</p>
+<p>
+What they're doing now is not going to work well long-term,
+because it's taking dependencies upon the internals of the
+C runtime library.
+The C runtime library team explained,
+</p>
+<blockquote CLASS="m"><p>
+There is no replacement for <code>_lock</code>
+and
+<code>_unlock</code>.
+The Universal CRT does not expose its internal locks as older CRTs did.
+Note that their current approach of acquiring the CRTs heap lock
+before suspending the thread is not sufficient to avoid deadlock.
+The CRT <code>malloc</code> calls the Windows <code>Heap&shy;Alloc</code>,
+and the Windows heap has its own locks that it uses for synchronization.
+</p>
+</blockquote>
+<p>
+On top of this, the
+documentation for <code>Suspend&shy;Thread</code>
+cautions directly against this usage (emphasis mine):
+</p>
+<blockquote CLASS="q"><p>
+This function is primarily designed for use by debuggers.
+<u>It is not intended to be used for thread synchronization.</u>
+Calling <b>Suspend&shy;Thread</b>
+on a thread that owns a synchronization object,
+such as a mutex or critical section,
+can lead to a deadlock if the calling thread tries to
+obtain a synchronization object owned by a suspended thread.
+To avoid this situation,
+a thread within an application that is not a debugger
+<u>should signal the other thread to suspend itself.
+The target thread must be designed to watch
+for this signal and respond appropriately</u>.
+</p>
+</blockquote>
+<p>
+(Further discussion
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743">
+here</a>.)
+</p>
+<p>
+We didn't understand what the customer meant by
+"they are developing a simulator for their product"
+and how that required them to suspend a thread "as accurately as
+possible."
+We asked for clarification in the hopes that understanding their
+scenario would help us come up with a solution,
+but we never did get a clarification.
+That didn't stop us from trying to help anyway:
+</p>
+<p>
+If the customer is really
+insistent on suspending the thread in order to do inspection of
+the process state, there are a few options.
+</p>
+<p>
+One option, as noted in MSDN, is to
+coordinate with the thread so it is
+suspended at only well-defined points
+where it does not own any locks or resource.
+This is what the CLR does.
+</p>
+<p>
+Another option is to make sure that while
+any thread is suspended,
+you never take any locks or more generally try to acquire any resources.
+Among other things,
+this means preallocating memory before suspending the thread.
+It also means that you cannot call into external functions
+because you have no idea what locks those external functions may take.
+Suspend the thread,
+memcpy the results into preallocated memory,
+resume the thread,
+and then process the results.
+Do not call the heap or anything else&sup1; that may require a lock.&sup2;
+</p>
+<p>
+The best option is to
+do the suspension and inspection from another process.
+Even in that case,
+you need to be careful if the inspecting process requires
+locks that may be owned by the process being inspected,
+such as shared mutexes.
+</p>
+<p>
+Suspending a thread at a random point in its execution,
+and then trying to do anything interesting from
+within the same process is a bad idea and has high
+deadlock potential.
+</p>
+<p>
+The customer liaison thanked us for the information
+and explained that the customer wants to suspend the thread
+at arbitrary points in its execution because it is an application
+requirement.&sup3;
+They will take our recommendations into consideration while
+they decide what to do next.
+</p>
+<p>
+&sup1;
+Furthermore, you would be best served to
+take the heap lock (<code>Heap&shy;Lock</code>)
+before suspending the thread,
+because the Detours library will allocate memory
+during thread suspension.
+</p>
+<p>
+&sup2;
+It may be difficult to avoid allocating memory.
+You can at least avoid the heap lock by using
+<code>Virtual&shy;Alloc</code> instead of
+<code>Heap&shy;Alloc</code>.
+</p>
+<p>
+&sup3;
+This sounds like a circular argument, but hey.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-koldude even thread-even depth-1" id="comment-1281356">
+				<div id="div-comment-1281356" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281356">
+			January 25, 2017 at 7:42 am</a>		</div>
+
+		<p>To make this more <em>FUN</em> <code>_lock</code> and <code>_unlock</code> are removed as of VS2015.  VS2017 does implement <code>threads.h</code> so there is a platform independent way to synchronize in C on windows via <code>mtx_lock</code>. That said this seems like an X/Y problem overall, so all of that is irrelevant.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1281365">
+				<div id="div-comment-1281365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.silverbacknetworks.tech' rel='external nofollow' class='url'>Joshua Bowman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281365">
+			January 25, 2017 at 7:54 am</a>		</div>
+
+		<p>You do  what you can, and then you let your children go to bump their heads in their own ways, unfortunately.</p>
+<p>HeapLock sounds like a fun constant, now it&#8217;s time to find all the ways I can insert it in old code to give maintainers a heart attack. :D</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1281375">
+				<div id="div-comment-1281375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Koro</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281375">
+			January 25, 2017 at 8:16 am</a>		</div>
+
+		<p>&#8220;Even in that case, you need to be careful if the inspecting process requires locks that may be owned by the process being inspected, such as shared mutexes.&#8221;</p>
+<p>This reminds me how debugging any process using WININET.DLL was a nightmare because it would deadlock the debugger (which tried to download symbols using the same DLL).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1281425">
+				<div id="div-comment-1281425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281425">
+			January 25, 2017 at 1:27 pm</a>		</div>
+
+		<p>&gt; because it is an application requirement.³</p>
+<p>&gt; ³ This sounds like a circular argument, but hey.</p>
+<p>Ha.</p>
+<p>In context, it sounds like what they meant to say was &#8220;Under the current design, we use the thread suspension to implement feature X, which is an application requirement.  Changing our design to avoid thread suspension, while still providing feature X, costs more than our budget for this bug (and may be wholly infeasible without a complete rewrite).&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1" id="comment-1281475">
+				<div id="div-comment-1281475" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281475">
+			January 25, 2017 at 9:25 pm</a>		</div>
+
+		<p>FYI, I actually checked and in the release version of the universal CRT, they just use HeapAlloc anyway and only resort to alternatives if that fails.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1281495">
+				<div id="div-comment-1281495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281495">
+			January 25, 2017 at 10:50 pm</a>		</div>
+
+		<p>And another story in the unending annals of people who have no clue about concurrent programming trying to do so anyhow..</p>
+<p>The state of this industry is depressing sometimes.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1281505">
+				<div id="div-comment-1281505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281505">
+			January 26, 2017 at 1:25 am</a>		</div>
+
+		<p>That&#8217;s what happens when you say &#8220;everyone can code.&#8221;. No, not everyone can. And even then, mastering things such as concurrent programming is not an easy task.</p>
+<p>As a result, badly written software (or languages, like *cough* PHP *cough* ) which should never have been written are set as standards, making people miserable.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-deltics odd alt depth-3" id="comment-1281545">
+				<div id="div-comment-1281545" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Deltics' rel='external nofollow' class='url'>Deltics</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170125-00/?p=95255#comment-1281545">
+			January 26, 2017 at 4:51 pm</a>		</div>
+
+		<p>&#8230; which is when someone comes along and says &#8220;we can make this hard stuff easy for everyone.  Just use this framework/library/toolkit/whatever.  No understanding required.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

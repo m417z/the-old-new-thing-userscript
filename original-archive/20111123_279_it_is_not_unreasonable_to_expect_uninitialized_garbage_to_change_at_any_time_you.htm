@@ -1,0 +1,473 @@
+<html>
+<head>
+<title>It is not unreasonable to expect uninitialized garbage to change at any time, you don't need to ask for an explanation</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>It is not unreasonable to expect uninitialized garbage to change at any time, you don&#8217;t need to ask for an explanation</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 23, 2011 / year-entry #280</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer admitted that they had a bug in their code: #define UNICODE #define _UNICODE #include <windows.h> // error checking removed for expository purposes // code that writes out the data RegSetValueEx(hkey, pszValue, 0, REG_SZ, (const BYTE *)pszData, _tcslen(pszData) * sizeof(TCHAR) + 1); // code that reads the data DWORD dwType, cbData; RegQueryValueEx(hkey, pszValue, NULL,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer admitted that they had a bug in their code:
+</p>
+<pre>
+<i><a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/02/12/71851.aspx">#define UNICODE
+#define _UNICODE</a>
+#include &lt;windows.h&gt;
+
+// error checking removed for expository purposes
+
+// code that writes out the data
+RegSetValueEx(hkey, pszValue, 0, REG_SZ, (const BYTE *)pszData,
+              _tcslen(pszData) * sizeof(TCHAR) + 1);
+
+// code that reads the data
+DWORD dwType, cbData;
+RegQueryValueEx(hkey, pszValue, NULL, &amp;dwType, NULL, &amp;cbData);
+TCHAR *pszData = new TCHAR[cbData / sizeof(TCHAR)];
+RegQueryValueEx(hkey, pszValue, NULL, &amp;dwType, pszData, &amp;cbData);
+</i></pre>
+<p>
+One bug in the above code is in the final parameter passed to
+<code>Reg&shy;Set&shy;Value&shy;Ex</code>:
+It's supposed to be the count in bytes,
+but the calculation appends only one byte for the terminating null
+instead of a full <code>TCHAR</code>.
+In other words, it should be</p>
+<pre>
+RegSetValueEx(hkey, pszValue, 0, REG_SZ, (const BYTE *)pszData,
+              _tcslen(pszData) * sizeof(TCHAR) + <font COLOR=blue>sizeof(TCHAR)</font>);
+</pre>
+<p>
+For concreteness, let's say the original string was five <code>TCHAR</code>s
+in length, not counting the terminating null.
+Therefore, the correct buffer size is 12 bytes, but they passed only 11
+to <code>Reg&shy;Set&shy;Value&shy;Ex</code>.
+</p>
+<p>
+This error is compounded in the code that reads the value back:
+The code happily divides <code>cbData / sizeof(TCHAR)</code>
+without checking that the division is even.
+In our example, the call returns a length of 11 bytes.
+They divide by <code>sizeof(TCHAR)</code> (which is 2, since the
+code is compiled as Unicode), leaving 5 (remainder discarded),
+causing them to allocate a 5-<code>TCHAR</code> buffer.
+</p>
+<p>
+That error would have been okay by itself except for another error,
+which is calling <code>Reg&shy;Query&shy;Value&shy;Ex</code>
+a second time with
+an invalid buffer size:
+The <code>cbData</code> variable remains the original value of 11
+even though they allocated only 10 bytes.
+The subsequent <code>Reg&shy;Query&shy;Value&shy;Ex</code> call reads 11 bytes
+into a 10-byte buffer.
+</p>
+<p>
+The customer conceded that the code that writes the value is buggy,
+but points out that the code "worked" on Windows&nbsp;XP,
+in the sense that the string read back from the registry was
+correct.
+But Windows Vista "broke" their program,
+because the string read back now contained garbage at the end.
+Instead of returning <code>"Hello"</code>,
+it returned
+<code>"Hello&#x0400;&#x2545;&#x06DE;"</code>.
+The customer wanted to know what change to Windows Vista broke
+their program.
+</p>
+<p>
+The change to Windows Vista that broke their program
+is known as "luck running out."
+The program contained three bugs, which combined to form a heap
+buffer write overflow.
+The uninitialized garbage at the end of the heap block they
+allocated happened to be zero on Windows&nbsp;XP
+due to a coincidence in the way their program allocated and freed
+memory.
+Consequently, when the data was read from the registry, the
+"string" ended in a single null byte instead of two.
+The extra null byte that "happened to be there already"
+combined with the single null byte read from the registry to form
+a proper null terminator.
+</p>
+<p>
+When run on Windows Vista, that happy coincidence no longer
+took place, and the uninitialized garbage was nonzero,
+resulting in the subsequent attempt to use the string to read
+past the end of the buffer and pick up heap garbage.
+(Yay, bug number four: read overflow.)
+Why was the uninitialized garbage different?
+</p>
+<p>
+It's different because there was nothing forcing it to be the same.
+The internals of the heap manager change all the time.
+(Look-aside lists, low fragmentation heap, and fault-tolerant heap
+are just a few recent examples.)
+Any of these changes will result in heap memory being used and reused
+differently.
+Plus, changes in other parts of Windows may have allocated and freed
+memory differently between Windows&nbsp;XP and Windows Vista.
+Heck, the program itself may have allocated and freed memory differently
+due to the change in operating system.
+(For one thing, the length of the string <code>"Windows Vista"</code>
+is different from the length of the string <code>"Windows XP"</code>.)
+</p>
+<p>
+Uninitialized garbage will contain unpredictable values.
+There's no point asking why you got a different unpredictable value
+this time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-949103">
+				<div id="div-comment-949103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949103">
+			November 23, 2011 at 7:17 am</a>		</div>
+
+		<p>It is amazing the number of C questions that can be answered: You engaged in undefined behavior. &nbsp;One possible value of undefined is &quot;It works as expected.&quot; Another is &quot;It doesn&#39;t.&quot;</p>
+<p>Nitpickers corner: Even if coding in C++, anytime you use the Windows API, you are engaging in C programming because Windows uses a C API and very few people I have seen bother to do full on RAII around Windows API calls.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949113">
+				<div id="div-comment-949113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949113">
+			November 23, 2011 at 7:23 am</a>		</div>
+
+		<p>&quot;Uninitialized garbage will contain unpredictable values. There&#39;s no point asking why you got a different unpredictable value this time.&quot;</p>
+<p>True, but Microsoft has written compatibility shims for worse things in the past. I guess this guy just wasn&#39;t important enough.</p>
+<div class="post">[<i>Whether a compatibility shim exists for this issue is independent of the question &quot;Why did this change?&quot;, and &quot;Why did this change?&quot; was the topic for today, not &quot;<a href="http://technet.microsoft.com/en-us/magazine/ff625273.aspx" rel="nofollow">Can we cajole the heap into behaving like it used to</a>?&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949123">
+				<div id="div-comment-949123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tanveer Badar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949123">
+			November 23, 2011 at 7:47 am</a>		</div>
+
+		<p>I always want to complain when something stops exhibiting normal levels of abnormalness. There&#39;s a limit to one&#39;s tolerance.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949143">
+				<div id="div-comment-949143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mathieu Garstecki</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949143">
+			November 23, 2011 at 7:52 am</a>		</div>
+
+		<p>I have found that many developers around me translate &quot;undefined&quot; as &quot;random behavior&quot;, as in &quot;will not behave the same in each run&quot;. I think that&#39;s why so many people rely on implementation details: it works every time for them so &quot;obviously&quot; it is not undefined !</p>
+<p>I try to correct this misconception every time I encounter it, but it is very common unfortunately.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949163">
+				<div id="div-comment-949163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949163">
+			November 23, 2011 at 8:22 am</a>		</div>
+
+		<p>Sometimes I think everybody would be a lot better off if at some point Microsoft decided to shrug their shoulders and sell (but not support) every version of every Microsoft product that ever existed for something like its market price near the time of its obsolescence.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949173">
+				<div id="div-comment-949173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Guillaume</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949173">
+			November 23, 2011 at 8:25 am</a>		</div>
+
+		<p>Raymond, I read and love your blog. And this quote is the best : The change to Windows Vista that broke their program is known as &quot;luck running out.&quot;</p>
+<p>I don&#39;t about code reuse, but I known there&#39;s going to be a lot of quote reuse !</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949183">
+				<div id="div-comment-949183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949183">
+			November 23, 2011 at 8:26 am</a>		</div>
+
+		<p>@SimonRev: No need for nitpicking, C++ also comes with undefined behavior!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949213">
+				<div id="div-comment-949213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WhoDoesThis</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949213">
+			November 23, 2011 at 9:43 am</a>		</div>
+
+		<p>The correct resolution for this would have been for the customer to fix their bug in both the XP and Vista versions of their software and then admit the mistake and move on. To place blame on Microsoft is garbage.</p>
+<p>Too bad names aren&#39;t named, I would really like to stop supporting development houses that engage in this type of behavior (it was Microsoft&#39;s Fault our software is broken!). I understand your blog ground rules that forbid you from doing this, but one would hope that there is a site out there that would call these people out by name.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949223">
+				<div id="div-comment-949223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WendyHome</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949223">
+			November 23, 2011 at 10:56 am</a>		</div>
+
+		<p>For a moment I thought the title was an extract from a US Home Owners Association set of rules and regulations&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949243">
+				<div id="div-comment-949243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PhilW</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949243">
+			November 23, 2011 at 11:35 am</a>		</div>
+
+		<p>Maybe the customer had that attitude &quot;if it isn&#39;t broke, don&#39;t fix it&quot; on XP, since it apparently worked. The proper attitude should be &quot;if it isn&#39;t broke, you haven&#39;t looked hard enough&quot;, and that would have prompted them to correct it before they got burnt on Vista.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949253">
+				<div id="div-comment-949253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949253">
+			November 23, 2011 at 11:42 am</a>		</div>
+
+		<p>PhilW: Specifically, &quot;if it isn&#39;t broke, use AppVerifier to break it&quot;. AppVerifier would&#39;ve detected this problem right away.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949273">
+				<div id="div-comment-949273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949273">
+			November 23, 2011 at 1:02 pm</a>		</div>
+
+		<p>@SimonRev: I think Bjarne Stroustrup said it best: &quot;C makes it easy to shoot yourself in the foot; C++ makes it harder, but when you do, it blows away your whole leg.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949283">
+				<div id="div-comment-949283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JohnL</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949283">
+			November 23, 2011 at 1:32 pm</a>		</div>
+
+		<p>I&#39;m always wondering why the National Lottery never seems to randomly select the same numbers I did. &nbsp;I guess it must be a bug in their ball selection machines?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949303">
+				<div id="div-comment-949303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949303">
+			November 23, 2011 at 4:57 pm</a>		</div>
+
+		<p>So what if Bjarne Stroustrup said it, it&#39;s a stupid argument from authority. Besides, in its original context is was probably meant as a joking poke at something particular, that no one can find again since if you look up the phrase now you only get inane quotation websites.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949193">
+				<div id="div-comment-949193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949193">
+			November 23, 2011 at 9:00 am</a>		</div>
+
+		<p>@NB, Yeah I know. &nbsp;But the recent MS meme has been that *modern* C++ is safe. Which is true &#8212; if you use modern techniques and ignore the C-with-classes techniques it is quite easy to avoid undefined behavior in C++.</p>
+<p>Unfortunately, I find that a lot of that flies out the window when you have to interact with a C API. &nbsp;People forget all the lessons they have learned for the past 15 years.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949323">
+				<div id="div-comment-949323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949323">
+			November 23, 2011 at 7:44 pm</a>		</div>
+
+		<p>I&#39;d prefer &quot;(_tcslen(pszData) + 1) * sizeof(TCHAR)&quot; also. &nbsp;Seems like a better expression of the code&#39;s intent.</p>
+<p>I&#39;m amused, but not really that surprised, that anyone would after learning their code had these bugs in it, still complain that they were lucky enough in one OS version for the bug to not hurt them, but not in some other version.</p>
+<p>It&#39;s the classic &quot;always someone else&#39;s fault&quot; attitude. &nbsp;All too common in so many facets of daily life. &nbsp;:(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949333">
+				<div id="div-comment-949333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949333">
+			November 23, 2011 at 8:52 pm</a>		</div>
+
+		<p>Here&#39;s a fifth bug in the code: Apparently the RegQueryValueEx() function can never fail (unless error checking code was removed from the sample that was posted to keep it simple).</p>
+<p>(That&#39;s not bad, that&#39;s more than one serious bug per line of code. &nbsp;A friend of mine once had to security-audit code with those characteristics. &nbsp;His recommendation was &quot;the only way to secure this code is to run it in an isolated sandbox, since they can churn out buggy crap far faster than we can ever fix it&quot;).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949343">
+				<div id="div-comment-949343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949343">
+			November 23, 2011 at 11:11 pm</a>		</div>
+
+		<p>@Dave &#8211; I&#39;m guessing you missed the comment that frequently appears at the top of code samples here (as it does on today&#39;s):</p>
+<p>// error checking removed for expository purposes</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-949313">
+				<div id="div-comment-949313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949313">
+			November 23, 2011 at 5:32 pm</a>		</div>
+
+		<p>Personally, I would prefer (_tcslen(pszData) + 1) * sizeof(TCHAR) to _tcslen(pszData) * sizeof(TCHAR) + sizeof(TCHAR).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-949363">
+				<div id="div-comment-949363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949363">
+			November 24, 2011 at 4:06 am</a>		</div>
+
+		<p>@Damien: Code comments? &nbsp;I&#39;ve heard of those&#8230; :-). &nbsp;In this case I&#39;ll attribute it to inattentional blindness, <a rel="nofollow" target="_new" href="http://www.scholarpedia.org/article/Inattentional_blindness" rel="nofollow">http://www.scholarpedia.org/&#8230;/Inattentional_blindness</a>.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-949603">
+				<div id="div-comment-949603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zan Lynx</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111123-00/?p=9053#comment-949603">
+			November 25, 2011 at 2:13 am</a>		</div>
+
+		<p>Undefined behavior like this is why building on different systems and architectures is so helpful. Windows, OSX or Linux; x86, x86_64, ARM, PPC and Itanium; GCC, MSVC, ICC combinations for example.</p>
+<p>It wouldn&#39;t have helped this guy, because the code in question only runs on Windows, but even then he might have detected the problem if he&#39;d tried it on Windows 2000 during development.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

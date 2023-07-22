@@ -1,0 +1,464 @@
+<html>
+<head>
+<title>What's up with compare_exchange_weak anyway?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What&#8217;s up with <CODE>compare_</CODE><CODE>exchange_</CODE><CODE>weak</CODE> anyway?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 29, 2018 / year-entry #74</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It's handy for certain classes of processors.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180328-00/?p=98365">
+Last time</a>, I left you with a homework assignment:
+<a HREF="https://www.youtube.com/watch?v=ZQFzMfHIxng">
+Watch this video on <code>std::atomic</code></a>.
+</p>
+<p>
+<a HREF="https://www.youtube.com/watch?v=ZQFzMfHIxng&t=33m03s">
+At time code 33:03</a>, the presenter notes the weak version of
+compare-exchange (which is permitted to fail even if the value
+matches the expected value)
+and
+<a HREF="https://www.youtube.com/watch?v=ZQFzMfHIxng&t=36m26s">
+tries to reverse-engineer</a>
+what kind of hardware
+would require this operation,
+eventually settling on a NUMA architecture where cross-node
+memory accesses can time out.
+</p>
+<p>
+But there's no need to speculate about something that exotic,
+because the answer is all around us.
+In fact, it's probably happening right now on a computer
+in the presenter's pocket.
+</p>
+<p>
+Most RISC processors do not have a compare-exchange instruction.
+Instead, they use a
+<i>load locked/store conditional</i> pattern.
+This pattern is employed by the
+ARM architecture,
+and
+we also saw it for
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835">
+Alpha AXP</a>,
+and we'll see it later for MIPS and PowerPC.
+</p>
+<p>
+The <i>load locked/store conditional</i> pattern
+goes like this:
+</p>
+<ul>
+<li>Issue a <i>load locked</i> instruction which
+    reads a value from memory and instructs the processor
+    to monitor that location for writes from other processors.</li>
+<li>Perform some computations.</li>
+<li>Issue a <i>store conditional</i> instruction which
+    writes a value to the same memory location that was locked,
+    provided the processor can prove that the memory has not
+    been written to in the interim.</li>
+</ul>
+<p>
+The conditional store can fail if another processor has written
+to the memory,
+or memory on the same cache line or other unit of monitoring
+granularity,
+or if the processor took an interrupt.
+</p>
+<p>
+On an ARM,
+a strong compare-exchange contains a loop
+because the only way that
+<code>compare_</code><code>exchange_</code><code>strong</code>
+can fail is when the current value of the atomic variable
+does not match the expected value.
+If the failure reason was because of contention, then
+the strong version must perform an internal retry loop
+until the operation succeeds, or until the failure condition is met.
+</p>
+<pre>
+    ; r0 is the proposed new value
+    ; r1 is the expected old value
+    ; r2 is the address of the atomic variable
+
+retry:
+    DMB                     ; data memory barrier
+    LDREX   r3, [r2]        ; load current value and lock it
+    CMP     r3, r1          ; is it what we expected?
+    BNE     fail            ; N: operation failed
+                            ; actual current value is in r3
+
+    STREX   r4, r0, [r2]    ; try to store new value
+    CBNZ    r4, retry       ; lost the lock, try again
+    DMB                     ; data memory barrier
+</pre>
+<p>
+Consider the compare-exchange loop in the code sample in the
+presentation:
+</p>
+<pre>
+    do { new_n-&gt;next = old_h; }
+    while (!head.compare_exchange_strong(old_h, new_n));
+</pre>
+<p>
+The <code>compare_</code><code>exchange_</code><code>strong</code>
+has an embedded loop, and it's part of another loop.
+So we have to generate two loops:
+</p>
+<pre>
+    ; r0 is new_n
+    ; r1 is old_h
+    ; r2 is the address of the atomic variable "head"
+
+outer_loop:
+    STR     r1, [r0]        ; new_n-&gt;next = old_h
+
+retry:
+    DMB                     ; data memory barrier
+    LDREX   r3, [r2]        ; locked load of head
+    CMP     r3, r1          ; is it what we expected?
+    BNE     fail            ; N: operation failed
+
+    STREX   r4, r0, [r2]    ; try to store new value
+    CBNZ    r4, retry       ; lost the lock, try again
+
+    DMB                     ; data memory barrier
+
+    ; succeeded - continue with code that comes after
+
+    ...
+
+    ; This code goes at the end of the function because ARM
+    ; statically predicts forward-jumps as not-taken.
+fail:
+    DMB                     ; data memory barrier
+    MOV     r1, r3          ; old_h = current value of head
+    B       outer_loop      ; restart the outer loop
+</pre>
+<p>
+The outer loop drives the loop written by the C++ programmer.
+The inner loop is the one required by
+<code>compare_</code><code>exchange_</code><code>strong</code>.
+</p>
+<p>
+The weak version avoids this nested loop:
+</p>
+<pre>
+    do { new_n-&gt;next = old_h; }
+    while (!head.compare_exchange_<font COLOR=blue>weak</font>(old_h, new_n));
+</pre>
+<p>
+With this version, the compiler can simply bail out at
+the first sign of trouble.
+It avoids having to create a separate <code>fail</code> label
+and reduces register pressure because it doesn't need to
+carry the expected and actual values
+through the (no-longer present) inner loop.
+</p>
+<pre>
+    ; r0 is new_n
+    ; r1 is old_h
+    ; r2 is the address of the atomic variable "head"
+
+outer_loop:
+    STR     r1, [r0]        ; new_n-&gt;next = old_h
+
+    MOV     r3, r1          ; save old_h before we overwrite it
+    DMB                     ; data memory barrier
+    LDREX   r1, [r2]        ; locked load of head into old_h
+    CMP     r3, r1          ; is it what we expected?
+    BNE     outer_loop      ; N: retry with revised old_h
+
+    STREX   r3, r0, [r2]    ; try to store new value
+    CBNZ    r3, retry       ; lost the lock, try again
+
+    DMB                     ; data memory barrier
+
+    ; succeeded - continue with code that comes after
+</pre>
+<p>
+When should you prefer the strong version of compare-exchange
+as opposed to the weak version?
+We'll take up that question next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1331295">
+				<div id="div-comment-1331295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331295">
+			March 29, 2018 at 7:32 am</a>		</div>
+
+		<p>My guess for the use of the weak version is building locks with TryAcquireXXX type calls. Slim locks at a guess.</p>
+<p>The performance should be pretty fast.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1331345">
+				<div id="div-comment-1331345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331345">
+			March 29, 2018 at 9:17 am</a>		</div>
+
+		<p>That&#8217;s it, more-or-less.  Basically, you use the weak versions (in a loop) whenever you <i>must</i> update the shared state and the strong version when the update is optional.  The most common case I&#8217;ve come across is &#8220;if I win the race, do X; otherwise, bail.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aadsso-1live-com0007bffd8056eca8 even thread-odd thread-alt depth-1 parent" id="comment-1331315">
+				<div id="div-comment-1331315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Grant+R' rel='external nofollow' class='url'>Grant R</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331315">
+			March 29, 2018 at 8:20 am</a>		</div>
+
+		<p>Please be careful using compare_exchange for lock-free linked lists. It suffers from the A-B-A problem, and cane lead to some horribly corrupted lists. the &#8216;push&#8217; algorithm you show here is safe, but there is no corresponding safe &#8216;pop&#8217; without changing the &#8216;push&#8217;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1331365">
+				<div id="div-comment-1331365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331365">
+			March 29, 2018 at 11:34 am</a>		</div>
+
+		<p>Interestingly, the RISC load locked/store conditional pattern successfully detects A-B-A issues because the conditional store will fail because the memory was indeed written to (twice).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-aadsso-1live-com0007bffd8056eca8 even depth-3 parent" id="comment-1331415">
+				<div id="div-comment-1331415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Grant+R' rel='external nofollow' class='url'>Grant R</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331415">
+			March 29, 2018 at 9:41 pm</a>		</div>
+
+		<p>While that is true for many RISC processors, it is not true for x86, and thus the C++ code snippet is not very portable.  It will work fine on ARM, but fail in strange and bizarre ways, but only under stress on x86.  Hence my warning to be careful.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4" id="comment-1331505">
+				<div id="div-comment-1331505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331505">
+			March 30, 2018 at 10:09 am</a>		</div>
+
+		<p>Right. I was talking about the machine language, not C++. If you use the LL/SC pattern on a RISC processor, it will detect A-B-A. But x86 doesn&#8217;t have LL/SC, so no help there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1331325">
+				<div id="div-comment-1331325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331325">
+			March 29, 2018 at 8:47 am</a>		</div>
+
+		<p>I have often wondered why a simple increment seems to require a compare and retry by the calling assembler code.  Isn&#8217;t it possible to create a hardware &#8220;increment&#8221; instruction, at the chip level, which doesn&#8217;t require retries by the calling assembler code?  The same for decrement.</p>
+<p>Maybe there are such hardware instructions and I&#8217;m just ignorant of them.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1331375">
+				<div id="div-comment-1331375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331375">
+			March 29, 2018 at 11:37 am</a>		</div>
+
+		<p>You could do it at the chip level, but it requires two memory accesses in a single instruction, which is very non-RISCy. (No other RISC instruction performs two memory accesses in a single instruction, so you&#8217;re increasing chip space, power consumption, and instruction time, all just for one instruction.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1331395">
+				<div id="div-comment-1331395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331395">
+			March 29, 2018 at 1:46 pm</a>		</div>
+
+		<p>One could imagine putting such logic <i>in the RAM chips</i>, where the CPU could issue an &#8220;increment&#8221; instruction to the RAM much like it currently issues &#8220;read&#8221; and &#8220;write&#8221; commands. I assume it only hasn&#8217;t been done because the benefits wouldn&#8217;t be worth the costs. Probably it&#8217;d increase the cost and decrease the speed of the RAM (as the RAM would have to make sure to do the increment all within one &#8220;cycle&#8221;), and make caching a lot harder, but it&#8217;s surely <i>possible</i> if one really wanted to build hardware that did it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1331425">
+				<div id="div-comment-1331425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331425">
+			March 30, 2018 at 6:48 am</a>		</div>
+
+		<p>Well, it SEEMS like it&#8217;s a frequent enough thing that it would be worth building into RAM or at the CPU chip level, since there are well-known patterns for interlocked increment, and spin locks, and so on.   However, I&#8217;m not sure if anyone knows how often an increment actually has to retry, or not.  If I were designing a chip, I would build an increment and a decrement at the hardware level&#8230;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-5" id="comment-1331445">
+				<div id="div-comment-1331445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331445">
+			March 30, 2018 at 7:42 am</a>		</div>
+
+		<p>&#8220;Sorry, you bought the wrong kind of RAM. You got big-endian 32-bit RAM, but you need little-endian 64-bit RAM with support for 32-bit aligned operations.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt depth-5" id="comment-1332505">
+				<div id="div-comment-1332505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1332505">
+			April 9, 2018 at 4:30 pm</a>		</div>
+
+		<p>AFAIK modern DDR memory does read/write in bursts and assume that you have a cache anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1331335">
+				<div id="div-comment-1331335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331335">
+			March 29, 2018 at 8:48 am</a>		</div>
+
+		<p>When the loop body is big.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1331385">
+				<div id="div-comment-1331385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1331385">
+			March 29, 2018 at 12:55 pm</a>		</div>
+
+		<p>Reminds me of Redis&#8217; WATCH command and how it works with transactions for optimistic locking: <a href="https://redis.io/topics/transactions#optimistic-locking-using-check-and-set" rel="nofollow">https://redis.io/topics/transactions#optimistic-locking-using-check-and-set</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-odd thread-alt depth-1" id="comment-1332495">
+				<div id="div-comment-1332495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180329-00/?p=98375#comment-1332495">
+			April 9, 2018 at 4:17 pm</a>		</div>
+
+		<p>I wonder if the ARM64 version use LL/SC or the new CAS instructions introduced in ARMv8.1.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

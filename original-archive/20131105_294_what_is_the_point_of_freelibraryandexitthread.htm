@@ -1,0 +1,631 @@
+<html>
+<head>
+<title>What is the point of FreeLibraryAndExitThread?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What is the point of FreeLibraryAndExitThread?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 5, 2013 / year-entry #295</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>24</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The Free­Library­And­Exit­Thread function seems pointless. I mean, all the function does is DECLSPEC_NORETURN void WINAPI FreeLibraryAndExitThread( HMODULE hLibModule, DWORD dwExitCode) { FreeLibrary(hLibModule); ExitThread(dwExitCode); } Who needs such a trivial function? If I wanted to do that, I could just write it myself. DWORD CALLBACK MyThreadProc(void *lpParameter) { ... blah blah blah ... // FreeLibraryAndExitThread(g_hinstSelf, 0);...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The <code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>
+function seems pointless.
+I mean, all the function does is
+</p>
+<pre>
+DECLSPEC_NORETURN
+void WINAPI FreeLibraryAndExitThread(
+    HMODULE hLibModule,
+    DWORD dwExitCode)
+{
+    FreeLibrary(hLibModule);
+    ExitThread(dwExitCode);
+}
+</pre>
+<p>
+Who needs such a trivial function?
+If I wanted to do that, I could just write it myself.
+</p>
+<pre>
+DWORD CALLBACK MyThreadProc(void *lpParameter)
+{
+    ... blah blah blah ...
+    // <strike STYLE="color: red">FreeLibraryAndExitThread(g_hinstSelf, 0);</strike>
+    <font COLOR=blue>FreeLibrary(g_hinstSelf);
+    ExitThread(0);</font>
+}
+</pre>
+<p>
+And then you discover that occasionally your program crashes.
+What's going on?
+</p>
+<p>
+Let's rewind and look at the original problem.
+</p>
+<p>
+Originally, you had code that did something like this:
+</p>
+<pre>
+DWORD CALLBACK SomethingThreadProc(void *lpParameter)
+{
+ ... do something ...
+ return 0;
+}
+
+void DoSomethingInTheBackground()
+{
+ DWORD dwThreadId;
+ HANDLE hThread = CreateThread(nullptr, 0, SomethingThreadProc,
+                  nullptr, 0, &amp;dwThreadId);
+ if (hThread) CloseHandle(hThread);
+}
+</pre>
+<p>
+This worked great, until somebody did this to your DLL:
+</p>
+<pre>
+HMODULE hmodDll = LoadLibrary(TEXT("awesome.dll"));
+if (hmodDll) {
+ auto pfn = reinterpret_cast&lt;decltype(DoSomethingInTheBackground)*&gt;
+            (GetProcAddress(hmodDll, "DoSomethingInTheBackground"));
+ if (pfn) pfn();
+ FreeLibrary(hmodDll);
+}
+</pre>
+<p>
+This code fragment calls your
+<code>Do&shy;Something&shy;In&shy;The&shy;Background</code>
+function and then immediately unloads the DLL,
+presumably because all they wanted to do was call that one function.
+</p>
+<p>
+Now you have a problem:
+That
+<code>Free&shy;Library</code>
+call frees your DLL,
+while your
+<code>Something&shy;Thread&shy;Proc</code> is still running!
+Result:
+A crash at an address where there is no code.
+Older debuggers reported this as a crash in &lang;unknown&rang;;
+newer ones can dig into the recently-unloaded modules list
+and report it as a crash in
+<code>awesome_<wbr>unloaded</code>.
+</p>
+<p>
+This is a very common class of error.
+When I helped out the application compatibility team
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/06/02/10018606.aspx">
+by looking at crashes in third-party code</a>,
+the majority of the crashes I looked at in Internet Explorer
+were of this sort,
+where a plug-in got unloaded while it still had a running thread.
+</p>
+<p>
+How do you prevent your DLL from being unloaded while you still
+have code running (or have registered callbacks)?
+You perform a bonus <code>Load&shy;Library</code> on yourself,
+thereby bumping your DLL reference count by one.
+</p>
+<p>
+If you don't need to support Windows&nbsp;2000,
+you can use the new <code>Get&shy;Module&shy;Handle&shy;Ex</code> function,
+which is much more convenient and probably a lot faster, too.
+</p>
+<pre>
+BOOL IncrementDLLReferenceCount(HINSTANCE hinst)
+{
+ HMODULE hmod;
+ return GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                          reinterpret_cast&lt;LPCTSTR&gt;(hinst),
+                          &amp;hmod);
+}
+</pre>
+<p>
+Bumping the DLL reference count means that when the original person
+who called <code>Load&shy;Library</code> finally calls
+<code>Free&shy;Library</code>,
+your DLL will still remain in memory because the reference count
+has not yet dropped all the way to zero because you have taken
+a reference to the DLL yourself.
+</p>
+<p>
+When you unregister your callback or your background thread finishes,
+you call
+<code>Free&shy;Library</code> to release your reference to the DLL,
+and if that's the last reference, then the DLL will be unloaded.
+</p>
+<p>
+But wait, now we have a problem.
+When you call
+<code>Free&shy;Library</code> to release your reference to the DLL,
+that call might end up unloading the code that is making the call.
+When the call returns, there is no more code there.
+This most commonly happens when you are calling
+<code>Free&shy;Library</code> on yourself and that was the last reference.
+In rarer circumstances, it happens indirectly through a
+chain of final references.
+</p>
+<p>
+Let's walk through that scenario again, since understanding it is central
+to solving the problem.
+</p>
+<ol>
+<li>Some application calls <code>Load&shy;Library</code> on your DLL.
+    The reference count on your DLL is now 1.</p>
+<li>The application calls a function in your DLL that uses a background
+    thread.</p>
+<li>Your DLL prepares for the background thread by doing a
+    <code>Get&shy;Module&shy;Handle&shy;Ex</code> on itself,
+    to avoid a premature unload.
+    The reference count on your DLL is now 2.</p>
+<li>Your DLL starts the background thread.
+<li>The application decides that it doesn't need your DLL any more,
+    so it calls <code>Free&shy;Library</code>.
+    The reference count on your DLL is now 1.</p>
+<li>Your DLL background thread finishes its main work.
+    The thread procedure ends with the lines</p>
+<pre>
+    FreeLibrary(g_hinstSelf);
+    return 0;
+</pre>
+<li>The thread procedure calls
+    <code>Free&shy;Library(<wbr>g_hinst&shy;Self)</code>
+    to drop its reference count.</p>
+<li>The
+    <code>Free&shy;Library</code> function frees your DLL.</p>
+<li>The
+    <code>Free&shy;Library</code> function returns to its caller,
+    namely your thread procedure.</p>
+<li>Crash, because your thread procedure was unloaded!
+</ol>
+<p>
+This is why you need
+<code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>:
+So that the return address of the <code>Free&shy;Library</code>
+is not in code that's being unloaded by the
+<code>Free&shy;Library</code> itself.
+</p>
+<p>
+Change the last two lines of the thread procedure to
+<code>Free&shy;Library&shy;AndExit&shy;Thread(<wbr>g_hinstSelf, 0);</code>
+and watch what happens.
+The first five steps are the same, and then we take a turn:
+</p>
+<ol START=6>
+<li>Your DLL background thread finishes its main work.
+    The thread procedure ends with a call to</p>
+<pre>
+    FreeLibraryAndExitThread(g_hinstSelf, 0);
+</pre>
+<li>The
+    <code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>
+    function calls
+    <code>Free&shy;Library(<wbr>g_hinst&shy;Self)</code>.</p>
+<li>The
+    <code>Free&shy;Library</code> function frees your DLL.</p>
+<li>The
+    <code>Free&shy;Library</code> function returns to its caller,
+    which is not your thread procedure but rather the
+    <code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>
+    function,
+    which was not unloaded.</p>
+<li>The
+    <code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>
+    function calls <code>Exit&shy;Thread(0)</code>.</p>
+<li>The thread exits and no further code is executed.
+</ol>
+<p>
+That's why the
+<code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>
+function exists:
+So you don't pull the rug out from underneath yourself.
+Instead, you have somebody else pull the rug for you.
+</p>
+<p>
+This issue of keeping your DLL from unloading prematurely
+rears its head in several ways.
+We'll look at some of them in the next few days.
+</p>
+<p>
+<b>Bonus chatter</b>:
+The thread pool version of
+<code>Free&shy;Library&shy;And&shy;Exit&shy;Thread</code>
+is
+<code>Free&shy;Library&shy;When&shy;Callback&shy;Returns</code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (24)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1087613">
+				<div id="div-comment-1087613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087613">
+			November 5, 2013 at 7:08 am</a>		</div>
+
+		<p>Neat trick. I almost never have to worry about unloading DLLs though (except one case where this is inadequate)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matteo odd alt thread-odd thread-alt depth-1" id="comment-1087623">
+				<div id="div-comment-1087623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087623">
+			November 5, 2013 at 7:56 am</a>		</div>
+
+		<p>Definitely a nice trick, I didn&#39;t have any clue of why it could be useful.</p>
+<p>(On an unrelated note, the &lt;ol&gt; are misaligned on Firefox 24/Windows XP, in the &quot;post view&quot; only the last digit of each list number is shown, and in the blog home page only the dot remains visible)</p>
+<div class="post">[<em>It&#39;s a bug in my style sheet that&#39;s been around for a decade. Fixed. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087633">
+				<div id="div-comment-1087633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CarlD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087633">
+			November 5, 2013 at 8:13 am</a>		</div>
+
+		<p>I remember building a mechanism like FreeLibraryAndExitThread years ago &#8211; back in the days NT4 or earlier &#8211; to handle essentially this very scenario. &nbsp;As I recall, the lack of such a feature did make for some difficult to debug bugs until we figured out what was happening.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matteo odd alt thread-odd thread-alt depth-1" id="comment-1087643">
+				<div id="div-comment-1087643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087643">
+			November 5, 2013 at 9:04 am</a>		</div>
+
+		<p>I had to debug similar crashes when writing a plugin for an application; there was no threading involved, but the application managed to unload my dll before I destroyed its window; Visual Studio was quite confused trying to debug the crashes in the now-disappeared window procedure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-joshuaganes even thread-even depth-1" id="comment-1087653">
+				<div id="div-comment-1087653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Joshua+Ganes' rel='external nofollow' class='url'>Joshua Ganes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087653">
+			November 5, 2013 at 9:30 am</a>		</div>
+
+		<p>Wow, this seems like something that would take days of pounding my head against my desk, wall, and other hard objects. Wonderful advice that I, unfortunately, will probably forget just in time to shoot myself in the foot.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1087663">
+				<div id="div-comment-1087663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087663">
+			November 5, 2013 at 10:05 am</a>		</div>
+
+		<p>&gt; How do you prevent your DLL from being unloaded while you still have code running (or have registered callbacks)?</p>
+<p>You have a clear contract for your clients which enforces that all of your background threads are shut down, and all of your callbacks are unregistered, before your .dll is unloaded.</p>
+<div class="post">[<em>And what if you are adding a feature to an existing component, and the existing contract for that component didn&#39;t cover background threads? Or if you don&#39;t control the contract at all (e.g. COM)? -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087673">
+				<div id="div-comment-1087673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mario Vilas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087673">
+			November 5, 2013 at 10:05 am</a>		</div>
+
+		<p>One could build a similar mechanism by manipulating the stack and pointing the return address of LoadLibrary directly to the entry point of ExitThread. Of course, while it&#39;d be clever, it&#39;d never be portable! :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087683">
+				<div id="div-comment-1087683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087683">
+			November 5, 2013 at 10:26 am</a>		</div>
+
+		<p>Hypothetically, one could set one&#39;s own thread procedure parameter to the HMODULE of the library, move ebp to esp to clear the local variables off the stack, and then jump to FreeLibrary rather than calling it. Also not at all portable, but far easier than also manipulating FreeLibrary&#39;s return address.</p>
+<p>Not that I&#39;ve ever done this. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087693">
+				<div id="div-comment-1087693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087693">
+			November 5, 2013 at 11:15 am</a>		</div>
+
+		<p>&gt; Not that I&#39;ve ever done this.</p>
+<p>Hmmm that&#39;s an interesting idea. If FreeLibrary is tail called (note that most archs allow tail call), this would work. It might be possible by passing a certain set of optimization flags to convince the compiler to generate the call as a jmp instruction; but now code correctness depends on exact optimizer flags (a terrible proposition).</p>
+<p>Better to write such fragments in assembly. Then somebody reading it either gives up or can see that it is correct.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087723">
+				<div id="div-comment-1087723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087723">
+			November 5, 2013 at 11:43 am</a>		</div>
+
+		<p>Huh. The blog sees fit to censor what I consider to be quite a mild insult in English, involving the questioning of the legally wedded status of one&#39;s parents. Just in case anyone thought I&#39;d written something much worse there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-1087753">
+				<div id="div-comment-1087753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087753">
+			November 5, 2013 at 2:44 pm</a>		</div>
+
+		<p>&gt; what if you are adding a feature to an existing component, and the existing contract for that component didn&#39;t cover background threads? Or if you don&#39;t control the contract at all (e.g. COM)?</p>
+<p>I don&#39;t understand the question.</p>
+<p>If a contract already exists, you try to work within it and still implement the feature. If the feature is fundamentally incompatible with the contract, you either define a new contract or you change the feature.</p>
+<p>What else can you do?</p>
+<div class="post">[<em>I asked &quot;How do you prevent your DLL from being unloaded prematurely?&quot; and you said, &quot;You write the contract so that is not allowed.&quot; Then I asked, &quot;What if you can&#39;t rewrite the contract?&quot; And you said, &quot;I don&#39;t understand the question. If there is an existing contract, then you try to work within the contract.&quot; And that&#39;s what this article is about: How to work within an existing contract that does not cover background threads. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087763">
+				<div id="div-comment-1087763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087763">
+			November 5, 2013 at 2:47 pm</a>		</div>
+
+		<p>@Myra (*): It was actually possible on NT4 and 2000 to completely unload the .EXE. Closing handle 3 after calling UnmapViewOfFile would get rid of it. On XP and up, the handle isn&#39;t 3 anymore, and I&#39;m told it&#39;s now in-kernel only so userspace cannot close it (if it were merely in another process I&#39;d try the safe variant of the unlocker trick that I have posted here).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087773">
+				<div id="div-comment-1087773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087773">
+			November 5, 2013 at 3:46 pm</a>		</div>
+
+		<p>(e.g. COM)?</p>
+<p>Out-of-process COM. /me ducks</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087783">
+				<div id="div-comment-1087783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087783">
+			November 5, 2013 at 4:27 pm</a>		</div>
+
+		<p>@Joshua: I&#39;d love a /SWAPRUN:ALWAYS linker option.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087793">
+				<div id="div-comment-1087793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087793">
+			November 5, 2013 at 4:45 pm</a>		</div>
+
+		<p>The scary part is that I guessed the correct answer just from the title of the post.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087703">
+				<div id="div-comment-1087703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087703">
+			November 5, 2013 at 11:26 am</a>		</div>
+
+		<p>@Maurits: from the years I&#39;ve read Raymond&#39;s blog, I&#39;ve come to think that contracts are almost entirely mythological in Windows programming. There is Stuff That Works and Stuff That Does Not Work (with shades of Stuff That Nearly Always Works and Stuff That Shouldn&#39;t Work But We&#39;ve Made Damn Sure It Does thrown in, of course), but contracts, no. The kindest thing you can do (for end users) is to assume everyone else is a *** and be as unobtrusive yourself as possible. Forget &quot;trust, but verify&quot; &#8212; make it &quot;assume hostile intent&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087733">
+				<div id="div-comment-1087733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087733">
+			November 5, 2013 at 1:55 pm</a>		</div>
+
+		<p>Too bad there is no _freelibraryandendthreadex to avoid leaking C runtime memory if you use _beginthreadex. &nbsp;Such a thing could be made.</p>
+<p>To avoid the possibility of msvcr*.dll getting unloaded before the calling DLL (because the calling DLL might be the last reference to msvcr*.dll), a hypothetical _freelibraryandendthreadex could increase its own reference count first via the GetModuleHandleExW trick above. &nbsp;msvcr*.dll could free the C runtime memory, FreeLibrary the calling DLL, then FreeLibraryAndExitThread itself to terminate the thread and remove its last reference, possibly also unloading msvcr*.dll.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087743">
+				<div id="div-comment-1087743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087743">
+			November 5, 2013 at 2:01 pm</a>		</div>
+
+		<p>@myself: OK, I&#39;m dumb. &nbsp;If X depends on Y, X will get unloaded(*) before Y, so no special trick is required. &nbsp;Therefore, _freelibraryandendthreadex could be implemented in a straightforward manner.</p>
+<p>(*) If X is the process EXE, neither X nor Y ever actually get unloaded prior to process termination. &nbsp;Instead, they merely get deinitialized with DLL_PROCESS_DETACH as in the DLL case, but then NtTerminateProcess gets called to make the process go &quot;poof&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087813">
+				<div id="div-comment-1087813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087813">
+			November 5, 2013 at 10:56 pm</a>		</div>
+
+		<p>Of course, one must beware of additional stuff that the language adds at scope end. For example, if you have some auto-class that releases on exit (CComPtr, CCoInitialize, etc), its destructor won&#39;t get called, and you&#39;ll have a nasty memory leak on you hands. Solution: Put the &quot;Thread API funny stuff&quot; and nothing else in the thread proc, and call DoSomething() from it &#8211; inside you can use whatever scope-dependent stuff you want.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087823">
+				<div id="div-comment-1087823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087823">
+			November 6, 2013 at 3:07 am</a>		</div>
+
+		<p>XP&#39;s version of Verdana doesn&#39;t seem to have the &lang; or &rang; characters. IE8 just gives up while the browser I&#39;m using substitutes a different font where the characters seem to have lots of ascent and descent for some reason. (I couldn&#39;t work out which font it was though.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087853">
+				<div id="div-comment-1087853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087853">
+			November 6, 2013 at 11:05 am</a>		</div>
+
+		<p>@Neil: &nbsp;And that is related to this issue how, exactly? &nbsp;I&#39;m confused&#8230;. &nbsp;Surely those aren&#39;t the greater-than and less-than characters you&#39;re mentioning.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1087893">
+				<div id="div-comment-1087893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087893">
+			November 6, 2013 at 1:34 pm</a>		</div>
+
+		<p>&gt; Better to write such fragments in assembly.</p>
+<p>Which is exactly what I did when I never did that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1087903">
+				<div id="div-comment-1087903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">aaronla</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1087903">
+			November 6, 2013 at 2:17 pm</a>		</div>
+
+		<p>Threads are awfully expensive. There are times in which you could instead call &quot;FreeLibraryAndSwitchToFiber(hmodule, fiber);&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1088073">
+				<div id="div-comment-1088073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul M. Parks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733#comment-1088073">
+			November 7, 2013 at 12:08 pm</a>		</div>
+
+		<p>@aaronla: The statement &quot;Threads are awfully expensive&quot; is meaningless without context, or at least examples. Fibers are also more trouble than they&#39;re worth, if you&#39;re suggesting using them in place of threads as a general solution. See <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2010/02/26/9969664.aspx">blogs.msdn.com/&#8230;/9969664.aspx</a> </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

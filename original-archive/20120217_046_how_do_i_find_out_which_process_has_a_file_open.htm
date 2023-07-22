@@ -1,0 +1,629 @@
+<html>
+<head>
+<title>How do I find out which process has a file open?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I find out which process has a file open?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 17, 2012 / year-entry #47</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>24</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Classically, there was no way to find out which process has a file open. A file object has a reference count, and when the reference count drops to zero, the file is closed. But there's nobody keeping track of which processes own how many references. (And that's ignoring the case that the reference is not...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Classically, there was no way to find out which process has a file open.
+A file object has a reference count, and when the reference count drops
+to zero, the file is closed.
+But there's nobody keeping track of which processes own how many references.
+(And that's ignoring the case that the reference is not coming from a
+process in the first place; maybe it's coming from a kernel driver,
+or maybe it came from a process that no longer exists but whose reference
+is being kept alive by a kernel driver that
+<a HREF="http://msdn.microsoft.com/library/ff558679.aspx">
+captured the object reference</a>.)
+</p>
+<p>
+This falls into the category of
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2009/02/17/9426787.aspx">
+not keeping track of information you don't need</a>.
+The file system doesn't care who has the reference to the file object.
+Its job is to close the file when the last reference goes away.
+</p>
+<p>
+You do the same thing with your COM object reference counts.
+All you care about is whether your reference count has reached zero
+(at which point it's time to destroy the object).
+If you later discover an object leak in your process,
+you don't have a magic query
+"Show me all the people who called
+<code>AddRef</code> on my object"
+because you never kept track of all the people who called
+<code>AddRef</code> on your object.
+Or even, "Here's an object I want to destroy.
+Show me all the people who called <code>AddRef</code> on it
+so I can destroy them
+and get them to call <code>Release</code>."
+</p>
+<p>
+At least that was the story under the classical model.
+</p>
+<p>
+Enter the
+<a HREF="http://msdn.microsoft.com/library/cc948910.aspx">
+Restart Manager</a>.
+</p>
+<p>
+The official goal of the Restart Manager is to help make it possible to
+shut down and restart applications which are using a file you want
+to update.
+In order to do that, it needs to keep track of which processes are
+holding references to which files.
+And it's that database that is of use here.
+(Why is the kernel keeping track of which processes have a file open?
+Because it's the converse of the principle of not keeping track
+of information you don't need:
+Now it needs the information!)
+</p>
+<p>
+Here's a simple program which takes a file name on the command line
+and shows which processes have the file open.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;RestartManager.h&gt;
+#include &lt;stdio.h&gt;
+
+int __cdecl wmain(int argc, WCHAR **argv)
+{
+ DWORD dwSession;
+ WCHAR szSessionKey[CCH_RM_SESSION_KEY+1] = { 0 };
+ DWORD dwError = RmStartSession(&amp;dwSession, 0, szSessionKey);
+ wprintf(L"RmStartSession returned %d\n", dwError);
+ if (dwError == ERROR_SUCCESS) {
+   PCWSTR pszFile = argv[1];
+   dwError = RmRegisterResources(dwSession, 1, &amp;pszFile,
+                                 0, NULL, 0, NULL);
+   wprintf(L"RmRegisterResources(%ls) returned %d\n",
+           pszFile, dwError);
+  if (dwError == ERROR_SUCCESS) {
+   DWORD dwReason;
+   UINT i;
+   UINT nProcInfoNeeded;
+   UINT nProcInfo = 10;
+   RM_PROCESS_INFO rgpi[10];
+   dwError = RmGetList(dwSession, &amp;nProcInfoNeeded,
+                       &amp;nProcInfo, rgpi, &amp;dwReason);
+   wprintf(L"RmGetList returned %d\n", dwError);
+   if (dwError == ERROR_SUCCESS) {
+    wprintf(L"RmGetList returned %d infos (%d needed)\n",
+            nProcInfo, nProcInfoNeeded);
+    for (i = 0; i &lt; nProcInfo; i++) {
+     wprintf(L"%d.ApplicationType = %d\n", i,
+                              rgpi[i].ApplicationType);
+     wprintf(L"%d.strAppName = %ls\n", i,
+                              rgpi[i].strAppName);
+     wprintf(L"%d.Process.dwProcessId = %d\n", i,
+                              rgpi[i].Process.dwProcessId);
+     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                   FALSE, rgpi[i].Process.dwProcessId);
+     if (hProcess) {
+      FILETIME ftCreate, ftExit, ftKernel, ftUser;
+      if (GetProcessTimes(hProcess, &amp;ftCreate, &amp;ftExit,
+                          &amp;ftKernel, &amp;ftUser) &amp;&amp;
+          CompareFileTime(&amp;rgpi[i].Process.ProcessStartTime,
+                          &amp;ftCreate) == 0) {
+       WCHAR sz[MAX_PATH];
+       DWORD cch = MAX_PATH;
+       if (QueryFullProcessImageNameW(hProcess, 0, sz, &amp;cch) &amp;&amp;
+           cch &lt;= MAX_PATH) {
+        wprintf(L"  = %ls\n", sz);
+       }
+      }
+      CloseHandle(hProcess);
+     }
+    }
+   }
+  }
+  RmEndSession(dwSession);
+ }
+ return 0;
+}
+</pre>
+<p>
+The first thing we do is call, no wait, even before we call
+the <code>Rm&shy;Start&shy;Session</code> function, we have the line
+</p>
+<pre>
+ WCHAR szSessionKey[CCH_RM_SESSION_KEY+1] = { 0 };
+</pre>
+<p>
+That one line of code addresses two bugs!
+</p>
+<p>
+First is a documentation bug.
+The documentation for the
+<code>Rm&shy;Start&shy;Session</code> function doesn't specify
+how large a buffer you need to pass for the session key.
+The answer is <code>CCH_<wbr>RM_<wbr>SESSION_<wbr>KEY+1</code>.
+</p>
+<p>
+Second is a code bug.
+The
+<code>Rm&shy;&shy;StartSession</code> function doesn't properly
+null-terminate the session key, even though the function
+is documented as returning a null-terminated string.
+To work around this bug, we pre-fill the buffer with null characters
+so that whatever ends gets written will have a null terminator
+(namely, one of the null characters we placed ahead of time).
+</p>
+<p>
+Okay, so that's out of the way.
+The basic algorithm is simple:
+</p>
+<ol>
+<li>Create a Restart Manager session.
+<li>Add a file resource to the session.
+<li>Ask for a list of all processes affected by that resource.
+<li>Print some information about each process.
+<li>Close the session.
+</ol>
+<p>
+We already mentioned that you create the session by calling
+<code>Rm&shy;Start&shy;Session</code>.
+Next, we add a single file resource to the session by
+calling <code>Rm&shy;Register&shy;Resources</code>.
+</p>
+<p>
+Now the fun begins.
+Getting the list of affected processes is normally a two-step
+affair.
+First, you ask for the number of affected processes
+(by passing <code>0</code> as the <code>nProcInfo</code>),
+then allocate some memory and call a second time to get the data.
+But this is just a sample program, so I've hard-coded a limit
+of ten processes.
+If more than ten processes are affected, I just give up.
+(You can see this if you ask for all the processes that
+have open handles to <code>kernel32.dll</code>.)
+</p>
+<p>
+The other tricky part is mapping the <code>RM_<wbr>PROCESS_<wbr>INFO</code>
+to an actual process.
+Since process&nbsp;IDs can be recycled,
+the
+<code>RM_<wbr>PROCESS_<wbr>INFO</code> structure identifies a process
+by the combination of the process&nbsp;ID and the process creation time.
+That combination is unique because two processes cannot have the same
+ID at the same time.
+We open the handle to the process via its ID, then confirm that the
+start times match.
+(If not, then
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/08/26/10054386.aspx#10054750">
+the ID refers to a process that exited</a>
+during the
+time we obtained the list and the time we actually looked at it.)
+Assuming it all matches, we get the image name and print it.
+</p>
+<p>
+And that's all there is to enumerating all the processes that have
+a particular file open.
+Of course, a more expressive interface for managing files in use
+is
+<code>IFileIsInUse</code>,
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/08/06/10046812.aspx">
+which I mentioned some time ago</a>.
+That interface not only tells you the application that has the file open
+(in a friendlier format than just an executable path),
+you can also use it to switch to the application and even ask it to
+close the file.
+(Windows&nbsp;7 first tries <code>IFileIsInUse</code>,
+and if that fails, then it goes to the Restart Manager.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (24)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-967323">
+				<div id="div-comment-967323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967323">
+			February 17, 2012 at 7:11 am</a>		</div>
+
+		<p>In regards to the two bugs, please excuse me while I scream in frustration. &nbsp;The first bug I can chalk up to a simple documentation oversight; MSDN documentation doesn&#39;t exactly have a stellar history (though it is better than it used to be). &nbsp;But the second bug, failing to NULL-terminate an out string? &nbsp;My eyes, the goggles do nothing!</p>
+<div class="post">[<i>As I recall, the null termination bug occurs only if the session key name length is exactly CCH_RM_SESSION_KEY. My guess is that <a href="http://blogs.msdn.com/b/oldnewthing/archive/2005/01/07/348437.aspx" rel="nofollow">by trying to prevent a buffer overrun, they accidentally introduced one</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967333">
+				<div id="div-comment-967333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jcs</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967333">
+			February 17, 2012 at 7:32 am</a>		</div>
+
+		<p>So, if this is possible, then why doesn&#39;t Windows tell me which process has a file open when I can&#39;t safely remove my external hard drive or USB key?</p>
+<p>Frequently, nothing short of logging off and logging on again allows me to remove my device.</p>
+<div class="post">[<i>Please read the article again. You have to know the name of the file first. There is no wildcard query like &quot;all files on this drive, even the ones that I don&#39;t have permission to access or even know the existence of.&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967343">
+				<div id="div-comment-967343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967343">
+			February 17, 2012 at 7:42 am</a>		</div>
+
+		<p>Neat, I didn&#39;t know that API existed. &nbsp;I wonder when Process Explorer will be updated to use it; it still searches through all handles in all processes to find open handles to a given file (or at least that&#39;s what I assume it does, given that it takes a couple of seconds to do the search).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967353">
+				<div id="div-comment-967353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BOFH</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967353">
+			February 17, 2012 at 8:02 am</a>		</div>
+
+		<p>Isn&#39;t this what handle.exe does?</p>
+<p>I&#39;ve used it for years to find out what process is holding up some file, so I can kill the process and delete the file:</p>
+<p><a rel="nofollow" target="_new" href="http://technet.microsoft.com/en-us/sysinternals/bb896655" rel="nofollow">technet.microsoft.com/&#8230;/bb896655</a></p>
+<p>I remember there was predecessor many years ago, called nthandle.exe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967363">
+				<div id="div-comment-967363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967363">
+			February 17, 2012 at 8:25 am</a>		</div>
+
+		<p>Man, this is gonna come in handy.</p>
+<p>Incidentally, the classical model still allows for this by walking the open handle tables of all processes and comparing device &amp; file identity. Even though Windows has a poor idea of device identity in user mode, there must be a good identity in kernel mode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967373">
+				<div id="div-comment-967373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PSjr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967373">
+			February 17, 2012 at 8:42 am</a>		</div>
+
+		<p>You can also use Process Explorer to search for open file handles and which process is holding a file open. It&#39;s dangerous but you can also kill the file handle, and many other types of handles.</p>
+<p><a rel="nofollow" target="_new" href="http://technet.microsoft.com/en-us/sysinternals/bb896653.aspx" rel="nofollow">technet.microsoft.com/&#8230;/bb896653.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jader3rd even thread-even depth-1" id="comment-967383">
+				<div id="div-comment-967383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/jader3rd' rel='external nofollow' class='url'>jader3rd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967383">
+			February 17, 2012 at 9:04 am</a>		</div>
+
+		<p>I thought that the system would need to keep track of what processes had which files open because not all processes clean up nicely. If a process is killed how does it decrement the reference count to the file?</p>
+<div class="post">[<i>The system knows, for each process, what files (more specifically, handles) it has open. But it classically did not maintain a reverse mapping (for each file, what processes have it open). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967393">
+				<div id="div-comment-967393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Schroedl</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967393">
+			February 17, 2012 at 10:32 am</a>		</div>
+
+		<p>For those playing along at home in visual studio (like me), you may want to add:</p>
+<p>#pragma comment(lib,&quot;Rstrtmgr.lib&quot;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967403">
+				<div id="div-comment-967403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967403">
+			February 17, 2012 at 10:37 am</a>		</div>
+
+		<p>[Please read the article again. You have to know the name of the file first. There is no wildcard query like &quot;all files on this drive, even the ones that I don&#39;t have permission to access or even know the existence of.&quot; -Raymond]</p>
+<p>Are you saying I have no permission to yank out my usb stick 20cm infront of me?</p>
+<p>w9x didn&#39;t have these kind of locking, and it worked fine. File handles which lock up file &amp; folders in NT doesn&#39;t guarantee anything for apps anyway. It&#39;s only a inconvenience for users. Please bring back the old behaviour please.</p>
+<div class="post">[<i>No, I&#39;m saying that Rsetart Manager doesn&#39;t help you solve this problem. Because today&#39;s topic is Restart Manager, right? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967413">
+				<div id="div-comment-967413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967413">
+			February 17, 2012 at 10:41 am</a>		</div>
+
+		<p>Yet another Microsoft API designed with an in-built race condition. When are you going to learn that &quot;call for buffer size/call for data&quot; is a flawed design in a multi-tasking operating system?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967433">
+				<div id="div-comment-967433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967433">
+			February 17, 2012 at 11:11 am</a>		</div>
+
+		<p>640k: Are you saying that Windows has a way to prevent you from yanking out your USB device?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967443">
+				<div id="div-comment-967443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967443">
+			February 17, 2012 at 12:00 pm</a>		</div>
+
+		<p>But is there a way to tell which process locking a file if file handle already been closed but that file is still mapped into process memory?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967453">
+				<div id="div-comment-967453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967453">
+			February 17, 2012 at 12:25 pm</a>		</div>
+
+		<p>@Jon:</p>
+<p>Because the alternative is worse.</p>
+<p>The alternative would be to have the API allocate some memory for you and return the data. &nbsp;(Remember that the OS uses a C-based API so it cannot return an object except via handle) &nbsp;Now you have either a handle to clean up or some memory that you have to remember to call HeapFree (or LocalFree or GlobalFree or something else)</p>
+<p>And even if the OS did all that, it STILL doesn&#39;t solve the problem because while it was busy allocating memory and filling your buffer some other thread or process could have jumped in and changed things. &nbsp;Unless, of course, you want the OS to synchronize access to the underlying resource collection and now you are in Denial of Service attack mode &#8212; all you have to do is write a process that continuously runs the query and writes will be delayed or even prevented.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967473">
+				<div id="div-comment-967473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ordag</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967473">
+			February 17, 2012 at 12:43 pm</a>		</div>
+
+		<p>@BOFH @Adam Rosenfield</p>
+<p>This is not an alternative for what Process Explorer or Handles.exe are doing, they are both enumerating all handles, opened files are just one type of them.</p>
+<p>You still need QuerySystemInformation filtered for the specific process for that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-967503">
+				<div id="div-comment-967503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967503">
+			February 17, 2012 at 6:29 pm</a>		</div>
+
+		<p>Does the Restart Manager talk to network shares too? I think it&#39;s still a common practice for opening applications on central shared folder in coperations. If system sees the updated folder is a shared folder, will it by some sort of magic send notification through the Server/Workstation service to the list of openers, and then let the remotes Restart Manager handle it accordingly?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-xpclientgmail-com odd alt thread-odd thread-alt depth-1" id="comment-967513">
+				<div id="div-comment-967513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/xpclient' rel='external nofollow' class='url'>xpclient</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967513">
+			February 17, 2012 at 8:18 pm</a>		</div>
+
+		<p>Does Explorer try IFileIsInUse for every single file operation? Why do I still get messages like this: <a rel="nofollow" target="_new" href="http://www.aerotaskforce.com/view/878" rel="nofollow">http://www.aerotaskforce.com/&#8230;/878</a> and <a rel="nofollow" target="_new" href="http://www.windows7taskforce.com/view/2288" rel="nofollow">http://www.windows7taskforce.com/&#8230;/2288</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967463">
+				<div id="div-comment-967463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken Hagan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967463">
+			February 17, 2012 at 12:38 pm</a>		</div>
+
+		<p>@Jon</p>
+<p>Any API that lets you retrieve information has a &quot;race condition&quot; in the sense that the information may be out of date by the time the caller does anything with the information. The kernel is entitled to swap you out (for several hours if it is feeling particularly perverse) after *any* instruction, even RET.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967493">
+				<div id="div-comment-967493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Leo Davidson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967493">
+			February 17, 2012 at 3:38 pm</a>		</div>
+
+		<p>@SimonRev: I don&#39;t see why the alternative is worse, and plenty of Win32 APIs *do* use the alternative.</p>
+<p>It&#39;s only better for the application to have to allocate the buffer itself in fairly rare situations. e.g. When it&#39;s likely that the app will already have a buffer that&#39;s probably big enough, and will be calling the API repeatedly, in a tight loop where re-allocating the buffer on each iteration would incur significant costs.</p>
+<p>In this case, and with most other APIs, the caller is almost certainly going to allocate a one-off buffer and then free it after a one-off API call. So the operating system might as well do that itself, and provide a way to free the buffer (or more likely just tell people to use an existing API like CoTaskMemFree).</p>
+<p>And the OS does not have to handle synchronizing the resources or any of that stuff. It just has to handle the &quot;check size, allocate, request data; loop if the data is too big now&quot; logic. Because that is the kind of logic that only needs to be written in one place &#8212; the OS &#8212; rather than in every single application, and it&#39;s also the kind of logic that programmers often get wrong or don&#39;t even realise they need to write in the first place.</p>
+<p>Having that kind of loop (or wrapper function) around so many API calls in Win32 programs really gets in the way for, most of the time, zero benefit. Having to think about that stuff, instead of calling a simple API and moving on, takes you out of writing (or later reading) the main flow/logic of the code.</p>
+<p>That said, you have to start a &quot;session&quot; with the restart manager, so maybe it takes a snapshot of the system state at the start of that and there isn&#39;t a race condition here?</p>
+<p>RE the null-termination bug in the API, I&#39;m glad my paranoia about passing Win32 APIs buffers one null longer than I tell them ia vindicated. :) The docs are rarely explicit about null termination in those cases.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967523">
+				<div id="div-comment-967523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nicholas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967523">
+			February 18, 2012 at 5:40 am</a>		</div>
+
+		<p>What wrong with fuser? Oh&#8230; yes&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967543">
+				<div id="div-comment-967543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">grumpy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967543">
+			February 18, 2012 at 9:19 am</a>		</div>
+
+		<p>So, in a few more versions lsof will come along? Neat. ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967553">
+				<div id="div-comment-967553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967553">
+			February 19, 2012 at 6:05 am</a>		</div>
+
+		<p>The ability to see which process has a file open was necessary long before this Restart Manager came along. Many of us have been seeing Explorer&#39;s irritating dialogue boxes when you try to delete / move / &amp;c. a file that&#39;s in use. Fortunately Process Hacker can figure out which process uses it.</p>
+<p>@Simon Rev &amp;c: Having the OS allocate a block of memory isn&#39;t a bad thing; in the case of text strings many APIs already return BSTRs (which you must then free later) and calls to those are much less likely to be buggy.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967603">
+				<div id="div-comment-967603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967603">
+			February 20, 2012 at 8:31 am</a>		</div>
+
+		<p>Choice of allocator is probably not that useful today, but the main benefit of this style of API is that you can but the buffer on the stack (in cases where you know the data can only be so large).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-967663">
+				<div id="div-comment-967663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/analisnudesette_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>analisnudesette@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967663">
+			February 20, 2012 at 2:32 pm</a>		</div>
+
+		<p>@John: You can rarely know for sure how large is large enough, especially in functions that allow you to call them once to get the buffer size, then call them again to get the actual data.</p>
+<p>If there was a max size known in advance then the API would just tell you to use that size and not bother with the first call at all. And that kind of thinking is why we&#39;re still limited to 260 character paths in a lot of places.</p>
+<p>Allocating the buffer on the stack in this case saves you nothing in reality. You are not going to call the Restart Manager APIs in a tight loop, and the performance/resource differences between a stack and heap allocation will never matter in this situation.</p>
+<p>In code that gets called in a tight loop, it might make sense to try a stack-based buffer first and then fall back on the heap to cover the rare (but far from impossible) cases where something larger is needed. That&#39;s a lot of complexity (i.e. potential bugs) if it isn&#39;t needed, though.</p>
+<p>Don&#39;t forget that you need to try the stack buffer, then it if isn&#39;t big enough try an allocated buffer, then, if that isn&#39;t big enough (because the data changed between calls), loop and try a bigger allocated buffer, and keep looping until it works or you hit a sanity-check loop/size limit or until the OS refuses to allocate something that large&#8230;</p>
+<p>If it really matters for an API, the OS could always provide two versions of the API, one a wrapper around the other which handles the allocation logic and saves everyone else having to write and test that code in their apps.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-967673">
+				<div id="div-comment-967673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120217-00/?p=8283#comment-967673">
+			February 20, 2012 at 8:28 pm</a>		</div>
+
+		<p>Some APIs are generalized, though; something like GetTokenInformation where some parameters have fixed or maximum sizes while others do not. &nbsp;Having the caller manage the buffer also allows you to use constructs like vectors or smart pointers without making extra copies or having to deal with raw pointers. &nbsp;The OS generally doesn&#39;t provide wrapper functions that are trivial to implement yourself. &nbsp;Personally I prefer flexibility over simplicity in this particular case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

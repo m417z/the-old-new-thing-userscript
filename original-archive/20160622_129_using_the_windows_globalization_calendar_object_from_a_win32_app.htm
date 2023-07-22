@@ -1,0 +1,580 @@
+<html>
+<head>
+<title>Using the Windows::Globalization::Calendar object from a Win32 app</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using the Windows::Globalization::Calendar object from a Win32 app</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 22, 2016 / year-entry #130</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">An introduction to projection.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The
+<a HREF="https://msdn.microsoft.com/library/windows/apps/windows.globalization.calendar(v=win.10).aspx">
+<code>Windows.<wbr>Globalization.<wbr>Calendar</code>
+object</a>
+is documented as supported for use by both Windows Store apps
+and desktop apps.
+The UWP samples repo has a
+<a HREF="http://go.microsoft.com/fwlink/p/?LinkId=624043">
+Calendar sample</a>
+that demonstrates how to use it from a Windows Store app,
+but how do you use it from a desktop app?
+</p>
+<p>
+That's our motivation for looking at the Windows Runtime ABI.
+Normally, these objects are consumed via a mechanism known as
+<i>projection</i>,
+whereby the low-level ABI guts of the Windows Runtime are
+adapted to the usage pattern of a target language,
+so that the objects feel more like language native objects.&sup1;
+That's great if you're using a projected language like
+C++/CX, C#, or JavaScript,
+but if you want to use raw C++, then you're going to be talking
+to the ABI.
+</p>
+<p>
+Crash course in projection:
+</p>
+<table BORDER=1 BORDERCOLOR=black CELLPADDING=3
+    style="border-collapse: collapse">
+<tr>
+<th></th>
+<th>Create an object</th>
+</tr>
+<tr>
+<th>ABI</th>
+<td><code>IWidget* widget;<br>
+    ActivateInstance(L"Widget", &amp;widget);</code></td>
+</tr>
+<tr>
+<th>C++/CX</th>
+<td><code>auto widget = ref new Widget();</code></td>
+</tr>
+<tr>
+<th>C#</th>
+<td><code>var widget = new Widget();</code></td>
+</tr>
+<tr>
+<th>JavaScript</th>
+<td><code>var widget = new Widget();</code></td>
+</tr>
+</table>
+<p>
+At the ABI level, you use
+<code>Activate&shy;Instance</code> to create an object;
+this projects as a parameterless constructor.
+We'll look at parameterized constructors some other time.
+</p>
+<p>
+Method calls at the ABI level look pretty much like method
+calls in projection, except that output parameters are passed
+explicitly as [out] parameters rather than as the return value
+of the method.
+(The return value of ABI methods is always <code>HRESULT</code>.
+We'll look at projected <code>HRESULT</code>s later.)
+</p>
+<table BORDER=1 BORDERCOLOR=black CELLPADDING=3
+    style="border-collapse: collapse">
+<tr>
+<th></th>
+<th COLSPAN=2>Invoke a method</th>
+</tr>
+<tr>
+<th></th>
+<th>no return value</th>
+<th>with return value</th>
+</tr>
+<tr>
+<th>ABI</th>
+<td><code>widget-&gt;Method();</code></td>
+<td><code>widget-&gt;Method(&amp;result);</code></td>
+</tr>
+<tr>
+<th>C++/CX</th>
+<td><code>widget-&gt;Method();</code></td>
+<td><code>result = widget-&gt;Method();</code></td>
+</tr>
+<tr>
+<th>C#</th>
+<td><code>widget.Method();</code></td>
+<td><code>result = widget.Method();</code></td>
+</tr>
+<tr>
+<th>JavaScript</th>
+<td><code>widget.method();</code></td>
+<td><code>result = widget.method();</code></td>
+</tr>
+</table>
+<p>
+Notice that the first character of the
+method name is converted to lowercase by
+the JavaScript projection, so that it matches existing
+JavaScript convention.
+</p>
+<p>
+And the last piece of projection for today:
+Properties.
+</p>
+<table BORDER=1 BORDERCOLOR=black CELLPADDING=3
+    style="border-collapse: collapse">
+<tr>
+<th></th>
+<th>Read property</th>
+<th>Write property</th>
+</tr>
+<tr>
+<th>ABI</th>
+<td><code>widget-&gt;get_Foo(&amp;v);</code></td>
+<td><code>widget-&gt;put_Foo(v);</code></td>
+</tr>
+<tr>
+<th>C++/CX</th>
+<td><code>v = widget-&gt;Foo;</code></td>
+<td><code>widget-&gt;Foo = v;</code></td>
+</tr>
+<tr>
+<th>C#</th>
+<td><code>v = widget.Foo;</code></td>
+<td><code>widget.Foo = v;</code></td>
+</tr>
+<tr>
+<th>JavaScript</th>
+<td><code>v = widget.foo;</code></td>
+<td><code>widget.foo = v;</code></td>
+</tr>
+</table>
+<p>
+Okay, we now know just enough to be dangerous.
+We'll write a little console program to get the current date,
+get the name of the day of the week in a form intended to be
+displayed on its own,
+get the last day of the current month,
+then skip forward six months and check whether daylight saving
+time will be in effect.
+Remember, Little Programs do little to no error checking.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;wrl/client.h&gt;                // WRL::ComPtr
+#include &lt;wrl/wrappers/corewrappers.h&gt; // WRL::Wrappers
+#include &lt;windows.globalization.h&gt;     // Windows::Globalization
+#include &lt;stdio.h&gt;
+
+namespace WRL = Microsoft::WRL;
+
+int main(int argc, wchar_t** argv)
+{
+  <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20040520-00/?p=39243">CCoInitialize</a> init;
+
+  // C++/CX: auto cal = ref new Windows::Globalization::Calendar();
+  WRL::ComPtr&lt;ABI::Windows::Globalization::ICalendar&gt; cal;
+  Windows::Foundation::ActivateInstance(
+    WRL::Wrappers::HStringReference(
+      RuntimeClass_Windows_Globalization_Calendar).Get(), &amp;cal);
+
+  // C++/CX: auto dayOfWeek = cal-&gt;DayOfWeekAsFullSoloString();
+  WRL::Wrappers::HString dayOfWeek;
+  cal-&gt;DayOfWeekAsFullSoloString(dayOfWeek.GetAddressOf());
+
+  wprintf(L"%ls\n", dayOfWeek.GetRawBuffer(nullptr));
+
+  // C++/CX: lastDayThisMonth = cal-&gt;LastDayInThisMonth;
+  INT32 lastDayThisMonth;
+  cal-&gt;get_LastDayInThisMonth(&amp;lastDayThisMonth);
+  wprintf(L"Last day in this month is %d\n", lastDayThisMonth);
+
+  // C++/CX: cal-&gt;AddMonths(6);
+  cal-&gt;AddMonths(6);
+
+  // C++/CX: isDST = cal-&gt;IsDaylightSavingTime;
+  boolean isDST;
+  cal-&gt;get_IsDaylightSavingTime(&amp;isDST);
+
+  wprintf(L"DST six months from now? %ls\n", isDST ? L"Yes" : L"No");
+
+  return 0;
+}
+</pre>
+<p>
+The raw C++ code is a straightforward translation of the
+corresponding C++/CX code.
+One thing to note is that we used the symbol
+<code>Runtime&shy;Class<wbr>_Windows_<wbr>Globalization_<wbr>Calendar</code>
+rather than hard-coding the string
+<code>L"Windows.<wbr>Globalization.<wbr>Calendar"</code>.
+</p>
+<p>
+Another thing to note is that Windows Runtime strings are
+handled in the form of <code>HSTRING</code>s,
+which
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20160615-00/?p=93675">
+we discussed a little while ago</a>.
+</p>
+<p>
+&sup1;Another approach is
+<a HREF="http://moderncpp.com/">Modern C++</a>,
+which is effectively a projection of the Windows Runtime
+into native C++.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1 parent" id="comment-1253416">
+				<div id="div-comment-1253416" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253416">
+			June 22, 2016 at 7:20 am</a>		</div>
+
+		<p>I had the unfortunate requirement of using a WinRT API in a win32 app that also supports older SDKs and MinGW (shameless plug; <a href="https://github.com/WndSks/Win32WinRTInterop_ShareContractSource" rel="nofollow">https://github.com/WndSks/Win32WinRTInterop_ShareContractSource</a> ) and that was not fun, never doing that again. When trying to do it at the lowest level you have to interact with interfaces that seem to be computer-generated, there are hundreds of them, all with really long names and probably not meant to be used by any human.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1253575">
+				<div id="div-comment-1253575" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253575">
+			June 23, 2016 at 9:42 am</a>		</div>
+
+		<p>Yup. The interfaces were designed to be projected into something less awkward to use. There wasn&#8217;t much expectation that human beings would deal with them directly.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-wndsks even depth-3 parent" id="comment-1253585">
+				<div id="div-comment-1253585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253585">
+			June 23, 2016 at 10:03 am</a>		</div>
+
+		<p>Why was there not much expectation? Why was the share API never promoted for use in desktop apps? It does not even work correctly in desktop apps until Win10. MS usually want apps to light up on newer versions. In the past this was GetProcAddress and trying to create the new COM interfaces but starting with Win8 there were basically no new shell features and no helper functions for dealing with the new WinRT stuff. It&#8217;s the same story with Action Center in 10, no shell32 goodies and I don&#8217;t want to generate XML and deal with low-level undocumented interfaces just to get basic notification and tile support.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4" id="comment-1253595">
+				<div id="div-comment-1253595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253595">
+			June 23, 2016 at 10:11 am</a>		</div>
+
+		<p>As you may have noticed, Windows 8 had a specific point of view with respect to separating new from old.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip even thread-odd thread-alt depth-1 parent" id="comment-1253425">
+				<div id="div-comment-1253425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253425">
+			June 22, 2016 at 7:29 am</a>		</div>
+
+		<p>Hmm, that link to the CCoInitialize class is using CoInitialize and CoUninitialize.<br />
+I thought that when you used any WinRT objects in an application, you had to use RoInitialize.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1253435">
+				<div id="div-comment-1253435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Curious</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253435">
+			June 22, 2016 at 8:57 am</a>		</div>
+
+		<p>&#8220;The Windows Runtime provides the RoInitialize function, which is a thin wrapper around CoInitializeEx.<br />
+Despite the fact that CoInitializeEx is usually sufficient, I suggest you use RoInitialize. This function allows future improvements to be made to the Windows Runtime without potentially breaking classic COM. It’s analogous to OleInitialize, which also calls CoInitializeEx and then some. The point is that there’s nothing mysterious about your application’s main thread.&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-chris_guzak even depth-3 parent" id="comment-1253505">
+				<div id="div-comment-1253505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Chris+Guzak' rel='external nofollow' class='url'>Chris Guzak</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253505">
+			June 22, 2016 at 3:33 pm</a>		</div>
+
+		<p>CoInit and RoInit do the same thing in desktop apps. they have slightly different behavior in modern processes. this can never change so it is fine to depend on it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-wndsks odd alt depth-4" id="comment-1253546">
+				<div id="div-comment-1253546" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253546">
+			June 23, 2016 at 7:27 am</a>		</div>
+
+		<p>Citation needed?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip even depth-4" id="comment-1253698">
+				<div id="div-comment-1253698" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253698">
+			June 24, 2016 at 3:02 am</a>		</div>
+
+		<p>This is actually directly contradictory to the official MSDN documentation.<br />
+The documentation for CoInitializeEx actually says<br />
+&#8220;You should call Windows::Foundation::Initialize to initialize the thread instead of CoInitializeEx if you want to use the Windows Runtime APIs or if you want to use both COM and Windows Runtime components. Windows::Foundation::Initialize is sufficient to use for COM components.&#8221;<br />
+If you notice, it doesn&#8217;t limit it to WinRT API in new processes, so it also includes WinRT API in Win32 processes too. Another thing to note, Windows::Foundation::Initialize is in roapi and it calls RoInitialize.<br />
+Using CoInitializeEx actually feels like a compatibility issue waiting to happened.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1253455">
+				<div id="div-comment-1253455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivan k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253455">
+			June 22, 2016 at 9:11 am</a>		</div>
+
+		<p>I tried disambiguation. Is it a pattern? <a href="https://en.m.wikipedia.org/wiki/Projection" rel="nofollow">https://en.m.wikipedia.org/wiki/Projection</a>. Anyways must be something like that DirectX absrtacting graphics thing?. Anyway, I&#8217;m more interested in typescript at the moment. Because Javacscript isn&#8217;t the best, even with hints. &#8220;Ansi C&#8221; Javascript would be awesome.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1253475">
+				<div id="div-comment-1253475" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253475">
+			June 22, 2016 at 10:07 am</a>		</div>
+
+		<p><a href="https://www.infoq.com/presentations/windows-api-winrt" rel="nofollow">https://www.infoq.com/presentations/windows-api-winrt</a> </p>
+<p>A little over 16 minutes in.  It is a way of presenting WinRT objects so that they appear native to the language.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matthew-manelahotmail-com odd alt depth-2" id="comment-1253495">
+				<div id="div-comment-1253495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matthew+Manela' rel='external nofollow' class='url'>Matthew Manela</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253495">
+			June 22, 2016 at 11:51 am</a>		</div>
+
+		<p>Projection is a fairly widely used term with many meanings, both in computer science and in plenty of other disciplines. A common theme to the various meanings is that it usually involves a transformation that changes form but preserves function or meaning in some way. Think of shadow puppets: you are using light to project an image of your 3 dimensional hand onto a 2 dimensional surface. The form is changed because you&#8217;re losing a dimension, but it&#8217;s still an image of your hand, so in a sense the original meaning was preserved.</p>
+<p>In computer science in general, this pattern is followed. Projection usually means taking some concept, code, api, what have you, and then transforming it in some way that is useful, but still preserves the original semantics as much as possible. This applies to the specific case Raymond is talking about: the low-level ABI is projected into the syntax and usage of each different language, but the semantics are preserved: calling widget.Method() in C# or widget.method() in JavaScript or widget-&gt;Method() in C++/CX will all end up running the same widget code. They&#8217;re just adapted to the conventions of each language.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1253485">
+				<div id="div-comment-1253485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt (Visual Studio and Development Technologies MVP with C++ focus)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253485">
+			June 22, 2016 at 10:12 am</a>		</div>
+
+		<p>Wasn&#8217;t it enough to have bool, _Bool, BOOL, and BOOLEAN?  Do we really need to add &#8220;boolean&#8221; on top of all that?  Should we look forward to types named boole, Boole, and BOOLE?</p>
+<p>Also, this &#8220;direct access&#8221; looks messier than real-COM-with-smart-pointers.  Are all the `GetAddressOf()` calls an artifact of the `WRL::ComPtr` choice of smart pointer?  Is there a choice?  (Note that I don&#8217;t want HRESULTs wrapped in exceptions and thrown, like the &#8220;Modern C++ Windows Runtime&#8221;&#8230; I just want my smart pointers to be smart, not get in the way)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-hardon odd alt depth-2 parent" id="comment-1253555">
+				<div id="div-comment-1253555" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/gdalsnes' rel='external nofollow' class='url'>gdalsnes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253555">
+			June 23, 2016 at 7:57 am</a>		</div>
+
+		<p>Wonder why it is not called Boolean, like System.Boolean, instead of inventing a new type that doesn&#8217;t exist in .NET.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-3" id="comment-1253565">
+				<div id="div-comment-1253565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253565">
+			June 23, 2016 at 9:40 am</a>		</div>
+
+		<p>If it were called Boolean, then wouldn&#8217;t it conflict with System.Boolean? And if it reused the type from System.Boolean, how would you use it from JavaScript?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt depth-2" id="comment-1253645">
+				<div id="div-comment-1253645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253645">
+			June 23, 2016 at 2:50 pm</a>		</div>
+
+		<p>boolean is at least 10 years old. It is unsigned char just like NTs BOOLEAN but maybe in those days they were still trying to maintain a strict wall between Win API and NT API for anyone outside MS.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-robrobpaveza-net even thread-even depth-1" id="comment-1253625">
+				<div id="div-comment-1253625" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Rob+Paveza+%5Bmsft%5D' rel='external nofollow' class='url'>Rob Paveza [msft]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253625">
+			June 23, 2016 at 1:45 pm</a>		</div>
+
+		<p>Two nits: 1.) While generally pushed, not all ABI methods must return an HRESULT, but if they don&#8217;t, they can&#8217;t throw exceptions.  2.) You shouldn&#8217;t use CCoInitialize there.  &#8220;New applications should call CoInitializeEx instead of CoInitialize. If you want to use the Windows Runtime, you must call Windows::Foundation::Initialize instead.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1253925">
+				<div id="div-comment-1253925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253925">
+			June 27, 2016 at 3:28 am</a>		</div>
+
+		<p>Uhm, if I need both OLE (e.g. drag&amp;drop) and Windows Runtime (e.g. compass), what should I call (CoInitializeEx, OleInitialize, RoInitialize, Windows::Foundation::Initialize, something else) and in which order?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-wndsks even depth-2 parent" id="comment-1253945">
+				<div id="div-comment-1253945" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253945">
+			June 27, 2016 at 7:55 am</a>		</div>
+
+		<p>You can stack STA Co* and Ole*: HRESULT hr = OleInitialize(); if (SUCCEEDED(hr)) DoSomething(), OleUninitialize();</p>
+<p>I would assume that you can stack MTA Co* and Ro* as well?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1253965">
+				<div id="div-comment-1253965" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160622-00/?p=93725#comment-1253965">
+			June 27, 2016 at 8:46 am</a>		</div>
+
+		<p>Almost.</p>
+<p>You see, Windows::Foundation::Initialize ( <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/hh404185.aspx" rel="nofollow">https://msdn.microsoft.com/en-us/library/windows/desktop/hh404185.aspx</a> ) mentions that the otherwise undocumented RO_INIT_SINGLETHREADED flag is not supported for desktop applications.</p>
+<p>At best, you can use it in an MTA thread, but that implies marshaling.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

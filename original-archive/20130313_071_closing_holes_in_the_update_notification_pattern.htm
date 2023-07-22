@@ -1,0 +1,581 @@
+<html>
+<head>
+<title>Closing holes in the update notification pattern</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Closing holes in the update notification pattern</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 13, 2013 / year-entry #72</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Suppose you have a function that is registered to be called the next time something gets updated, and suppose that the notification is a one-shot notification and needs to be re-armed each time you want to wait for the next notification. (For example, the Reg�Notify�Change�Key�Value function behaves this way.) Consider the following code fragment: void...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Suppose you have a function that is registered to be called
+the next time something gets updated,
+and suppose that the notification is a one-shot
+notification and
+needs to be re-armed each time you want to
+wait for the next notification</a>.
+(For example, the
+<a HREF="http://msdn.microsoft.com/library/ms724892.aspx">
+<code>Reg&shy;Notify&shy;Change&shy;Key&shy;Value</code></a>
+function behaves this way.)
+Consider the following code fragment:
+</p>
+<pre>
+<i>void onUpdateThing()
+{
+ // get the updated properties of the thing
+ getThingProperties();
+
+ // ask to be called back the next time it updates
+ registerUpdateCallback(onUpdateThing);
+}</i>
+
+mainProgram()
+{
+ // get the thing's initial properties
+ // and register for updates
+ onUpdateThing();
+}
+</pre>
+<p>
+There is a race condition here if the thing updates
+twice in rapid succession.
+On the first update, your <code>onUpdateThing</code>
+function is called.
+If the second update occurs
+<i>while <code>get&shy;Thing&shy;Properties</code> is running</i>,
+then your call to
+<code>register&shy;Update&shy;Callback</code> will be too late,
+and you will miss the second update.
+</p>
+<p>
+The solution is to register for the next update <i>before</i>
+studying the previous one.
+</p>
+<pre>
+void onUpdateThing()
+{
+ // ask to be called back the next time it updates
+ registerUpdateCallback(onUpdateThing);
+
+ // get the updated properties of the thing
+ getThingProperties();
+}
+</pre>
+<p>
+That way, if a second update comes in while you're studying
+the first one,
+your update callback will be called because you already
+registered it.
+(I'm assuming you're only interested in the last update.)
+</p>
+<p>
+Of course, this assumes that update requests are queued
+if the receiving thread is busy.
+If updates can be received during the execution of
+<code>get&shy;Thing&shy;Properties</code>,
+then you will end up in a bad re-entrant situation:
+During the processing of one update,
+you start processing a new update.
+Then when the nested update finishes,
+you return to the original update,
+which is now actually performing the second half
+of the second update.
+</p>
+<p>
+Suppose your update code wants to keep the colors
+of two additional objects in sync with the color
+of the thing:
+</p>
+<pre>
+void getThingProperties()
+{
+ Color currentThingColor = getThingColor();
+ object1.setColor(currentThingColor);
+ object2.setColor(currentThingColor);
+}
+</pre>
+<p>
+If the <code>set&shy;Color</code> method
+creates a re-entrancy window, you can have this problem:
+</p>
+<ul>
+<li>Thing changes color to red.
+<li><code>on&shy;Update&shy;Thing</code> begins.
+<li>Register update callback.
+<li><code>get&shy;Thing&shy;Properties</code> reads
+    current color as red.</p>
+<li><code>get&shy;Thing&shy;Properties</code>
+    sets object&nbsp;1's color to red.
+    The <code>set&shy;Color</code> method
+    creates an opportunity for re-entrancy
+    by some means.
+    (For example, it may send a message to another thread,
+    causing inbound sent messages to be processed.)</p>
+<ul>
+<li>Thing changes color to blue.
+<li><code>on&shy;Update&shy;Thing</code> begins.
+<li>Register update callback.
+<li><code>get&shy;Thing&shy;Properties</code> reads
+        current color as blue.</p>
+<li><code>get&shy;Thing&shy;Properties</code>
+        sets object&nbsp;1's color to blue.</p>
+<li><code>get&shy;Thing&shy;Properties</code>
+        sets object&nbsp;2's color to blue.</p>
+<li><code>get&shy;Thing&shy;Properties</code> returns.
+<li><code>on&shy;Update&shy;Thing</code> returns.
+</ul>
+<li><code>get&shy;Thing&shy;Properties</code>
+    sets object&nbsp;2's color to <i>red</i>. (Oops.)</p>
+<li><code>get&shy;Thing&shy;Properties</code> returns.
+<li><code>on&shy;Update&shy;Thing</code> returns.
+</ul>
+<p>
+One solution is to use a
+<a HREF="http://msdn.microsoft.com/library/ms649042.aspx">
+sequence number</a> (also known as a
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/12/10152296.aspx">
+change counter</a>)
+that gets incremented each time the thing changes.
+If there is only one thread which updates the thing,
+you can try to update it atomically.
+For example, if the information is in the registry,
+you can
+put all the information into a single registry value
+or use registry transactions.
+</p>
+<p>
+If you can associate a change counter with the data,
+then you can use the following algorithm:
+</p>
+<pre>
+// start with a known invalid value
+// (If you have multiple listeners, then this naturally
+// needs to be instance data rather than global.)
+LONG lLastChange = 0;
+
+void onUpdateThing()
+{
+ bool finished = false;
+ do {
+  // record the most recent change we've processed
+  lLastChange = getThingChangeCount();
+
+  getThingProperties();
+
+  // ask to be called back the next time it updates
+  registerUpdateCallback(onUpdateThing);
+
+  // did it change while we were busy?
+  LONG lNewChange = getThingChangeCount();
+
+  finished = lLastChange == lNewChange;
+  if (!finished) {
+   // cancel the update callback because we don't
+   // want to be re-entered
+   unregisterUpdateCallback(onUpdateThing);
+  }
+ } while (!finished);
+}
+</pre>
+<p>
+Another solution would be to detect the re-entrancy and just
+remember that there is more work to be done after
+the previous update finishes.
+</p>
+<pre>
+// 0 = not busy
+// 1 = busy
+// 2 = busy, and a change occurred while we were busy
+// (If you have multiple listeners, then this naturally
+// needs to be instance data rather than global.)
+int iBusy = 0;
+
+void onUpdateThing()
+{
+ // ask to be called back the next time it updates
+ registerUpdateCallback(onUpdateThing);
+
+ if (iBusy) {
+   iBusy = 2;
+ } else {
+  iBusy = 1;
+  do {
+   getThingProperties();
+  } while (--iBusy);
+ }
+}
+</pre>
+<p>
+Note that all of the above examples assume that the
+<code>on&shy;Update&shy;Thing</code> function
+has thread affinity.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-matteo even thread-even depth-1" id="comment-1045023">
+				<div id="div-comment-1045023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045023">
+			March 13, 2013 at 7:28 am</a>		</div>
+
+		<p>:%s/execption/execution/g</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045033">
+				<div id="div-comment-1045033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">saveddijon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045033">
+			March 13, 2013 at 7:43 am</a>		</div>
+
+		<p>The whole &quot;one-shot and then re-register&quot; model is broken.</p>
+<p>That&#39;s why SVR3-style Unix signal handling (one-shot) was replaced with BSD style signal handling (not necessarily one-shot, and can mask signals to avoid reentrancy issues).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045063">
+				<div id="div-comment-1045063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Smouch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045063">
+			March 13, 2013 at 8:51 am</a>		</div>
+
+		<p>One might ask, why do I have to continue to register, why doesn&#39;t the notification simply stay in force until I de-register.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045073">
+				<div id="div-comment-1045073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045073">
+			March 13, 2013 at 8:59 am</a>		</div>
+
+		<p>Execption is what you get when you cross execution with an exception.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman even thread-even depth-1" id="comment-1045093">
+				<div id="div-comment-1045093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045093">
+			March 13, 2013 at 10:10 am</a>		</div>
+
+		<p>Smouch: &quot;why do I have to continue to register, why doesn&#39;t the notification simply stay in force until I de-register.&quot;</p>
+<p>Because it&#39;s a one-shot. If it weren&#39;t then you have the same re-entrantcy problem you get if you re-register. I.e. It updates while you&#39;re processing the previous update.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045133">
+				<div id="div-comment-1045133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SpecLad</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045133">
+			March 13, 2013 at 1:06 pm</a>		</div>
+
+		<p>It seems like the second example is still susceptible to the same race condition as the first one &#8211; what if the second update happens before registerUpdateCallback is entered?</p>
+<div class="post">[<em>Then <code>getThingProperties</code> gets the second updated value, so everything works out. The assumption here is that you merely want to be up to date; missing intermediate values is no big deal. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045143">
+				<div id="div-comment-1045143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045143">
+			March 13, 2013 at 1:10 pm</a>		</div>
+
+		<p>The one-shot/re-register model is broken because there&#39;s always a race condition even before the register-call, the thread can be preemted before the register call has even initiated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045163">
+				<div id="div-comment-1045163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua S.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045163">
+			March 13, 2013 at 1:16 pm</a>		</div>
+
+		<p>Why not create a Reg­Notify­Change­Key­ValueEx that takes a handle to an IOCP plus a completion key (or OVERLAPPED*) instead of an event handle? Then you get every single change notification through your IOCP without loss, and presumably better scalability.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045183">
+				<div id="div-comment-1045183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045183">
+			March 13, 2013 at 6:06 pm</a>		</div>
+
+		<p>Smouch: Why is it a one shot?</p>
+<p>Brian: Because it is.</p>
+<p>Smouch makes a valid point. Generally if you&#39;re interested in a key value you won&#39;t lose interest just because it changed once, I should think. And according to the documentation, NT &#8211; XP will behave sanely as long as you keep the key open. (I don&#39;t know/care about Vista+.) Note that this doesn&#39;t cause any reentrancy problems beyond those we already have and can avoid, since the application is calling the function and can wait for the event and call it at its leisure.</p>
+<p>However, regardless of whether the function were to behave as documented, you cannot guarantee that you&#39;ll receive all key changes. Raymond&#39;s suggestion might make the window smaller, but it doesn&#39;t eliminate the problem. I think this is because the function wasn&#39;t meant for detecting the changes as such, but to check if the key&#39;s value has changed (one or more times) from what you thought it was, and then the suggestion helps.</p>
+<p>Scenario 1: re-register after the check</p>
+<p>• Register</p>
+<p>• Key is modified</p>
+<p>• Handler enters</p>
+<p>• Key may be modified again (but we don&#39;t care)</p>
+<p>• We read the value</p>
+<p>• The value might change (that&#39;s bad!)</p>
+<p>• Re-register</p>
+<p>⇒ We might miss the change after we read the value. Our state is now inconsistent with the registry value.</p>
+<p>Scenario 2: re-register before the check</p>
+<p>• Register</p>
+<p>• Key is modified</p>
+<p>• Handler enters</p>
+<p>• Key may be modified again (but we don&#39;t care)</p>
+<p>• Re-register</p>
+<p>• Key may be modified again → handler will execute again when we&#39;re done</p>
+<p>        Note: we have to actually wait for the event so it won&#39;t be called recursively or in parallel.</p>
+<p>• We read the value</p>
+<p>• The value might change → handler will execute again when we&#39;re done</p>
+<p>⇒ We might miss some intermediate values, but if the barrage of updates stops, eventually we&#39;ll get it right.</p>
+<p>However it needs to be stressed again that Raymond&#39;s suggestion won&#39;t work in the general case and is to be avoided in other situations to prevent bugs caused by missed updates.</p>
+<p>I have worked with the BSD model before and I cannot advertise it as a replacement. The drop-what-you&#39;re-doing-and-handle-it-now model is a nightmare to work with in complex applications and the bit-mask signal model is very limiting. It&#39;s also too easy in certain situations to make the same error as in scenario 1 while thinking you&#39;re using the API as intended. On that note, the RegNotifyChangeKeyValue MSDN page should contain a code sample showing how to get it right, but at present the only sample there just shows how to wait for a single change, is overly verbose and suffers from the ‘i++ //increment i’ disease.</p>
+<p>Of all the event models I&#39;ve encountered, the VB event model is the easiest to work with. At its core is the Windows message queue, but rather than having to cast the arguments of the window procedure to the proper type depending on message code, every event type gets its own procedure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045203">
+				<div id="div-comment-1045203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Boyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045203">
+			March 13, 2013 at 9:05 pm</a>		</div>
+
+		<p>Wow, people really confused the problem with the example. Shouldn&#39;t have mentioned the registry, then people would have been forced to focus on the useful code pattern.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045213">
+				<div id="div-comment-1045213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045213">
+			March 13, 2013 at 9:42 pm</a>		</div>
+
+		<p>Ian, the problem is precisely that the code pattern works for this particular problem (getting notifications about a registry key) but not in general.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045223">
+				<div id="div-comment-1045223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jerome</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045223">
+			March 13, 2013 at 11:56 pm</a>		</div>
+
+		<p>Again, I&#39;m in South Africa so I&#39;m commenting nearly 12 hours after everone else. :(</p>
+<p>I love the way so many take every part of the example so literally. It&#39;s intended to be general, right? Raymond has provided a problem, and a possible solution that he deliberately left a hole in, to make us think about the problem.</p>
+<p>My managed code solution:</p>
+<p>Always register for the change immediately. Then fire off my async code to read the properties. The async code is serialized via a SemaphoreSlim (actually I use something similar &#8211; an AsyncLock, which is sample code from the Parallel programing blog.)</p>
+<p>I also pass the reading properties code a CancellationToken, which is in a class-level property. If there&#39;s another change, the currently running task is cancelled and the token is reinitialized for the next task, and so on. However many changes happen while the code is running doesn&#39;t matter, all but the last one will be cancelled, and the last one will save the correct property values.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn even thread-even depth-1" id="comment-1045233">
+				<div id="div-comment-1045233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045233">
+			March 14, 2013 at 1:35 am</a>		</div>
+
+		<p>Anonymous Coward: thanks for the detailed post!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045243">
+				<div id="div-comment-1045243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Smouch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045243">
+			March 14, 2013 at 1:40 am</a>		</div>
+
+		<p>Indeed, Raymonds &quot;solution&quot; isn&#39;t a solution at all, regardless of whether the notification is a one shot, continuous. &nbsp;The fact is, as soon as you allow for the possibility of re-entrance, you need to guard the callback with some kind of lock, or program the callback so that re-entrancy isn&#39;t an issue.</p>
+<p>My preference is the latter, so I almost always simply enqueue the notification, and do nothing else in the callback (except re-register in this case). &nbsp;This helps to ensure that the &quot;notifier&quot; isn&#39;t blocked, which is also frequently a serious issue.</p>
+<p>Another thread (not even necessary, if you know how to write a proper application) can be working on the messages, and then has the opportunity to ensure messages are processed in order, conflated, or discarded as desired. &nbsp;</p>
+<p>Working on messages inside a callback usually bites one in the tuchas.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045253">
+				<div id="div-comment-1045253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045253">
+			March 14, 2013 at 4:33 am</a>		</div>
+
+		<p>@Smouch, you&#39;re almost right. You should at the very least fetch the new registry value in the callback, because between the time you queue the notification and the time you&#39;ll read the value, the value may not be the same anymore.</p>
+<p>Or better yet, only keep the latest notification.</p>
+<p>In the registry&#39;s specific case, there are a few nuances:</p>
+<ul>
+<li>changed made by RegRestoreKey are not notified</li>
+<li>
+<p>only NT/2K/XP notify changes between two calls while the handle is still open</p>
+</li>
+<li>
+<p>only from 8 does it support no thread affinity</p>
+</li>
+<li>
+<p>you have to manage your own one-shot notification handling algorithm, and all presented by Raymond still have problems</p>
+</li>
+</ul>
+<p>But in the end, for what it&#39;s worth, you&#39;re probably overthinking it. Shouldn&#39;t the registry be some sort of lightweight DB for settings? Shouldn&#39;t it be something that an application&#39;s instance reads in the beginning and saves when the user applies or saves settings? Shouldn&#39;t it be that if multiple instances need to synchronize settings, then you&#39;ll need IPC and/or an out-of-process settings manager instead of local &quot;solutions&quot; (hacks)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045263">
+				<div id="div-comment-1045263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Smouch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045263">
+			March 14, 2013 at 5:50 am</a>		</div>
+
+		<p>I wasn&#39;t talking about the registry in particular, rather the concept of callbacks, be they one-shot, or continuous.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045283">
+				<div id="div-comment-1045283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045283">
+			March 14, 2013 at 7:26 am</a>		</div>
+
+		<p>The APC provides a nice model for callbacks, but alas, it seems to be seldom used.</p>
+<p>(I come from a pre-NT Cutlerian culture where the ancestor of the APC, the AST, was the primary program-organization principle, at least amongst the cognoscenti. &nbsp;Of course, we didn&#39;t have to worry about languages with complicated runtime systems then.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1045313">
+				<div id="div-comment-1045313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045313">
+			March 14, 2013 at 9:25 am</a>		</div>
+
+		<p>John Doe: If you have multiple instances of a program communicating via the Registry, you&#39;re probably doing something wrong. Odds are more likely that you want your program to be able to respond to configuration changes made by hand (via Regedit) or done remotely (via Group Policy?).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1045493">
+				<div id="div-comment-1045493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130313-00/?p=4963#comment-1045493">
+			March 18, 2013 at 7:17 am</a>		</div>
+
+		<p>@Gabe, that&#39;s my point exactly. I wasn&#39;t suggesting that the registry be used for communication. Such mis-fuctionality would be called what, registry I/O or registry IPC?</p>
+<p>What I suggested is that if this notification is necessary in multipel processes, there probably should be an intermediate one that checks this centrally and notifies interested (i.e. registered) applications.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

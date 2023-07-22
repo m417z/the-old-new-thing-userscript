@@ -1,0 +1,511 @@
+<html>
+<head>
+<title>The Alpha AXP, part 6: Memory access, basics</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Alpha AXP, part 6: Memory access, basics</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 14, 2017 / year-entry #183</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>7</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Start with the easy cases.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The Alpha AXP has only one memory addressing mode:
+Indexed indirect.
+</p>
+<pre>
+    ; load memory to register
+    LDL     Ra, disp16(Rb)  ; result is sign-extended to 64 bits
+    LDQ     Ra, disp16(Rb)
+
+    ; store register to memory
+    STL     Ra, disp16(Rb)
+    STQ     Ra, disp16(Rb)
+</pre>
+<p>
+In all cases, the address of the memory is
+<code>(int16_t)disp16 + Rb</code>.&sup1;
+As we learned when we discussed
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170809-00/?p=96785">
+integer constants</a>,
+the displacement is a 16-bit signed value,
+so it has a reach of &plusmn;32KB.
+By convention, a displacement of zero can be omitted.
+</p>
+<p>
+The <code>L</code> suffix loads/stores a 32-bit value (long)
+and the <code>Q</code> suffix loads/stores a 64-bit value (quad).
+</p>
+<p>
+If the memory address is not suitably aligned,
+then an alignment fault is generated.
+By default,
+Windows NT handles the alignment fault by emulating
+the unaligned load for you, then resuming execution.
+However, this is a ridiculously huge performance penalty,
+so you don't want to make it a habit.
+</p>
+<p>
+Note the absence of byte and word memory access.&sup2;
+You'll have to construct those yourself.
+And as noted above,
+you'll also construct unaligned memory access
+yourself if you know what's good for you.
+</p>
+<p>
+The
+special <code>_U</code> versions of the load and store instructions
+are useful for constructing byte access, word access,
+and unaligned memory access.
+</p>
+<pre>
+    LDQ_U   Ra, disp16(Rb)
+    STQ_U   Ra, disp16(Rb)
+</pre>
+<p>
+These special unaligned instructions are available only
+for quads.
+They ignore the bottom 3 bits of the effective address
+when calculating the address to load from.
+For example, if the current value of the <var>t2</var> register
+were <code>0x1234</code>, then the instruction
+</p>
+<pre>
+    LDQ_U    t1, 3(t2)
+</pre>
+<p>
+would take the value in the <var>t2</var> register,
+add <code>3</code> to it, resulting in <code>0x1237</code>,
+and then
+round the value down to the nearest multiple of 8,
+producing <code>0x1230</code>.
+It would then load the 8-byte value starting at <code>0x1230</code>
+and put into the <var>t1</var> register.
+</p>
+<p>
+There are a set of extra computational
+instructions to assist in taking apart and reassembling
+integers from their containing quads.
+They are the
+extraction, insertion, and masking opcodes.
+</p>
+<p>
+Here goes extraction:
+</p>
+<pre>
+    EXTBL   Ra, Rb/#b, Rc  ; Rc =  (uint8_t)(Ra &gt;&gt; (Rb/#b * 8 % 64))
+    EXTWL   Ra, Rb/#b, Rc  ; Rc = (uint16_t)(Ra &gt;&gt; (Rb/#b * 8 % 64))
+    EXTLL   Ra, Rb/#b, Rc  ; Rc = (uint32_t)(Ra &gt;&gt; (Rb/#b * 8 % 64))
+    EXTQL   Ra, Rb/#b, Rc  ; Rc = (uint64_t)(Ra &gt;&gt; (Rb/#b * 8 % 64))
+
+    EXTWH   Ra, Rb/#b, Rc  ; Rc = (uint16_t)(Ra &lt;&lt; ((64 - Rb/#b * 8) % 64))
+    EXTLH   Ra, Rb/#b, Rc  ; Rc = (uint32_t)(Ra &lt;&lt; ((64 - Rb/#b * 8) % 64))
+    EXTQH   Ra, Rb/#b, Rc  ; Rc = (uint64_t)(Ra &lt;&lt; ((64 - Rb/#b * 8) % 64))
+</pre>
+<p>
+These are weird to write out in formulas, but they are easy to explain.
+You want to read these mnemonics as
+"extract byte/&#x200B;word/&#x200B;long/&#x200B;quad low/&#x200B;high".
+For example,
+<code>EXTWL</code> is "extract word low".
+</p>
+<p>
+To perform the extraction, you shift the first source parameter
+right (if extracting low) or left (if extracting high)
+by the number of bytes controlled by the second parameter.
+(More precisely, specified by the least significant
+3 bits of the second parameter.)
+And then you extract the low-order
+byte/&#x200B;word/&#x200B;long/&#x200B;quad from the result.
+</p>
+<p>
+Note that these are fully 64-bit instructions, so there is no
+sign extension in the <code>EXTLx</code> instructions.
+</p>
+<p>
+For example,
+if <var>t1</var> is <code>0x7531</code>,
+then
+</p>
+<pre>
+    EXTWH   t0, t1, t2
+</pre>
+<p>goes like this:
+The shift amount is 7 bytes because
+the least significant three bits of <var>t1</var> are <code>001</code>,
+and we are extracting the high part.
+So take the value in <var>t0</var>,
+shift it left 56 bits (7 bytes),
+and then extract the least significant 16 bits,
+zero-extending the result to 64 bits.
+</p>
+<p>
+The way to think of these instructions is that the extract a byte,
+word, long, or quad from a 128-bit value.
+The "low" version extracts the value from the least-significant 64 bits
+of the 128-bit value,
+and the "high" version extracts the value from the most-significant 64 bits
+of the 128-bit value.
+Both instructions position the extracted value so the two pieces can be
+"or"d together.
+</p>
+<pre>
+    high part  low part
+    --------- ---------
+    ABCD EFGH IJKL MNOP -- 16-byte value
+          ^^^ ^         -- 4 bytes extracted at this position
+        EXTLH EXTLL
+         FGH0 000I
+</pre>
+<p>
+Note that this is <i>not</i> how the instructions actually
+operate,
+because there are edge conditions when the shift amount is
+an exact multiple of 8,
+but it's a nice way to help remember how the instructions work.
+</p>
+<p>
+Anyway,
+with the extraction instruction, we can load a single byte
+of memory, even if not aligned:
+</p>
+<pre>
+    LDQ_U  t1, (t0)
+    EXTBL  t1, t0, t1
+</pre>
+<p>
+To see how this works,
+let's number
+the bytes in a 64-bit value from least significant
+to most significant, zero through seven.
+</p>
+<p>
+If <var>t0</var> were <code>0x9731</code>,
+then the <code>LDQ_U</code> loads 8 bytes of memory from
+<code>0x9730</code>.
+The least significant byte (index 0)
+contains the value of the byte
+<code>0x9730</code>,
+and the next-least-significant byte (index 1)
+contains the value of the byte <code>0x9731</code>,
+which is the one we want.
+And by an amazing non-coincidence,
+the <code>EXTBL</code> instruction selects the
+byte at index <code>0x9731 &amp; 7 == 1</code>,
+which is exactly the byte we want.
+</p>
+<p>
+Loading signed data is a bit more work because you have
+to sign-extend the result.
+The simple way of doing this is to add
+</p>
+<pre>
+    SLL     t1, #56, t1    ; shift byte all the way up to index 7
+    SRA     t1, #56, t1    ; shift it all the way back to index 0
+                           ; but with sign extension
+</pre>
+<p>
+However, DEC recommends this alternative four-instruction sequence:
+</p>
+<pre>
+    LDQ_U   t1, (t0)       ; load the entire enclosing quad
+    LDA     t2, 1(t0)      ; sneaky trick to extract at index 7
+    EXTQH   t1, t2, t1     ; shift the desired byte into index 7
+    SRA     t1, #56, t1    ; signed shift right to move to index 0
+</pre>
+<p>
+The basic idea here is to extract the desired byte into index 7
+and then use a signed shift right to shift it into
+index 0 with sign extension.
+If we hadn't added 1 to <var>t0</var>,
+then the byte we wanted would have shifted off the end of of
+the register (into imaginary index 8);&sup3;
+adding 1 means that the <code>EXTQH</code> will shift one fewer
+index, so that instead of shifting into imaginary index 8,
+the value we want ends up in index 7.
+</p>
+<p>
+I'm guessing that DEC recommends the latter sequence because it
+has a slightly shorter dependency chain,
+but at the cost of an extra register.
+</p>
+<p>
+Of course, if you know ahead of time what the alignment of
+<var>t0</var> is,
+then you can avoid having to calculate the shift amount in
+<var>t2</var> and could just hard-code
+<code>(</code><var>t0</var> <code>+ 1) % 8</code> as the second parameter
+to the <code>EXTQH</code>.
+</p>
+<p>
+The standard sequence for loading an aligned word is
+</p>
+<pre>
+    LDQ_U   t1, (t0)    ; load the entire enclosing quad
+    EXTWL   t1, t0, t1  ; extract the appropriate word, zero-extended
+</pre>
+<p>
+And if you want sign extension, you use the same trick:
+</p>
+<pre>
+    LDQ_U   t1, (t0)    ; load the entire enclosing quad
+    LDA     t2, 2(t0)   ; sneaky trick to extract at index 6+7
+    EXTQH   t1, t2, r1  ; shift the desired bytes to index 6+7
+    SRA     t1, #48, t1 ; signed right shift to move to index 0+1
+</pre>
+<p>
+These sequences are designed for properly word-aligned addresses.
+But what if it's not correctly-aligned?
+</p>
+<p>
+Let's find out.
+Suppose that <var>t0</var> is <code>0x1357</code>.
+Let's say that the word pointed to by <var>t0</var>
+is <code>XXYY</code>,
+with <code>YY</code> stored at <code>0x1357</code>
+and <code>XX</code> stored at <code>0x1358</code>.
+But we erroneously treat it as an aligned address and
+execute the standard aligned word load sequence:
+</p>
+<pre>
+    LDQ_U   t1, (t0)    ; loads the quad at 0x1350
+                        ; t1 = YY??????`????????
+    EXTWL   t1, t0, t1  ; shifts the value in t1 right by 7 bytes
+                        ;      00000000`000000YY
+                        ; and then extracts the least-significant word
+                        ; t1 = 00000000`000000YY
+</pre>
+<p>
+Oops, we read only the least significant byte of the value;
+the <code>XX</code> was not loaded at all.
+</p>
+<p>
+If you sit down and work it out,
+the aligned word load sequence produces the desired results
+for most unaligned addresses,
+but if the word crosses a quad boundary,
+the code executes without any faults
+but produces incorrect results.
+This is worse than crashing!
+</p>
+<p>
+On the Alpha AXP, it is absolutely essential that you
+accurately declare the fact that a pointer may point to
+misaligned data.
+If you forget, then depending on the size of the data
+you are accessing and the precise nature of the misalignment,
+you might get away with it,
+or you might crash,
+or (worst case) you will proceed with incorrect data.
+</p>
+<p>
+So far, we've been looking only at loading aligned
+bytes and words.
+Next time, we'll look at unaligned accesses,
+as well as storing bytes and words,
+as well as storing unaligned longs and quads.
+</p>
+<p>
+&sup1;
+Note that the base register must be a general-purpose register.
+This means no PC-relative addressing,
+because the program counter is not a general-purpose register.
+This is another strike against
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170810-00/?p=96795#comment-1306055">
+storing constants in the code stream</a>.
+</p>
+<p>
+&sup2;
+Later versions of the Alpha AXP
+added instructions for aligned byte and word access,
+but Windows NT didn't require that you had one of those
+newer processors.
+Consequently,
+you were unlikely to encounter them in practice
+unless you had code that did processor feature detection
+and had separate code paths for processors with and without
+support for byte and word access instructions.
+</p>
+<p>
+However, the
+<a HREF="https://technet.microsoft.com/en-us/library/2008.08.windowsconfidential.aspx">
+proof-of-concept Alpha AXP 64-bit edition of Windows</a>
+did require a processor that supported the byte and word
+memory access instructions, so you would see those instructions
+if you had to debug the Alpha AXP 64-bit verison of Windows.
+(And by "you" I mean "me,"
+because that version of Windows never shipped.)
+</p>
+<p>
+&sup3;
+Well, except that if <var>t0</var> had been an exact multiple of 8,
+then the <code>EXTQH</code> wouldn't have shifted anything at all.
+But you can work it out with pencil and paper and convince yourself
+that the right thing happens even if <var>t0</var> is an exact
+multiple of 8.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (7)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-s-m-joshi-02 even thread-even depth-1 parent" id="comment-1306385">
+				<div id="div-comment-1306385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/camhusmj38' rel='external nofollow' class='url'>camhusmj38</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306385">
+			August 14, 2017 at 7:15 am</a>		</div>
+
+		<p>DEC may have taken the R in RISC a little far. The code density must have been awful.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1306386">
+				<div id="div-comment-1306386" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306386">
+			August 14, 2017 at 8:17 am</a>		</div>
+
+		<p>Perhaps this processor is the reason why some compilers had an option &#8220;default char is unsigned&#8221;; this would radically improve the code density here. Somehow I find two instructions to complete a char memory read not unreasonable. This processor is probably a lot faster for  being unable to do unaligned memory access at all.</p>
+<p>On another processor I encountered the &#8220;misaligned read&#8221; effect of reading an unaligned pointer. That was a pain to debug until I understood what was going on (no debugger for that environment&#8230;).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1306395">
+				<div id="div-comment-1306395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mihkel Soomere</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306395">
+			August 14, 2017 at 2:26 pm</a>		</div>
+
+		<p>I&#8217;d sure like read more about that 64-bit Windows that was never publicly released. There&#8217;s got to be some more interesting stories to share.<br />
+While I&#8217;ve only seen one Alpha machine in my life ( just a few years ago, still running critical air traffic control software), it was a &#8220;force to be reckoned with&#8221;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-even depth-1 parent" id="comment-1306425">
+				<div id="div-comment-1306425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306425">
+			August 14, 2017 at 4:53 pm</a>		</div>
+
+		<p>&#8220;Later versions of the Alpha AXP added instructions for aligned byte and word access, but Windows NT didn&#8217;t require that you had one of those newer processors&#8221;<br />
+Does how NTFS compression works has to do with this?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1306435">
+				<div id="div-comment-1306435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306435">
+			August 14, 2017 at 5:17 pm</a>		</div>
+
+		<p>Turns out I was wrong about the compression issue. I have a correction in the queue.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1306426">
+				<div id="div-comment-1306426" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306426">
+			August 14, 2017 at 5:04 pm</a>		</div>
+
+		<p>&gt;(And by &#8220;you&#8221; I mean &#8220;me,&#8221; because that version of Windows never shipped.)</p>
+<p>How do you feel about that? It always saddens me when I drop support for old hardware. In a perfect world I could make money by writing commodore 64 software&#8230;..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1306475">
+				<div id="div-comment-1306475" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170814-00/?p=96806#comment-1306475">
+			August 15, 2017 at 3:43 am</a>		</div>
+
+		<p>ARM v5&#8217;s &#8220;unaligned&#8221; load was slightly nicer in that respect because it did the rotate for you.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,414 @@
+<html>
+<head>
+<title>The Alpha AXP, part 17: Reconstructing a call stack</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Alpha AXP, part 17: Reconstructing a call stack</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 30, 2017 / year-entry #195</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Putting the information into practice.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+I'm going to wrap up the formal part of the
+series by applying the information
+we've been learning over the past several
+<del>days</del> weeks:
+We're going to reconstruct a broken stack.
+</p>
+<p>
+Suppose you have a debug session
+where all the <code>k</code> command says is
+</p>
+<pre>
+Callee-SP Return-RA  Call Site
+ 0235d380 777b63e4 : contoso!OnSysColorChange+<u>0x60</u>
+</pre>
+<p>
+That's it.
+We'll have to unwind the stack manually.
+We need to keep track of the stack pointer depth and watch
+where the compiler stashed the return address.
+We can do this by going forward or backward.
+I'll demonstrate both.
+</p>
+<p>
+Let's go backward:</p>
+<pre>
+kd&gt; u .-<b>60</b>
+contoso!OnSysColorChange:
+777b6380 : 23deffe0 lda    <u>sp,-20(sp)</u>
+777b6384 : b53e0000 stq    s0,0(sp)
+777b6388 : b55e0008 stq    s1,8(sp)
+777b638c : b75e0010 stq    <u>ra,10(sp)</u>
+</pre>
+<p>
+From the function prologue, we see that it allocates
+<code>0x20</code> bytes of stack and puts the
+return address at offset <code>0x10</code>.
+So we can pull the first return address right away:
+</p>
+<pre>
+kd&gt; dd @sp+<b>10</b> L1
+0235d390  <u>7773b4e8</u>
+</pre>
+<p>
+Since our local stack frame is <code>0x20</code> bytes,
+that means that the caller's stack begins at
+<code>@sp + 20</code>.
+Let's look at the caller.
+</p>
+<pre>
+kd&gt; u <b>7773b4e8</b>
+contoso!WndProc+1f58:
+7773b4e8 : a20b0040 ldl    a0,40(s2)
+7773b4ec : 47ef0411 bis    zero,fp,a1
+7773b4f0 : 47ed0412 bis    zero,s4,a2
+7773b4f4 : 47ec0413 bis    zero,s3,a3
+7773b4f8 : e61ff989 beq    a0,0000000077739b20 contoso!WndProc+590
+7773b4fc : d3407858 bsr    ra,0000000077759660 contoso!ForwardMessage
+7773b500 : 47ff0400 bis    zero,zero,v0
+7773b504 : c3e00122 br     zero,<u>000000007773b990</u> contoso!WndProc+2400
+</pre>
+<p>
+Referring to the source code reveals that
+the last two lines are a <code>return 0</code>,
+so that last jump goes to the function epilogue.
+This time, we're debugging forward.
+</p>
+<pre>
+kd&gt; u <b>7773b990</b>
+contoso!WndProc+2400:
+7773b990 : a75e0048 ldq    <u>ra,48(sp)</u>
+7773b994 : a57e0020 ldq    s2,20(sp)
+7773b998 : a59e0028 ldq    s3,28(sp)
+7773b99c : a5be0030 ldq    s4,30(sp)
+7773b9a0 : a5de0038 ldq    s5,38(sp)
+7773b9a4 : a53e0010 ldq    s0,10(sp)
+7773b9a8 : a55e0018 ldq    s1,18(sp)
+7773b9ac : a5fe0040 ldq    fp,40(sp)
+7773b9b0 : 63ff0000 trapb
+7773b9b4 : 23de01b0 lda    <u>sp,1b0(sp)</u>
+7773b9b8 : 6bfa8001 ret    zero,(ra),1  contoso!OnSysColorChange+60
+</pre>
+<p>
+(The disassembler is "helpfully" resolving the
+<code>(ra)</code> to
+<code>contoso!OnSysColorChange+60</code>,
+based on the current value in the <var>ra</var> register.
+It's not correct because the <var>ra</var> register will
+certainly change between the current execution point and the
+<code>ret</code>, but we'll give the debugger
+a nice pat on the head for trying.)
+</p>
+<p>
+By studying the epilogue,
+we see that the function keeps its return address
+at offset <code>0x48</code>.
+Since we already had an adjustment of <code>0x20</code>
+from <code>WndProc</code>,
+the combined offset from <code>@sp</code> is
+</p>
+<pre>
+kd&gt; dd @sp+<b>20+48</b> L1
+0235d3e8  <u>77c9a028</u>
+</pre>
+<p>
+And now we just repeat this procedure until we get the full stack trace
+or we get bored.
+</p>
+<pre>
+kd&gt; u <b>77c9a028</b>
+user32!CallWindowProcAorW+1d8:
+77c9a028 : b01e0040 stl    v0,40(sp)
+77c9a02c : 43e00000 addl   zero,v0,v0
+77c9a030 : a75e0030 ldq    <u>ra,30(sp)</u>
+77c9a034 : a53e0008 ldq    s0,8(sp)
+77c9a038 : a55e0010 ldq    s1,10(sp)
+77c9a03c : a57e0018 ldq    s2,18(sp)
+77c9a040 : a59e0020 ldq    s3,20(sp)
+77c9a044 : a5be0028 ldq    s4,28(sp)
+77c9a048 : 23de0060 lda    <u>sp,60(sp)</u>
+77c9a04c : 6bfa8001 ret    zero,(ra),1  contoso!OnSysColorChange+60
+kd&gt; dd @sp+<b>20+1b0+30</b> l1
+0235d580  <u>77cb64c0</u>
+kd&gt; u <b>77cb64c0</b>
+user32!CallWindowProcW+10:
+77cb64c0 : a75e0000 ldq    <u>ra,0(sp)</u>
+77cb64c4 : 23de0010 lda    <u>sp,10(sp)</u>
+77cb64c8 : 6bfa8001 ret    zero,(ra),1  contoso!OnSysColorChange+60
+kd&gt; dd @sp+<b>20+1b0+60+0</b> l1
+0235d5b0  777a7c04
+</pre>
+<p>
+So we have successfully reconstructed this call stack:
+</p>
+<pre>
+contoso!OnSysColorChange+0x60
+contoso!WndProc+1f58
+user32!CallWindowProcAorW+1d8
+user32!CallWindowProcW+10
+</pre>
+<p>
+Lather, rinse, repeat.
+(In this particular case,
+I needed to go back around 20 stack frames in order to find out
+why the <code>WM_</code><code>SYS&shy;COLOR&shy;CHANGE</code>
+message was coming in at such a strange time.)
+</p>
+<p>
+That concludes our rather lengthy
+whirlwind tour of the Alpha AXP processor.
+Maybe you found it interesting, maybe not,
+but there you have it.
+</p>
+<p>
+Next up is the MIPS R4000.
+But I don't do it right now, since you're probably all tired
+of this CPU architecture stuff.
+I'll wait a while and then spring it on you when you least expect it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1307615">
+				<div id="div-comment-1307615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307615">
+			August 30, 2017 at 7:27 am</a>		</div>
+
+		<p>Thank you for another wonderful series! And after MIPS, hopefully we will get another trip back in time with the PPC or a ride into the future with ARM64?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1307625">
+				<div id="div-comment-1307625" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307625">
+			August 30, 2017 at 7:29 am</a>		</div>
+
+		<p>I can&#8217;t wait for the next installment. I have to wonder just how much esoteric processor knowledge Raymond has in his head.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1307637">
+				<div id="div-comment-1307637" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ted Spence</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307637">
+			August 30, 2017 at 7:58 am</a>		</div>
+
+		<p>Esoteric processor information is the best.  Fascinating how tiny decisions the designers use to optimize something can turn out to have huge effects on software development.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip odd alt thread-odd thread-alt depth-1" id="comment-1307645">
+				<div id="div-comment-1307645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307645">
+			August 30, 2017 at 8:03 am</a>		</div>
+
+		<p>This was a really interesting series of posts, a view into a really early 64 bit processor is interesting.<br />
+I&#8217;m also looking forward to the MIPS series.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1307655">
+				<div id="div-comment-1307655" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Clarkstone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307655">
+			August 30, 2017 at 8:08 am</a>		</div>
+
+		<p>These processor architecture posts are fascinating stuff. I still have an Alpha lying around somewhere, but I put BSD on it.</p>
+<p>I thought that Windows binaries usually had metadata and restrictions on function prologue/epilogue form to allow <i>automatic</i> unwinding. I have only looked at the x64 though, so was this not done on the Alpha, or does the debugger not have the ability to read it, or did this binary not include the required information?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1307666">
+				<div id="div-comment-1307666" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307666">
+			August 30, 2017 at 8:38 am</a>		</div>
+
+		<p>Debuggers weren&#8217;t that smart back in the day.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1307656">
+				<div id="div-comment-1307656" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CarlD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307656">
+			August 30, 2017 at 8:14 am</a>		</div>
+
+		<p>Bring on the MIPS, and then the i860!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1307675">
+				<div id="div-comment-1307675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307675">
+			August 30, 2017 at 9:06 am</a>		</div>
+
+		<p>I enjoyed the series.  Hopefully it&#8217;s completely useless information to me, but always good to have your mind broadened a bit.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1307715">
+				<div id="div-comment-1307715" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Steve</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307715">
+			August 31, 2017 at 1:04 am</a>		</div>
+
+		<p>Amen to that. The vast majority of it has whooshed straight over my head, but I&#8217;ve enjoyed picking up the few scraps that have sunk in &#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1307695">
+				<div id="div-comment-1307695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bmm6o</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307695">
+			August 30, 2017 at 4:38 pm</a>		</div>
+
+		<p>Since you said you won&#8217;t do it right away, tomorrow is when we least expect it!<br />
+(Also, interesting series)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1308866">
+				<div id="div-comment-1308866" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">D-Coder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1308866">
+			September 8, 2017 at 6:32 am</a>		</div>
+
+		<p><i>No one</i> expects the MIPS R4000!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1307785">
+				<div id="div-comment-1307785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307785">
+			August 31, 2017 at 10:00 am</a>		</div>
+
+		<p>I never get tired of CPU architecture stuff</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1307835">
+				<div id="div-comment-1307835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">viila</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170830-00/?p=96906#comment-1307835">
+			September 1, 2017 at 1:01 am</a>		</div>
+
+		<p>Ooh, MIPS! Finally that&#8217;ll be something I can follow. Only assembly programming I&#8217;ve ever done was 68000 on Amiga and MIPS2000 at university for the CPU architecture course.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

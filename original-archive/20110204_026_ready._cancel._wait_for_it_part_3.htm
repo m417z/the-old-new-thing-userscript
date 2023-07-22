@@ -1,0 +1,531 @@
+<html>
+<head>
+<title>Ready... cancel... wait for it! (part 3)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Ready&#8230; cancel&#8230; wait for it! (part 3)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 4, 2011 / year-entry #27</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer reported that their application was crashing in RPC, and they submitted a sample program which illustrated the same crash as their program. Their sample program was actually based on the AsyncRPC sample client program, which was nice, because it provided a mutually-known starting point. They made quite a few changes to the program,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer reported that their application was crashing in RPC,
+and they submitted a sample program which illustrated the same
+crash as their program.
+Their sample program was actually based on the
+AsyncRPC sample client program, which was nice, because it
+provided a mutually-known starting point.
+They made quite a few changes to the program, but this is
+the important one:
+</p>
+<pre>
+// old code:
+// status = RpcAsyncCancelCall(&amp;Async, FALSE);
+
+// new code:
+ status = RpcAsyncCancelCall(&amp;Async, TRUE);
+</pre>
+<p>
+(It was actually more complicated than this,
+but this is the short version.)
+</p>
+<p>
+The program was crashing for the same reason that
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/02/02/10123392.aspx">
+Wednesday's I/O cancellation program was crashing</a>:
+The program issued an asynchronous cancel and didn't
+wait for the cancel to complete.
+In this case, the crash occurred when the RPC call
+finally completed and RPC went about cleaning up the call
+based on the information in the now-freed
+<code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code> structure.
+</p>
+<p>
+The error was probably caused by the not-very-helpful
+name for that last parameter to <code>Rpc&shy;Async&shy;Cancel&shy;Call</code>:
+<code>fAbort&shy;Call</code>,
+and the accompanying documentation which says,
+"In an abortive cancel (<i>fAbort&shy;Call</i> is TRUE),
+the <b>Rpc&shy;Async&shy;Cancel&shy;Call</b> function sends a cancel
+notification to the server and client side and the
+asynchronous call is canceled immediately,
+not waiting for a response from the server."
+Compare this to a nonabortive cancel,
+where "the <b>Rpc&shy;Async&shy;Cancel&shy;Call</b> function notifies
+the server of the cancel and the client waits for the
+server to complete the call."
+</p>
+<p>
+Obviously,
+it's faster if you don't wait for the server to respond, right?
+Let's pass <code>TRUE</code>, so that the function cancels the
+asynchronous call immediately without waiting for the server.
+Wow, look at how fast our program runs now!
+</p>
+<p>
+Unfortunately,
+the documentation doesn't make it sufficiently clear
+that when you issue a cancellation, you still have to
+wait for the operation to complete before you can clean up
+all the resources associated with that operation.
+Another way of looking at that last parameter is to think
+of it as <code>fAsync</code>.
+If you pass <code>fAsync = TRUE</code>,
+then the
+<code>Rpc&shy;Async&shy;Cancel&shy;Call</code>
+function issues the cancellation
+and returns before the operation completes.
+If you pass <code>fAsync = FALSE</code>,
+then the
+<code>Rpc&shy;Async&shy;Cancel&shy;Call</code>
+function issues the cancellation
+and waits for the operation to complete before returning.
+</p>
+<p>
+If you switch from a synchronous cancel to an asynchronous cancel,
+then you become responsible for keeping the
+<code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code>
+valid until the cancellation completes.
+In this case, the customer was using the
+<code>Rpc&shy;Notification&shy;Type&shy;Event</code> notification type,
+which means that they need to wait for the
+<code>Async.u.hEvent</code> to become signaled before they
+can free the <code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code>.
+</p>
+<p>
+The customer confirmed the fix and closed the support case.
+Another problem solved.
+</p>
+<p>
+Three months later, the customer reopened the case,
+reporting that after they released a new version of their
+program with the aforementioned fix,
+they were nevertheless getting
+<a HREF="https://winqual.microsoft.com/">WinQual</a>
+crashes which looked exactly like the ones that they were
+having before they applied the fix.
+It appears that the fix wasn't working.
+</p>
+<p>
+Upon closer investigation, it turns out that the customer
+originally did apply the fix as recommended:
+They added a
+<code>Wait&shy;For&shy;Single&shy;Object(Async.u.hEvent, INFINITE)</code>
+call before destroying the <code>Async</code> object
+to ensure that the cancellation was complete.
+However, they became frustrated that sometimes the cancellation
+would take a long time to complete, so they changed it to
+</p>
+<pre>
+WaitForSingleObject(Async.u.hEvent, 5000); // wait up to 5 seconds
+</pre>
+<p>
+The customer explained,
+"After the wait fails due to timeout,
+we just proceed as normal and call
+<code>Rpc&shy;Async&shy;Complete&shy;Call</code> and free the the
+<code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code>. Is that wrong?"
+</p>
+<p>
+Um, yeah.
+Changing the
+<code>Wait&shy;For&shy;Single&shy;Object</code>
+from an infinite wait
+to one with a timeout means that
+you just reintroduced the bug that the
+<code>Wait&shy;For&shy;Single&shy;Object</code>
+was originally supposed to fix!
+If the cancellation takes more than 5&nbsp;seconds,
+then your code will continue and free the
+<code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code>,
+just like it did when you didn't wait at all.
+</p>
+<p>
+"How long can I wait before assuming that the event will simply
+never get signaled?"
+</p>
+<p>
+There is no such duration after which you can safely abandon the operation.
+Even if the event doesn't get signaled for 30 minutes
+(say because the computer is thrashing its guts out),
+it may get signaled at 30 minutes and 1 second.
+</p>
+<p>
+"But we don't want our program to get stuck waiting for the server."
+</p>
+<p>
+Great.
+It's fine to have your program continues running after
+issuing the cancellation, even if the RPC call hasn't completed.
+Just don't free the <code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code>
+until the call is complete.
+and if you set things up so that your completion event takes the
+form of a callback,
+<a HREF="http://social.msdn.microsoft.com/Forums/en-CA/windowssdk/thread/d4ca3eb0-cbc0-4cbe-9626-7d80043969d8">
+you can just make the callback free the
+<code>RPC_<wbr>_ASYNC_<wbr>STATE</wbr></wbr></code></a>.
+Then you don't have to keep track of the asynchronous call any more;
+the system will merely call you when it's finished, and then you
+can free the state structure.
+</p>
+<p>
+<b>Bonus RPC chatter</b>:
+(For the purpose of this discussion, I'll use the term
+<i>RPC operation</i> instead of <i>RPC call</i> so we don't have
+confusion between function calls and RPC calls.)
+A colleague explained the lifetime of an RPC operation as follows:
+</p>
+<table BORDER=1 BORDERCOLOR=black STYLE="border-collapse: collapse"
+    CELLPADDING=3>
+<tbody>
+<tr>
+<td NOWRAP ROWSPAN=3>Submit phase</td>
+<td>You call into the MIDL-generated stub.</td>
+<td ROWSPAN=3>You cannot call
+    <code>Rpc&shy;Async&shy;Cancel&shy;Call</code>
+    during the submit phase.</td>
+</tr>
+<tr>
+<td>The stub does magic RPC stuff.</td>
+</tr>
+<tr>
+<td>The stub returns control back to the caller.</td>
+</tr>
+<tr>
+<td NOWRAP>Pending phase</td>
+<td>RPC is waiting for the response to the operation.
+    The operation remains in this phase until
+    the operation completes or is cancelled.
+</td>
+<td>You can call
+    <code>Rpc&shy;Async&shy;Cancel&shy;Call</code> to cancel the
+    RPC operation and accelerate the transition to the Notified phase.
+</td>
+</tr>
+<tr>
+<td NOWRAP>Notified phase</td>
+<td>RPC informs the application of the result of the operation
+    in a manner described by the <code>Notification&shy;Type</code>
+    and <code>RPC_<wbr>ASYNC_<wbr>NOTIFICATION_INFO</wbr></wbr></code> members of
+    the <code>RPC_<wbr>ASYNC_<wbr>STATE</wbr></wbr></code> structure.
+</td>
+<td>You can call
+    <code>Rpc&shy;Async&shy;Cancel&shy;Call</code> but it will have no effect
+    since the operation is already complete.
+</td>
+</tr>
+<tr>
+<td NOWRAP>Completion phase</td>
+<td>The application calls
+    the <code>Rpc&shy;Async&shy;Complete&shy;Call</code> function to clean up
+    the resources used to track the RPC operation.
+    You exit the completion phase when
+    <code>Rpc&shy;Async&shy;Complete&shy;Call</code>
+    returns something other than
+    <code>RPC_<wbr>S_<wbr>ASYNC_<wbr>CALL_<wbr>PENDING.
+</wbr></wbr></wbr></wbr></code></td>
+<td>You cannot call <code>Rpc&shy;Async&shy;Cancel&shy;Call</code> after
+    <code>Rpc&shy;Async&shy;Complete&shy;Call</code>
+    indicates that the operation
+    is complete, since that is the call that says "I'm all done!"
+</td>
+</tr>
+</tbody>
+</table>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-893253">
+				<div id="div-comment-893253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893253">
+			February 4, 2011 at 7:26 am</a>		</div>
+
+		<ol>
+<li>Write some stuff in MIDL language.</li>
+<li>
+<p>Issue RPC call.</p>
+</li>
+</ol>
+<p>&#8230;</p>
+<ol>
+<li>
+<p>Profit!</p>
+</li>
+<li>
+<p>Go to ATM machine and enter your PIN number&#8230;</p>
+</li>
+</ol>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893283">
+				<div id="div-comment-893283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893283">
+			February 4, 2011 at 7:55 am</a>		</div>
+
+		<p>@Alex: I was going to mumble something about RAS syndrome, but you put it way better than I possibly could have.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-893313">
+				<div id="div-comment-893313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tanveer Badar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893313">
+			February 4, 2011 at 8:18 am</a>		</div>
+
+		<p>Do you crucify the people who utter things like &quot;garbage collection&quot;, &quot;managed memory&quot; and CLR?</p>
+<p>P.S.: Lack of comments is astounding.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893323">
+				<div id="div-comment-893323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mathieu Garstecki</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893323">
+			February 4, 2011 at 8:48 am</a>		</div>
+
+		<p>@Tanveer: There must be a nitpickers&#39; convention somewhere this week.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jader3rd even thread-even depth-1" id="comment-893333">
+				<div id="div-comment-893333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/jader3rd' rel='external nofollow' class='url'>jader3rd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893333">
+			February 4, 2011 at 9:02 am</a>		</div>
+
+		<p>I wish there was an FxCop rule which forbid boolean parameters. They virtually never make sense to someone reading the code that calls the method.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893343">
+				<div id="div-comment-893343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893343">
+			February 4, 2011 at 9:48 am</a>		</div>
+
+		<p>&quot;fAbort­Call&quot;? &nbsp;I don&#39;t think I&#39;ve ever seen an f prepended to a boolean parameter before. &nbsp;What does it stand for?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-893373">
+				<div id="div-comment-893373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul M. Parks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893373">
+			February 4, 2011 at 10:03 am</a>		</div>
+
+		<p>@Mason: &quot;Flag&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893383">
+				<div id="div-comment-893383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893383">
+			February 4, 2011 at 10:10 am</a>		</div>
+
+		<p>FYI, Garbage collection doesn&#39;t help here as garbage collection can&#39;t see pointers in kernel.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-893423">
+				<div id="div-comment-893423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodr&#237;guez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893423">
+			February 4, 2011 at 11:43 am</a>		</div>
+
+		<p>@Joshua: Then simply rewrite the whole kernel in managed code&#8230; Ah, yes, I forgot this is Windows, not Singularity&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893453">
+				<div id="div-comment-893453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mr Pickles</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893453">
+			February 4, 2011 at 3:45 pm</a>		</div>
+
+		<p>It&#39;s about time Microsoft did something about this.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-893463">
+				<div id="div-comment-893463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893463">
+			February 4, 2011 at 4:10 pm</a>		</div>
+
+		<p>@Mr. Pickles: no, it isn&#39;t.</p>
+<p>These problems are normal to cancellable async. I/O. If you can&#39;t stomach it, don&#39;t use it. Memory&#39;s cheap. Use threads for cancellable sync. I/O.</p>
+<p>I know UNIX has another solution involving select(), but that&#39;s its own headache until you get it right.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893493">
+				<div id="div-comment-893493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gechurch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893493">
+			February 4, 2011 at 11:26 pm</a>		</div>
+
+		<p>Unbelievable! I&#39;m used to seeing customers on Raymond&#39;s blog that miss something obvious, or do something dumb. But this customer has been told the problem in their code (they aren&#39;t waiting until the async call is cancelled before cleaning it up), then they go and changed the fixed code to have a timeout! And then they re-open a case with Microsoft!</p>
+<p>&quot;Hey Microsoft, you know how we had that bug where we weren&#39;t waiting for the async event to cancel? Well your fixed worked for a while, but now that we&#39;ve rewritten the code to only wait five seconds and then to clean up even if the call hasn&#39;t been cancelled the bug has come back. What could possibly be causing it?&quot;.</p>
+<p>Duh!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-893593">
+				<div id="div-comment-893593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893593">
+			February 6, 2011 at 4:46 pm</a>		</div>
+
+		<p>@jader3rd &#8211; absolutely correct. Valid for setting a property (assuming a language without native property syntax), but I&#39;m even now in the middle of cleaning up some code featuring object constructors with up to 4 boolean parameters. Not exactly readable &#8211; I want to replace them with enums, assuming the settings cannot be removed entirely.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893623">
+				<div id="div-comment-893623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cheong</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893623">
+			February 6, 2011 at 6:36 pm</a>		</div>
+
+		<p>@Joshua: I&#39;m always hesitate to choose between 1) having asynchronous I/O; and 2) using synchronous I/O on a pool of threads. Is there any guideline on choosing which approach to use?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-893703">
+				<div id="div-comment-893703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893703">
+			February 7, 2011 at 3:32 pm</a>		</div>
+
+		<p>@Cheong:</p>
+<p>If a file handle is opened for synchronous IO (no OVERLAPPED flag), pool of threads is pointless, because only one IO can be in progress on such a handle.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-893723">
+				<div id="div-comment-893723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cheong</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110204-00/?p=11583#comment-893723">
+			February 7, 2011 at 5:07 pm</a>		</div>
+
+		<p>@Alex: My question comparing between pool of thread (or perheps better saying using background thread instead) is for the sake of responsiveness.</p>
+<p>But by what you said the result is clear.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

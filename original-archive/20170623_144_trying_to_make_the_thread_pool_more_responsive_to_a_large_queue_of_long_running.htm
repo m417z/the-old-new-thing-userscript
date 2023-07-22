@@ -1,0 +1,762 @@
+<html>
+<head>
+<title>Trying to make the thread pool more responsive to a large queue of long-running work items</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Trying to make the thread pool more responsive to a large queue of long-running work items</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 23, 2017 / year-entry #145</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>22</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Convert them to tasks.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had a question about the thread pool.
+Specifically, they found that when they queued a work item
+with the
+<code>System.</code><code>Threading.</code><code>Thread&shy;Pool.</code
+><code>Queue&shy;User&shy;Work&shy;Item</code>
+method,
+the work item didn't start running until eight minutes later.
+They used
+<code>Get&shy;Min&shy;Threads()</code> and
+<code>Get&shy;Max&shy;Threads()</code>
+to determine that the thread pool is configured with
+a minimum or 40 worker threads and maximum of 32767.
+</p>
+<p>
+The system thread pool
+intentionally delays the creation of new threads
+to reduce the likelihood of "wakeup storms".
+<a HREF="https://channel9.msdn.com/Shows/Going+Deep/Inside-Windows-8-Pedro-Teixeira-Thread-pool">
+Here's a Channel9 video that
+looks inside the thread pool</a>.
+The thread pool is designed to maximize throughput,
+not to minimize latency.
+</p>
+<p>
+The customer replied that the delay, while well-intentioned,
+is resulting in significant delays in the completion of work items.
+The customer wanted to know if there was some way to tell
+the thread pool to be more aggressive about creating new
+threads to help drain the backlog.
+Or should they just create a thread for each work item,
+so that it starts running immediately?
+The customer explained that
+the work items are relatively long-running
+because they communicate with a Web service,
+which means that most of the work item's
+running time is just waiting for a response from the service.
+</p>
+<p>
+While
+there may be some CPU-bound portions of the operation,
+most of the time, the work item is just waiting for a response.
+The customer should formulate the work items
+as C# tasks
+and use the <code>async</code> infrastructure to yield threads
+back to the thread pool when they are waiting for the server
+to return with an answer.
+</p>
+<p>
+A colleague demonstrated with a sample program that creates a thousand
+work items,
+each of which simulates a network call that takes 500ms to complete.
+In the first demonstration,
+the network calls were blocking synchronous calls, and
+the sample program limited the thread pool to ten threads in order
+to make the effect more apparent.
+Under this configuration,
+the first few work items were quickly dispatched to threads,
+but then the latency started to build as there were no more threads
+available to service new work items, so the remaining work items
+had to wait
+longer and longer for a thread to become available to service it.
+The average latency to the start of the work item was over two minutes.
+</p>
+<p>
+The second version of the sample increased the number of threads
+in the thread pool to 200 but made no changes to the work items themselves.
+Under this configuration, there were more threads available to retire
+work items,
+which meant that there were five times as many threads working to
+retire work items.
+In this configuration, the average latency to the start of the work item
+was only four seconds.
+</p>
+<p>
+The third version of the sample converted the work item to a C# task.
+Instead of performing a synchronous wait for the response from the server,
+the work item used the <code>await</code> keyword to initiate the
+I/O operation, requested to be called back when the I/O completed
+(by attaching a continuation to the task),
+and then returned the thread back to the thread pool
+immediately.
+When the simulated I/O operation completed, the task continuation ran,
+which took the simulated I/O results and did some imaginary work with them.
+In this version, even with a thread pool cap of only 10 threads,
+the average latency to the start of the work item was
+0.0005 milliseconds.
+That's because the work items got in, did their work, and when they
+found themselves waiting on something, they got out,
+thereby releasing the thread pool thread to work on a new task,
+which could be a newly-queued work item, or the continuation of one
+that had already started.
+</p>
+<p>
+The point of this exercise was to show that breaking the work item
+into tasks improves the efficient of the thread pool threads since
+they are always busy doing something rather than sitting around
+waiting for something to do.
+It's like that movie where there was a thread that had to
+<i>speed</i>
+around the work item queue,
+keeping its <i>speed</i> above 100% CPU,
+and if its <i>speed</i> dropped,
+it would explode.
+I think it was called
+<a HREF="https://www.youtube.com/watch?v=DIrIvKKT_nk">
+<i>The thread that couldn't slow down</i></a>.
+</p>
+<p>
+The customer replied,
+"This is amazing.
+My understanding is: enlarging min threads in thread pool
+and switching to Task can definitely improve the performance?"
+</p>
+<p>
+The customer got half the point.
+</p>
+<p>
+Increasing the number of threads in the task pool mitigates
+the original problem,
+because you increase the number of threads that can work to retire
+work items.
+Your improvement is linear in the number of threads.
+</p>
+<p>
+Switching to C# tasks solves the problem entirely.
+Notice that when we switched to C# tasks, we were able to
+process a thousand work items in under a second, even though
+we had only ten threads.
+Indeed, even if we dropped the thread pool maximum thread count
+to two, the program can still process 1000 tasks in one second.
+The improvement is superlinear, at no additional thread cost.
+</p>
+<p>
+Tasks allow a small number of threads to process
+multiple work items in pseudo-parallel.
+Ten threads can be juggling 100 tasks each,
+if the tasks spend most of their time waiting.
+</p>
+<p>
+Enlarging the thread pool allows more threads to
+work at draining the task queue.
+Each thread can drain one task, so 200 threads can drain 200 tasks.
+However, if you have 200 threads in your thread pool,
+it's really not a thread pool any more.
+The purpose of a thread pool is to amortize
+the overhead cost of creating threads by having
+a single thread do multiple pieces of work.
+Creating 200 threads is effectively abandoning the idea
+that you're trying to minimize thread creation overhead.
+(Context switching, memory for stacks, etc.)
+</p>
+<p>
+Imagine that each work item is a customer in line at a fast-food restaurant.
+Each person gets to the counter,
+and then stops and says, "Hm, I wonder what to get.
+Let me look at the menu."
+In version&nbsp;1,
+each cashier has to stand there and
+wait for the customer to decide what they want to order.
+</p>
+<p>
+Using tasks means that when the customer gets to the
+front of the line and starts looking at the menu,
+the cashier can say,
+"Let me know when you're ready," and then call "Next!"
+and start helping the next person in line.
+If that person stops and stares at the menu,
+then the cashier can keep calling "Next!"
+and have 20 people all standing there at the counter staring at the menu.
+Eventually, a customer will say, "Okay, I'm ready,"
+as soon as a cashier finishes
+with the customer they are currently serving,
+that cashier can
+help the customer who is now ready to order.
+A single cashier can serve 20 customers simultaneously
+because through most of the transaction,
+the customer is staring at the menu trying to decide what to do next.
+During that time, the cashier can be doing something else.
+Furthermore, when the customer becomes ready,
+any cashier can resume the transaction.
+It doesn't have to be the cashier that started the transaction.
+</p>
+<p>
+Using threads means that you hire 200 cashiers.
+Each cashier calls "Next!,"
+and then when the customer stops to look at the menu,
+the cashier just stands there waiting.
+Youre paying the overhead for 200 cashiers,
+but not utilizing them efficiently.
+</p>
+<p>
+And in fact it's worse than that.
+Because those 200 cashiers are not true physical cashiers standing there.
+The ordering system is really a video chat,
+and there's a person in a remote office taking the order.
+And the dirty secret is that the remote office has only four employees!
+When you hired 200 cashiers,
+you set up 200 video terminals,
+but there are only four employees
+at the remote office who are actually taking orders.
+Those four employees are switching between video chat windows
+based on which customers are ready.
+And sometimes,
+there are five ready customers,
+and the remote employee
+has to put an existing customer on hold
+in order to service the fifth customer.
+So basically, it's back to the same thing as tasks,
+but with a lot more overhead,
+and more rudeness
+(putting a customer on hold
+while they are in the middle of placing an order).
+</p>
+<p>
+(In case you haven't figured it out:
+The person in the remote office is a CPU core.)
+</p>
+<p>
+My colleague didn't share the code for their sample program
+to demonstrate tasks,
+so I wrote one based on the description.
+Here it is:
+</p>
+<pre>
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+ 
+class Program
+{
+ static int ITERATIONS = 1000;
+ static CountdownEvent done = new CountdownEvent(ITERATIONS);
+ static DateTime startTime = DateTime.Now;
+ static TimeSpan totalLatency = TimeSpan.FromSeconds(0);
+ static SynchronizedCollection&lt;string&gt; messages =
+  new SynchronizedCollection&lt;string&gt;();
+ 
+ static void Log(int id, DateTime queueTime, string action)
+ {
+   var now = DateTime.Now;
+   var timestamp = now - startTime;
+   var latency = now - queueTime;
+   var msg = string.Format("{0}: {1} {2,3}, latency = {3}",
+     timestamp, action, id, latency);
+   messages.Add(msg);
+   System.Console.WriteLine(msg);
+ }
+
+ static void OnTaskStart(int id, DateTime queueTime)
+ {
+   var latency = DateTime.Now - queueTime;
+   lock(done) totalLatency += latency;
+   Log(id, queueTime, "Starting");
+ }
+ 
+ static void OnTaskEnd(int id, DateTime queueTime)
+ {
+   Log(id, queueTime, "Finished");
+   done.Signal();
+ }
+ 
+ public static void V1()
+ {
+  ThreadPool.SetMaxThreads(10, 10);
+  for (int i = 0; i &lt; ITERATIONS; i++) {
+   var queueTime = DateTime.Now;
+   int id = i;
+   ThreadPool.QueueUserWorkItem((o) =&gt; {
+    OnTaskStart(id, queueTime);
+    Thread.Sleep(500);
+    OnTaskEnd(id, queueTime);
+   });
+   Thread.Sleep(10);
+  }
+ }
+ 
+ public static void V2()
+ {
+  ThreadPool.SetMinThreads(20, 1);
+  ThreadPool.SetMaxThreads(20, 1);
+  for (int i = 0; i &lt; ITERATIONS; i++) {
+   var queueTime = DateTime.Now;
+   int id = i;
+   ThreadPool.QueueUserWorkItem((o) =&gt; {
+    OnTaskStart(id, queueTime);
+    Thread.Sleep(500);
+    OnTaskEnd(id, queueTime);
+   });
+   Thread.Sleep(10);
+  }
+ }
+ 
+ public static void V3()
+ {
+  ThreadPool.SetMaxThreads(1, 1);
+  for (int i = 0; i &lt; ITERATIONS; i++) {
+   var queueTime = DateTime.Now;
+   int id = i;
+   ThreadPool.QueueUserWorkItem(async (o) =&gt; {
+    OnTaskStart(id, queueTime);
+    await Task.Delay(500);
+    OnTaskEnd(id, queueTime);
+   });
+   Thread.Sleep(10);
+  }
+ }
+ 
+ public static void Main(string[] args)
+ {
+  if (args.Length&lt;1) return;
+  switch (args[0]) {
+  case "1": V1(); break;
+  case "2": V2(); break;
+  case "3": V3(); break;
+  }
+  done.Wait();
+  foreach (var message in messages) {
+    System.Console.WriteLine(message);
+  }
+  System.Console.WriteLine(
+   "Average latency = {0}",
+   TimeSpan.FromMilliseconds(totalLatency.TotalMilliseconds / ITERATIONS));
+ }
+}
+</pre>
+<p>
+This program simulates a workload where a new work item
+is requested every 10ms, for a total of 1000 work items.
+</p>
+<p>
+Run the program with the command line parameter <code>1</code>
+to run the original version,
+where we simply sleep to simulate the network operation,
+on a thread pool with a maximum of ten threads.
+This version reports an average latency of around 32 seconds.
+When you run this version,
+notice that the only time a work item starts is when a previous
+work item completes.
+</p>
+<p>
+If you use the command line parameter <code>2</code>,
+then you get the first alternate,
+which also sleeps to simulate the network operation,
+but on a thread pool with twenty threads.
+In this version, the average latency
+is significantly better (around 5 seconds)
+because we have more threads
+available.
+However, those theads are still being used inefficiently,
+because they spend most of their time waiting.
+</p>
+<p>
+<p>
+If you use the command line parameter <code>3</code>,
+then you get the second alternate,
+which uses asynchronous I/O
+(here simulated as an asynchronous delay).
+In this version, the average latency
+is minuscule (cannot even be measured),
+even though all the tasks are running on a single thread.
+That one thread runs the task as long as the task is actively
+doing work,
+but once it performs an I/O operation,
+the thread stops running the task and moves to another ready task.
+When the I/O completes, then the task continuation becomes ready,
+and it joins the list of tasks that our one thread can process.
+One thread can juggle a thousand tasks with low latency.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (22)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1300495">
+				<div id="div-comment-1300495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://Damsteen.nl' rel='external nofollow' class='url'>Sebastiaan D.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300495">
+			June 23, 2017 at 7:26 am</a>		</div>
+
+		<p>What happens when many web requests (from your example) complete simultaniously? Then you would have a problem in the task example wouldn&#8217;t you?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1300565">
+				<div id="div-comment-1300565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300565">
+			June 23, 2017 at 2:33 pm</a>		</div>
+
+		<p>Then all tasks will become ready and the thread pool will work through them. If you have one thread pool thread per core, then you are going as fast as possible (since all threads will be at 100% CPU utilization until the work queue is drained).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1300505">
+				<div id="div-comment-1300505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300505">
+			June 23, 2017 at 7:49 am</a>		</div>
+
+		<p>This is neat !</p>
+<p>But I&#8217;m kind of surprised. I believed that Raymond wasn&#8217;t a C# programmer and didn&#8217;t want to write about C# / .NET ? (according to very old posts)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1300506">
+				<div id="div-comment-1300506" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300506">
+			June 23, 2017 at 8:06 am</a>		</div>
+
+		<p>Very old blog post is very old. Have you not heard of CLR Week?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1300515">
+				<div id="div-comment-1300515" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300515">
+			June 23, 2017 at 8:24 am</a>		</div>
+
+		<p>Yes I have. I was under the impression they were exceptionnal, and didn&#8217;t change the &#8220;rule&#8221;.  My bad !</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1300585">
+				<div id="div-comment-1300585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300585">
+			June 24, 2017 at 3:44 am</a>		</div>
+
+		<p>Even if the customer wasn&#8217;t actually using C#, I for one don&#8217;t want to see all the boilerplate that would be needed to propagate state through an asynchronous network call in C, as it would obscure the point of the post.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1300516">
+				<div id="div-comment-1300516" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken in NH</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300516">
+			June 23, 2017 at 8:42 am</a>		</div>
+
+		<p>Thank you Raymond. This post will go into my bookmarks. I have had a few <strike>arguments</strike> discussions with colleagues who have misread Stephen Cleary&#8217;s advice to either make it async/await all the way down (and use in appropriate situations) or ConfigureAwait(false) (basically turning tasks into threads). They found it hard to keep tasks from deadlocking and read Cleary&#8217;s post as a justification for their dislike of tasks and async/await.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1300525">
+				<div id="div-comment-1300525" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jnm2</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300525">
+			June 23, 2017 at 10:00 am</a>		</div>
+
+		<p>Funny that I read this just after reading this article with a jaundiced eye:<br />
+<a href="https://ayende.com/blog/178369/a-thread-per-task-keep-the-headache-away" rel="nofollow">https://ayende.com/blog/178369/a-thread-per-task-keep-the-headache-away</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mngoldeneagle even depth-2" id="comment-1300555">
+				<div id="div-comment-1300555" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300555">
+			June 23, 2017 at 12:23 pm</a>		</div>
+
+		<p>Reading that post, it sounds like what they need moreso is a custom threadpool that can manage the workflow more efficiently and take priority into account, rather than dedicated threads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1300625">
+				<div id="div-comment-1300625" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300625">
+			June 25, 2017 at 10:18 am</a>		</div>
+
+		<p>This is a classical case of &#8220;Good advice comes with a rationale so you can tell when it becomes bad advice&#8221;*. The argument for not using explicit threads is that creating millions of short-lived threads is expensive and wasteful. The argument does in no way apply if what you&#8217;re doing is create a handful of long-lived threads for specific scenarios. Doing so is perfectly acceptable and using thread-pool threads for such a scenario would be an abuse of the system. </p>
+<p>Now if you still want to use tasks for your long running threads because frankly the API is nicer, you can go and use TaskFactory.StartNew TaskCreationOptions.LongRunning (just be careful with the other parameters you have to pass to that function, it&#8217;s rather tricky to use correctly). </p>
+<p>*https://blogs.msdn.microsoft.com/oldnewthing/20091104-00/?p=16153</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1300556">
+				<div id="div-comment-1300556" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Piotr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300556">
+			June 23, 2017 at 1:24 pm</a>		</div>
+
+		<p>is await implemented as I/O Completion Port?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1300566">
+				<div id="div-comment-1300566" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300566">
+			June 23, 2017 at 5:36 pm</a>		</div>
+
+		<p>await is nothing more than a suspend/resume point in a function; upon waking up it&#8217;ll do the right thing.  In other words, it depends on the actual thing being awaited since it will be the one doing the waking up.  If the thing you are doing is using the IO completion port then yes, if it is dumb and it is not, then no.</p>
+<p>Also yes, more so than not, if you stick with things in the CLR/BCL/.NET proper, their awaitable types/methods are most likely using the IO completion port infrastructure under the covers simply by ways of already using what was there before async/wait came into being.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1300575">
+				<div id="div-comment-1300575" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua Schaeffer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300575">
+			June 24, 2017 at 2:30 am</a>		</div>
+
+		<p>IIRC the Windows 8 thread pool isn&#8217;t used in the .NET Framework but it is used in WinRT which is now used for I/O in .NET Core on Windows 10. The thread creation throttling finally made it possible to run managed code on the same pool without thread explosion during GC. The original .NET Framework thread pool was supposedly forked from the WinXP native pool and all the I/O was written to complete with explicit event handles instead of IOCP packets, meaning it ran like an old dog under stress. How it lasted this long is far beyond me.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1300595">
+				<div id="div-comment-1300595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300595">
+			June 24, 2017 at 9:06 pm</a>		</div>
+
+		<p>Good to know. I never used it, being lazy and just keeping around enough threads to always service something. Now I never will.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1300666">
+				<div id="div-comment-1300666" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.wpdev.fr' rel='external nofollow' class='url'>Kevin Gosse</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300666">
+			June 26, 2017 at 3:45 am</a>		</div>
+
+		<p>Do you have more information on the subject? Poking around the code of WinRT, the threadpool is clearly just a wrapper to native APIs. However, I can&#8217;t find the same thing on the CoreClr repository&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1300626">
+				<div id="div-comment-1300626" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vilx-</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300626">
+			June 25, 2017 at 12:26 pm</a>		</div>
+
+		<p>I just wonder &#8211; at the end of the day, you still have X items of work that need doing and SOMEONE SOMEWHERE needs to switch between them and schedule CPU time for each of them. What difference does it make if we do this locally via 200 Tasks, or offload it to the kernel in the form of 200 threads? It seems to me that the total amount of work that needs to be done doesn&#8217;t change either way. Why are the Tasks considered more efficient?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1300635">
+				<div id="div-comment-1300635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Csaba Varga</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300635">
+			June 25, 2017 at 1:36 pm</a>		</div>
+
+		<p>Threads need memory for their stack, thread-local storage, plus whatever per-thread bookkeeping the OS needs to do. Tasks need memory only to store their current state, which is typically at least an order of magnitude less than what a full-blown thread needs.</p>
+<p>Switching between C# tasks is also more efficient since the same thread can just look up what to do next from some internal data structure. Switching between OS threads, on the other hand, requires complex steps like saving and restoring registers and switching memory descriptors, and you also must involve the kernel to do it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt depth-2" id="comment-1300645">
+				<div id="div-comment-1300645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300645">
+			June 25, 2017 at 7:10 pm</a>		</div>
+
+		<p>Consider task that takes 500ms waiting for network resource and then 500ms to do actual work (common pattern for task like reading database from network and do computations and return result. More often the wait itself is longer than the work itself on busy systems), and running on 4 core machine.</p>
+<p>In pure ThreadPool based model, the 200 task will offload to 200 Threads which in turn compete for the 4 logical CPU cores available. Total time taken will be around 200 * 1000ms / 4 = 50 seconds.</p>
+<p>In Task based model, the thread will be suspended on wait and freeing the CPU to do other works, so when each thread will hit the CPU briefly and put to wait, and then waken when data is ready and can perform CPU intensive tasks. Since time is not wasted when waiting, the overall processing time now becomes a little more than 200 * 500ms / 4 = 25 seconds, (the &#8220;a little more&#8221; part refers to the cost of task switching and the delay on waking out tasks, which is usually very small when compare with the time spent on wait).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1300665">
+				<div id="div-comment-1300665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">samlh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300665">
+			June 25, 2017 at 9:34 pm</a>		</div>
+
+		<p>The reason Tasks are more scalable than threads is that they do not need to keep the whole stack around when suspended, they can just store the needed data on the heap (4MB vs (e.g.) 1kb). Also, the tasks are scheduled in user space, and thus can avoid the need to context-switch to the kernel and back.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1300955">
+				<div id="div-comment-1300955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1300955">
+			June 29, 2017 at 11:14 am</a>		</div>
+
+		<p>&#8220;The reason Tasks are more scalable than threads is that they do not need to keep the whole stack around when suspended, &#8221;</p>
+<p>This only applies to solutions with dedicated threads, not to thread pool solutions. There is no principle difference between C# tasks and using a threadpool (even the C# tasks has to run somewhere in the background =&gt; they use the .Net thread pool).</p>
+<p>It all depends on how small the parts are which are put to background execution (assigned to a task or to a thread), and how good eternal operations (i.e. I/O) are made asynchronous (that is, by not putting threads to sleep to wait for the result, but freeing up the thread in the meantime).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1301015">
+				<div id="div-comment-1301015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1301015">
+			June 30, 2017 at 4:57 am</a>		</div>
+
+		<p>s/eternal/external/</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1301375">
+				<div id="div-comment-1301375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170623-00/?p=96455#comment-1301375">
+			July 5, 2017 at 2:29 am</a>		</div>
+
+		<p>To perform the same over-all work, .NET Tasks are not magically faster than .NET threads. .NET Tasks are executed by the .NET threadpool. If some of your tasks are doing cpu-bound operations which therefore really need a thread for some lengthy time, .NET seems to be somewhat lazy to create additional threads to process other waiting tasks. So, when only ever two threadpool threads are processing a larger number of waiting tasks, this will be slower than using an appropriate number of threads.</p>
+<p>.NET does not know in advance how long or short a task will run. The creation of new threadpool threads to process other waiting tasks is bound to some heuristic which may or may not work in favor of your specific case.</p>
+<p>(Also: .NET threads are also not the same as OS threads. As far as I understood, in many cases of waiting for something by a .NET synchronization method, the OS thread will be released for reuse by another .NET thread.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

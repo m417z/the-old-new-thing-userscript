@@ -1,0 +1,504 @@
+<html>
+<head>
+<title>Why did my thread pool stop processing work once it hit a long-running work item?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why did my thread pool stop processing work once it hit a long-running work item?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 15, 2017 / year-entry #38</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Because you ran the work item on the persistent thread.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer found that occasionally, their program's thread pool
+stopped processing work items queued with the
+<code>WT_EXECUTE&shy;IN&shy;PERSISTEN&shy;THREAD</code> flag.
+They would queue up the work items to the thread pool,
+but the work items would not get dispatched.
+Naturally, this caused problems with the program because
+certain background actions would simply stall.
+</p>
+<p>
+After some investigation, the problem was traced to this
+work item that appears to be preventing the thread pool
+from processing any work:
+</p>
+<pre>
+ntdll!NtWaitForMultipleObjects+0xc
+KERNELBASE!WaitForMultipleObjectsEx+0xcc
+kernel32!WaitForMultipleObjects+0x19
+contoso!WidgetMonitor::WidgetNotificationCallback+0xfd
+contoso!std::tr1::_Callable_fun&lt;void (__stdcall*const)
+    (std::tr1::shared_ptr&lt;WidgetService&gt;),0&gt;::_ApplyX+0x1b
+contoso!std::tr1::_Impl_no_alloc1&lt;std::tr1::_Callable_fun&lt;
+    void (__stdcall*const)(std::tr1::shared_ptr&lt;WidgetService&gt;),0&gt;,
+    void,std::tr1::shared_ptr&lt;WidgetService&gt; &amp;&gt;::_Do_call+0x2d
+contoso!std::tr1::_Function_impl1&lt;void,std::tr1::shared_ptr&lt;
+    WidgetMonitor::WidgetNotificationContext&gt; &amp;&gt;::operator()+0x1e
+contoso!Win32Adapters::Threading::Callback&lt;std::tr1::shared_ptr&lt;
+    WidgetMonitor::WidgetNotificationContext&gt; &gt;::
+    ExecuteCallbackTarget+0x3f
+contoso!Win32Adapters::Threading::Callback&lt;std::tr1::shared_ptr&lt;
+    WidgetMonitor::WidgetNotificationContext&gt; &gt;::
+    DefaultThreadProc+0xd
+ntdll!RtlpTpWorkCallback+0xef
+ntdll!TppWorkerThread+0x4f3
+kernel32!BaseThreadInitThunk+0x24
+ntdll!__RtlUserThreadStart+0x2f
+ntdll!_RtlUserThreadStart+0x1b
+</pre>
+<p>
+(I inserted line breaks for readability.)
+</p>
+<p>
+Once they closed the widget monitor,
+the thread pool woke up and the work items
+that targeted the persistent thread
+started running again.
+</p>
+<p>
+Okay, first things first: For expository purposes, let's
+remove all of the <code>std::tr1</code> stuff and pretend
+that the stack was this:
+</p>
+<pre>
+ntdll!NtWaitForMultipleObjects+0xc
+KERNELBASE!WaitForMultipleObjectsEx+0xcc
+kernel32!WaitForMultipleObjects+0x19
+contoso!WidgetMonitor::WidgetNotificationCallback+0xfd
+ntdll!RtlpTpWorkCallback+0xef
+ntdll!TppWorkerThread+0x4f3
+kernel32!BaseThreadInitThunk+0x24
+ntdll!__RtlUserThreadStart+0x2f
+ntdll!_RtlUserThreadStart+0x1b
+</pre>
+<p>
+That gets rid of the project's internal callback scaffolding
+and lets us focus on the interaction with the operating system.
+</p>
+<p>
+The problem isn't really visible in the stack trace.
+We'll have to go to the code.
+</p>
+<pre>
+void WidgetMonitor::WidgetNotificationCallback(void* parameter)
+{
+ WidgetNotificationContext* context =
+   reinterpret_cast&lt;WidgetNotificationContext*&gt;(parameter);
+
+ RAII_HKEY hkey = ...;
+ RAII_HANDLE registryEvent = ...;
+ bool keepWaiting = true;
+ while (keepWaiting) {
+  if (RegNotifyChangeKeyValue(hkey, false, REG_NOTIFY_CHANGE_LAST_SET,
+                              registryEvent, TRUE) == ERROR_SUCCESS) {
+   HANDLE handles[2] = { registryEvent, context-&gt;shutdownEvent };
+   DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+   switch (waitResult) {
+   case WAIT_OBJECT_0: // the registry key changed
+    ...
+    break;
+   case WAIT_OBJECT_0+1: // we are being asked to shut down
+    ...
+    keepWaiting = false;
+    break;
+   default: // Something unexpected happened
+    ...
+    keepWaiting = false;
+    break;
+   }
+  }
+ }
+}
+</pre>
+<p>
+The deal is that the callback function processes the callback,
+and then goes into a loop monitoring a registry key.
+It continues monitoring the key until the shutdown event is signaled.
+</p>
+<p>
+Okay, so this looks a little weird, holding a thread pool thread
+hostage for an extended period of time,
+which is sort of contrary to the intent of a thread pool,
+which is to reuse a thread for multiple short work items.
+But it's technically legal,
+and you are
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20050722-15/?p=34843">
+encouraged to pass the
+<code>WT_EXECUTE&shy;LONG&shy;FUNCTION</code> flag</a>
+to tell the thread pool,
+"This function will take
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20111209-00/?p=8933">
+a long time</a>, so you may want to
+schedule work onto other threads more aggressively instead of
+sitting around waiting for this work item to finish."
+</p>
+<p>
+But the problem is that the program didn't pass only the
+<code>WT_EXECUTE&shy;LONG&shy;FUNCTION</code> flag.
+It did this:
+</p>
+<pre>
+BOOL WidgetMonitor::StartMonitoringChangeNotifications()
+{
+  WidgetNotificationContext context = ...;
+  return QueueUserWorkItem(
+    WidgetMonitor::WidgetNotificationCallback,
+    context, WT_EXECUTELONGFUNCTION | WT_EXECUTEINPERSISTENTTHREAD);
+}
+</pre>
+<p>
+Notice that they requested that the callback run in the persistent thread.
+But the documentation for that flag says
+</p>
+<blockquote CLASS="q"><p>
+This flag should be used only for short tasks&hellip;
+</p>
+</blockquote>
+<p>
+So we have a contradiction.
+One flag says,
+"Run this callback in a persistent thread, and I promise I don't
+take a long time."
+The other flag says,
+"I'm going to take a long time."
+</p>
+<p>
+The original thread pool was a bit too trusting and assumed that
+nobody would be so crazy as to explicitly declare their intent
+to break the rules.&sup1;
+I mean, if you're going to break the rules, you are probably going
+to be sneaky about it, right?
+It so happened that the way the thread pool code was written,
+the
+<code>WT_EXECUTE&shy;IN&shy;PERSISTEN&shy;THREAD</code> flag
+takes precedence.
+The callback runs in the persistent thread, even though it runs long.&sup2;
+</p>
+<p>
+And that's why the thread pool persistent thread grinds to a halt.
+The persistent thread is running the callback function,
+and the callback function is stuck.
+As a result, the persistent thread can't do anything else,
+and the thread pool makes no progress.
+This also explains why shutting down widget notifications
+caused everything to wake up:
+Shutting down widget notifications causes the
+<code>Widget&shy;Config::Widget&shy;Notification&shy;Callback</code>
+function to break out of its loop and finally exit.
+This releases the persistent thread to run more work items.
+</p>
+<p>
+Okay, so we've diagnosed the problem.
+Next time, we'll speculate as to why the developers
+chose to combine contradictory threads
+and (perhaps more important) suggest a solution.
+</p>
+<p>
+&sup1;
+Actually, what's happening is that the two flags are targeting
+different parts of the thread pool.
+The "persistent thread" flag is an instruction to the thread pool
+work item dispatcher, telling it to dispatch the work item to
+a persistent thread.
+The "long function" flag is an instruction to the thread pool
+throughput manager to let it know that it should prefer to start
+a new thread instead of waiting for the work item to complete.
+Neither component on its own noticed anything wrong.
+</p>
+<p>
+&sup2;
+If we had a time machine, we could go back and make this combination of
+flags cause <code>Queue&shy;User&shy;Work&shy;Item</code> fail with
+<code>ERROR_INVALID_PARAMETER</code>,
+but unfortunately that option is not available to us.
+We're stuck with the existing behavior of allowing the contradictory
+flags and ignoring the
+<code>WT_EXECUTE&shy;LONG&shy;FUNCTION</code> flag.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1284965">
+				<div id="div-comment-1284965" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Haim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1284965">
+			February 15, 2017 at 7:42 am</a>		</div>
+
+		<p>I always assumed the win32 thread pool uses some sort of hill-climbing with the number of threads to prevent exactly this kind of problems, isn&#8217;t it?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1285035">
+				<div id="div-comment-1285035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285035">
+			February 15, 2017 at 9:09 am</a>		</div>
+
+		<p>Not sure how <a href="https://en.wikipedia.org/wiki/Hill_climbing" rel="nofollow">hill-climbing</a> comes into play. The deal is that &#8220;the persistent thread&#8221; is the thread that dispatches the work to worker threads. For very short tasks, you can run them directly in the persistent thread. This means they dispatch faster, but it also means that nothing else gets dispatched until you&#8217;re done.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1285045">
+				<div id="div-comment-1285045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285045">
+			February 15, 2017 at 9:38 am</a>		</div>
+
+		<p>In which case I can imagine somebody doing this on purpose to pause the entire pool.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1285055">
+				<div id="div-comment-1285055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Haim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285055">
+			February 15, 2017 at 9:42 am</a>		</div>
+
+		<p>Yes, but is it mandatory that there&#8217;s only one singular persistence thread? The threadpool can see after sometime that the persistence thread is not free, add yet another persistence thread, see if the throughput of the workitems completion rate went up (it should in this case), stop for few seconds, and retry again.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-4 parent" id="comment-1285065">
+				<div id="div-comment-1285065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285065">
+			February 15, 2017 at 10:54 am</a>		</div>
+
+		<p>So you&#8217;re saying that the thread pool should work around other people&#8217;s programming errors? The &#8220;don&#8217;t need to be compatible with apps that break the rules&#8221; people might disagree with you on that.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1285125">
+				<div id="div-comment-1285125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Haim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285125">
+			February 15, 2017 at 1:13 pm</a>		</div>
+
+		<p>Well, I have to say that MSDN is really not clear on this, MSDN only writes &#8220;. This flag should be used only for short tasks or it could affect other timer operations.&#8221; , so for me, as a developer, that implies that if my thread pool doesn&#8217;t consume any timers it&#8217;s not the end of the world. MSDN does not really say that this is the dispatcher thread, and you also assume that as a thread pool, it knows to handle with long tasks (and you can clearly see in your debugger that the thread pool injects more threads if needed, aka the hill climbing), you assume it&#8217;s not the end of the world if your task takes longer. I wouldn&#8217;t call it &#8220;programming error&#8221; as much as I call it &#8220;ambiguous documentation&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle even depth-4" id="comment-1285085">
+				<div id="div-comment-1285085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285085">
+			February 15, 2017 at 11:27 am</a>		</div>
+
+		<p>I feel like that would increase the complexity of the threadpool considerably to support a workflow that the threadpool wasn&#8217;t designed to support (at which point the appropriate response would be, &#8220;write your own threadpool or grab one of the many libraries that does this for you&#8221;).  Honestly I&#8217;m surprised the WT_EXECUTEINPERSISTENTTHREAD flag exists.  I feel like that is just begging for abuse and kind of defeats the purpose of having a threadpool.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1284975">
+				<div id="div-comment-1284975" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1284975">
+			February 15, 2017 at 7:51 am</a>		</div>
+
+		<p>&#8220;We need a persistent thread to monitor registry changes&#8221;<br />
+&#8220;Why not run a workitem with WT_EXECUTE­IN­PERSISTEN­THREAD flag then?&#8221;<br />
+!!!!Profit!!!!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jeremytais even thread-even depth-1" id="comment-1284995">
+				<div id="div-comment-1284995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1284995">
+			February 15, 2017 at 8:05 am</a>		</div>
+
+		<p>My guess is that the devs didn&#8217;t read MSDN, and whoever named the flag WT_EXECUTE­IN­PERSISTEN­THREAD was wearing kernel-colored-glasses.  From a developer PoV, the name WT_EXECUTE­IN­PERSISTEN­THREAD kind of sounds like you want the thread pool to allocate a permanent thread to you.  So they were helpfully trying to tell the thread pool that this thread would be running a long time and so issue it its own thread.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1285025">
+				<div id="div-comment-1285025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wear</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285025">
+			February 15, 2017 at 9:01 am</a>		</div>
+
+		<p>Wouldn&#8217;t it be nice if all API issues could be solved with a time machine?</p>
+<p>&#8220;It hurts when I do this&#8221;<br />
+&#8220;I have just made it so that you were never able to do that&#8221;<br />
+&#8220;Do what?&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1285095">
+				<div id="div-comment-1285095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285095">
+			February 15, 2017 at 12:04 pm</a>		</div>
+
+		<p>&gt; The deal is that “the persistent thread” is the thread that dispatches the work to worker threads. For very short tasks, you can run them directly in the persistent thread. </p>
+<p>To put it simply: if an app uses the WT_EXECUTEINPERSISTENTTHREAD but it turns out to be a long running work item, then the whole thread pool is stalled for as long as that work item is being handled.  It doesn&#8217;t matter whether the WT_EXECUTELONGFUNCTION is specified or not.</p>
+<p>&gt; We&#8217;re stuck with the existing behavior of allowing the contradictory flags and ignoring the WT_EXECUTELONGFUNCTION flag.</p>
+<p>If you wanted to be nice to apps that pass the contradictory flags, couldn&#8217;t a change be made so that the WT_EXECUTELONGFUNCTION flag takes precedence?  That way the dispatcher would spin up a new thread for the work item (or pass it to an existing thread that isn&#8217;t the dispatcher thread).  This would leave the dispatcher free to handle new work items.  The cost would be that if the thread actually was a short task it might not be handled as efficiently.  But it would still be handled.</p>
+<p>I don&#8217;t see a downside to such a change, but maybe I&#8217;m missing something (like something to do with APCs).  Of course, the developer can still shoot themselves in the foot if they lie and use only the WT_EXECUTEINPERSISTENTTHREAD flag for a long running task. But at least some small subset of apps that attempt to tell the truth by also setting the WT_EXECUTELONGFUNCTION would be helped.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1285175">
+				<div id="div-comment-1285175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285175">
+			February 15, 2017 at 8:08 pm</a>		</div>
+
+		<p>Existing code that sometimes used both flags and sometimes used only WT_EXECUTE­IN­PERSISTEN­THREAD might break when work items that were expected to run from the same thread suddenly start running on two different threads.  (Granted, the code was already broken, but possibly only in the sense of running inefficiently; your proposed change could mean it no longer worked at all.)</p>
+<p>It might be safe for the thread pool to create a dedicated &#8220;persistent thread&#8221; separate from the dispatcher thread.  But that would defeat the original purpose of the flag, and make properly written code less efficient than it should be.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1285195">
+				<div id="div-comment-1285195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ismo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285195">
+			February 15, 2017 at 8:46 pm</a>		</div>
+
+		<p>Where was it implied that the persistent thread would be the very same every time ? As a developer I would have assumed that the are some persistent threads put a side  which are used when WT_EXECUTEINPERSISTENTTHREAD was specified. The documentation is not good here.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1285256">
+				<div id="div-comment-1285256" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285256">
+			February 16, 2017 at 10:11 am</a>		</div>
+
+		<p>Actually, now that I check, the documentation explicitly says that it ISN&#8217;T guaranteed to be the same thread each time.<br />
+Nonetheless, if that is the current implementation, there is likely to be existing code that depends on it. :-(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1285275">
+				<div id="div-comment-1285275" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170215-00/?p=95435#comment-1285275">
+			February 16, 2017 at 10:35 am</a>		</div>
+
+		<p>It&#8217;s been a while since I&#8217;ve had to deal with this kind of stuff on Windows, but in general combining a thread pool with something that &#8216;has to run on a particular thread&#8217; seems like a bad idea to me.  To me a threadpool should be used for work that can occur on any thread.  If the work needs to happen on a particular thread it shouldn&#8217;t be done using a threadpool (or the work done on the threadpool should just pass the real work on to the correct thread).  But maybe I&#8217;m over simplifying real world issues.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

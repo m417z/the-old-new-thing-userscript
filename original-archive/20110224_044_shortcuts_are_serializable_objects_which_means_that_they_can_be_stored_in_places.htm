@@ -1,0 +1,503 @@
+<html>
+<head>
+<title>Shortcuts are serializable objects, which means that they can be stored in places other than just a file</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Shortcuts are serializable objects, which means that they can be stored in places other than just a file</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 24, 2011 / year-entry #45</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It's true that the vast majority of the time, people consider the shell shortcut object as synonymous with the .lnk file it is normally saved into, shortcuts need not spend their time in a file. You can put a shortcut anywhere you can save a hunk of bytes. Here's a program that creates a shortcut...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+It's true that the vast majority of the time,
+people consider the shell shortcut object as synonymous with the
+<code>.lnk</code> file it is normally saved into,
+shortcuts need not spend their time in a file.
+You can put a shortcut anywhere you can save a hunk of bytes.
+Here's a program that creates a shortcut to the file name passed
+on the command line (make sure it's a full path),
+and then serializes the shortcut to a blob of bytes
+(in the form of a <code>HGLOBAL</code>).
+Once that's done, it reconstitutes the bytes back into a
+shortcut object and sucks information out of it.
+</p>
+<pre>
+#define UNICODE
+#define _UNICODE
+#include &lt;windows.h&gt;
+#include &lt;shlobj.h&gt;
+#include &lt;ole2.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;tchar.h&gt;
+#include &lt;atlbase.h&gt;
+
+HGLOBAL CreateShellLinkInMemory(PCWSTR pszFile)
+{
+ BOOL fSuccess = FALSE;
+ HGLOBAL hglob = GlobalAlloc(GMEM_MOVEABLE, 0);
+ if (hglob) {
+  CComPtr&lt;IStream&gt; spstm;
+  if (SUCCEEDED(CreateStreamOnHGlobal(hglob, FALSE, &amp;spstm))) {
+   CComPtr&lt;IShellLink&gt; spsl;
+   if (SUCCEEDED(spsl.CoCreateInstance(CLSID_ShellLink))) {
+    if (SUCCEEDED(spsl-&gt;SetPath(pszFile))) {
+     CComQIPtr&lt;IPersistStream&gt; spps(spsl);
+     fSuccess = spps &amp;&amp; SUCCEEDED(spps-&gt;Save(spstm, TRUE));
+    }
+   }
+  }
+ }
+ if (fSuccess) return hglob;
+ if (hglob) GlobalFree(hglob);
+ return NULL;
+}
+</pre>
+<p>
+After creating the shortcut object, we serialize it into
+a stream backed by a chunk of memory we record in a <code>HGLOBAL</code>.
+The shortcut object itself is no longer anywhere to be seen.
+It's been dehydrated into a pile of dust like in that old
+<i>Star Trek</i> episode.
+</p>
+<p>
+But this time, we know how to bring it back.
+</p>
+<pre>
+IShellLink *CreateShellLinkFromMemory(HGLOBAL hglob)
+{
+ IShellLink *pslReturn = NULL;
+ CComPtr&lt;IStream&gt; spstm;
+ if (SUCCEEDED(CreateStreamOnHGlobal(hglob, FALSE, &amp;spstm))) {
+  CComPtr&lt;IShellLink&gt; spsl;
+  if (SUCCEEDED(spsl.CoCreateInstance(CLSID_ShellLink))) {
+   CComQIPtr&lt;IPersistStream&gt; spps(spsl);
+   if (spps &amp;&amp; SUCCEEDED(spps-&gt;Load(spstm))) {
+    pslReturn = spsl.Detach();
+   }
+  }
+ }
+ return pslReturn;
+}
+</pre>
+<p>
+We create a new shortcut object and tell it to restore itself
+from the chunk of memory we squirreled away.
+Bingo, the shortcut is back, ready for action.
+</p>
+<pre>
+int __cdecl wmain(int argc, WCHAR **argv)
+{
+ if (SUCCEEDED(CoInitialize(NULL))) {
+  HGLOBAL hglob = CreateShellLinkInMemory(argv[1]);
+  if (hglob) {
+   CComPtr&lt;IShellLink&gt; spsl;
+   spsl.Attach(CreateShellLinkFromMemory(hglob));
+   if (spsl) {
+    WCHAR szTarget[MAX_PATH];
+    if (spsl-&gt;GetPath(szTarget, MAX_PATH, NULL, 0) == S_OK) {
+     wprintf(L"Welcome back, shortcut to %s\n", szTarget);
+    }
+   }
+   GlobalFree(hglob);
+  }
+  CoUninitialize();
+ }
+ return 0;
+}
+</pre>
+<p>
+Since shortcuts can be stored anywhere,
+you can't
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/05/28/9645162.aspx#9647906">
+rely on the file name to distinguish between shortcuts to files
+and shortcuts to folders</a>
+because there may not be a file name at all!
+(What's the file name for our <code>HGLOBAL</code>?)
+Even if you decide that the convention applies only to shortcuts
+saved in a file,
+you've created an additional burden on people who manipulate shortcut files:
+They have to check whether the target is a file or folder before
+choosing the file name,
+and if the target of the shortcut changes, they may have to rename the file
+as well.
+This is a real problem for the standard file property sheet:
+If you change the shortcut target from the <i>Shortcut</i> page,
+this might change the underlying file name.
+If you had also made changes to the <i>Security</i> page,
+it will try to update the security attributes on the old file name,
+even though the <i>Shortcut</i> page had renamed it.
+Oops, none of the other property sheet pages work, because they
+are now operating on a file that no longer exists!
+</p>
+<p>
+<b>Exercise</b>:
+Under what conditions would it be useful to store a shortcut
+in memory rather than in a file?
+(<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/02/24/10133280.aspx#10133664"
+>Answer</a>.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-896873">
+				<div id="div-comment-896873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896873">
+			February 24, 2011 at 7:32 am</a>		</div>
+
+		<p>The first thought that came to my mind was the clipboard: the only times I&#39;ve ever written code dealing with HGLOBALs have been when dealing with the clipboard. &nbsp;So, if you wanted your program to have the ability to copy a file shortcut to the clipboard without actually creating the shortcut (and in so doing allow the user to paste that shortcut wherever he wanted), you could create an in-memory shortcut and then call SetClipboardData(CF_SOMETHING, hglob).</p>
+<p>Figuring out which clipboard format to use might be tricky: when I copy a shortcut on Windows 7, I get 11 different formats on the clipboard: &quot;DataObject&quot; (49161), &quot;Shell IDList Array&quot; (49312), &quot;DataObjectAttributes&quot; (49502), &quot;DataObjectAttributesRequiringElevation&quot; (49542), &quot;Shell Object Offsets&quot; (49387), &quot;Preferred DropEffect&quot; (49359), &quot;AsyncFlag&quot; (49412), CF_HDROP, &quot;FileName&quot; (49158), &quot;FileNameW (49159), and &quot;Ole Private Data&quot; (49171).</p>
+<div class="post">[<i>No need to guess. <a href="http://blogs.msdn.com/b/oldnewthing/archive/2008/03/19/8080215.aspx" rel="nofollow">I covered this topic already</a>. And you don&#39;t even need to do that; you can just put a HIDA on the clipboard and call it good. (The clipboard client will create the shortcut from the HIDA.) And you can even <a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/12/06/275659.aspx" rel="nofollow">ask the shell to create the HIDA too</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-896903">
+				<div id="div-comment-896903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896903">
+			February 24, 2011 at 8:26 am</a>		</div>
+
+		<p>&quot;Exercise: Under what conditions would it be useful to store a shortcut in memory rather than in a file? &quot;</p>
+<p>When passing a reference to a non-file shell &quot;virtual folder&quot; between processes (or maybe threads depending on the threading model)?</p>
+<div class="post">[<i>A shortcut is overkill for that. Just pass the pidl. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-896923">
+				<div id="div-comment-896923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896923">
+			February 24, 2011 at 9:38 am</a>		</div>
+
+		<p>&quot;Exercise: Under what conditions would it be useful to store a shortcut in memory rather than in a file? &quot;</p>
+<p>Templatizing a shortcut, and adding/replacing certain values and/or properties based on the context in which you need a full shortcut based on that template&#39;s properties.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-896933">
+				<div id="div-comment-896933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896933">
+			February 24, 2011 at 9:53 am</a>		</div>
+
+		<p>Once, I actually found myself designing a system where shortcuts were stored in a database. Obviously serializing them to memory is the easiest way of getting the bits to store in the DB.</p>
+<p>So why on Earth would I need to store shortcuts in a database? The answer is link tracking. I actually just wanted to keep the paths to files, but people can move and rename files, thus invalidating their paths in the DB. If I stored a shortcut, though, I could deserialize it and tell it to resolve the link. Now I don&#39;t have to worry about files changing names and locations, servers changing names, or even moving drive arrays to new servers.</p>
+<div class="post">[<i>This was the answer I was looking for. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-896973">
+				<div id="div-comment-896973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896973">
+			February 24, 2011 at 10:47 am</a>		</div>
+
+		<p>[No need to guess. I covered this topic already. And you don&#39;t even need to do that; you can just put a HIDA on the clipboard and call it good. (The clipboard client will create the shortcut from the HIDA.) -Raymond]</p>
+<p>With what clipboard format? &nbsp;I&#39;ve never heard of a HIDA, and it barely appears anywhere on MSDN (<a target="_new" href="http://msdn.microsoft.com/en-us/library/bb762126%28v=vs.85%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/bb762126%28v=vs.85%29.aspx</a> suggests CFSTR_SHELLIDLIST).</p>
+<div class="post">[<i>HIDA is the data structure that corresponds to CFSTR_SHELLIDLIST, the same way that LPSTR corresponds to CF_TEXT. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-896983">
+				<div id="div-comment-896983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jmthomas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896983">
+			February 24, 2011 at 10:50 am</a>		</div>
+
+		<p>I do believe that IBM&#39;s OS/2 used an associative data base to track this stuff (as links) so a connection between two object never got lost. &nbsp;A few things got lost in the divorce!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-896993">
+				<div id="div-comment-896993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896993">
+			February 24, 2011 at 10:50 am</a>		</div>
+
+		<p>@Gabe, I&#39;m slightly confused by your use case. The only way I can parse it that makes sense to me is if you wanted to track URIs, wanted to keep those in shortcut files, but then chose to store them in a database instead.</p>
+<p>Is that correct?</p>
+<div class="post">[<i>Don&#39;t get distracted by the database. The user gave you a path, which you want to save. (Say, a path to the mp3 file to play as background music for your slideshow.) But the user might rename the file or move it to another drive, so just storing a path won&#39;t work. Solution: Instead of (or in addition to) the path, also create a shortcut and save that in your project file. Then when it&#39;s time to play the slideshow, you can use the shortcut to find the background music. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-897003">
+				<div id="div-comment-897003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897003">
+			February 24, 2011 at 11:24 am</a>		</div>
+
+		<p>If you&#39;re worried about the user moving or renaming files, why bother working with names at all? &nbsp;Just use shortcuts for everything!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-897013">
+				<div id="div-comment-897013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WndSks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897013">
+			February 24, 2011 at 11:34 am</a>		</div>
+
+		<p>@Mike: Extending on Raymonds answer; A shortcut has more metadata than just the path, it also knows the UNC name of the computer, the relative path and size, time&amp;data and attribute information, so when you call IShellLink-&gt;Resolve() windows can search all your drives for the closest match if the original path is no longer valid.</p>
+<p>@Raymond: IShellItem might be enough, unless you need custom icon, launch parameters etc but that is not really the point, MSDN recommends you to use ShellLinks with ICustomDestinationList::AddUserTasks and ShellItems with ICustomDestinationList::AppendCategory. (I have never tried to give AddUserTasks a ShellItem, maybe it displays it as &quot;myapp.exe&quot; and not just myapp, I don&#39;t know, but MSDN recommends you to use ShellLinks with AddUserTasks and ShellItems with AppendCategory)</p>
+<p>@Adam Rosenfield/Raymond: HIDA is not a common term in the public SDK, but it is a pointer to a CIDA struct and a CIDA struct is really just a way to store PIDLs in a array. <a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/bb773212%28v=vs.85%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/bb773212%28v=vs.85%29.aspx</a> shows two HIDA_* macros, off the top of my head, those two and the NSWF_IGNORE_AUTOPLAY_HIDA flag are the only places where the HIDA name is part of a public &quot;function&quot; or flag</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-897053">
+				<div id="div-comment-897053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897053">
+			February 24, 2011 at 12:54 pm</a>		</div>
+
+		<p>@WndSks, @Raymond, thanks; that was the missing bit I needed. I didn&#39;t realize Explorer could find shortcut targets when the shortcut&#39;s target had moved.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-897083">
+				<div id="div-comment-897083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zan Lynx</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897083">
+			February 24, 2011 at 4:55 pm</a>		</div>
+
+		<p>Now if only the Registry could track down files too. There are many times I&#39;d like to move a program to a different disk for space reasons, or maybe I want to keep old copies of TurboTax on a USB stick.</p>
+<p>But nooooo, all the install references are to drive C:original-directory which forces a silly uninstall/reinstall cycle or the use of one of those program mover apps which track down and fix up all the registry keys for you.</p>
+<p>The shortcut resolver is only half the problem there. But it is pretty cool that it does work so well so thanks, shell guys!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-896943">
+				<div id="div-comment-896943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WndSks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896943">
+			February 24, 2011 at 10:18 am</a>		</div>
+
+		<p>&quot;Exercise: Under what conditions would it be useful to store a shortcut in memory rather than in a file? &quot;</p>
+<p>Win7 saves IShellLink and IShellItem items for the jump lists in Recent&quot;SecretFolders&quot;?hashofappusermodelid?.*ms</p>
+<div class="post">[<i>I think you misunderstood the exercise. It wasn&#39;t &quot;name somebody who stores a shortcut in memory rather than in a file&gt;&quot; It&#39;s &quot;Under what conditions would it be *useful*&quot;? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-896953">
+				<div id="div-comment-896953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896953">
+			February 24, 2011 at 10:30 am</a>		</div>
+
+		<p>I never seem to have the answer the instructor was looking for.</p>
+<p>*sigh* :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-896963">
+				<div id="div-comment-896963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WndSks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-896963">
+			February 24, 2011 at 10:43 am</a>		</div>
+
+		<p>@Raymond: And that does not fall under *useful*? I guess I could have phrased it differently, but my point still stands. Naming names is just a bonus!</p>
+<div class="post">[<i>All you said is &quot;This component stores it in a file.&quot; You didn&#39;t say why it is useful. (Isn&#39;t the IShellItem enough to identify the object?) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-897023">
+				<div id="div-comment-897023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">waleri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897023">
+			February 24, 2011 at 11:42 am</a>		</div>
+
+		<p>I am a little confused. If I move/rename the file, how the shortcut will know to update itself? Yes, I know explorer searches (and sometimes find) moved/renamed programs, but I always thought it is kinda a guesswork (unless the link file contains a checksum or some sort of fileid or whatever). Point is, if I simply move my MP3 around its name remains the same and there is a chance that whoever resolves the shorcut will find the file, but it might find some other file with the same name. Also, what would happen if I rename the file to something *completly* different? </p>
+<p>I am not trying to nitpick, I just try to figure how this works.</p>
+<div class="post">[<i>See &quot;link tracking service&quot;. Also <a href="http://technet.microsoft.com/en-us/magazine/2009.10.windowsconfidential.aspx" rel="nofollow">this old article</a>. Probably others, didn&#39;t bother searching. I assume you know how to search. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-897303">
+				<div id="div-comment-897303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897303">
+			February 25, 2011 at 9:10 am</a>		</div>
+
+		<p>Minor nitpick: &nbsp;The first sentence in this post would parse a lot easier if it began with &quot;while&quot;.</p>
+<p>Minor nitpick #2: I don&#39;t remember any Star Trek episode where people got dehydrated into piles of dust. &nbsp;I do remember that being part of the original Batman movie, though. &nbsp;(The one with Adam West.)</p>
+<div class="post">[<i>I dimly recall an episode in which crew members were reduced to little dodecahedrons. I must be mistaken&#8230; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-897353">
+				<div id="div-comment-897353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zan Lynx</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897353">
+			February 25, 2011 at 10:16 am</a>		</div>
+
+		<p>Raymond, could you be thinking of Farscape instead of Star Trek? The final TV episode had John and Aeryn dehydrated into dust. (Later to be restored in the actual final mini-series.)</p>
+<div class="post">[<i>Unlikely, since I&#39;ve never heard of <span style="text-decoration:underline;">Farscape</span> much less seen an epsiode&#8230; I remember a scene in the Enterprise corridor with little dodecahedrons scattered about the floor. Maybe I just dreamed the episode&#8230; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-897373">
+				<div id="div-comment-897373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James Caccese</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897373">
+			February 25, 2011 at 10:54 am</a>		</div>
+
+		<p>@Raymond in Mason Wheeler&#39;s and Zan Lynx&#39;s comments</p>
+<p>No, you&#39;re right, I saw that episode when I was about 15. It creeped me out then, but now I think it was a pretty cool episode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-897393">
+				<div id="div-comment-897393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897393">
+			February 25, 2011 at 11:46 am</a>		</div>
+
+		<p>&quot;By any other Name&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-897403">
+				<div id="div-comment-897403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897403">
+			February 25, 2011 at 12:15 pm</a>		</div>
+
+		<p>This was a second-season episode, By Any Other Name.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-897453">
+				<div id="div-comment-897453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Crichton</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110224-00/?p=11403#comment-897453">
+			February 26, 2011 at 7:55 am</a>		</div>
+
+		<p>Clearly Raymond is not a SciFi fan.. never heard of Farscape! Best SciFi ever.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

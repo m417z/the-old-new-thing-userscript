@@ -1,0 +1,691 @@
+<html>
+<head>
+<title>Who is this rogue operative that filled my object with 0xDD, then sent me a message?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Who is this rogue operative that filled my object with 0xDD, then sent me a message?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 12, 2015 / year-entry #32</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A failure occurred during stress testing, and the component team came to the conclusion that their component was actually the victim of memory corruption and they asked for help trying to see if there was anything still in memory that would give a clue who did the corrupting. /* static */ LRESULT CALLBACK CContoso::WndProc( HWND...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A failure occurred during stress testing,
+and the component team came to the conclusion that
+their component was actually the victim of memory corruption
+and they asked for help trying to see if there was anything
+still in memory that would give a clue who did the corrupting.
+</p>
+<pre>
+/* static */ LRESULT CALLBACK CContoso::WndProc(
+    HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    CContoso *pThis = reinterpret_cast&lt;CContoso *&gt;
+                           (<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/02/03/10496248.aspx">GetWindowLongPtr(hwnd, GWLP_USERDATA)</a>);
+    ...
+    pThis->... // crash on first dereference of pThis
+</pre>
+<p>
+According to the debugger, the value of <code>pThis</code>
+is a valid pointer to memory that is complete nonsense.
+</p>
+<pre>
+0: kd&gt; dv
+           hwnd = 0xf0040162
+           uMsg = 0x219
+           ...
+          pThis = 0x10938bf0
+           ...
+0: kd&gt; dt pThis
+Type CContoso*
+   +0x000 __VFN_table : 0xdddddddd 
+   +0x004 m_cRef           : 0n-572662307
+   +0x008 m_hwnd           : 0xdddddddd HWND__
+   ...
+</pre>
+<p>
+The <code>CContoso</code> object was filled with the byte <code>0xDD</code>.
+Who would do such a thing?
+</p>
+<p>
+There are a few clues so far,
+and if you're psychic, you may have picked up on their aura.
+</p>
+<p>
+But I had a suspicion what happened,
+so I dug straight into the code to check my theory.
+</p>
+<pre>
+BOOL CContoso::StartStuffInBackground()
+{
+ AddRef(); // DoBackgroundWork will release the reference
+ BOOL fSuccess = QueueUserWorkItem(&amp;CContoso::DoBackgroundWork, this, 0);
+ if (!fSuccess) Release();
+ return fSuccess;
+}
+
+/* static */ DWORD CALLBACK CContoso::DoBackgroundWork(void *lpParameter)
+{
+ CContoso *pThis = static_cast&lt;CContoso *&gt;(lpParameter);
+ pThis-&gt;DoThis();
+ pThis-&gt;DoThat();
+ pThis-&gt;Release();
+ return 0;
+}
+</pre>
+<p>
+So far, we have a standard pattern.
+An extra reference to the object is kept alive as long as the background
+thread is still running.
+This prevents the object from being destroyed prematurely.
+</p>
+<p>
+(Note that this object is not necessarily a COM object.
+It could be a plain object that happens to have chosen the names
+<code>Add&shy;Ref</code>
+and
+<code>Release</code> for the methods that manipulate the reference count.)
+</p>
+<p>
+What people often forget to consider is that this means that the final
+release of the <code>CContoso</code> object can occur
+<i>on the background thread</i>.
+I mean, this is obvious in one sense, because they are adding the extra
+reference specifically to handle the case where we want to delay
+object destruction until the background thread completes.
+But what happens if that scenario actually comes to pass?
+</p>
+<pre>
+CContoso::~CContoso()
+{
+ if (m_hwnd != nullptr) DestroyWindow(m_hwnd);
+ ...
+}
+</pre>
+<p>
+As part of the destruction of the <code>CContoso</code> object,
+it destroys its window.
+But <code>Destroy&shy;Window</code> must be called on the same thread
+which created the window:
+"A thread
+<a HREF="http://msdn.microsoft.com/library/ms632682">
+cannot use <b>Destroy&shy;Window</b> to destroy
+a window created by a different thread</a>."
+</p>
+<p>
+This means that if the final release of the <code>CContoso</code>
+object comes from the background thread,
+the destructor will run on the background thread,
+and the destructor will try to destroy the window,
+but the call will fail because it is on the wrong thread.
+</p>
+<p>
+The result is that the object is destroyed,
+but the window still hangs around,
+and the window has a (now dangling) pointer to the object
+that no longer exists.
+</p>
+<p>
+Since the window in question was a hidden helper window,
+the program managed to survive like this for quite some time:
+Since the program thought the window was destroyed,
+there was no code that tried to send it a message,
+and the normal system-generated messages were not anything
+the object cared about, so they all fell through to
+<code>Def&shy;Window&shy;Proc</code> and nobody got hurt.
+But eventually, some other stress test running on the machine
+happened coincidentally to broadcast the
+<code>WM_<wbr>SETTING&shy;CHANGE</code> message <code>0x0219</code>,
+and when the object tried to check what settings changed,
+that's when it crashed.
+(That was one of the clues I hinted at above:
+The message that triggered the crash is <code>0x0219</code>.
+This is a good number to memorize if you spend time studying
+stress failures because it is often the trigger for crashes
+like this where a window has been orphaned by its underlying object.)
+</p>
+<p>
+The root cause is that the object was treated as a free-threaded object
+even though it actually had thread affinity.
+</p>
+<p>
+One way to fix this is to isolate the parts with thread affinity
+so that they are used only on the UI thread.
+The one we identified is the destructor due to its use of
+<code>Destroy&shy;Window</code>.
+So at a minimum, we could marshal destruction to the UI thread.
+</p>
+<pre>
+LONG CContoso::Release()
+{
+ LONG cRef = InterlockedDecrement(&amp;this-&gt;m_cRef);
+ if (cRef == 0)
+ {
+  <font COLOR=blue>if (m_hwnd == nullptr) {</font>
+    delete this;
+  <font COLOR=blue>} else {
+    PostMessage(m_hwnd, CWM_DESTROYTHIS, 0, 0);
+  }</font>
+ }
+ return cRef;
+}
+
+/* static */ LRESULT CALLBACK CContoso::WndProc(
+    HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    CContoso *pThis = reinterpret_cast&lt;CContoso *&gt;
+                           (GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    ...
+
+    <font COLOR=blue>case CWM_DESTROYTHIS:
+     delete pThis;
+     return 0;</font>
+    ...
+</pre>
+<p>
+(The original code had better have been using an interlocked
+operation on <code>Release</code> because it was releasing
+from a background thread already.)
+</p>
+<p>
+If the final <code>Release</code> happens before we have a window,
+then we just destruct in-place, on the theory that if no window
+is created, then we are being destroyed due to failed initialization
+and are still on the original thread.
+Otherwise, we post a message to the window to ask it to destroy
+the object.
+</p>
+<p>
+Note that this design does have its own caveats:
+</p>
+<ul>
+<li>Even if the final <code>Release</code> happens on the UI thread,
+    we still post a message,
+    even though we could have destroyed it inline.</p>
+<li>Posting a message assumes that the message pump will continue
+    to run after the object is released.
+    If somebody releases the object and then immediately
+    exits the thread, the posted message will never arrive
+    and the object will be leaked.</p>
+<li>Posting a message makes destruction asynchronous.
+    There may be some assumptions that destruction is synchronous
+    with the final release.
+</ul>
+<p>
+As for the first problem, we could do a thread check and destruct
+in-place if we are on the UI thread.
+This would most likely solve the second problem because the exiting thread
+is not the one that will process the message.
+It will still be a problem if the background thread does something
+like
+</p>
+<pre>
+  Release();
+  DoSomethingThatCausesTheUIThreadToExitImmediately();
+</pre>
+<p>
+For the second problem, we could change the
+<code>Post&shy;Message</code> to a <code>Send&shy;Message</code>,
+but this creates its own problems
+because of the risk of deadlock.
+If the UI thread is blocked waiting for the background thread,
+and the background thread tries to send the UI thread a message,
+the two threads end up waiting for each other and nobody makes
+any progress.
+On the other hand, making the destruction synchronous would fix the
+third problem.
+</p>
+<p>
+<p>
+Another approach is to push the affinity out one more step:
+</p>
+<pre>
+/* static */ DWORD CALLBACK CContoso::DoBackgroundWork(void *lpParameter)
+{
+ CContoso *pThis = static_cast&lt;CContoso *&gt;(lpParameter);
+ pThis-&gt;DoThis();
+ pThis-&gt;DoThat();
+ <font COLOR=blue>pThis-&gt;AsyncRelease();</font>
+ return 0;
+}
+
+<font COLOR=blue>void CContoso::AsyncRelease()
+{
+ PostMessage(m_hwnd, CWM_RELEASE, 0, 0);
+}</font>
+
+/* static */ LRESULT CALLBACK CContoso::WndProc(
+    HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    CContoso *pThis = reinterpret_cast&lt;CContoso *&gt;
+                           (GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    ...
+    <font COLOR=blue>case CWM_RELEASE:
+     pThis-&gt;Release();
+     return 0;</font>
+
+    ...
+</pre>
+<p>
+In this design, we make the asynchronicity explicit
+in the name of the function,
+and we require all background threads to use the asynchronous version.
+This design again assumes that the only reason the window wouldn't
+exist is that something went wrong during initialization
+before any background tasks were created.
+</p>
+<p>
+Unfortunately,
+this design
+also retains the original constraint that
+<code>Release</code> can be called only from the UI thread.
+That makes the object rather fragile,
+because it is not obvious that <code>Release</code> has such
+constraints.
+If you go this route, you probably
+should rename <code>Release</code> to
+<code>Release&shy;From&shy;UI&shy;Thread</code>.
+</p>
+<p>
+If this object is a COM object,
+then another option is
+to use COM marshaling to marshal the
+<code>IUnknown</code> to the background thread and use
+<code>IUnknown::Release</code> to release the object.
+Since you used COM to marshal the object,
+it knows that <code>Co&shy;Uninitialize</code>
+should wait for all outstanding references marshaled to other
+threads,
+thereby avoiding the "lost message" problem.
+</p>
+<p>
+Anyway, those are a few ideas for addressing this problem.
+None of them are particularly beautiful, though.
+Maybe you can come up with something better.
+</p>
+<p>
+(The component team fixed this problem by taking advantage of
+a detail in the usage pattern of the <code>CContoso</code> object:
+The client of the <code>CContoso</code> object is expected to
+call <code>CContoso::Stop</code> before destroying the object,
+and after calling <code>CContoso::Stop</code>,
+the only valid thing you can do with the object is destroy it.
+Furthermore,
+that call to
+<code>CContoso::Stop</code> must occur on the UI thread.
+Therefore, they moved the part of the cleanup code that
+must run on the UI thread into the <code>Stop</code> method.
+The object's background tasks already knew to abandon work
+once they detected that the object had been stopped.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1175533">
+				<div id="div-comment-1175533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175533">
+			February 12, 2015 at 7:08 am</a>		</div>
+
+		<p>PostMessage(hand, WM_CLOSE, 0, 0)</p>
+<div class="post">[<em>This assumes the class did not override the WM_CLOSE message to display a &quot;You have unsaved changes.&quot; prompt or other shenanigans. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175543">
+				<div id="div-comment-1175543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175543">
+			February 12, 2015 at 8:09 am</a>		</div>
+
+		<p>[This assumes the class did not override the WM_CLOSE message to display a &quot;You have unsaved changes.&quot; prompt or other shenanigans. -Raymond]</p>
+<p>Oh right I put that code in WM_SYSCOMAND (SC_CLOSE) now for distinguishing between interactive and non-interactive close.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175553">
+				<div id="div-comment-1175553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175553">
+			February 12, 2015 at 8:35 am</a>		</div>
+
+		<p>This makes me wonder. Besides the mass breakage that would occur now if it was tried, would making more of the UI functions enforce thread affinity have helped any.</p>
+<p>Even though we are supposed to know that UI functions have thread affinity, it is easy enough to forget that they do, and new programmers often don&#39;t even learn this.</p>
+<p>But I guess that is up for speculation and the only way to test this out would not only require a time machine, but the ability to create an alternate universe too.</p>
+<div class="post">[<em>Some of them do enforce thread affinity. For example, DestroyWindow fails if you call it from the wrong thread. That&#39;s what got us into this mess in the first place. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175573">
+				<div id="div-comment-1175573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sven2</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175573">
+			February 12, 2015 at 9:15 am</a>		</div>
+
+		<p>The mention of the &quot;hidden helper window&quot; makes me wonder why so many functions in Windows are tied to window handles. For example, couldn&#39;t message queues be separate form windows? Each window would have a message queue, but message queues would have their own handle and could also exist without a window.</p>
+<p>If fewer functions were tied to window handles, you might need fewer &quot;hidden helper windows&quot; in the first place.</p>
+<div class="post">[<em>You can have a message queue without a window. It&#39;s called a thread. See PostThreadMessage. But <a href="http://blogs.msdn.com/b/oldnewthing/archive/2005/04/26/412116.aspx">watch out for modal loops</a>. That&#39;s why people use helper windows. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175603">
+				<div id="div-comment-1175603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175603">
+			February 12, 2015 at 9:38 am</a>		</div>
+
+		<p>Sven2: What&#39;s the difference between a message queue and a hidden window?</p>
+<p>A window is nothing more than a message queue that has some extra metadata that allows it to do some drawing. If you never use that extra metadata (your &quot;window&quot; is &quot;hidden&quot;), then it&#39;s just a message queue with a misleading name.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175623">
+				<div id="div-comment-1175623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AsmGuru62</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175623">
+			February 12, 2015 at 10:20 am</a>		</div>
+
+		<p>I wonder if EndDialog() can be called from a different thread, that opened a modal dialog box.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175633">
+				<div id="div-comment-1175633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175633">
+			February 12, 2015 at 10:21 am</a>		</div>
+
+		<p>I&#39;m not sure what to think of the component team&#39;s solution. &nbsp;If I forget to call Stop() before releasing the object, it could cause my program to crash? &nbsp;But only once in a blue moon? &nbsp;Seems poor.</p>
+<p>My approach would be not to let the worker thread hold a reference to the object at all. &nbsp;Instead, I would make CContoso&#39;s destructor do something like this:</p>
+<p>CContoso::~CContoso()</p>
+<p>{</p>
+<p>if (m_hwnd != nullptr) DestroyWindow(m_hwnd);</p>
+<p>&#8230;</p>
+<p>if (WorkerIsRunning())</p>
+<p>{</p>
+<p>&nbsp; &nbsp;SignalWorkerToExit();</p>
+<p>&nbsp; &nbsp;WaitForWorker();</p>
+<p>}</p>
+<p>}</p>
+<div class="post">[<em>This could deadlock if the worker thread is trying to talk to the main thread. (Which it definitely will do if it tries to send a message.) It also means that you have <a href="http://blogs.msdn.com/b/oldnewthing/archive/2005/09/29/475298.aspx">an object with reference count zero</a>. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175643">
+				<div id="div-comment-1175643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175643">
+			February 12, 2015 at 10:38 am</a>		</div>
+
+		<p>Since it&#39;s never specifically called out in the article and I think it&#39;s valuable for every Windows developer to know, the answer to the question &quot;who filled my object with 0xDD?&quot; is: the debug runtime heap did when the object was freed. So in any debug session that you see an object filled with 0xDD, your first instinct should be to say to yourself, &quot;I&#39;m trying to use an object that has already been freed&quot;. &nbsp;</p>
+<p>There are a number of different memory fill values that can be useful to know about when debugging and you encounter variables/objects that hold unusual values. See <a rel="nofollow" target="_new" href="http://stackoverflow.com/a/370362/12711">stackoverflow.com/&#8230;/12711</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175653">
+				<div id="div-comment-1175653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175653">
+			February 12, 2015 at 11:55 am</a>		</div>
+
+		<p>[This could deadlock if the worker thread is trying to talk to the main thread. (Which it definitely will do if it tries to send a message.) It also means that you have an object with reference count zero. -Raymond]</p>
+<p>Yes, that&#39;s certainly a possibility. &nbsp;It really comes down to what &quot;DoThis()&quot; and &quot;DoThat()&quot; actually do (which you haven&#39;t shown). &nbsp;But I think the approach is a good one in general, and it&#39;s still what I&#39;d do unless there was prohibitive amounts of refactoring involved.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175673">
+				<div id="div-comment-1175673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175673">
+			February 12, 2015 at 12:25 pm</a>		</div>
+
+		<p>BTW, 0xDDDD disassembles to fstp st5 so it&#39;s probably not a NOP sled.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-hankhein even thread-even depth-1" id="comment-1175683">
+				<div id="div-comment-1175683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Henri+Hein' rel='external nofollow' class='url'>Henri Hein</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175683">
+			February 12, 2015 at 12:35 pm</a>		</div>
+
+		<p>I don&#39;t like reference counting in general, and I would certainly never voluntarily use it on an object that owns any part of the UI, or a helper window. &nbsp;This kind of problem is exactly why.</p>
+<p>Another rule of thumb for me is that when I use GWLP_USERDATA to attach an object to a window, I always null it out when I destroy the object (actually before). &nbsp;My WndProc is always written so that when the GWLP_USERDATA returns NULL, fall through to DefWindowProc. &nbsp;In this case, that rule would have fixed (or prevented) the crash, but it would not have fixed the inert DestroyWindow() call.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175693">
+				<div id="div-comment-1175693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175693">
+			February 12, 2015 at 12:42 pm</a>		</div>
+
+		<p>mikeb: A pointer to an object filled with 0xDD could be an object that was freed &#8212; or it could be an uninitialized/corrupt variable pointing to random memory.</p>
+<p>Yet another possibility is a double-free bug. You have a pointer to an object 1, you free that object, then the next allocation gets a pointer to the same memory and initializes it, but later somebody else tries to free object 1. This yields a live object that was overwritten rather than a destructed object that was freed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175703">
+				<div id="div-comment-1175703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175703">
+			February 12, 2015 at 4:14 pm</a>		</div>
+
+		<p>[Some of them do enforce thread affinity. For example, DestroyWindow fails if you call it from the wrong thread. That&#39;s what got us into this mess in the first place. -Raymond]</p>
+<p>Yup, but I was thinking more functions checking, like the ones that currently don&#39;t.</p>
+<p>But well, it was more of a thought exercise along the lines of, if the UI functions consistently checked for the correct thread, would we see less issues with people modifying the UI state across threads.</p>
+<p>The thought was if they had the constant reminder of the UI function failing, then it would hopefully follow that modifying other state, like destroying objects, or closing a window by posting a message rather than calling a member function, would decrease.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175583">
+				<div id="div-comment-1175583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175583">
+			February 12, 2015 at 9:20 am</a>		</div>
+
+		<p>For the various Window things that require they start on the right thread, why doesn&#39;t Windows actually *check* and abort if they don&#39;t?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175713">
+				<div id="div-comment-1175713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">manuell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175713">
+			February 13, 2015 at 2:05 am</a>		</div>
+
+		<p>If you use PostMessage for resource management, don&#39;t forget to use PeekMessage after window destruction, to check if there is still some work to be done.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick odd alt thread-odd thread-alt depth-1" id="comment-1175743">
+				<div id="div-comment-1175743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175743">
+			February 13, 2015 at 7:11 am</a>		</div>
+
+		<p>@Gabe: The debug heap initializes blocks to 0xCC on allocation.</p>
+<p>@Joshua: Choosing 0xCC for initialization is indeed because 0xCC is int 3, the breakpoint instruction. Whoever chose 0xDD wasn&#39;t really considering attempts to execute code from the buffer.</p>
+<div class="post">[<em>NX means that code execution in the heap is most likely going to be caught some other way. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175753">
+				<div id="div-comment-1175753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175753">
+			February 13, 2015 at 8:34 am</a>		</div>
+
+		<p>Sven2 wrote &quot;each window would have a message queue, but message queues would have their own handle and could also exist without a window.&quot;</p>
+<p>If you ignore the names given to things then this is pretty much what Windows does already. &nbsp;You create a message queue by calling CreateWindowEx and specifying HWND_MESSAGE as the parent window. &nbsp;You create a message queue and attach a window to it by calling CreateWindowEx with some other parent window.</p>
+<p><a rel="nofollow" target="_new" href="https://msdn.microsoft.com/en-us/library/windows/desktop/ms632599%28v=vs.85%29.aspx#message_only">msdn.microsoft.com/&#8230;/ms632599%28v=vs.85%29.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175763">
+				<div id="div-comment-1175763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sven2</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175763">
+			February 13, 2015 at 8:39 am</a>		</div>
+
+		<p>laonianren: Cool, thanks, I didn&#39;t know that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn even thread-even depth-1" id="comment-1175863">
+				<div id="div-comment-1175863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1175863">
+			February 13, 2015 at 12:53 pm</a>		</div>
+
+		<p>I believe the problem would be much worse with release runtime libs, which does not setmem(0xDD), so that broadcast message would encounter an almost correct object.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1176243">
+				<div id="div-comment-1176243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1176243">
+			February 17, 2015 at 3:38 pm</a>		</div>
+
+		<p>You shouldn&#39;t confuse a window with a queue, that&#39;s vile!</p>
+<p>At most, you can consider a window as a stream processor (e.g. the window procedure of a HWND_MESSAGE descendant), but the queue is still tied to the thread and it requires pumping. &nbsp;If you don&#39;t pump it, no window will process posted messages, or messages sent from other threads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1176283">
+				<div id="div-comment-1176283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrei</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150212-00/?p=44693#comment-1176283">
+			February 18, 2015 at 5:18 am</a>		</div>
+
+		<p>Why isn&#39;t there a special setting in App Verifier for this kind of errors? Like DestroyWindow on a different thread?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

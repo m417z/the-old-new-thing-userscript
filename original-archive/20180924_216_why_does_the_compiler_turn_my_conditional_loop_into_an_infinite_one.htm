@@ -1,0 +1,534 @@
+<html>
+<head>
+<title>Why does the compiler turn my conditional loop into an infinite one?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does the compiler turn my conditional loop into an infinite one?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 24, 2018 / year-entry #216</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It's all in the threading.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer asked why the compiler turned their conditional
+loop into an infinite one.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+
+int x = 0, y = 1;
+int* ptr;
+
+DWORD CALLBACK ThreadProc(void*)
+{
+  Sleep(1000);
+  ptr = &amp;y;
+  return 0;
+}
+
+int main(int, char**)
+{
+ ptr = &amp;x; // starts out pointing to x
+
+ DWORD id;
+ HANDLE hThread = CreateThread(nullptr, 0, ThreadProc, 0, &amp;id);
+
+ // Wait for the thread to change the ptr
+ // so that it points to a nonzero value
+ while (*ptr == 0) { }
+
+ return 0;
+}
+</pre>
+<p>
+Translating into standard C++, for those who don't want to get
+bogged down in Windows-specific goop:
+</p>
+<pre>
+#include &lt;chrono&gt;
+#include &lt;thread&gt;
+
+int x = 0, y = 1;
+int* ptr = &amp;x;
+
+void ThreadProc()
+{
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  ptr = &amp;y;
+}
+
+int main(int, char**)
+{
+ ptr = &amp;x; // starts out pointing to x
+
+ std::thread thread(ThreadProc);
+
+ // Wait for the thread to change the ptr
+ // so that it points to a nonzero value
+ while (*ptr == 0) { }
+
+ return 0;
+}
+</pre>
+<p>
+The customer explained,
+</p>
+<blockquote CLASS="q">
+<p>
+The conditional loop becomes an infinite loop.
+The assembly code loads <code>ptr</code> into a register
+once (at the start of the loop),
+and then it compares the value pointed-to by that register
+against zero.
+It never reloads the <code>ptr</code> variable,
+so it never notices that the thread changed
+the value of <code>ptr</code> to point to a different value.
+</p>
+<p>
+We understand that if <code>ptr</code> is declared as
+<code>volatile int*</code>,
+then that will force the compiler to reload the <code>ptr</code>
+variable,
+which will then load to correct behavior.
+</p>
+<p>
+We'd like to understand
+why the compiler cannot be smart enough to turn off the optimization
+automatically.
+Clearly, this global variable will be accessed by more than one thread.
+So why can't the compiler do the right thing?
+</p>
+</blockquote>
+<p>
+Okay, first the nitpick:
+The declaration <code>volatile int* ptr</code> does not make the
+<code>ptr</code> variable volatile.
+It defines <code>ptr</code> as a non-volatile pointer to
+a volatile integer.
+You wanted <code>int* volatile ptr</code>.
+</p>
+<p>
+Back to the main question.
+</p>
+<p>
+First: What's going on here?
+</p>
+<p>
+Observe that in the loop,
+there are no accesses to <code>std::atomic</code> variables,
+nor are there any <code>std::memory_order</code> operations.
+This means that any changes to <code>ptr</code> or <code>*ptr</code>
+are a
+<a HREF="https://en.cppreference.com/w/cpp/language/memory_model">
+data race</a>
+and consequently trigger undefined behavior.
+</p>
+<p>
+(An intuitive way of thinking of this rule is
+"The compiler optimizes as if the program were single-threaded.
+The only points at which the compiler considers the possibility
+of multi-threading is when you access a <code>std::atomic</code>
+or apply a <code>std::memory_order</code>.")
+</p>
+<p>
+That explains why the program doesn't behave as "expected".
+But what about the claim that the compiler should recognize this
+and disable the optimization?
+</p>
+<p>
+Well, it struck me as odd to request that the compiler
+recognize that perhaps it's optimizing too much and intentionally
+"deoptimize" itself.
+And especially for the compiler to be able to look into
+the mind of the programmer and conclude,
+"Oh, this loop must be waiting for that global variable to change."
+</p>
+<p>
+But suppose there's some rule in the compiler that says
+"If optimization results in an infinite loop,
+then go back and recompile the function with optimizations disabled."
+(Or maybe "keep turning off optimizations until you get something
+that isn't an infinite loop.")
+Aside from the surprise this rule might create,
+would that rule help?
+</p>
+<p>
+Notice that in this case, we do not have an infinite loop.
+The loop will be broken if any thread does
+<code>x = 1</code> or <code>*ptr = 1</code>.
+It's not clear how much analysis the customer expects the
+compiler to do to scour the entire program to see if that
+is possible.
+Would it have to check every integer variable modification
+and try to see if that could possibly be a variable that
+<code>ptr</code> could point to?
+</p>
+<p>
+Since it's not practical for the compiler to
+<a HREF="https://en.wikipedia.org/wiki/Halting_problem">
+do a complete flow analysis</a>
+to determine whether
+<code>x = 1</code> or <code>*ptr = 1</code> would ever
+occur,
+it would have to play it safe and assume it might.
+</p>
+<p>
+Which means more generally that any access to global variables
+or references or pointers to data that could be shared between threads
+could not be cached because of the possibility
+that another thread modified the value between the two accesses.
+</p>
+<pre>
+int limit;
+
+void do_something()
+{
+    ...
+    if (value &gt; limit)
+        value = limit; // would have to re-fetch "limit"
+    ...
+    for (i = 0; i &lt; 10; i++)
+      array[i] = limit; // would have to re-fetch "limit"
+    ...
+}
+</pre>
+<p>
+You've basically declared open season on data races.
+"Go ahead and modify anything in any order from multiple
+threads. It's all good! Data races for you.
+Data races for you.
+<span>Data races for everyone</span>!"
+</p>
+<p><img HEIGHT="100" WIDTH="100" TITLE="Oprah 'You get a car!' meme." SRC="https://i.kym-cdn.com/entries/icons/square/000/012/809/oprah-free-car.gif"></p>
+<p>
+But that's not the direction the C++ standard took.
+The C++ standard says that if you are going to modify
+a variable that is also being accessed by another thread,
+then you must use an atomic operation or enforce a memory order
+(which usually comes with a synchronization object).
+</p>
+<p>
+So please do that.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1362825">
+				<div id="div-comment-1362825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephen Oberholtzer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362825">
+			September 24, 2018 at 8:26 am</a>		</div>
+
+		<p>The word &#8220;Clearly&#8221; in &#8220;Clearly, this global variable will be accessed by more than one thread&#8221; jumped out at me. I wonder why the author thought that such a thing was &#8220;clear&#8221;.</p>
+<p>I present the following counterexample:<br />
+This file is compiled to object form, then linked with another object file that contains the following code:<br />
+(I hope this works.  Blog software needs a preview button.)<br />
+<code><br />
+extern int x;<br />
+class A { public: A() { x = 1; } } a = A();<br />
+</code></p>
+<p>Important caveat: According to [1], particularly 3.6.2.4, it is implementation-defined whether the initialization of &#8216;a&#8217; (and thus the constructor call) will execute prior to the main() function reaching the &#8216;while (*ptr == 0);&#8217; statement.   If it does not, the program will still execute an infinite loop.</p>
+<p>Important caveat 2: Per [1] (3.6.2.2): While &#8216;x = 1&#8217; will work (because &#8216;x&#8217; is initialized with a constant, and such initialization occurs in phase 2), &#8216;*ptr = 1&#8217; might not; &#8216;ptr&#8217; is initialized in the same phase as &#8216;a&#8217;, which means that A() may execute before &#8216;ptr = &amp;x&#8217;.  If this occurs, &#8216;ptr&#8217; will be NULL inside A(), causing undefined behavior.</p>
+<p>[1] C++14 draft (N4140), section 3.6.2 &#8220;Initialization of non-local variables&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-iboyd odd alt thread-odd thread-alt depth-1" id="comment-1362835">
+				<div id="div-comment-1362835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/IanBoyd' rel='external nofollow' class='url'>IanBoyd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362835">
+			September 24, 2018 at 8:53 am</a>		</div>
+
+		<p>No one ever said programming would be easy. </p>
+<p>If you want to do multi-threaded programming, you have to understand multi-threaded programming.</p>
+<p>And i&#8217;ve been around long enough to know that nobody can get multi-threaded programming right the first time.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1362845">
+				<div id="div-comment-1362845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362845">
+			September 24, 2018 at 9:42 am</a>		</div>
+
+		<p>Oh look Fermat&#8217;s Last Theorem is false. For some reason this code performs really badly when not optimized though. <a href="https://codegolf.stackexchange.com/a/32698/14306" rel="nofollow">https://codegolf.stackexchange.com/a/32698/14306</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1362855">
+				<div id="div-comment-1362855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362855">
+			September 24, 2018 at 10:00 am</a>		</div>
+
+		<p>Sounds like a case of someone trying to evade blame for a bug they wrote.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-koldude even thread-even depth-1 parent" id="comment-1362865">
+				<div id="div-comment-1362865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362865">
+			September 24, 2018 at 10:49 am</a>		</div>
+
+		<p>What amazes me is they opened a support ticket at cost when a quick google search would have found results for this on stackoverflow where this exact question has been answered quite a bit. I&#8217;ve come to the assumption generally that when the result is not expected it&#8217;s usually my fault not the compiler&#8217;s and thus far I&#8217;ve been very rarely wrong on that. I&#8217;m fond of saying that computers are very very good at doing exactly what we tell them to do, <b>especially when it&#8217;s wrong.</b></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1362875">
+				<div id="div-comment-1362875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Bonner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362875">
+			September 24, 2018 at 2:15 pm</a>		</div>
+
+		<p>Yup.  I&#8217;ve been programming 35 years.  So far, I have hit *one* compiler bug (complicated bit of bit-twiddling with /Os &#8211; the work round was to rewrite with much less complexity which meant that mortals could read it).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1362885">
+				<div id="div-comment-1362885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362885">
+			September 24, 2018 at 4:38 pm</a>		</div>
+
+		<p>I&#8217;ve hit more compiler bugs than that. I filed one against gcc this year that turned out to be a well-known one documented under completely different terms than the ones I searched for.</p>
+<p>Fun fact: when you do if (somecondition) { WIN32_FIND_DATA find; /* &#8230; /* } /* &#8230; */ if (somecondition) { WIN32_FIND_DATA find; /* &#8230; /* } watch on the find variable on the second block actually uses the address of the find variable in the first block. I filed a rather useless security bug against Windows because it took me too long to figure out the debugger was lying. I though for sure the kernel was  clobbering my memory. The FindFirstFileEx call I was using was particularly obscure. Most of the time you write this code they&#8217;ll end up at the same address. That time they didn&#8217;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1362925">
+				<div id="div-comment-1362925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe Blog</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362925">
+			September 24, 2018 at 7:52 pm</a>		</div>
+
+		<p>I&#8217;ve been programming for 4 years and hit 3 compiler bugs (all in the C++ front end of GCC). Whilst a compiler bug is one of the last things you should check for, you SHOULD still check for it, and it isn&#8217;t as uncommon to find a compiler bug as your annecdote suggests.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1363005">
+				<div id="div-comment-1363005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1363005">
+			September 25, 2018 at 12:18 am</a>		</div>
+
+		<p>I&#8217;ve hit several compiler bugs, however to date all of them were the compiler claiming full.compatibility with a different version of the C/C++ standards than the one they <i>actually</i> complied with.</p>
+<p>In all the cases I remember, the program didn&#8217;t compile, and I simply added compiler-specific checks to use the &#8220;old version of&#8221; the thing.</p>
+<p>Which is one of the reasons why we are only now using C++11, and not 14 or 17.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1363025">
+				<div id="div-comment-1363025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1363025">
+			September 25, 2018 at 1:33 am</a>		</div>
+
+		<p>I think Raymond&#8217;s mentioned elsewhere: there are some places that pay for a support contract that entitles them to a certain number of tickets in a year and are determined to get their money&#8217;s worth, so if they&#8217;ve not used up all their tickets at the end of the period they&#8217;ll use them on whatever questions pique their curiosity. (Or possibly their resident bean counters will stop paying for support if they don&#8217;t use them.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-john-stewien even thread-odd thread-alt depth-1" id="comment-1362985">
+				<div id="div-comment-1362985" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/John+Stewien+%28Cheesy+Design%29' rel='external nofollow' class='url'>John Stewien (Cheesy Design)</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1362985">
+			September 24, 2018 at 10:30 pm</a>		</div>
+
+		<p>This can be demonstrated in C# too, which leaves me slightly concerned about our 500,000 line C# codebase. I&#8217;ve put the <a href="https://github.com/stewienj/StewienCodeExamples/blob/master/VolatileTest/Program.cs" rel="nofollow">sample code on GitHub</a> because I couldn&#8217;t get the code to format right in this comment section:</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1363055">
+				<div id="div-comment-1363055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Cawley</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1363055">
+			September 25, 2018 at 7:10 am</a>		</div>
+
+		<p>I would just like to point out that older versions of MSVC deviated from the C/C++ standards regarding volatile. According to MSDN documentation, MSVC would enforce a full memory barrier for access to volatile storage locations. This behavior can also still be enabled with the &#8220;/volatile:ms&#8221; switch.  Also C# and Java both enforce a full memory barrier for access to volatile fields.  This leads to a lot of confusion for programmers not completely familiar with the C/C++ standards behavior of volatile.  There is a lot of bad advice on the internet of simply slapping volatile onto variables to fix all of your threading problems so it makes sense why this person may have mistakenly believed such a thing would work.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1363065">
+				<div id="div-comment-1363065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1363065">
+			September 25, 2018 at 7:14 am</a>		</div>
+
+		<p>&#8220;Deviates from the standard&#8221; is a bit strong since it suggests the behavior is in violation of the standard. The behavior is still standard-conforming, though certainly not required by the standard.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1363145">
+				<div id="div-comment-1363145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1363145">
+			September 25, 2018 at 2:33 pm</a>		</div>
+
+		<p>&#8220;Also C# and Java both enforce a full memory barrier for access to volatile fields&#8221;<br />
+The JMM is not specified in terms of memory barriers, so it&#8217;s a pretty bad idea to think about it in these terms.</p>
+<p>The actual semantics of the JMM are weaker in some cases (for one they allow coalescing of barriers which gives nice performance improvements) and stronger in others.</p>
+<p>Now whether .NET actually does follow the simple assumption wrt memory barriers I have no idea about. But then I doubt even the implementers have an idea on that, since to the best of my knowledge there&#8217;s no detailed spec around.</p>
+<p>In both cases it&#8217;s best to let experts worry about these things and use the high-level constructs yourself. </p>
+<p>I wouldn&#8217;t try to write low-level concurrent code and I used to work on Java JIT compilers and actually worked through jsr-133 a few times..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1363415">
+				<div id="div-comment-1363415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Cawley</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1363415">
+			September 26, 2018 at 8:47 am</a>		</div>
+
+		<p>@Raymond Chen<br />
+True, a poor choice in wording on my part. I should have said it is non-portable behavior.</p>
+<p>@Voo<br />
+I suppose full memory barrier is misleading as it is really only acquire on read and release on write memory ordering semantics that are being enforced. In any case the volatile keyword was never intended to be used for thread synchronization when it was introduced but rather to permit code to read and write device registers without those memory accesses being optimized away. I agree with you about using higher level synchronization constructs. That was the point I was trying to make. I have seen a lot of C code that relies on the MSVC behavior which breaks under different compilers and and I have myself used volatile incorrectly for synchronization before.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1364955">
+				<div id="div-comment-1364955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1364955">
+			October 2, 2018 at 1:45 pm</a>		</div>
+
+		<p>&#8220;I suppose full memory barrier is misleading as it is really only acquire on read and release on write memory ordering semantics that are being enforced.&#8221;<br />
+No! This is absolutely not true for Java. Yes it&#8217;s a good approximation that will work on many cases, but the main point of my post was to **not** think about the JMM in terms of memory barriers.</p>
+<p>That&#8217;s a simplification in a field where simplifications are deadly. </p>
+<p>Otherwise yes we&#8217;re pretty much in agreement.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1364025">
+				<div id="div-comment-1364025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180924-00/?p=99805#comment-1364025">
+			September 28, 2018 at 2:44 pm</a>		</div>
+
+		<p>&#8220;The declaration volatile int* ptr does not make the ptr variable volatile. It defines ptr as a non-volatile pointer to a volatile integer.&#8221;</p>
+<p>I might be completely confused, but .. is that right?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

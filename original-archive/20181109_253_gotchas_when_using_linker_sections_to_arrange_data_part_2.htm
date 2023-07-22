@@ -1,0 +1,317 @@
+<html>
+<head>
+<title>Gotchas when using linker sections to arrange data, part 2</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Gotchas when using linker sections to arrange data, part 2</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 9, 2018 / year-entry #253</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20181109-00/?p=100175</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">An unexpected null could throw the whole thing out of alignment.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+We saw
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165">
+last time</a>
+that you need to accommodate potential
+padding between fragments within a section
+when walking through an array of pointers.
+Fortunately, it's a simple matter of skipping over null pointer entries.
+</p>
+<p>
+Dealing with padding between fragments when you have
+a sequence of structures is more complicated,
+because the amount of padding may not be an exact
+multiple of the structure size.
+</p>
+<pre>
+struct THING
+{
+    const char* name;
+    int value;
+};
+
+#pragma section("mydata$a", read)  
+__declspec(allocate("mydata$a")) \
+    const THING firstThing{};
+
+#pragma section("mydata$m", read)  
+#define ADD_THING(x, y) \
+__declspec(allocate("mydata$m")) \
+    const THING thing##x{#x, y}
+
+#pragma section("mydata$z", read)  
+__declspec(allocate("mydata$z")) \
+    const THING lastThing{};
+
+// file1.cpp
+ADD_THING(Red, 3);
+
+// file2.cpp
+ADD_THING(Blue, 4);
+
+// file3.cpp
+ADD_THING(Green, 0);
+</pre>
+<p>
+We would be tempted to write 
+</p>
+<pre>
+// Code in italics is wrong.
+<i>void LessNaiveRegisterAllTheThings()
+{
+    auto begin = (uintptr_t)&amp;firstThing + sizeof(firstThing);
+    auto end = (uintptr_t)&amp;lastThing;
+    for (auto current = begin; current &lt; end;
+         current += sizeof(THING)) {
+      auto thing = (const THING*)current;
+      if (thing-&gt;name) RegisterThing(thing-&gt;name, thing-&gt;value);
+    }
+}</i>
+</pre>
+<p>
+However this will run into trouble
+if padding is inserted that is not
+a multiple of <code>sizeof(THING)</code>.
+In that case,
+advancing by <code>sizeof(THING)</code>
+would eventually cause us to step over some padding bytes
+as well as the initial bytes of a valid <code>THING</code>.
+</p>
+<p>
+We will have to walk the pointer
+past any null bytes
+until we find the start of a "good" structure. 
+</p>
+<p>
+This also means that
+zero cannot be a legitimate value
+for the first member of a "good" structure,
+because we wouldn't be able to figure out
+whether a zero value is the start of a "good" structure,
+or whether it's just padding. 
+</p>
+<p>
+In the above example,
+we know that the name is never null,
+so we can use that as our signal
+as to whether we have the start of a valid <code>THING</code>.
+If not, then we advance
+by the alignment of a <code>THING</code> and try again. 
+</p>
+<pre>
+void RegisterAllTheThings()
+{
+    auto begin = (uintptr_t)&amp;firstThing + sizeof(THING);
+    auto end = (uintptr_t)&amp;lastThing;
+    auto current = begin;
+    while (current &lt; end) {
+        auto thing = (const THING*)current;
+        if (thing-&gt;name) {
+            RegisterThing(thing-&gt;name, thing-&gt;value);
+            current += sizeof(THING);
+        } else {
+            current += alignof(THING);
+        }
+    }
+}
+</pre>
+<p>
+A less complicated alternative is
+to avoid generating structures into ordered segments
+and just use pointers exclusively. 
+</p>
+<pre>
+#pragma section("mydata$a", read)  
+__declspec(allocate("mydata$a")) \
+    const THING* const firstThing = nullptr;
+
+#pragma section("mydata$m", read)  
+#define ADD_THING(x, y, s) \
+    const THING thing##x{#x, y}; \
+__declspec(allocate("mydata$m")) \
+    const THING* const thing##x##ptr = &thing##x;
+
+#pragma section("mydata$z", read)  
+__declspec(allocate("mydata$z")) \
+    const THING* const lastThing = nullptr;
+
+// file1.cpp
+ADD_THING(Red, 3);
+
+// file2.cpp
+ADD_THING(Blue, 4);
+
+// file3.cpp
+ADD_THING(Green, 0);
+</pre>
+<p>
+At this point, we can use the "pointers" pattern.
+</p>
+<pre>
+void RegisterAllTheThings()
+{
+    auto begin = (uintptr_t)&amp;firstThing
+                 + sizeof(firstThing);
+    auto end = (uintptr_t)&amp;lastThing;
+    for (auto current = begin; current &lt; end;
+         current += sizeof(const THING*)) {
+      auto thing = *(const THING* const*)current;
+      if (thing) RegisterThing(thing-&gt;name, thing-&gt;value);
+    }
+}
+</pre>
+<p>
+For extra style points, you could move the
+<code>firstThing</code> to <code>mydata$b</code>
+and generate the
+<code>THING</code> objects into <code>mydata$a</code>.
+This keeps all the <code>THING</code> objects contiguous
+in memory, which is more cache-friendly.
+It also keeps them close to the pointer table,
+which means that they will all page in/out together.
+Since this data is probably going to be used only
+at process startup, putting them all together lets
+them page out once and stay out.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-jan-ringos even thread-even depth-1 parent" id="comment-1370315">
+				<div id="div-comment-1370315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Jan+Ringo%C5%A1' rel='external nofollow' class='url'>Jan Ringoš</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181109-00/?p=100175#comment-1370315">
+			November 9, 2018 at 2:36 pm</a>		</div>
+
+		<p>I can&#8217;t help but think: wouldn&#8217;t it be nice if you could ask linker for an automatically generated symbol representing beginning and ending of a section? Something like __mydataSectionBase and __mydataSectionEnd, akin to __ImageBase symbol. It doesn&#8217;t seems very difficult to implement in linker (but maybe it is), and since this isn&#8217;t the first series of articles on this topic I&#8217;ve read, I wonder if Visual C++ Compiler/Linker team has a feature like this buried somewhere deep in their TODO lists?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mr-telnet odd alt depth-2" id="comment-1370395">
+				<div id="div-comment-1370395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mr.+Telnet' rel='external nofollow' class='url'>Mr. Telnet</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181109-00/?p=100175#comment-1370395">
+			November 12, 2018 at 7:09 am</a>		</div>
+
+		<p>It is worth nothing that this is how glibc runs global initializers, so I would imagine there is some equivalent technology to linker scripts in the Microsoft compiler tool chain.  Matt Godbolt gave a talk at CppCon 2018 which covered the topic as it relates to gcc (<a href="https://youtu.be/dOfucXtyEsU?t=31m18s" rel="nofollow">https://youtu.be/dOfucXtyEsU?t=31m18s</a>)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matteo even thread-odd thread-alt depth-1 parent" id="comment-1370355">
+				<div id="div-comment-1370355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181109-00/?p=100175#comment-1370355">
+			November 10, 2018 at 2:39 am</a>		</div>
+
+		<p>There&#8217;s something I&#8217;m surely missing&#8230; <code>sizeof</code> does count the padding required to align an immediately adjacent other object of the same type, in particular an element of an array is distant from the next one exactly <code>sizeof(T)</code> bytes. Are we talking about some other padding the compiler may decide to insert between two adjacent global objects? But why would it do so? (Of course the standard allows pretty much anything in this regard, but why would VC++ do so?)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-matteo odd alt depth-2" id="comment-1370365">
+				<div id="div-comment-1370365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181109-00/?p=100175#comment-1370365">
+			November 10, 2018 at 2:41 am</a>		</div>
+
+		<p>By the way, at least yesterday there was something very broken posting from mobile&#8230; trying to post this comment from my phone (Android/Firefox) the &#8220;Post comment&#8221; was present, but did nothing when touched. Logging out from my account made the comment box disappear entirely.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-d-sturm even depth-2" id="comment-1370385">
+				<div id="div-comment-1370385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DanStur' rel='external nofollow' class='url'>DanStur</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181109-00/?p=100175#comment-1370385">
+			November 10, 2018 at 6:31 am</a>		</div>
+
+		<p>You mean you&#8217;re wondering why Raymond uses alignof in case of a null area?</p>
+<p>The following would be legal, assuming struct S is 48 bytes in size and needs 24 byte alignment.<br />
+S1 0-48<br />
+Null area 48-72<br />
+S2 72-96</p>
+<p>If we see that after S1 there is a null area we know we can always increase by the alignment of S to get to the next possible starting point. Neither sizeof nor a smaller value than the alignment would necessarily work (if we increase by 16 we would miss the next valid point for example). </p>
+<p>Or is it simply a question of why the compiler would insert such padding? Raymond mentioned incremental linking last time &#8211; if you leave enough space you could put a changed version of the struct there. Although I don&#8217;t see what advantage compared to putting new things at the end of the section this would have.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

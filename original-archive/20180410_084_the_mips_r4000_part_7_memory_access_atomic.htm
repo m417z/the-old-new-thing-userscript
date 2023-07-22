@@ -1,0 +1,294 @@
+<html>
+<head>
+<title>The MIPS R4000, part 7: Memory access (atomic)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The MIPS R4000, part 7: Memory access (atomic)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 10, 2018 / year-entry #84</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Load and lock, erm, link.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Atomic memory access on the MIPS R4000 is performed with
+the load-linked and store-conditional instructions.
+This pattern shouldn't be much of a surprise because
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835">
+we already encountered it on the Alpha AXP</a>.
+</p>
+<pre>
+    LL      rd, disp16(rs)  ; load linked
+    SC      rs, disp16(rd)  ; store conditional
+</pre>
+<p>
+The <code>LL</code> instruction loads a value from memory
+and monitors the memory address to see if another processor
+writes to it.
+The <code>SC</code> instruction stores the value to memory,
+provided there have been no writes&sup1; to the monitored memory address&sup2;
+and no exceptions have occurred.&sup3;
+If the store succeeds, then <var>rs</var> is set to one;
+otherwise it is set to zero.
+</p>
+<p>
+In both cases, the memory address must be word-aligned.
+</p>
+<p>
+The intended usage pattern is
+</p>
+<pre>
+retry:
+    LL      r1, disp16(r2)  ; load linked
+    ADDIU   r1, r1, 1       ; increment
+    SC      r1, disp16(r2)  ; store conditional
+    BEQ     r1, 0, retry    ; if failed, then retry
+    NOP                     ; (we'll learn about this later)
+</pre>
+<p>
+The state created by the <code>LL</code> is ephemeral,
+and the subsequent <code>SC</code> is permitted (but not required)
+to fail if any
+of the following occur prior to the <code>SC</code>:
+</p>
+<ul>
+<li>A memory access is performed.</li>
+<li>A branch is taken.</li>
+<li>More than 512 instructions are executed.</li>
+</ul>
+<p>
+Furthermore, after the <code>SC</code> (either successful or unsuccessful),
+all subsequent <code>SC</code> instructions are required to fail
+until a new <code>LL</code> is executed.
+</p>
+<p>
+If the <code>LL</code> from an address is followed by
+<code>SC</code> which does not
+write to the same address,
+then it is unspecified whether the <code>SC</code> succeeds.
+So don't do that.
+</p>
+<p>
+It is legal to execute the <code>LL</code> instruction
+and not follow it with
+the <code>SC</code> instruction.
+This can happen if you want to perform a conditional atomic operation,
+and you discover that the condition is not met.
+</p>
+<p>
+Before and after the <code>LL</code>/<code>SC</code> operation,
+you probably want to do a
+</p>
+<pre>
+    SYNC            ; memory barrier
+</pre>
+<p>
+All memory operations that precede the <code>SYNC</code> must complete
+before any operations that follow the <code>SYNC</code> can begin.
+</p>
+<p>
+Note that atomic operations are supported only on aligned words.
+For aligned sub-word objects, you can perform the atomic operation on the
+containing word.
+But if the object is not aligned, then you're out of luck.
+</p>
+<p>
+Next time, we enter the exciting world of control transfer.
+That's where the <code>NOP</code> above gets its moment to shine.
+</p>
+<p>
+&sup1;
+Note that if another processor writes the value that is already
+there back to the memory,
+or if there is an ABA condition where another processor changes
+the value, and then changes it back,
+then the conditional store will fail,
+even though the value in memory is the same value you started with.
+This is one cause for the mysterious case of the
+<a HREF="https://www.youtube.com/watch?v=ZQFzMfHIxng#t=33m03s">
+<code>compare_</code><code>exchange_</code><code>weak</code>
+spurious failure</a>.
+</p>
+<p>
+&sup2;
+The architecture permits implementations to be sloppy with the
+detection of a write.
+In particular, any modification on the same
+4<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">KB</a>
+page as the locked address is permitted to cause the subsequent
+store conditional instruction to fail.
+Mind you, an implementation that was this sloppy would not be a
+very good implementation, but it is technically legal.
+</p>
+<p>
+&sup3;
+This last clause is actually an operating system convention,
+not something inherent in the processor architecture.
+One of the things that kernel mode does before returning to user
+mode is execute the <code>SC</code> instruction
+with a scratch writable memory location.
+The <code>SC</code> might succeed, it might not, but it doesn't matter.
+The reason
+for the <code>SC</code>
+is to ensure that if the next atomic memory operation
+performed by
+user-mode code is <code>SC</code>, then that operation
+<i>definitely</i> fails.
+This is important in the case where the interrupt occurred after
+the user-mode code performed the <code>LL</code> but before it could
+execute the subsequent <code>SC</code>.
+Without it, the <code>SC</code> in user mode
+might succeed accidentally.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1332555">
+				<div id="div-comment-1332555" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Clarkstone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475#comment-1332555">
+			April 10, 2018 at 11:22 am</a>		</div>
+
+		<p>It occurs to me that the kernel performing a SC before returning to user mode also stops user-mode programs from probing anything about the kernel by executing SC on various locations and seeing which succeed and which fail (or how they fail).</p>
+<p>I also like how the SC instruction unconditionally erasing its input value register encourages you (in the case of failure) not to just re-try writing the old value without paying attention to what you got from re-reading. I know the limited size of the instruction word pretty much forces SC to be that way, but it&#8217;s still nice.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-bboorman odd alt depth-2 parent" id="comment-1332595">
+				<div id="div-comment-1332595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475#comment-1332595">
+			April 11, 2018 at 6:54 am</a>		</div>
+
+		<p>I would think that you couldn&#8217;t probe the kernel memory at all (regardless of how SC behaves). As Raymond mentions in Part 1 of this series, the kernel space / user space division is architectural in the hardware. Base assumption would be that the MMU does its job.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1332695">
+				<div id="div-comment-1332695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475#comment-1332695">
+			April 11, 2018 at 9:52 am</a>		</div>
+
+		<p>That stopped being a defensible assumption when Meltdown (and Spectre, but Meltdown is more relevant here) became public.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-bboorman odd alt depth-4" id="comment-1332765">
+				<div id="div-comment-1332765" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475#comment-1332765">
+			April 11, 2018 at 2:01 pm</a>		</div>
+
+		<p>Don&#8217;t confuse the MIPS architecture with x86/x64. You are thinking about speculative execution exploits, which are of a different class.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman even depth-4 parent" id="comment-1332785">
+				<div id="div-comment-1332785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475#comment-1332785">
+			April 11, 2018 at 2:34 pm</a>		</div>
+
+		<p>Directly from MIPS: <a href="https://www.mips.com/blog/mips-response-on-speculative-execution-and-side-channel-vulnerabilities/" rel="nofollow">https://www.mips.com/blog/mips-response-on-speculative-execution-and-side-channel-vulnerabilities/</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1332855">
+				<div id="div-comment-1332855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180410-00/?p=98475#comment-1332855">
+			April 12, 2018 at 8:45 am</a>		</div>
+
+		<p>I wasn&#8217;t confusing x86_* with MIPS, I was saying that since such a defect has been discovered in one architecture, it&#8217;s no longer safe for any architecture to simply assert the MMU works, it requires actual analysis and proof.  Apparently the MIPS people agree, because you linked to the response that wouldn&#8217;t even exist if the assumption were made blindly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

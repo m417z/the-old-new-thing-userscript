@@ -1,0 +1,225 @@
+<html>
+<head>
+<title>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result using intrinsics (part 3)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result using intrinsics (part 3)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 15, 2017 / year-entry #274</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171215-00/?p=97586</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Applying the sign adjustment.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20171214-00/?p=97577">
+Last time</a>,
+we converted our original assembly language code for
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453">
+creating double-precision integer multiplication with
+a quad-precision result
+from single-precision multiplication
+with a double-precision result</a>
+to C++ code with intrinsics
+working entirely in registers,
+thereby making the function eligible for leaf function optimizations.
+</p>
+<p>
+Our last step is adding support for signed multiplication.
+This is a straightforward translation of the original assembly language
+into intrinsics.</p>
+<pre>
+__m128i Multiply64x64To128(<font COLOR=blue>int64_t</font> x, <font COLOR=blue>int64_t</font> y)
+{
+    auto x128 = _mm_loadl_epi64((__m128i*) &amp;x);
+    auto term1 = _mm_unpacklo_epi32(x128, x128);
+
+    auto y128 = _mm_loadl_epi64((__m128i*) &amp;y);
+    auto term2 = _mm_unpacklo_epi32(y128, y128);
+
+    auto flip2 = _mm_shuffle_epi32(term2, _MM_SHUFFLE(1, 0, 3, 2));
+
+    auto result = _mm_mul_epu32(term1, term2);
+    auto crossterms = _mm_mul_epu32(term1, flip2);
+
+    // Now apply the cross-terms to the provisional result
+    unsigned temp;
+
+    auto result1 = _mm_srli_si128(result, 4);
+    auto carry = _addcarry_u32(0,
+                               _mm_cvtsi128_si32(result1),
+                               _mm_cvtsi128_si32(crossterms),
+                               &amp;temp);
+    result1 = _mm_cvtsi32_si128(temp);
+
+    auto result2 = _mm_srli_si128(result, 8);
+    crossterms = _mm_srli_si128(crossterms, 4);
+    carry = _addcarry_u32(carry,
+                          _mm_cvtsi128_si32(result2),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    result2 = _mm_cvtsi32_si128(temp);
+
+    auto result3 = _mm_srli_si128(result, 12);
+    _addcarry_u32(carry,
+                  _mm_cvtsi128_si32(result3),
+                  0,
+                  &amp;temp);
+    result3 = _mm_cvtsi32_si128(temp);
+
+    crossterms = _mm_srli_si128(crossterms, 4);
+    carry = _addcarry_u32(0,
+                          _mm_cvtsi128_si32(result1),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    result1 = _mm_cvtsi32_si128(temp);
+
+    crossterms = _mm_srli_si128(crossterms, 4);
+    carry = _addcarry_u32(carry,
+                          _mm_cvtsi128_si32(result2),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    result2 = _mm_cvtsi32_si128(temp);
+
+    _addcarry_u32(carry,
+                  _mm_cvtsi128_si32(result3),
+                  0,
+                  &amp;temp);
+    result3 = _mm_cvtsi32_si128(temp);
+
+    result = _mm_unpacklo_epi64(
+       _mm_unpacklo_epi32(result, result1),
+       _mm_unpacklo_epi32(result2, result3));
+
+    <font COLOR=blue>// Apply sign adjustment.
+    __m128i xsign = _mm_shuffle_epi32(x128, _MM_SHUFFLE(1, 1, 3, 2));
+    xsign = _mm_srai_epi32(xsign, 31);
+    __m128i ysign = _mm_shuffle_epi32(y128, _MM_SHUFFLE(1, 1, 3, 2));
+    ysign = _mm_srai_epi32(ysign, 31);
+    __m128i xshift64 = _mm_shuffle_epi32(x128, _MM_SHUFFLE(1, 0, 3, 2));
+    __m128i yshift64 = _mm_shuffle_epi32(x128, _MM_SHUFFLE(1, 0, 3, 2));
+    __m128i xadjust = _mm_and_si128(xsign, xshift64);
+    __m128i yadjust = _mm_and_si128(ysign, yshift64);
+    result = _mm_sub_epi64(result, xadjust);
+    result = _mm_sub_epi64(result, yadjust);</font>
+
+    return result;
+}
+</pre>
+<p>
+Each of the new statements translates into a single
+instruction.
+There are still enough of XMM registers available
+so that we can still do all the work in registers.
+(And if you look at the resulting assembly, you'll see that
+the compiler reordered the operations, presumably for optimization purposes.)
+</p>
+<p>
+So there you have it,
+creating 64-bit by 64-bit multiplication with a 128-bit result
+(either signed or unsigned)
+from 32-bit code without any inline assembly.
+Intrinsics let you express what you want in C++,
+and give the variables meaningful names,
+and you can let the compiler do the tedious work of
+of register assignment,
+something compiler are generally better at than humans anyway.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20171215-00/?p=97586#respond" style="display:none;">Cancel reply</a></small></h3>			<form action="https://blogs.msdn.microsoft.com/oldnewthing/wp-comments-post.php" method="post" id="commentform" class="comment-form">
+				<p class="comment-form-comment"><textarea id="comment" name="comment" cols="45" rows="4" aria-required="true"></textarea></p><p class="comment-form-author"><label for="author">Name <span class="required">*</span></label> <input id="author" name="author" type="text" value="" size="30" maxlength="245" aria-required='true' required='required' /></p>
+<p class="comment-form-email"><label for="email">Email <span class="required">*</span></label> <input id="email" name="email" type="text" value="" size="30" maxlength="100" aria-describedby="email-notes" aria-required='true' required='required' /></p>
+<p class="comment-form-url"><label for="url">Website</label> <input id="url" name="url" type="text" value="" size="30" maxlength="200" /></p>
+<p class="form-submit"><input name="submit" type="submit" id="submit" class="submit btn btn-default" value="Post Comment" /> <input type='hidden' name='comment_post_ID' value='97586' id='comment_post_ID' />
+<input type='hidden' name='comment_parent' id='comment_parent' value='0' />
+</p><p style="display: none;"><input type="hidden" id="akismet_comment_nonce" name="akismet_comment_nonce" value="4c8847e1bc" /></p><p style="display: none;"><input type="hidden" id="ak_js" name="ak_js" value="108"/></p>			</form>
+			</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1317897">
+				<div id="div-comment-1317897" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damit</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171215-00/?p=97586#comment-1317897">
+			December 16, 2017 at 11:19 am</a>		</div>
+
+		<p>__m128i yshift64 = _mm_shuffle_epi32(x128, _MM_SHUFFLE(1, 0, 3, 2));</p>
+<p>Shouldn&#8217;t this be operating on y128 instead of x128?</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171215-00/?p=97586&#038;replytocom=1317897#respond' onclick='return addComment.moveForm( "div-comment-1317897", "1317897", "respond", "97586" )' aria-label='Reply to Damit'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1317926">
+				<div id="div-comment-1317926" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">French Guy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171215-00/?p=97586#comment-1317926">
+			December 18, 2017 at 6:43 am</a>		</div>
+
+		<p>In 2&#8217;s complement, there&#8217;s no need for separate add and multiply functions for signed and unsigned integers because of how modulo arithmetic works. Does C++ allow other integer representations?</p>
+<p>[<i>Hey look, somebody <a href="https://stackoverflow.com/questions/12125650/what-do-the-c-and-c-standards-say-about-bit-level-integer-representation-and-m" rel="nofollow">asked the same question on StackOverflow</a>! -Raymond</i>]</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171215-00/?p=97586&#038;replytocom=1317926#respond' onclick='return addComment.moveForm( "div-comment-1317926", "1317926", "respond", "97586" )' aria-label='Reply to French Guy'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,776 @@
+<html>
+<head>
+<title>Investigating a problem constructing a security descriptor to deny thread-specific access rights to Everyone</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Investigating a problem constructing a security descriptor to deny thread-specific access rights to Everyone</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 20, 2015 / year-entry #246</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer had a question about how to set up a security access mask. How can I deny thread-specific access rights to Everyone? Specifically, I want to deny the Everyone group the following rights when I create a process: THREAD_SET_INFORMATION THREAD_SET_THREAD_TOKEN THREAD_TERMINATE PROCESS_CREATE_PROCESS PROCESS_SET_SESSION­ID PROCESS_VM_OPERATION PROCESS_VM_WRITE How do I create the access mask for this?...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had a question about how to set up a security access mask.
+</p>
+<blockquote CLASS=q>
+<p>
+How can I deny thread-specific access rights to Everyone?
+</p>
+<p>
+Specifically, I want to deny the Everyone group the following
+rights when I create a process:
+</p>
+<ul>
+<li><code>THREAD_<wbr>SET_<wbr>INFORMATION</code>
+<li><code>THREAD_<wbr>SET_<wbr>THREAD_<wbr>TOKEN</code>
+<li><code>THREAD_<wbr>TERMINATE</code>
+<li><code>PROCESS_<wbr>CREATE_<wbr>PROCESS</code>
+<li><code>PROCESS_<wbr>SET_<wbr>SESSION&shy;ID</code>
+<li><code>PROCESS_<wbr>VM_<wbr>OPERATION</code>
+<li><code>PROCESS_<wbr>VM_<wbr>WRITE</code>
+</ul>
+<p>
+How do I create the access mask for this?
+Will this function work?
+</p>
+<pre>
+DWORD GetDeniedMask()
+{
+  DWORD accessMask = 0;
+  GENERIC_MAPPING genmap;
+  genmap.GenericRead = WRITE_DAC | WRITE_OWNER;
+  genmap.GenericWrite = WRITE_DAC | WRITE_OWNER;
+  genmap.GenericExecute = WRITE_DAC | WRITE_OWNER;
+  genmap.GenericAll = WRITE_DAC | WRITE_OWNER |
+    THREAD_SET_INFORMATION |
+    THREAD_SET_THREAD_TOKEN |
+    THREAD_TERMINATE |
+    PROCESS_CREATE_PROCESS |
+    PROCESS_SET_SESSIONID |
+    PROCESS_VM_OPERATION |
+    PROCESS_VM_WRITE;
+  MapGenericMask(&amp;accessMask, &amp;genmap);
+  return accessMask;
+}
+</pre>
+</blockquote>
+<p>
+This question is so confused it's hard to say where to start.
+</p>
+<blockquote CLASS=m><p>
+Why are you trying to deny these accesses to Everyone?
+Note that Everyone includes the owner of the process,
+which means that the owner of the process can't even
+terminate his own process!
+Furthermore, many normal operations need accesses
+like the ones you are denying.
+You are going to end up with a process that
+can't do much, not even to itself.
+For example, the <code>Virtual&shy;Alloc</code>
+function needs
+<code>PROCESS_<wbr>VM_<wbr>OPERATION</code> access.&sup1;
+A process that can't
+allocate any memory is not going to get very far.
+Some of these accesses are needed by
+the process creator in order to do things like
+set up the initial environment and command line.
+And anti-malware software is going to block the
+creation of any process that refuses to let
+the anti-malware software inspect it!
+</p>
+</blockquote>
+<p>
+The customer explained,</p>
+<blockquote CLASS=q>
+<p>
+A security audit uncovered that
+our processes granted the rights listed above
+to Everyone,
+so we are seeing what we can do to deny those
+rights to Everyone while still allowing those
+rights to the
+creator and people in the right security group.
+</p>
+<p>
+Is it a security risk to grant the above listed
+rights to Everyone?
+If so, how do we deny them to Everyone
+while
+still allowing it to the right people?
+We assume we need to pass custom security
+attributes as the
+<code>lpProcess&shy;Attributes</code>
+and
+<code>lpThread&shy;Attributes</code>
+parameters when we call
+the <code>Create&shy;Process</code>
+function,
+but we need help building those security
+attributes.
+</p>
+</blockquote>
+<p>
+Since deny actions override allow actions,&sup2;
+you can't deny something to Everyone,
+and then grant it to a special subgroup.
+The deny on Everyone will override the allow
+on the subgroup.
+</p>
+<p>
+The way to do this is not to deny Everyone,
+but rather to <i>stop allowing</i> Everyone.
+A security principal receives access if there
+is an applicable allow rule and no
+applicable deny rule.&sup2;
+So remove the spurious allow rule.
+</p>
+<p>
+Actually, where is the allow rule for
+Everyone coming from?
+The default process security does not
+grant Everyone those accesses.
+The customer must be doing something
+unusual.
+</p>
+<blockquote CLASS=q>
+<p>
+Here is the code we are using to set the
+security attributes on the process.
+[I have converted the long C++ code
+into equivalent pseudo-C# code for readability.
+-Raymond]
+</p>
+<pre>
+var acl = new AccessControlList();
+
+// Deny some accesses to AU and WD.
+var deniedMask = GetDeniedMask();
+acl.AddDenyAce(AuthenticatedUsersSid, deniedMask);
+acl.AddDenyAce(WorldSid, deniedMask);
+
+// Grant some accesses to AU and WD.
+var worldMask = GetAllowedMask();
+acl.AddAllowAce(AuthenticatedUsersSid, worldMask);
+acl.AddAllowAce(WorldSid, worldMask);
+</pre>
+</blockquote>
+<p>
+It's not clear why they denied and granted identical
+accesses both to Authenticated Users and to Everyone.
+(aka World).
+Since Authenticated Users are a subset of Everyone,
+all the rules for Authenticated Users are redundant.
+</p>
+<p>
+We need to peel away yet another layer of the onion.
+What is the custom access mask being granted to Everyone?
+</p>
+<blockquote CLASS=q>
+<p>
+Here is the <code>Get&shy;Allowed&shy;Mask</code>
+function.
+</p>
+<pre>
+DWORD GetAllowedMask()
+{
+ DWORD accessMask = GENERIC_READ | GENERIC_EXECUTE;
+ GENERIC_MAPPING genmap;
+ genmap.GenericRead = GENERIC_READ |
+                      FILE_GENERIC_READ |
+                      SECTION_MAP_READ;
+ genmap.GenericWrite = 0;
+ genmap.GenericExecute = GENERIC_EXECUTE |
+                         FILE_GENERIC_EXECUTE |
+                         SECTION_MAP_EXECUTE;
+ genmap.GenericAll = GENERIC_READ |
+                     GENERIC_EXECUTE ;
+ MapGenericMask(&amp;accessMask, &amp;genmap);
+ return accessMask;
+}
+</pre>
+</blockquote>
+<p>
+Here we see the same confusion that started the whole thing.
+</p>
+<p>
+The customer appears not to understand what
+the <code>Map&shy;Generic&shy;Mask</code> function
+does, or what it is for.
+</p>
+<p>
+I will pause now so you can review
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2015/05/15/10614925.aspx">
+my earlier discussion of the
+<code>Map&shy;Generic&shy;Mask</code> function,
+what it does,
+and its intended usage pattern</a>.
+</p>
+<p>
+Welcome back.
+If you read and understood that article,
+you'll observe that
+this customer completely misses
+the point of
+the <code>Map&shy;Generic&shy;Mask</code> function.
+They are using it to calculate information
+on the client side.
+But if you're on the client side, you don't need
+to convert <code>GENERIC_<wbr>READ</code> to
+a specific mask.
+That's the server's job!
+Just ask for generic access and go home.
+</p>
+<p>
+Anyway, let's see what happens.
+The 
+<code>Get&shy;World&shy;Access&shy;Mask</code>
+function is passing a hard-coded access mask and a
+hard-coded generic mapping.
+We can walk through the code ourselves to see
+what happens.</p>
+<ul>
+<li>We start with
+    <code>GENERIC_<wbr>READ | GENERIC<wbr>_EXECUTE</code>.</p>
+<li>Since <code>GENERIC_<wbr>READ</code> is set,
+    we remove it and replace it with
+    <code>genmap.<wbr>Generic&shy;Read</code>,
+    which is <code>GENERIC_<wbr>READ |
+                      FILE_<wbr>GENERIC_<wbr>READ |
+                      SECTION_<wbr>MAP_<wbr>READ</code>,
+   resulting in
+<code>GENERIC_<wbr>READ |
+                      FILE_<wbr>GENERIC_<wbr>READ |
+                      SECTION_<wbr>MAP_<wbr>READ |
+ GENERIC_<wbr>EXECUTE</code>.
+</ul>
+<p>
+Hey, wait a second. We're making things worse!
+The whole point of <code>Map&shy;Generic&shy;Mask</code>
+is to get rid of generic mappings, but this
+<code>genmap</code> structure says,
+"To get rid of <code>GENERIC_<wbr>READ</code>,
+convert it to this other stuff that <i>includes
+<code>GENERIC_<wbr>READ</code></i>."
+</p>
+<p>
+This is like reading some tips on how
+to rid your room of outdated clutter,
+and one of them says,
+"If you see an old magazine,
+you can get rid of it by putting a fern
+next to it."
+Um, that's not actually getting rid of anything.
+You just added more stuff.
+</p>
+<ul>
+<li>Since <code>GENERIC_<wbr>WRITE</code> is not set,
+    nothing is done with <code>Generic&shy;Write</code>.</p>
+<li>Since <code>GENERIC_<wbr>EXECUTE</code> is set,
+    we remove it and replace it with
+    <code>genmap.<wbr>Generic&shy;Execute</code>,
+    which is <code>GENERIC_<wbr>EXECUTE |
+                      FILE_<wbr>GENERIC_<wbr>EXECUTE |
+                      SECTION_<wbr>MAP_<wbr>EXECUTE</code>,
+   resulting in
+<code>GENERIC_<wbr>READ |
+                      FILE_<wbr>GENERIC_<wbr>READ |
+                      SECTION_<wbr>MAP_<wbr>READ |
+ GENERIC_<wbr>EXECUTE |
+                      FILE_<wbr>GENERIC_<wbr>EXECUTE |
+                      SECTION_<wbr>MAP_<wbr>EXECUTE</code>.</p>
+<li>Since <code>GENERIC_<wbr>ALL</code> is not set,
+    nothing is done with <code>Generic&shy;All</code>.</p>
+<li>Finally, the <code>Map&shy;Generic&shy;Mask</code>
+    function removes all generic access bits,
+    because it promises never to return any generic
+    access bits.
+</ul>
+<p>
+The result of all these shenanigans is that
+we are granting Everyone the follow access mask:
+</p>
+<table BORDER=1 BORDERCOLOR=black
+  STYLE="border-collapse: collapse">
+<tr>
+<td><strike><code>GENERIC_<wbr>READ</code></strike></td>
+<td><strike><code>0x80000000</strike></code>
+</tr>
+<tr>
+<td><code>FILE_<wbr>GENERIC_<wbr>READ =<br>
+STANDARD_RIGHTS_READ |<br>
+FILE_READ_DATA |<br>
+FILE_READ_ATTRIBUTES |<br>
+FILE_READ_EA |<br>
+SYNCHRONIZE</code><br>
+</td>
+<td><code>0x00120089 =<br>
+0x00020000 |<br>
+0x00000001 |<br>
+0x00000080 |<br>
+0x00000008 |<br>
+0x00100000</code>
+</tr>
+<tr>
+<td><code>SECTION_<wbr>MAP_<wbr>READ</code></td>
+<td><code>0x00000004</code>
+</tr>
+<tr>
+<td><strike><code>GENERIC_<wbr>EXECUTE</code></strike></td>
+<td><strike><code>0x20000000</code></strike></td>
+</tr>
+<tr>
+<td><code>FILE_<wbr>GENERIC_<wbr>EXECUTE =<br>
+STANDARD_RIGHTS_EXECUTE |<br>
+FILE_READ_ATTRIBUTES |<br>
+FILE_EXECUTE |<br>
+SYNCHRONIZE</code></td>
+<td><code>0x001200A0 =<br>
+0x00020000 |<br>
+0x00000080 |<br>
+0x00000020 |<br>
+0x00100000</code></p>
+<tr>
+<td><code>SECTION_<wbr>MAP_<wbr>EXECUTE</code></td>
+<td><code>0x00000008</code>
+</tr>
+<tr>
+<td>Grand total</td>
+<td><code>0x001200AD</code></td>
+</tr>
+</table>
+<p>
+Actually, this mask makes no sense.
+It is combining file-specific access masks
+and section-specific access masks.
+And then applying them to a process
+and a thread!
+(<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/12/04/55933.aspx"
+>Background reading</a>.)
+</p>
+<p>
+This is like looking at the menu for
+a Chinese restaurant and deciding that
+you want the Number 21 (cashew chicken),
+then looking at the menu for an Indian
+restaurant and deciding that you want
+the Number 18 (saag paneer),
+then calling a Greek restaurant,
+ordering the number 21 and 18 for take-out,
+then calling a Thai restaurant, and
+ordering the number 21 and 18 for take-out.
+And then you wonder why
+the Greek restaurant gave you a moussaka
+and a pork souvlaki,
+and the Thai restaurant gave you a
+phad thai and a yam nua.
+Where's your cashew chicken and saag paneer?
+</p>
+<p>
+Let's see what Greek food we ended up
+ordering by accident.
+</p>
+<table BORDER=1 BORDERCOLOR=black
+  STYLE="border-collapse: collapse">
+<tr>
+<td><code>0x00020000 |<br>
+0x00000001 |<br>
+0x00000080 |<br>
+0x00000008 |<br>
+0x00100000</code></p>
+<td><code>READ_DAC |<br>
+PROCESS_TERMINATE |<br>
+PROCESS_CREATE_PROCESS |<br>
+PROCESS_VM_OPERATION |<br>
+SYNCHRONIZE</code><br>
+</td>
+</tr>
+<tr>
+<td><code>0x00000004</code></p>
+<td><code>PROCESS_<wbr>SET_<wbr>SESSION&shy;ID</code></td>
+</tr>
+<tr>
+<td><code>0x00020000 |<br>
+0x00000080 |<br>
+0x00000020 |<br>
+0x00100000</code></p>
+<td><code>READ_DAC |<br>
+PROCESS_CREATE_PROCESS |<br>
+PROCESS_VM_WRITE |<br>
+SYNCHRONIZE</code></td>
+<tr>
+<td><code>0x00000008</code></p>
+<td><code>PROCESS_<wbr>VM_<wbr>OPERATION</code></td>
+</tr>
+</table>
+<p>
+Well, that explains why the process grants so many
+weird accesses to Everyone:
+Because you're granting all these weird accesses to
+Everyone!
+</p>
+<p>
+I think we can predict what Thai food
+we ordered by accident,
+but let's do the math.
+</p>
+<table BORDER=1 BORDERCOLOR=black
+  STYLE="border-collapse: collapse">
+<tr>
+<td><code>0x00020000 |<br>
+0x00000001 |<br>
+0x00000080 |<br>
+0x00000008 |<br>
+0x00100000</code></p>
+<td><code>READ_DAC |<br>
+THREAD_TERMINATE |<br>
+THREAD_SET_THREAD_TOKEN |<br>
+THREAD_GET_CONTEXT |<br>
+SYNCHRONIZE</code><br>
+</td>
+</tr>
+<tr>
+<td><code>0x00000004</code></p>
+<td>???? undefined ????</td>
+</tr>
+<tr>
+<td><code>0x00020000 |<br>
+0x00000080 |<br>
+0x00000020 |<br>
+0x00100000</code></p>
+<td><code>READ_DAC |<br>
+THREAD_SET_THREAD_TOKEN |<br>
+THREAD_SET_INFORMATION |<br>
+SYNCHRONIZE</code></td>
+<tr>
+<td><code>0x00000008</code></p>
+<td><code>THREAD_<wbr>GET_<wbr>CONTEXT</code></td>
+</tr>
+</table>
+<p>
+From reading the confused code,
+it appears that the customer wants to grant
+read and execute rights to Everyone,
+but it's not clear why.
+In particular, Execute rights don't have
+intrinsic meaning for most types of objects,
+aside from files (to see if you can execute
+them)
+and memory (to see if you can execute code
+from them).
+Consequently, many object types overload Execute
+to mean something else.
+For example, our Gizmo object overloads
+Execute to mean start/stop.
+</p>
+<p>
+If it's the case that the customer merely
+wants to grant permission to execute the
+program to Everyone,
+then that's done by applying the ACL to the
+executable file itself.
+</p>
+<p>
+Assuming the presumption above is true,
+then the solution to the customer's problem
+is simple:
+Delete all the code that tries to create
+a custom security descriptor and just
+pass <code>NULL</code> as the security
+descriptor for the process and thread.
+This creates the process with default security,
+which is just fine for what you want.
+</p>
+<p>
+The customer wrote back,
+</p>
+<blockquote CLASS=q><p>
+Thanks.
+This is code we acquired recently,
+and the code base is so old that nobody
+knows exactly what this custom security
+attribute is trying to do.
+</p>
+</blockquote>
+<p>
+&sup1; But you luck out because
+<code>Get&shy;Current&shy;Process</code>
+returns a handle with full access,
+so the ACLs on the process object
+don't get a chance to flex
+their muscles if the process is talking
+about itself.
+</p>
+<p>
+&sup2; Reality is more complex than this
+simple statement, but the details are not
+important to the story.
+The statements are true enough.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1213111">
+				<div id="div-comment-1213111" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1213111">
+			November 20, 2015 at 7:09 am</a>		</div>
+
+		<p>Rule number one for working with access masks: they have to be for the correct object type.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1213101">
+				<div id="div-comment-1213101" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1213101">
+			November 20, 2015 at 7:30 am</a>		</div>
+
+		<p>Make the process deny-all for everyone, but start it suspended. Then track down the process&#39;s original handle to itself and replace it w/ yours.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1213091">
+				<div id="div-comment-1213091" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wyatt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1213091">
+			November 20, 2015 at 7:36 am</a>		</div>
+
+		<p>My brain hurts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1213081">
+				<div id="div-comment-1213081" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1213081">
+			November 20, 2015 at 8:40 am</a>		</div>
+
+		<p>Well, the customer&#39;s reply explains a lot! &nbsp;I have often said that good commenting helps a lot. &nbsp;</p>
+<p>If the original coder would have added comments saying what he was TRYING to do, or WHY he was setting those masks, then the customer who acquired the code might have had a clue. &nbsp;Although I predict that the original coder didn&#39;t know what he was doing; maybe he cobbled it together from examples he found elsewhere.</p>
+<p>If you don&#39;t know a piece of code well enough to write a meaningful comment explaining WHY you are doing what you are doing, then you don&#39;t understand the code well enough to include it in your program.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1213041">
+				<div id="div-comment-1213041" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1213041">
+			November 20, 2015 at 10:51 am</a>		</div>
+
+		<p>Your analogies are really good at cracking me up. &nbsp;I just recovered from the cleanup tip, and then the restaurants came.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1213001">
+				<div id="div-comment-1213001" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1213001">
+			November 20, 2015 at 11:27 am</a>		</div>
+
+		<p>People that slog through impossible mystery code and fix it are my heroes. A salute to whoever this customer was o&gt;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1212991">
+				<div id="div-comment-1212991" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212991">
+			November 20, 2015 at 11:38 am</a>		</div>
+
+		<p>@DWalker: if the code is that confused, the comments probably would be too. Wouldn&#39;t surprise me if the comments say something completely different than what the code does, and neither &nbsp;is what the programmer actually wanted to do. (I&#39;ve seen things like a comment explaining what the string returned by the function means, while the function actually returns a boolean!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1212981">
+				<div id="div-comment-1212981" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212981">
+			November 20, 2015 at 12:31 pm</a>		</div>
+
+		<p>@Joshua: You don&#39;t need to replace a process&#39;s handle to itself: a process always has the -1 pseudo-handle that&#39;s always opened with full access.</p>
+<p>But why would you want to make a process deny access to everyone running as the same user? &nbsp;This seems pointless, because if you&#39;re the process&#39;s owner, you can open the process with WRITE_DAC access using the owner&#39;s prerogative, then add access for yourself and/or remove the deny for yourself.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1212961">
+				<div id="div-comment-1212961" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Passed NULL, Gimme my $200</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212961">
+			November 20, 2015 at 4:42 pm</a>		</div>
+
+		<p> &nbsp; &nbsp;&quot;the solution &#8230; is simple: Delete all the code &#8230; and just pass NULL&quot;</p>
+<p>This applies universally. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1212951">
+				<div id="div-comment-1212951" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212951">
+			November 21, 2015 at 2:44 pm</a>		</div>
+
+		<p>To keep running after logout w/o admin of course.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1212941">
+				<div id="div-comment-1212941" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hildar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212941">
+			November 21, 2015 at 3:29 pm</a>		</div>
+
+		<p>I have to ask, what the hell does PROCESS_SET_SESSIONÂ­ID do, and why is that a problem?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1212931">
+				<div id="div-comment-1212931" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212931">
+			November 22, 2015 at 3:04 am</a>		</div>
+
+		<p>&quot;To keep running after logout w/o admin of course.&quot; And why that? Hopefully, the sesseion manager takes measure (by resetting this) to kill your rogue process on logout anyway.</p>
+<p>Use services or scheduled tasks for this.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1212921">
+				<div id="div-comment-1212921" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1212921">
+			November 22, 2015 at 1:06 pm</a>		</div>
+
+		<p>@Hildar: presumably related to terminal services (aka remote desktop) sessions. &nbsp;Although I didn&#39;t think it was actually possible to move a process between sessions or put it in any session other than the one given by its access token. &nbsp;The permission might be obsolete, or it might be used internally by Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215181">
+				<div id="div-comment-1215181" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1215181">
+			November 23, 2015 at 8:26 am</a>		</div>
+
+		<p>@Harry Johnston:</p>
+<p>After doing a bit of digging, there is stuff defined in the WDK in regards to this. So if it is available from user mode, then it would be in the native API only. Even then, I wouldn&#39;t be surprised if you require the run as part of the operating system privilege to be able to do it.</p>
+<p>There is more you can do with processes than is exposed in the Win32 API. The two most obvious ones are the posix support, and the sandbox mode that modern processes use. They are obviously possible because MS has used them before, the posix support was in sfu/sua and IE for Windows 8 and 8.1 used the sandbox for enhanced protected mode (it doesn&#39;t seem to do it in 10).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215141">
+				<div id="div-comment-1215141" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Max</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151120-00/?p=92041#comment-1215141">
+			November 23, 2015 at 11:48 am</a>		</div>
+
+		<p>@DWalker: If the code is that old then it&#39;s likely been worked on by several people, going through incremental changes and updates and patches and bugfixes over the course of years. The comments don&#39;t just have to be made, they have to be maintained, just like the code is. And even if you meticulously document every fix, over time the comments will accumulate to the point where they become unreadable, and most likely no one&#39;s going to go back and analyze the code and rewrite/summarize all the comments into something that&#39;s still relevant and accurate until it&#39;s already become a problem. On projects that big and old, managing code readability isn&#39;t as simple as &quot;comment everything&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

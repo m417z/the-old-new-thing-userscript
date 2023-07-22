@@ -1,0 +1,329 @@
+<html>
+<head>
+<title>How can I append to a file and know where it got written, even if the file is being updated by multiple processes?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I append to a file and know where it got written, even if the file is being updated by multiple processes?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 27, 2015 / year-entry #251</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>7</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer had a collection of processes, all of which are writing to a single file. Each process wants to append some data to a file and also know where the appended data was written, because the location of the appended record needed to be saved somewhere else. "We are currently using a named mutex...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had a collection of processes,
+all of which are writing to a single file.
+Each process wants to append some data to a file and also know where
+the appended data was written, because the location of the appended
+record needed to be saved somewhere else.
+"We are currently using a named mutex derived from the path to the file.
+To add a new record, we take the mutex,
+set the file pointer to the end of the file,
+record the current position,
+write the data,
+then release the mutex.
+This works, but it feels clunky,
+and it is vulnerable to multiple names for the same file,
+or multiple computers trying to append to the same file.
+Is there a better way?"
+</p>
+<p>
+Now, if the program needed to append data but didn't care where
+it got appended,
+then it could make the file system do the work:
+Open the file for
+<code>FILE_<wbr>APPEND_<wbr>DATA | SYNCHRONIZE</code>
+and <i>nothing else</i>.
+(In particular, do not open for
+<code>FILE_<wbr>WRITE_<wbr>DATA</code>.)
+<a HREF="http://msdn.microsoft.com/en-us/library/ff548289.aspx">
+This is documented</a> as meaning that the caller can
+write only to the end of the file,
+and any offset information provided in the write operation is ignored.
+Unfortunately, the technique doesn't tell you where the data got written,&sup1;
+so it doesn't help in this case.
+</p>
+<p>
+This is a job for
+<code>Lock&shy;File</code>.
+In fact, this is not only a job for
+<code>Lock&shy;File</code>,
+this is precisely the job that
+<code>Lock&shy;File</code>
+was created to solve.
+The
+<code>Lock&shy;File</code>
+is so proud of its job that there's even
+<a HREF="http://msdn.microsoft.com/en-us/library/windows/desktop/aa363778(v=vs.85).aspx">
+a sample program right there in MSDN</a>
+showing how to use file locking to append data.
+But that sample isn't quite the scenario we have here,
+because that sample assumes that only one process is writing
+(because it opens the file in deny-write mode),
+and it merely needs to lock out reads.
+In our case, we also want to permit others to write to the file,
+except when we are extending.
+</p>
+<p>
+I sketched out a few different algorithms for the customer.
+First, you could agree that byte zero is the "I am appending" signal.
+This is merely
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/09/05/10555220.aspx">
+using the file as its own synchronization object</a>.
+</p>
+<pre>
+// Requires that everybody agree that byte 0 is the lock
+AppendData()
+{
+ LockFile(from 0 to 0);
+ size = GetFileSize;
+ WriteAt(size, data);
+ UnlockFile(from 0 to 0);
+}
+</pre>
+<p>
+But choosing byte zero makes that byte of the file inaccessible while
+the lock is held, even though it is unrelated to the append operation.
+Therefore, you are probably better locking a nonexistent byte well
+beyond the anticipated maximum file size.
+Byte <code>0xFFFFFFFF`FFFFFFFF</code> will probably do nicely.
+</p>
+<p>
+Better would be to use file locking in the way it was intended:
+To assert access to a range of bytes in the file because you actually
+want to access them.
+(File locking comes from the database world, where you would lock
+a record,
+perform an update, then unlock the record.)
+</p>
+<pre>
+AppendData()
+{
+ originalSize = GetFileSize;
+ LockFile(from originalSize to 0xFFFFFFFF`FFFFFFFF);
+ actualSize = GetFileSize;
+ WriteAt(actualSize, data);
+ UnlockFile(from originalSize to 0xFFFFFFFF`FFFFFFFF);
+}
+</pre>
+<p>
+The idea here is that you lock the entire remainder of the file,
+from its current size out to infinity.
+If the file size changes before the lock, that's okay,
+because the file only grows in size, so we locked more than necessary.
+</p>
+<p>
+If it's possible for the file to shrink in size, then you need
+to detect that case and expand the lock so that it covers the
+region you intend to write to.
+</p>
+<pre>
+AppendData()
+{
+ originalSize = GetFileSize;
+ LockFile(from originalSize to 0xFFFFFFFF`FFFFFFFF);
+ actualSize = GetFileSize;
+ if (actualSize &lt; originalSize) {
+  UnlockFile(from originalSize to 0xFFFFFFFF`FFFFFFFF);
+  originalSize = actualSize;
+  LockFile(from originalSize to 0xFFFFFFFF`FFFFFFFF);
+ }
+ WriteAt(actualSize, data);
+ UnlockFile(from originalSize to 0xFFFFFFFF`FFFFFFFF);
+}
+</pre>
+<p>
+Or you can be sloppy and just lock the entire file.
+It's more expansive than you need, but it'll get the job done.
+</p>
+<pre>
+AppendData()
+{
+ LockFile(from 0 to 0xFFFFFFFF`FFFFFFFF);
+ size = GetFileSize;
+ WriteAt(size, data);
+ UnlockFile(from 0 to 0xFFFFFFFF`FFFFFFFF);
+}
+</pre>
+<p>
+The customer was okay with the sloppy version,
+and noted that using file locks also solves the problem
+of files with multiple names (due to hard links or
+network aliasing),
+as well as permitting multiple computers to operate
+on the file simultaneously.
+</p>
+<p>
+&sup1; You might hope that
+the <code>OVERLAPPED.Offset</code> member
+would be updated with the actual file offset used,
+but sadly it isn't.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (7)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1215611">
+				<div id="div-comment-1215611" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215611">
+			November 27, 2015 at 7:15 am</a>		</div>
+
+		<p>In your &quot;shrinkable&quot; sample, shouldn&#39;t you loop? If the file can both grow and be shrunk by external actors, isn&#39;t it possible that it shrank again between your UnlockFile and LockFile inside the if?</p>
+<div class="post">[<em>You&#39;re right. Better would be to require that the file be locked when shrunk. Then you wouldn&#39;t need to re-lock. (Basically, fall back to &quot;Use byte 0xFFFFFFFF`FFFFFFFF has the &quot;I&#39;m changing the file size&quot; signal.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215591">
+				<div id="div-comment-1215591" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215591">
+			November 27, 2015 at 8:54 am</a>		</div>
+
+		<p>FILE_APPEND_DATA is tricky unless you like occasional split writes (therefore I only use it for log files). Good call on LockFile. LockFile doesn&#39;t work reliably across a network due to unavoidable physics. There ought to be a solution using transactional filesystem (handle the rollbacks by starting again).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215581">
+				<div id="div-comment-1215581" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">waleri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215581">
+			November 27, 2015 at 9:05 am</a>		</div>
+
+		<p>What about using</p>
+<p>FILE_APPEND + GetFileSize + WriteFile.</p>
+<p>Eventualy WriteFile would fail if you&#39;re NOT at the end of file and in this case retry the operation.</p>
+<div class="post">[<em>If you open in FILE_APPEND_DATA mode, then the WriteFile ignores your current position and always appends, as noted in the linked article. (I.e., WriteFile succeeds even if you are not at the end of the file.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215561">
+				<div id="div-comment-1215561" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215561">
+			November 27, 2015 at 11:03 am</a>		</div>
+
+		<p>Apart from &quot;being sloppy&quot; (and preventing writing to earlier parts of the file, if that&#39;s something you need) are there any other downsides to locking the entire file?</p>
+<p>Ie. is it more expensive in addition to being more expansive?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215551">
+				<div id="div-comment-1215551" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Douglas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215551">
+			November 27, 2015 at 12:56 pm</a>		</div>
+
+		<p>@Michael</p>
+<p>Disclaimer: I&#39;m just guessing here.</p>
+<p>On its own, probably not at all. With no readers, again, probably not.</p>
+<p>Where it would matter is if somebody wanted to read the first however many bytes/chunks/logs of the file. If you only lock the &#39;end&#39; of the file and the reader only locks the &#39;beginning&#39;, both can work concurrently, objectives permitting.</p>
+<p>Going off on a tangent:</p>
+<p>You could probably make the data consumer process the file a chunk at a time whenever the filesize increases. At that point, you should probably just use a pipe (or named pipe, or FIFO, etc.). For saving the data as it goes through (if you want that), you use a &quot;tee&quot; program.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215281">
+				<div id="div-comment-1215281" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Juan Garcia</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215281">
+			November 30, 2015 at 7:55 am</a>		</div>
+
+		<p>I am afraid to ask. Yet the desire to know the answer beats me. Why don&#39;t you use a critical section when writing the file? (Just asking)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215271">
+				<div id="div-comment-1215271" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sean</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151127-00/?p=92211#comment-1215271">
+			November 30, 2015 at 8:33 am</a>		</div>
+
+		<p>@Juan Garcia</p>
+<p>Because a critical section only works within a single process. The customer was asking for a solution which would work not only cross-process, but also cross-computer, as well as handling the possibility of the same file being accessed through different paths.</p>
+<p>The existing solution the customer had used mutexes, which are named and cross-process (a process can access existing mutexes created by other processes using their names), but those do not work with processes on different computers. The mutex solution also required each process writing the file to use the same mutex name for that file, and their approach (to use the file&#39;s path) is not guaranteed to work (files can have multiple paths, e.g. due to a hard link to the file).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

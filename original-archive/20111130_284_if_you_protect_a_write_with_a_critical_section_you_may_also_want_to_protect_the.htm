@@ -1,0 +1,714 @@
+<html>
+<head>
+<title>If you protect a write with a critical section, you may also want to protect the read</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>If you protect a write with a critical section, you may also want to protect the read</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 30, 2011 / year-entry #285</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>30</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It is common to have a critical section which protects against concurrent writes to a variable or collection of variables. But if you protect a write with a critical section, you may also want to protect the read, because the read might race against the write. Adam Rosenfield shared his experience with this issue in...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+It is common to have a critical section which protects against
+concurrent writes to a variable or collection of variables.
+But if you protect a write with a critical section,
+you may also want to protect the read,
+because the read might race against the write.
+</p>
+<p>
+<a HREF="http://adamrosenfield.com">
+Adam Rosenfield</a>
+shared his experience with this issue
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2009/12/23/9940330.aspx#9940599">
+in a comment from a few years back</a>.
+I'll reproduce the example here in part to save you the trouble of clicking,
+but also to make this entry look longer and consequently make it seem
+like I'm actually doing some work (when in fact Adam did nearly all of the
+work):
+</p>
+<pre>
+<i>class X {
+ volatile int mState;
+ CRITICAL_SECTION mCrit;
+ HANDLE mEvent;
+};
+
+X::Wait() {
+ while(mState != kDone) {
+   WaitForSingleObject(mEvent, INFINITE);
+ }
+}
+
+X::~X() {
+ DestroyCriticalSection(&amp;mCrit);
+}
+
+X::SetState(int state) {
+ EnterCriticalSection(&amp;mCrit);
+ // do some state logic
+ mState = state;
+ SetEvent(mEvent);
+ LeaveCriticalSection(&amp;mCrit);
+}
+
+Thread1()
+{
+ X x;
+ ... spawn off thread 2 ...
+ x.Wait();
+}
+
+Thread2(X* px)
+{
+ ...
+ px-&gt;SetState(kDone);
+ ...
+}</i>
+</pre>
+<p>
+There is a race condition here:
+</p>
+<ul>
+<li>Thread&nbsp;1 calls <code>X::<wbr>Wait</code> and waits.
+<li>Thread&nbsp;2 calls <code>X::<wbr>SetState</code>.
+<li>Thread&nbsp;2 gets pre-empted immediately after calling
+    <code>Set&shy;Event</code>.</p>
+<li>Thread&nbsp;1 wakes up from the
+    <code>Wait&shy;For&shy;Single&shy;Object</code>
+    call, notices that <code>mState == kDone</code>, and therefore
+    returns from the <code>X::<wbr>Wait</code> method.</p>
+<li>Thread&nbsp;1 then destructs the <code>X</code> object, which 
+    destroys the critical section.</p>
+<li>Thread&nbsp;2 finally runs and tries to leave a critical section
+    that has been destroyed.
+</ul>
+<p>
+The fix was to enclose the <i>read</i> of <code>mState</code>
+inside a critical section:
+</p>
+<pre>
+X::Wait() {
+ while(1) {
+   EnterCriticalSection(&amp;mCrit);
+   int state = mState;
+   LeaveCriticalSection(&amp;mCrit);
+   if(state == kDone)
+     break;
+   WaitForSingleObject(mEvent, INFINITE);
+ }
+}
+</pre>
+<p>
+Forgetting to enclose the read inside a critical section is a common
+oversight.
+I've made it myself more than once.
+You say to yourself,
+"I don't need a critical section here.
+I'm just reading a value which can safely be read atomically."
+But you forget that the critical section isn't just for protecting
+the write to the variable;
+it's also to protect all the other actions that take place under
+the critical section.
+</p>
+<p>
+And just to make it so I actually did some work today,
+I leave you with this puzzle based on an actual customer problem:
+</p>
+<pre>
+<i>class BufferPool {
+public:
+ BufferPool() { ... }
+ ~BufferPool() { ... }
+
+ Buffer *GetBuffer()
+ {
+  Buffer *pBuffer = FindFreeBuffer();
+  if (pBuffer) {
+   pBuffer-&gt;mIsFree = false;
+  }
+  return pBuffer;
+ }
+
+ void ReturnBuffer(Buffer *pBuffer)
+ {
+  pBuffer-&gt;mIsFree = true;
+ }
+
+private:
+ Buffer *FindFreeBuffer()
+ {
+  EnterCriticalSection(&mCrit);
+  Buffer *pBuffer = NULL;
+  for (int i = 0; i &lt; 8; i++) {
+   if (mBuffers[i].mIsFree) {
+    pBuffer = &amp;mBuffers[i];
+    break;
+   }
+  }
+  LeaveCriticalSection(&mCrit);
+  return pBuffer;
+ }
+private:
+ CRITICAL_SECTION mCrit;
+ Buffer mBuffers[8];
+};</i>
+</pre>
+<p>
+The real class was significantly more complicated than this,
+but I've distilled the problem to its essence.
+</p>
+<p>
+The customer added,
+"I tried declaring <code>mIs&shy;Free</code> as a volatile variable,
+but that didn't seem to help."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (30)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-950343">
+				<div id="div-comment-950343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">tsaf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950343">
+			November 30, 2011 at 7:04 am</a>		</div>
+
+		<p>pBuffer-&gt;mIsFree = false;</p>
+<p>is not in the critical section</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950353">
+				<div id="div-comment-950353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950353">
+			November 30, 2011 at 7:16 am</a>		</div>
+
+		<p>Setting it to true also is not in the crit section, which is much worse.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950363">
+				<div id="div-comment-950363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950363">
+			November 30, 2011 at 7:17 am</a>		</div>
+
+		<p>Um forget what I said, I thought the var was called IsUsed. Then you are right and setting it to false is a race condition while setting it to true is irrelevent.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950373">
+				<div id="div-comment-950373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">slow</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950373">
+			November 30, 2011 at 8:06 am</a>		</div>
+
+		<p>Yeah, FindFreeBuffer can return the same buffer if called from multiple threads before GetBuffer sets the state variable. I think ReturnBuffer might be ok if the assignment is atomic and the class is used correctly (ie: no double-returns, etc), though I&#39;ve been wrong before and this isn&#39;t the way I&#39;d write that kind of code and so haven&#39;t been bitten.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950383">
+				<div id="div-comment-950383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">slow</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950383">
+			November 30, 2011 at 8:13 am</a>		</div>
+
+		<p>Also, don&#39;t forget to flush your pBuffers. har har.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950393">
+				<div id="div-comment-950393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Diego F.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950393">
+			November 30, 2011 at 8:19 am</a>		</div>
+
+		<p>What a mess! Multiple threads could acquire the same buffer! The FindFreeBuffer should NEVER leave the critical section without setting mIsFree to false first.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950403">
+				<div id="div-comment-950403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950403">
+			November 30, 2011 at 8:19 am</a>		</div>
+
+		<p>FindFreeBuffer can allocate the same buffer twice (already discussed). ReturnBuffer is safe assuming nobody screws up. With modern coding standards, ReturnBuffer should check null first, but older coding standards dind&#39;t require that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950413">
+				<div id="div-comment-950413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950413">
+			November 30, 2011 at 8:23 am</a>		</div>
+
+		<p>@slow Yep I don&#39;t see any problems with ReturnBuffer as long as the write is atomic &#8211; if not we have a nasty race condition though. But that&#39;s highly unlikely without a programming error.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950423">
+				<div id="div-comment-950423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris B</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950423">
+			November 30, 2011 at 8:24 am</a>		</div>
+
+		<p>I won&#39;t even pretend that I understand the problem well enough to fix it, but I will say that when I hear people say things like &quot;I tried X, but that didn&#39;t seem to help.&quot;, it scares the dickens out of me. &nbsp;I generally find the &quot;stab in the dark&quot; and &quot;guess and test&quot; methods to be poor proofs of correctness.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950433">
+				<div id="div-comment-950433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Deduplicator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950433">
+			November 30, 2011 at 8:33 am</a>		</div>
+
+		<p>Wouldn&#39;t this work with even less overhead?</p>
+<p>X::Wait() {</p>
+<p>while (mState!=kDone)</p>
+<p>&nbsp; WaitForSingleObject(mEvent,INFINITE);</p>
+<p>EnterCriticalSection(&amp;mCrit);// Just make sure the last user left</p>
+<p>LeaveCriticalSection(&amp;mCrit);// Can one just leave a critical section locked if it will just be destroyed? Or will the fact that it is still owned bugger things?</p>
+<p>}</p>
+<p>It&#39;s not really that we need the read protected as I understand it, we just need to ensure that noone uses our mCrit any more. Did I forget anything?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950443">
+				<div id="div-comment-950443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bd_</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950443">
+			November 30, 2011 at 8:36 am</a>		</div>
+
+		<p>It should be noted that there are techniques to avoid the need to lock on read &#8211; RCU for one. I haven&#39;t heard of RCU being implemented on userspace in Windows however; an efficient implementation needs a way to cause a CPU memory barrier on a remote thread, which is difficult without unix signals.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950463">
+				<div id="div-comment-950463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/jeffwhitledge_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>jeffwhitledge@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950463">
+			November 30, 2011 at 11:41 am</a>		</div>
+
+		<p>&quot;And just to make it so I actually did some work today&#8230;&quot;</p>
+<p>Alright, with that last puzzle you&#39;ve earned your blog money.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950473">
+				<div id="div-comment-950473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">azth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950473">
+			November 30, 2011 at 2:31 pm</a>		</div>
+
+		<p>The first example is basically a condition variable right? Why not just use those? :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950453">
+				<div id="div-comment-950453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Deduplicator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950453">
+			November 30, 2011 at 8:49 am</a>		</div>
+
+		<p>I see two ways to fix things, and as FindFreeBuffer() is a private method and my gut says its name implies the doing, that&#39;s where it should be done, quarantining all the nitty-gritty:</p>
+<p> &nbsp; if (mBuffers[i].mIsFree) {</p>
+<p> &nbsp; &nbsp;pBuffer = &amp;mBuffers[i];</p>
+<p>/*Added*/ pBuffer-&gt;mIsFree=false;</p>
+<p> &nbsp; &nbsp;break;</p>
+<p> &nbsp; }</p>
+<p>One can do it in by changing GetBuffer() instead, if one so desires:</p>
+<p> Buffer *GetBuffer()</p>
+<p> {</p>
+<p>/*Added*/ EnterCriticalSection(&amp;mCrit);</p>
+<p> &nbsp;Buffer *pBuffer = FindFreeBuffer();</p>
+<p> &nbsp;if (pBuffer) {</p>
+<p> &nbsp; pBuffer-&gt;mIsFree = false;</p>
+<p> &nbsp;}</p>
+<p>/*Added*/ LeaveCriticalSection(&amp;mCrit);</p>
+<p> &nbsp;return pBuffer;</p>
+<p> }</p>
+<p>But that&#39;s more work to no useful end, as far as I can see, and doesn&#39;t clear up the behavior of FindFreeBuffer().</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950483">
+				<div id="div-comment-950483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950483">
+			November 30, 2011 at 5:47 pm</a>		</div>
+
+		<p>When i doubt, serialize execution. Thinking of concurrency hurts brain. And even if YOU get it right, the next dude which maintain the code will of course introduce bugs the first thing he do.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950493">
+				<div id="div-comment-950493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin J</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950493">
+			November 30, 2011 at 5:55 pm</a>		</div>
+
+		<p>Doesn&#39;t developers have any knowledge of basic CS algorithms any more?</p>
+<p><a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock" rel="nofollow">en.wikipedia.org/&#8230;/Readers%E2%80%93writer_lock</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950503">
+				<div id="div-comment-950503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950503">
+			November 30, 2011 at 10:06 pm</a>		</div>
+
+		<p>Read-Write Lock in Windows API has implemented since Vista.</p>
+<p>It will be buggy if implement is written by himself.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950513">
+				<div id="div-comment-950513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950513">
+			December 1, 2011 at 12:14 am</a>		</div>
+
+		<p>@Deduplicator &gt; &quot;Can one just leave a critical section locked if it will just be destroyed?&quot;</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2009/12/23/9940330.aspx" rel="nofollow">blogs.msdn.com/&#8230;/9940330.aspx</a></p>
+<p>One can, but you&#39;re introducing race condition.</p>
+<p>Thread1 (Worker): EnterCriticalSection(cs);</p>
+<p>Thread2 (Destructor): EnterCriticalSection(cs); //waits</p>
+<p>Thread1: LeaveCriticalSection(cs);</p>
+<p>Thread2: //enters cs</p>
+<p>Thread3: EnterCriticalSection(cs); //waits</p>
+<p>Thread2: DeleteCriticalSection(cs);</p>
+<p>Thread3: //wtf dude?! I&#39;m still waiting on it</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950523">
+				<div id="div-comment-950523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Deduplicator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950523">
+			December 1, 2011 at 1:49 am</a>		</div>
+
+		<p>@asdbsd:</p>
+<p>I don&#39;t see where you get the idea that anyone could want to handle the cs after the point the destructor destroys it. Looks like you want to keep the cs around forever.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950533">
+				<div id="div-comment-950533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950533">
+			December 1, 2011 at 1:57 am</a>		</div>
+
+		<p>@Deduplicator: If nobody can, then there&#39;s no point to do EnterCriticalSection(cs); before destroying it in the first place.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950583">
+				<div id="div-comment-950583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950583">
+			December 1, 2011 at 7:31 am</a>		</div>
+
+		<p>@azth: Yes, it&#39;s basically a condition variable, but Xbox 360 SDK does not have condition variables.</p>
+<p>@Martin J, @John Doe: Likewise, the Xbox 360 SDK does not have reader-writer locks (but I won&#39;t fault you for not knowing that, even if you didn&#39;t click through to the original post and scroll down to find it, since anchors still seem to be broken)</p>
+<p>Thanks for the call-out, Raymond.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950633">
+				<div id="div-comment-950633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peeter Joot</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950633">
+			December 1, 2011 at 10:17 am</a>		</div>
+
+		<p>How does a generic programming error like this end up serviced by Microsoft support? Do you offer general debugging support contracts? I can&#39;t imagine how this can be portrayed as a Windows bug.</p>
+<div class="post">[<i>My guess is that if you offer enough money, Microsoft Consulting Services will even wash your car for you. And don&#39;t forget, some people think that <a href="http://blogs.msdn.com/b/oldnewthing/archive/2011/02/10/10127054.aspx" rel="nofollow">any bug that occurs on Windows is a Windows bug</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950753">
+				<div id="div-comment-950753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Deduplicator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950753">
+			December 1, 2011 at 2:59 pm</a>		</div>
+
+		<p>asdbsd wrote: @Deduplicator: If nobody can [want to enter the critical section after it&#39;s destroyed], then there&#39;s no point to do EnterCriticalSection(cs); before destroying it in the first place.</p>
+<p>The point of the exercise is not to synchronize anything but the critical section itself. You don&#39;t want a ReleaseCriticalSection() in a different thread after you already destroyed it. So we wait till the last thread to lock it is done, by using EnterCriticalSection(). How else would you guarantee that?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950763">
+				<div id="div-comment-950763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950763">
+			December 1, 2011 at 3:01 pm</a>		</div>
+
+		<p>@Deduplicator</p>
+<p>Your code is basically the same as:</p>
+<p>X::Wait() {</p>
+<p>while(1) {</p>
+<p>&nbsp; EnterCriticalSection(&amp;mCrit);</p>
+<p>&nbsp; LeaveCriticalSection(&amp;mCrit);</p>
+<p>&nbsp; int state = mState;</p>
+<p>&nbsp; if(state == kDone)</p>
+<p>&nbsp; &nbsp; break;</p>
+<p>&nbsp; WaitForSingleObject(mEvent, INFINITE);</p>
+<p>}</p>
+<p>}</p>
+<p>I can&#39;t comment on efficiency or correctness though. Anyone care to comment?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950563">
+				<div id="div-comment-950563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Axel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950563">
+			December 1, 2011 at 7:03 am</a>		</div>
+
+		<p>volatile doesn&#39;t guarantee atomic access in C/C++ anyway! That&#39;s a common error, because in Java and C# it *does* actually do that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950813">
+				<div id="div-comment-950813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950813">
+			December 1, 2011 at 6:14 pm</a>		</div>
+
+		<p>Is it safe to leave ReturnBuffer() as it is, unlocked? I&#39;ve written and read plenty of code like that on x86 and x64, so wanted to be sure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950773">
+				<div id="div-comment-950773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">azth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950773">
+			December 1, 2011 at 3:18 pm</a>		</div>
+
+		<p>@Adam Rosenfield: Isn&#39;t the &#39;fixed&#39; version of X::Wait() also broken? Consider this scenario:</p>
+<p>* Thread 1 enters the critical section, saves mState (which at this point is != kDone), and just before it calls WaitForSingleObject(), it gets preempted.</p>
+<p>* Thread 2 starts running, does it&#39;s thing, and calls SetEvent(); however, Thread 1 did not call WaitForSingleObject() yet, so this signal is lost.</p>
+<p>* Thread 1 runs again, and enters WaitForSingleObject(). It will forever remain in this state as SetEvent() will not be called again.</p>
+<p>Am I missing anything? :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950863">
+				<div id="div-comment-950863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jon Daley</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950863">
+			December 1, 2011 at 11:31 pm</a>		</div>
+
+		<p>@azth, the behavior of SetEvent depends on how the event is created, as to whether it will be auto-reset or not.</p>
+<p>But, yes, this code is pretty strange. &nbsp;The &quot;fixed&quot; version doesn&#39;t do anything for protecting the critical section from being used after it is deleted. &nbsp;Sounds like a code redesign is needed, or else (as other people have said) the critical section shouldn&#39;t be deleted here.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-950873">
+				<div id="div-comment-950873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950873">
+			December 2, 2011 at 3:22 am</a>		</div>
+
+		<p>@Deduplicator&gt; &quot;So we wait till the last thread to lock it is done, by using EnterCriticalSection().&quot;</p>
+<p>How can you say that this was the last thread? That is the real problem. If you can guarantee that at most one thread is at worst case INSIDE of critical section right now then the worst part is already solved.</p>
+<p>There could be several threads approaching EnterCriticalSection at this moment. Some of them could be waiting in EnterCriticalSection, so no warning flags you set up are going to help: they&#39;re already there! Taking the section won&#39;t work either because you might get sorted before those other waiters:</p>
+<p>Thread1: EnterCriticalSection(cs); //enters</p>
+<p>Thread2: EnterCriticalSection(cs); //waits</p>
+<p>Thread3 (destructor): EnterCriticalSection(cs); //waits</p>
+<p>Thread1: LeaveCriticalSection(cs);</p>
+<p>Thread3: //enters critical section and destroys it</p>
+<p>Thread2: //huh?</p>
+<p>Even with only one other thread Enter/Leave can&#39;t protect anything:</p>
+<p>Thread1: bCanEnterSection==true? Okay, I&#39;ll enter it.</p>
+<p>Thread2: //commence destruction</p>
+<p>bCanEnterSection=false;</p>
+<p>EnterCriticalSection(cs); //make sure no one is inside</p>
+<p>Thread1: EnterCriticalSection(cs); //waits</p>
+<p>Thread2:</p>
+<p>//no one is inside so we&#39;re destroying it</p>
+<p>DestroyCriticalSection(cs);</p>
+<p>Thread1: //hey, wait a bit&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-950933">
+				<div id="div-comment-950933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jules</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111130-00/?p=9003#comment-950933">
+			December 3, 2011 at 2:39 am</a>		</div>
+
+		<p>Java has an interesting take on this problem: you can&#39;t call Object.wait() (equivalent to WaitForSingleObject()) unless you hold the mutex that&#39;s associated with that object; it throws an exception otherwise. &nbsp;This means that the code</p>
+<p>X::Wait() {</p>
+<p> while(mState != kDone) {</p>
+<p> &nbsp; WaitForSingleObject(mEvent, INFINITE);</p>
+<p> }</p>
+<p>}</p>
+<p>basically has to be translated in Java idiomatic usage to:</p>
+<p>class X {</p>
+<p> &nbsp;void Wait () {</p>
+<p> &nbsp; &nbsp;synchronized (event) {</p>
+<p> &nbsp; &nbsp; &nbsp;while (mState != kDone) {</p>
+<p> &nbsp; &nbsp; &nbsp; &nbsp;mEvent.wait ();</p>
+<p> &nbsp; &nbsp; &nbsp;}</p>
+<p> &nbsp; &nbsp;}</p>
+<p> &nbsp;}</p>
+<p>}</p>
+<p>Sure, you *could* put the synchronized block inside the while loop, but by doing so the bug is made obvious&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

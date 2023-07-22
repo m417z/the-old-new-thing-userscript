@@ -1,0 +1,605 @@
+<html>
+<head>
+<title>Does Windows have a limit of 2000 threads per process?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Does Windows have a limit of 2000 threads per process?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 29, 2005 / year-entry #206</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>30</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Often I see people asking why they can't create more than around 2000 threads in a process. The reason is not that there is any particular limit inherent in Windows. Rather, the programmer failed to take into account the amount of address space each thread uses. A thread consists of some memory in kernel mode...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Often I see people asking why they can't create more than around
+2000 threads in a process.
+The reason is not that there is any particular limit inherent in Windows.
+Rather, the programmer failed to take into account the amount of
+address space each thread uses.
+</p>
+<p>
+A thread consists of some memory in kernel mode (kernel stacks and
+object management), some memory in user mode (the thread environment
+block, thread-local storage, that sort of thing), plus its stack.
+(<a HREF="http://blogs.msdn.com/oldnewthing/archive/2005/04/21/410397.aspx"
+>Or stacks if you're on an Itanium system</a>.)
+</p>
+<p>
+Usually, the limiting factor is the stack size.
+</p>
+<pre>
+#include &lt;stdio.h&gt;
+#include &lt;windows.h&gt;
+
+DWORD CALLBACK ThreadProc(void*)
+{
+ Sleep(INFINITE);
+ return 0;
+}
+
+int __cdecl main(int argc, const char* argv[])
+{
+int i;
+ for (i = 0; i &lt; 100000; i++) {
+  DWORD id;
+  HANDLE h = CreateThread(NULL, 0, ThreadProc, NULL, 0, &amp;id);
+  if (!h) break;
+  CloseHandle(h);
+ }
+ printf("Created %d threads\n", i);
+ return 0;
+}
+</pre>
+<p>
+This program will typically print a value around 2000 for the
+number of threads.
+</p>
+<p>
+Why does it give up at around 2000?
+</p>
+<p>
+Because the default stack size assigned by the linker is 1MB,
+and 2000 stacks times 1MB per stack equals around 2GB, which is
+how much address space is available to user-mode programs.
+</p>
+<p>
+You can try to squeeze more threads into your process by reducing
+your stack size, which can be done either by tweaking linker options
+or manually overriding the stack size passed to
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/createthread.asp">
+the <code>CreateThread</code> functions</a>
+as described
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/thread_stack_size.asp">
+in MSDN</a>.
+</p>
+<p>
+<pre>
+  HANDLE h = CreateThread(NULL, 4096, ThreadProc, NULL,
+               STACK_SIZE_PARAM_IS_A_RESERVATION, &amp;id);
+</pre>
+<p>
+With this change, I was able to squeak in around 13000 threads.
+While that's certainly better than 2000, it's short of the
+naive expectation of
+500,000 threads.
+(A thread is using 4KB of stack in 2GB address space.)
+But you're forgetting the other overhead.
+<a href="http://blogs.msdn.com/oldnewthing/archive/2003/10/08/55239.aspx">
+Address space allocation granularity is 64KB</a>, so each thread's
+stack occupies 64KB of address space even if only 4KB of it is used.
+Plus of course you don't have free reign over all 2GB of the address
+space; there are system DLLs and other things occupying it.
+</p>
+<p>
+But the real question that is raised whenever somebody asks,
+"What's the maximum number of threads that a process can create?"
+is "Why are you creating so many threads that this even becomes an issue?"
+</p>
+<p>
+The "one thread per client" model is well-known not to scale beyond
+a dozen clients or so.  If you're going to be handling more than that
+many clients simultaneously, you should move to a model where
+instead of dedicating a thread to a client, you instead allocate
+an object.  (Someday I'll muse on the duality between threads and objects.)
+Windows provides
+<a HREF="http://msdn.microsoft.com/library/en-us/fileio/base/i_o_completion_ports.asp">
+I/O completion ports</a>
+and
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/thread_pooling.asp">
+a thread pool</a>
+to help you convert from a thread-based model to a work-item-based model.
+</p>
+<p>
+Note that fibers do <strong>not</strong> help much here,
+because a fiber has a stack,
+and it is the address space required by the stack
+that is the limiting factor nearly all of the time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (30)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-293483">
+				<div id="div-comment-293483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.thespoke.net/MyBlog/travisowens/MyBlog.aspx' rel='external nofollow' class='url'>Travis Owens</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293483">
+			July 29, 2005 at 10:19 am</a>		</div>
+
+		<p>Of course we could raise the question, should any application be generating THAT many threads that this should be an issue in the first place.</p>
+<p>Or maybe I&#8217;m re-preaching &quot;640k is enough for anybody&quot; concepts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293493">
+				<div id="div-comment-293493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe Chung</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293493">
+			July 29, 2005 at 10:55 am</a>		</div>
+
+		<p>While it doesn&#8217;t make sense to have 2000+ threads on a single CPU yet, it might make sense in the (not so far) future when a machine may have several processors, each of which might be multi-core (2 or more processors per chip).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293503">
+				<div id="div-comment-293503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Ritchey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293503">
+			July 29, 2005 at 11:17 am</a>		</div>
+
+		<p>Ahh, I/O Completion ports. Everyone seems to be on an IOCP kick these days. I was all excited about them myself until I learned that you cannot support older versions of Windows. At that point,  the consensus seemed to be that OVERLAPPED I/O was the way to go for scalable networking sans threads. God help you if you are looking for a good example of how to create a robust overlapped networking application. At least more than just a simple echo client and echo server. I spent more time than I would like to admit getting everything to work. I don&#8217;t suppose anyone knows of a good real-world example of OVERLAPPED networking?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293513">
+				<div id="div-comment-293513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kbiel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293513">
+			July 29, 2005 at 11:23 am</a>		</div>
+
+		<p>I think Raymond has it right, the people asking this question are probably creating a thread per object.  They probably don&#8217;t have an expectation to run all 2000+ threads simultaneously, they just don&#8217;t understand thread pooling.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293523">
+				<div id="div-comment-293523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mschaef</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293523">
+			July 29, 2005 at 11:34 am</a>		</div>
+
+		<p>&#8216;The &quot;one thread per client&quot; model is well-known not to scale beyond a dozen clients or so.&#8217;</p>
+<p>Perhaps that should read &#8216;one win32 operating system thread per client&#8217;. From what I understand, never having used it myself, Erlang does a pretty good job of making application level threads cheap to create and dispatch:</p>
+<p><a rel="nofollow" target="_new" href="http://wagerlabs.com/tech/2005/05/27000-games.html" rel="nofollow">http://wagerlabs.com/tech/2005/05/27000-games.html</a></p>
+<p>&quot;I have a PowerBook G4 1.25Ghz with 512Mb of memory. Running 27K games consumes about 600Mb of memory and takes around 15 minutes per 10K games due to heavy swapping. &#8230;  Assuming an average of 5 players per game that&#8217;s 135,000 players and 405,000 simultaneous processes. &quot;</p>
+<p>As you&#8217;ve pointed out before (<a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2005/02/11/371042.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2005/02/11/371042.aspx</a>) sometimes it makes sense to think past OS-native services.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293533">
+				<div id="div-comment-293533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293533">
+			July 29, 2005 at 11:49 am</a>		</div>
+
+		<p>32-bit Windows&#8230; how&#8230; 20th century.</p>
+<p>So I guess this isn&#8217;t likely to be a limit for very much longer, eh?</p>
+<p>Of course, people will complain about having a mere 8 trillion threads, no doubt&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even thread-even depth-1" id="comment-293543">
+				<div id="div-comment-293543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293543">
+			July 29, 2005 at 11:52 am</a>		</div>
+
+		<p>Of course if you disallow native code you can get away with more tricks. A continuation does a lot less memory than a thread but its use is limited to managed environments. Great work if you can get it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mgrier odd alt thread-odd thread-alt depth-1" id="comment-293563">
+				<div id="div-comment-293563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MGrier' rel='external nofollow' class='url'>MGrier</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293563">
+			July 29, 2005 at 12:18 pm</a>		</div>
+
+		<p>The core problem here is the sequential programming model combined with the native compilers&#8217; reliance on the machine stack.</p>
+<p>As Raymond points out, continuations can effectively give you a ton of &quot;threads&quot;.  You don&#8217;t need managed code; there have been plenty of native-code-generating continuation-passing languages over the years.  Continuation-passing doesn&#8217;t even solve everything because you need synchronization primitives which are associated with these continuations/contexts instead of operating system units of execution.  (For example, I have no idea how well critical sections and fibers interact on NT&#8230;)</p>
+<p>You do have to wonder then what a &quot;thread&quot; means.  If it means whatever you want it to mean in a context, we&#8217;re compating apples and oranges.  In Raymond&#8217;s context, he&#8217;s talking about threads as an OS scheduling concept, not a programming language level concept.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293593">
+				<div id="div-comment-293593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skilled and Aware of it</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293593">
+			July 29, 2005 at 1:26 pm</a>		</div>
+
+		<p>re: Tim Smith:<br />
+<br /><a rel="nofollow" target="_new" href="http://www.phule.net/mirrors/unskilled-and-unaware.html" rel="nofollow">http://www.phule.net/mirrors/unskilled-and-unaware.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293603">
+				<div id="div-comment-293603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://nikitadanilov.blogspot.com' rel='external nofollow' class='url'>nikita</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293603">
+			July 29, 2005 at 2:30 pm</a>		</div>
+
+		<p>It&#8217;s true that thread-per-connection architecture has scalability problems, but its alternative has its drawbacks too. So many of them actually, that after my first serious encounter with non-blocking-state-machine type of server (SquidNG, circa 2000), I ended up compiling a list of problems I had with that type of architecture: <a rel="nofollow" target="_new" href="http://nikita.w3.to/thread-per-connection.html" rel="nofollow">http://nikita.w3.to/thread-per-connection.html</a></p>
+<p>Since then I had to write a lot of similar code both in user and kernel space, but my opinion is still the same: &quot;Async servers? Not in C.&quot;.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293613">
+				<div id="div-comment-293613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293613">
+			July 29, 2005 at 3:23 pm</a>		</div>
+
+		<p>Presumably this limit is higher in 64-bit processes?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293473">
+				<div id="div-comment-293473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293473">
+			July 29, 2005 at 10:15 am</a>		</div>
+
+		<p>Maybe I am just getting grumpy in my old age but&#8230;</p>
+<p>I&#8217;ve done plenty of non-scalable threading system.  I would even swear Larry O. used some of my code in an article about poor threading models using events.  But I understood it the ramifications of what I was doing.  I knew it wouldn&#8217;t work well in a high stress environment.</p>
+<p>Are people programming these days without a basic understanding of how computers work?  A simple philosophy of &quot;Nothing is free&quot; would raise a red flag on the 2000 thread issue.  Even before I got to sentence two in this article I was asking &quot;But why?&quot;</p>
+<p>*sigh* *rant off*</p>
+<p>The really sad thing is that it all the programmers who know they still have a lot to learn are the guys who are reading these blogs.  It is the people who don&#8217;t know that they don&#8217;t have a clue who need to be here.</p>
+<p>Ugh, I shouldn&#8217;t post before my morning coke.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293623">
+				<div id="div-comment-293623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293623">
+			July 29, 2005 at 5:21 pm</a>		</div>
+
+		<p>STACK_SIZE_PARAM_IS_A_RESERVATION is new in XP, for previous versions of Windows we&#8217;re entirely stuck because you can only increase the reserved stack side for each thread from the default, not decrease it.</p>
+<p>This means that since the main UI thread generally has a pretty large stack (several megs, for example, in a significant C++ application), any worker or helper thread end up having as large a reserved stack size.  This results in applications taking up much more memory than they anticipate for every additionnal thread, without knowing it. Something I learned the hard way, let&#8217;s just say!</p>
+<p></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293633">
+				<div id="div-comment-293633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Shailesh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293633">
+			July 29, 2005 at 5:54 pm</a>		</div>
+
+		<p>From MSDN topic &quot;Thread Stack Size&quot; : &quot;A stack is freed when its thread exits. It is not freed if the thread is terminated by another thread.&quot;</p>
+<p>Why exactly is the stack not freed if terminated by another thread?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293643">
+				<div id="div-comment-293643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">an0nym0us</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293643">
+			July 29, 2005 at 8:25 pm</a>		</div>
+
+		<p>I/O Completion ports work until you get blocked by a library or system API that is inherently sequential and does support overlapped operations (Winsock name resolution, and authentication APIs, for example).  These can take few seconds and then you end up with a thread-per-client or a denial of service.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-larryosterman odd alt thread-odd thread-alt depth-1" id="comment-293653">
+				<div id="div-comment-293653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Larry+Osterman+%5BMSFT%5D' rel='external nofollow' class='url'>Larry Osterman [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293653">
+			July 29, 2005 at 9:42 pm</a>		</div>
+
+		<p>Shailesh, because terminating a thread means simply unhooking it from the scheduler (which causes it to stop executing since it will never be scheduled again).</p>
+<p>The NT scheduler doesn&#8217;t know about thinks like &quot;stacks&quot;, a &quot;stack&quot; is a memory management thingy.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293663">
+				<div id="div-comment-293663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/dinoviehland' rel='external nofollow' class='url'>dinov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293663">
+			July 30, 2005 at 1:16 am</a>		</div>
+
+		<p>mgrier:</p>
+<p>On fibers &amp; critical sections: they work like water &amp; oil.  Critical sections are per-thread and don&#8217;t see fibers at all.  If Fiber a is running on thread 1 and takes a crst and then is switched out &amp; back in on thread 2 and attempts to re-acquire the critical section it blocks.  If fiber b was previously running on thread 3 and is then switched to thread 1 and attempts to acquire the same critical section it succeeds.</p>
+<p>This and all other thread based synchronization (in other words, all synchronization) was one of the big gotchas with the CLR &amp; fiber mode support.  It&#8217;s easy to eliminate this in your own code, but harder to eliminate from other code in your process.  One fun issue is the loader lock &#8211; which is just another critical section to watch out for (and on win64 it gets more fun w/ exception handling!).  Not to mention all the other thread-locale state that you need to watch out for that may bite you when using fibers.</p>
+<p>Ahh fibers&#8230; this is not the answer you&#8217;re looking for.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293673">
+				<div id="div-comment-293673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nathan Moore</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293673">
+			July 30, 2005 at 1:23 am</a>		</div>
+
+		<p>Re: mschaef</p>
+<p>That poker tech thing is talking about processes not threads.  You are comparing apples and oranges.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293683">
+				<div id="div-comment-293683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mschaef</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293683">
+			July 30, 2005 at 5:40 pm</a>		</div>
+
+		<p>Re: Nathan Moore</p>
+<p>I believe the term process, in this context, comes from Tony Hoare&#8217;s &quot;Communicating Sequential Processes&quot;, a book that contains a lot of the theoretical basis of Erlang.</p>
+<p>From <a rel="nofollow" target="_new" href="http://www.erlang.org/faq/t1.html" rel="nofollow">http://www.erlang.org/faq/t1.html</a>, </p>
+<p>&quot;Concurrency and message passing are a fundamental to the language. Applications written in Erlang are often composed of hundreds or thousands of lightweight processes.Context switching between Erlang processes is typically one or two orders of magnitude cheaper than switching between threads in a C program. &quot;</p>
+<p>In any event, I would think having a bunch of OS processes would be <em>worse</em> than having a bunch of OS threads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293693">
+				<div id="div-comment-293693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skywing</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293693">
+			July 31, 2005 at 12:45 am</a>		</div>
+
+		<p>Actually, there&#8217;s a new feature in XP/2003 that lets you (well, you as in the code that creates threads via NtCreateThread &#8212; kernel32, in the case of win32 programs) specify a pointer to be auto freed by the kernel when a thread is terminated (released via NtFreeVirtualMemory).</p>
+<p>The reason why the kernel doesn&#8217;t automatically free user stacks in general is that the kernel didn&#8217;t allocate them in the first place, so it doesn&#8217;t necessarily know how to free them.  The new auto stack free stuff works for all Win32 threads, which have stack allocated via a new block returned by NtAllocateVirtualMemory.  You could conceivably have a thread that uses stack allocated by HeapAlloc(), or that&#8217;s a global variable in a loaded image, or any number of other odd things, though, and in such cases you wouldn&#8217;t want the kernel trying to free the stack with NtFreeVirtualMemory.</p>
+<p>&quot;an0nymo0us&quot;: For those things, you&#8217;re pretty much stuck with using a dedicated thread pool or implementing them yourself (i.e. DNS queries).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293703">
+				<div id="div-comment-293703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">TC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293703">
+			July 31, 2005 at 2:06 am</a>		</div>
+
+		<p>Hmm, am I the only person here with 30+ years experience who has never heard of continuation style programming?  :-(</p>
+<p>TC</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293723">
+				<div id="div-comment-293723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andreas Haeber</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293723">
+			July 31, 2005 at 1:03 pm</a>		</div>
+
+		<p>TC: See <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Continuation" rel="nofollow">http://en.wikipedia.org/wiki/Continuation</a> :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293733">
+				<div id="div-comment-293733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.livejournal.com/users/merle_/' rel='external nofollow' class='url'>Merle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293733">
+			July 31, 2005 at 3:36 pm</a>		</div>
+
+		<p>TC: nope, you&#8217;re not the only programmer who has not heard of continuation-style programming (although I&#8217;m only halfway to 30 in terms of professional experience).</p>
+<p>However, thanks to the link from Andreas, I now know that I&#8217;ve used it.  Ah, the joys of setjmp().  I learned so many brutal hacks from reading the source to BSD&#8217;s telnet.</p>
+<p>Like genget(), their happy command parser.  I abused that in so many of my early C programs.</p>
+<p><a rel="nofollow" target="_new" href="http://ftp.gcu.info/tuhs/PDP-11/Trees/2.11BSD/usr/src/ucb/telnet.c" rel="nofollow">http://ftp.gcu.info/tuhs/PDP-11/Trees/2.11BSD/usr/src/ucb/telnet.c</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293973">
+				<div id="div-comment-293973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://sasiprize.blogspot.com/' rel='external nofollow' class='url'>Jawahar Mundlapati</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293973">
+			August 2, 2005 at 3:18 am</a>		</div>
+
+		<p>You may check Kegel&#8217;s excellent resource <a rel="nofollow" target="_new" href="http://www.kegel.com/c10k.html" rel="nofollow">http://www.kegel.com/c10k.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-293983">
+				<div id="div-comment-293983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://alski.dyndns.org/codingnotes/Maximum+Number+Of+Threads+Per+Process.aspx' rel='external nofollow' class='url'>Earning the next skiing holiday</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293983">
+			August 2, 2005 at 6:45 am</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-293993">
+				<div id="div-comment-293993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://alski.dyndns.org/codingnotes/Maximum+Number+Of+Threads+Per+Process.aspx' rel='external nofollow' class='url'>Earning the next skiing holiday</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-293993">
+			August 2, 2005 at 6:46 am</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-294093">
+				<div id="div-comment-294093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Craig Ringer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-294093">
+			August 2, 2005 at 12:36 pm</a>		</div>
+
+		<p>nikita, given your &quot;not in C&quot; comment with regards to threading alternatives, you might be interested in examining Twisted &#8211; it&#8217;s a Python framework for deferred &quot;reactor&quot;-style execution. Some of the things people have done with it are pretty astonishing.</p>
+<p>Speaking of which&#8230; I don&#8217;t suppose anybody here knows if IronPython is going anywhere? Python on .net might be very interesting indeed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-294103">
+				<div id="div-comment-294103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Craig Ringer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-294103">
+			August 2, 2005 at 12:42 pm</a>		</div>
+
+		<p>Actually, it appears that many of the criticisms leveled against async servers in C apply to Twisted too. I doubt it&#8217;d interest you much, though it&#8217;s evidently very useful for many problems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-415983">
+				<div id="div-comment-415983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/09/01/735298.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-415983">
+			September 1, 2006 at 10:00 am</a>		</div>
+
+		<p>It&#8217;s not like there&#8217;s one number that controls everything.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-608923">
+				<div id="div-comment-608923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://maniish.wordpress.com/2008/03/11/number-of-maximum-thread-on-windows/' rel='external nofollow' class='url'>Number of Maximum Thread on windows &laquo; Manish Pansiniya&#8217;s Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050729-14/?p=34773#comment-608923">
+			March 11, 2008 at 2:43 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://maniish.wordpress.com/2008/03/11/number-of-maximum-thread-on-windows/" rel="nofollow">http://maniish.wordpress.com/2008/03/11/number-of-maximum-thread-on-windows/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

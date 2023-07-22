@@ -1,0 +1,399 @@
+<html>
+<head>
+<title>How do I wait until all processes in a job have exited?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I wait until all processes in a job have exited?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 5, 2013 / year-entry #94</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer was having trouble with job objects, specifically, the customer found that a Wait­For­Single­Object on a job object was not completing even though all the processes in the job had exited. This is probably the most frustrating part of job objects: A job object does not become signaled when all processes have exited. The...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was having trouble with job objects,
+specifically, the customer found that a
+<code>Wait&shy;For&shy;Single&shy;Object</code>
+on a job object was not completing
+even though all the processes in the job had exited.
+</p>
+<p>
+This is probably the most frustrating part of job objects:
+A job object does not become signaled when all processes
+have exited.
+</p>
+<blockquote CLASS=q><p>
+The state of a job object is set to signaled when all of its processes
+are terminated
+<a HREF="http://msdn.microsoft.com/library/ms684161(v=vs.85).aspx">
+because the specified end-of-job time limit has been exceeded</a>.
+Use <b>Wait&shy;For&shy;Single&shy;Object</b>
+or
+<b>Wait&shy;For&shy;Single&shy;Object&shy;Ex</b>
+to monitor the job object for this event.
+</p>
+</blockquote>
+<p>
+The job object becomes signaled only if the end-of-job time limit
+has been reached.
+If the processes exit without exceeding the time limit,
+then the job object remains unsignaled. 
+This is a historical artifact of the original motivation for
+creating job objects,
+which was to manage batch style server applications which
+were short-lived and usually ran to completion.
+The original purpose of job objects was to keep those processes
+from getting into a runaway state and consuming excessive resources.
+Therefore, the interesting thing from a job object's point of view
+was whether the process being managed in the job had to be killed
+for exceeding its resource allocation.
+</p>
+<p>
+Of course, nowadays, most people use job objects just to wait for
+a process tree to exit,
+not for keeping a server batch process from going runaway.
+The original motivation for job objects has vanished into the mists
+of time.
+</p>
+<p>
+In order to wait for all processes in a job object to exit,
+you need to listen for job completion port notifications.
+Let's try it:
+</p>
+<pre>
+#define UNICODE
+#define <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/02/12/71851.aspx">_UNICODE</a>
+#define STRICT
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;atlbase.h&gt;
+#include &lt;atlalloc.h&gt;
+#include &lt;shlwapi.h&gt;
+
+int __cdecl wmain(int argc, PWSTR argv[])
+{
+ CHandle Job(CreateJobObject(nullptr, nullptr));
+ if (!Job) {
+  wprintf(L"CreateJobObject, error %d\n", GetLastError());
+  return 0;
+ }
+
+ CHandle IOPort(CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                                       nullptr, 0, 1));
+ if (!IOPort) {
+  wprintf(L"CreateIoCompletionPort, error %d\n",
+          GetLastError());
+  return 0;
+ }
+
+ JOBOBJECT_ASSOCIATE_COMPLETION_PORT Port;
+ Port.CompletionKey = Job;
+ Port.CompletionPort = IOPort;
+ if (!SetInformationJobObject(Job,
+       JobObjectAssociateCompletionPortInformation,
+       &amp;Port, sizeof(Port))) {
+  wprintf(L"SetInformation, error %d\n", GetLastError());
+  return 0;
+ }
+
+ PROCESS_INFORMATION ProcessInformation;
+ STARTUPINFO StartupInfo = { sizeof(StartupInfo) };
+ PWSTR <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/08/15/10195600.aspx">CommandLine</a> = PathGetArgs(GetCommandLine());
+
+ if (!CreateProcess(nullptr, CommandLine, nullptr, nullptr,
+                    FALSE, CREATE_SUSPENDED, nullptr, nullptr,
+                    &amp;StartupInfo, &amp;ProcessInformation)) {
+  wprintf(L"CreateProcess, error %d\n", GetLastError());
+  return 0;
+ }
+
+ if (!AssignProcessToJobObject(Job,
+         ProcessInformation.hProcess)) {
+  wprintf(L"Assign, error %d\n", GetLastError());
+  return 0;
+ }
+
+ ResumeThread(ProcessInformation.hThread);
+ CloseHandle(ProcessInformation.hThread);
+ CloseHandle(ProcessInformation.hProcess);
+
+ DWORD CompletionCode;
+ ULONG_PTR CompletionKey;
+ LPOVERLAPPED Overlapped;
+
+ while (GetQueuedCompletionStatus(IOPort, &amp;CompletionCode,
+          &amp;CompletionKey, &amp;Overlapped, INFINITE) &amp;&amp;
+          !((HANDLE)CompletionKey == Job &amp;&amp;
+           CompletionCode == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO)) {
+  wprintf(L"Still waiting...\n");
+ }
+
+ wprintf(L"All done\n");
+
+ return 0;
+}
+</pre>
+<p>
+The first few steps are to
+create a job object, then associate it with
+a completion port.
+We set the completion key to be the job itself,
+just in case some other I/O gets queued to our port that
+we aren't expecting.
+(Not sure how that could happen, but we'll watch out for it.)
+</p>
+<p>
+Next, we launch the desired process into the job.
+It's important that we create it suspended so that we can
+put it into the job before it exits or does something else
+that would mess up our bookkeeping.
+After it is safely assigned to the job, we can resume
+the process's main thread,
+at which point we have no use for the thread and process handles.
+</p>
+<p>
+Finally, we go into a loop pulling events from the I/O
+completion port.
+If the event is not "this job has no more active processes",
+then we just keep waiting.
+</p>
+<p>
+Officially, the last parameter to
+<code>Get&shy;Queued&shy;Completion&shy;Status</code>
+is
+<code>lpNumber&shy;Of&shy;Bytes</code>,
+but the job notifications are posted via
+<code>Post&shy;Queued&shy;Completion&shy;Status</code>,
+and
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2007/05/25/2854506.aspx">
+the parameters to
+<code>Post&shy;Queued&shy;Completion&shy;Status</code>
+can mean anything you want</a>.
+In particular,
+when the job object posts notifications, it
+<a HREF="http://msdn.microsoft.com/library/ms684141(v=vs.85).aspx">
+puts the notification
+code in the "number of bytes" field</a>.
+</p>
+<p>
+Run this program with, say, <code>cmd</code> on the command line.
+From the nested <code>cmd</code> prompt,
+type
+<code>start notepad</code>.
+Then type <code>exit</code> to exit the nested command prompt.
+Observe that our program is still waiting,
+because it's waiting for Notepad to exit.
+When you exit Notepad,
+our program finally prints <tt>"All done"</tt>.</p>
+<p>
+<b>Exercise</b>:
+The statement "Not sure how that could happen" is a lie.
+Name a case where a spurious notification could arrive,
+and how the code can protect against it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1048913">
+				<div id="div-comment-1048913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1048913">
+			April 5, 2013 at 8:17 am</a>		</div>
+
+		<p>Please note the ability to use job for waiting for a process tree is actually an abuse of the system. Your code cannot use it if some other piece of code is using it to monitor you becaue jobs do not nest. (This was fixed starting in Windows 8; however given its market uptake if this is not back-ported to Windows 7 it is useless for a long time yet).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1048923">
+				<div id="div-comment-1048923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1048923">
+			April 5, 2013 at 8:20 am</a>		</div>
+
+		<p>Exercise: JOBOBJECT_ASSOCIATE_COMPLETION_PORT structure: &quot;The system sends messages to the I/O completion port associated with a job when certain events occur. If the job is nested, the message is sent to every I/O completion port associated with any job in the parent job chain of the job that triggered the message.&quot;</p>
+<p>So if a process in your job happens to create a nested job, that nested job could generate notifications with a different completion key from your own job, yet these notifications would be sent to your job anyway?</p>
+<p>Seems like this is potentially breaking change /w Windows 8, since older Windows versions didn&#39;t have nested jobs, so a program never needed to worry about a job spawning child jobs that generate unwanted notifications. &nbsp;I don&#39;t see why a parent job would be interested in the notifications of its children, where the completion key is not the completion key of interest.</p>
+<p>Or did I read the documentation incorrectly here?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1048933">
+				<div id="div-comment-1048933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Smouch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1048933">
+			April 5, 2013 at 9:41 am</a>		</div>
+
+		<p>Seems the lack of the word &quot;only&quot; is a source of confusion.</p>
+<p>&quot;The state of a job object is set to signaled ONLY when all of its processes are terminated ONLY because the specified end-of-job time limit has been exceeded.&quot;</p>
+<p>Or something&#8230;</p>
+<p>And so it goes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1048953">
+				<div id="div-comment-1048953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1048953">
+			April 5, 2013 at 4:09 pm</a>		</div>
+
+		<p>Jobs would very good tool.. If they wouldn&#39;t be half-cooked. Every time I tried to use them I faced with some very stupid problems. Like unability to nest jobs (&#39;fixed&#39; in Win8) or unfixable impossibility to change thread&#39;s active input layout if it belongs to process attached to job with UI objects restrictions. If not this jobs could be very powerful toolset for creating sandboxes, but instead due to that annoying &#39;little&#39; problems they usable only as batch file execution ime limiters..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1048963">
+				<div id="div-comment-1048963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kalle Olavi Niemitalo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1048963">
+			April 6, 2013 at 2:33 am</a>		</div>
+
+		<p>I wonder whether using the job handle as the completion key is entirely reliable. &nbsp;I mean, the child process does not inherit the job handle, so if the child process also calls CreateJobObject, I&#39;m afraid CreateJobObject could return the same handle value as in the parent process, even though the handle refers to a different job object. &nbsp;I considered other ways to get unique completion keys (a LUID from AllocateLocallyUniqueId, or the process ID of the process that waits for the completion port), but these too require that all processes in the job allocate completion keys in the same way.</p>
+<p>For JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO specifically, I guess I&#39;d make the process first wait for the completion notification and check the completion key but then verify the situation with QueryInformationJobObject.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1048983">
+				<div id="div-comment-1048983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1048983">
+			April 6, 2013 at 3:15 pm</a>		</div>
+
+		<p>I use job objects to ensure that my child processes terminate in the worst case if for some reason the parent process terminates.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1049053">
+				<div id="div-comment-1049053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joker_vD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1049053">
+			April 8, 2013 at 10:17 am</a>		</div>
+
+		<p>I am genuinely surprised there is no easy way to make sure that your children processes won&#39;t outlive you, neither on Windows or Linux. When I ran into this problem the first time, I thought there had to be a CREATE_DONT_OUTLIVE_PARENT flag for CreateProcess, but there wasn&#39;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1049093">
+				<div id="div-comment-1049093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1049093">
+			April 8, 2013 at 1:18 pm</a>		</div>
+
+		<p>@Joker_vD: I agree &#8211; there ought to be one. &nbsp;In Windows, using a job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE mostly works, particularly if you trust the child process. &nbsp;In Linux, the child process can use prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0).</p>
+<p>The problems with these approaches are that you have to trust the child process, and that there is a slight window of not working &#8211; in Windows, between CreateProcess and AssignProcessToJobObject, and in Linux, between fork and prctl.</p>
+<p>I don&#39;t know a solution for Mac OS.</p>
+<div class="post">[<em>This article shows how you close the window: You start the child process suspended. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1049113">
+				<div id="div-comment-1049113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1049113">
+			April 8, 2013 at 5:08 pm</a>		</div>
+
+		<p>[This article shows how you close the window: You start the child process suspended. -Raymond]</p>
+<p>Sorry, I forgot to mention that. &nbsp;My implementation does use CREATE_SUSPENDED. &nbsp;The problem, though, is that if you somehow crash or get terminated between CreateProcess and AssignProcessToJobObject, you leave the suspended child process as a zombie.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1049543">
+				<div id="div-comment-1049543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743#comment-1049543">
+			April 10, 2013 at 10:37 pm</a>		</div>
+
+		<p>@Myria: one alternative would be to put the parent process into the job object, and let the child processes inherit membership. &nbsp;If the real parent process can&#39;t be put into the job object, create a trusted child process as an intermediary and use it as the job parent.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

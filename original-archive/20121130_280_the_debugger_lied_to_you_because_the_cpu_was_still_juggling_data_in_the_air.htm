@@ -1,0 +1,603 @@
+<html>
+<head>
+<title>The debugger lied to you because the CPU was still juggling data in the air</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The debugger lied to you because the CPU was still juggling data in the air</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 30, 2012 / year-entry #281</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>28</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A colleague was studying a very strange failure, which I've simplified for expository purpose. The component in question has the following basic shape, ignoring error checking: // This is a multithreaded object class Foo { public: void BeginUpdate(); void EndUpdate(); // These methods can be called at any time int GetSomething(int x); // These methods...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A colleague was studying a very strange failure,
+which I've simplified for expository purpose.
+</p>
+<p>
+The component in question has the following
+basic shape, ignoring error checking:
+</p>
+<pre>
+// This is a multithreaded object
+class Foo
+{
+public:
+ void BeginUpdate();
+ void EndUpdate();
+
+ // These methods can be called at any time
+ int GetSomething(int x);
+
+ // These methods can be called only between
+ // BeginUpdate/EndUpdate.
+ void UpdateSomething(int x);
+
+private:
+ Foo() : m_cUpdateClients(0), m_pUpdater(nullptr) { ... }
+
+ LONG m_cUpdateClients;
+
+ Updater *m_pUpdater;
+};
+</pre>
+<p>
+There are two parts of the <code>Foo</code> object.
+One part that is essential to the object's task,
+and another part that is needed only when updating.
+The parts related to updating are expensive, so the
+<code>Foo</code> object sets them up only when
+an update is active.
+You indicate that an update is active by calling
+<code>Begin&shy;Update</code>, and you indicate
+that you are finished updating by calling
+<code>End&shy;Update</code>.
+</p>
+<pre>
+<i>// Code in italics is wrong
+void Foo::BeginUpdate()
+{
+ LONG cClients = InterlockedIncrement(&amp;m_cUpdateClients);
+ if (cClients == 1) {
+  // remember, error checking has been elided
+  m_pUpdater = new Updater();
+ }
+ // else, we are already initialized for updating,
+ // so nothing to do
+}
+
+void Foo::EndUpdate()
+{
+ LONG cClients = InterlockedDecrement(&amp;m_cUpdateClients);
+ if (cClients == 0) {
+  // last update client has disconnected
+  delete m_pUpdater;
+  m_pUpdater = nullptr;
+ }
+}</i>
+</pre>
+<p>
+There are a few race conditions here,
+and one of them manifested itself in a crash.
+(If two threads call <code>Begin&shy;Update</code> at the same time,
+one of them will increment the client count to 1 and the other
+will increment it to 2.
+The one which increments it to 1 will get to work initializing
+<code>m_pUpdater</code>,
+whereas the second one will run ahead on the assumption that the
+updater is fully-initialized.)
+</p>
+<p>
+What we saw in the crash dump was that <code>Update&shy;Something</code>
+tries to use <code>m_pUpdater</code> and crashed on a null pointer.
+What made the crash dump strange was that if you actually looked
+at the <code>Foo</code> object in memory, the <code>m_pUpdater</code>
+was non-null!
+</p>
+<pre>
+    mov ecx, [esi+8] // load m_pUpdater
+    mov eax, [ecx]   // load vtable -- crash here
+</pre>
+<p>
+If you actually looked at the memory pointed-to by
+<code>ESI+8</code>,
+the value there was not null,
+yet in the register dump, <code>ECX</code> was zero.
+</p>
+<p>
+Was the CPU hallucinating?
+The value in memory is nonzero.
+The CPU loaded a value from memory.
+But the value it read was zero.
+</p>
+<p>
+The CPU wasn't hallucinating.
+The value it read from memory was in fact zero.
+The reason why you saw the nonzero value in memory was
+that in the time it took the null pointer exception to be raised,
+then caught by the debugger,
+the other thread managed to finish calling <code>new Updater()</code>,
+store the result back into memory,
+and then return back to its caller and proceed as if everything
+were just fine.
+Thus, when the debugger went to capture the memory dump,
+it captured a non-zero value in the dump,
+and the code which updated <code>m_pUpdater</code> was long gone.
+</p>
+<p>
+This type of race condition is more likely to manifest on multi-core
+machines, because on those types of machines, the two CPUs can have
+different views of memory.
+The thread doing the initialization can update
+<code>m_pUpdater</code> in memory,
+and other CPUs may not find out about it until some time later.
+The updated value was still in flight when the crash occurred.
+Before the debugger can get around to capturing the
+<code>m_pUpdater</code> member in the crash dump,
+the in-flight value lands, and what you see in the crash dump
+does not match what the crashing CPU saw.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (28)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1023483">
+				<div id="div-comment-1023483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023483">
+			November 30, 2012 at 7:07 am</a>		</div>
+
+		<p>So are you trying to say that the entire pair of functions is wrong, or did the italics flag get stuck on more than you intended? &nbsp;Surely at least the names of the functions and associated curly braces are at least correct.</p>
+<div class="post">[<em>I&#39;m trying to say, &quot;Be aware that the value in the crash dump is the value that existed in memory a split second <span style="text-decoration:underline;">after</span> the crash occurred. During that split second, other things may have happened. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ipoverscsi odd alt thread-odd thread-alt depth-1" id="comment-1023493">
+				<div id="div-comment-1023493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ipoverscsi' rel='external nofollow' class='url'>ipoverscsi</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023493">
+			November 30, 2012 at 7:14 am</a>		</div>
+
+		<p>@SimonRev: I&#39;m pretty sure all the code in italics is wrong because of the race conditioned mentioned in the article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023503">
+				<div id="div-comment-1023503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023503">
+			November 30, 2012 at 7:21 am</a>		</div>
+
+		<p>I think SimonRev&#39;s point is that the idea of having a BeginUpdate and an EndUpdate method isn&#39;t wrong it&#39;s just their implementation that&#39;s wrong. But I&#39;m not sure that making their method names upright and leaving their implementations in italics would make things any clearer (especially since their declarations in the class are upright).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman odd alt thread-odd thread-alt depth-1" id="comment-1023513">
+				<div id="div-comment-1023513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023513">
+			November 30, 2012 at 7:23 am</a>		</div>
+
+		<p>So&#8230;. create a flag variable in the class private section that indicates if Updater() has completed, and add a check in the else clause? Then something similar in the EndUpdate() that indicates the pointer is being deleted.</p>
+<p>Of course, what happens if the check of the flag happens before everything is coherent again. Hmmm.</p>
+<p>So what is the foolproof solution?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023523">
+				<div id="div-comment-1023523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">The foolproof solution...</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023523">
+			November 30, 2012 at 7:40 am</a>		</div>
+
+		<p>The foolproof solution is to wrap the contents of BeginUpdate and EndUpdate in a critical section or mutex. &nbsp;In essence, you need to prevent two (or more) threads from actually being in either of these functions at the same time, including not allowing a call to EndUpdate at the same time as a call to BeginUpdate&#8230; &nbsp;(Scenario: In thread one, EU decrements the counter to zero, and gets timesliced before even beginning to release the updater object. Now i thread two, BU increments the counter, sees that it is one, and creates a new updater object, and then gets timesliced. &nbsp;Thread one resumes, grabs the new object pointer and releases it. &nbsp;Result: thread two crashes on a NULL, and the old updater object is leaked. &nbsp;The critical section / mutex solution prevents thread two from actually entering BU before thread one has finished its work. &nbsp;Put the CRITICALSECTION structure in the host object!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023533">
+				<div id="div-comment-1023533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023533">
+			November 30, 2012 at 8:30 am</a>		</div>
+
+		<p>Nice! An occasional demonstration the debugger is not magic comes in handy to teach people to understand.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023543">
+				<div id="div-comment-1023543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Carl D</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023543">
+			November 30, 2012 at 8:35 am</a>		</div>
+
+		<p>Ahh memories of when the first dual-socket Pentium-Pro machines appeared and desktop programmers everywhere discovered that this type of bug is (at least) thousands of times more likely to be observed on a true multi-processor machine than due to simple time slicing on a single core.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023553">
+				<div id="div-comment-1023553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023553">
+			November 30, 2012 at 10:36 am</a>		</div>
+
+		<p>@The foolproof solution&#8230;: Actually you only have to use the mutex (or some synchronization of kinds) when initializing. So you can actually do double-checked locking to avoid the synchronization cost. Problem with that is obviously that getting double-checked locking right is quite.. interesting and I wouldn&#39;t want to come up with one for c++11 myself..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023563">
+				<div id="div-comment-1023563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Douglas Adams</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023563">
+			November 30, 2012 at 10:54 am</a>		</div>
+
+		<blockquote><p>
+  So what is the foolproof solution?
+</p></blockquote>
+<p>A common mistake that people make when trying to design something completely foolproof is to underestimate the ingenuity of complete fools.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023583">
+				<div id="div-comment-1023583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mordachai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023583">
+			November 30, 2012 at 1:02 pm</a>		</div>
+
+		<p>@Mike Dimmick &#8211; nice, thanks for the additional info!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023593">
+				<div id="div-comment-1023593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023593">
+			November 30, 2012 at 1:27 pm</a>		</div>
+
+		<p>@Mike Dimmick: Yes, but not the Windows CriticalSection API which is dog slow.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023603">
+				<div id="div-comment-1023603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ishai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023603">
+			November 30, 2012 at 1:34 pm</a>		</div>
+
+		<blockquote><p>
+  This type of race condition is more likely to manifest on multi-core machines
+</p></blockquote>
+<p>If you are dealing with JIT debugger / crash dump this is common also for single core machines. &nbsp;There is plenty of time for ready threads to modify memory between the time the unhandled exception filter launches the debugger and the time the debugger suspends all threads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023623">
+				<div id="div-comment-1023623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023623">
+			November 30, 2012 at 4:28 pm</a>		</div>
+
+		<p>@voo: The double-checked protocol when done right is pessimistic in that it takes the lock when it can&#39;t decide without taking the lock. The only hidden assumptions are the compiler cannot optimize across module boundaries and cache flushes cannot happen out of order.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick odd alt thread-odd thread-alt depth-1" id="comment-1023573">
+				<div id="div-comment-1023573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023573">
+			November 30, 2012 at 11:32 am</a>		</div>
+
+		<p>@voo: A correct implementation of double-checked locking requires you to use memory fences to ensure that the processor actually flushes its write queue out, and that the caches are kept properly coherent. If you do it properly, the result is actually about the same code as you would execute if you just used a critical section.</p>
+<p><a rel="nofollow" target="_new" href="http://www.aristeia.com/Papers/DDJ_Jul_Aug_2004_revised.pdf" rel="nofollow">http://www.aristeia.com/&#8230;/DDJ_Jul_Aug_2004_revised.pdf</a></p>
+<p>See also Herb Sutter&#39;s presentation to the Northwest C++ Users&#39; Group from 2007: <a rel="nofollow" target="_new" href="http://www.youtube.com/watch?v=L7zSU9HI-6I&amp;feature=gv" rel="nofollow">http://www.youtube.com/watch</a> titled &quot;Machine Architecture: Things Your Programming Language Never Told You&quot;.</p>
+<p>You might get away with it on x86, which has a strong memory model, but ARM has a *weak* memory model and you may well run into trouble. What do I mean by Memory Model? See <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/cbrumme/archive/2003/05/17/51445.aspx" rel="nofollow">blogs.msdn.com/&#8230;/51445.aspx</a> .</p>
+<p>.NET&#39;s memory model does, I believe, ensure that double-checked locking implemented naively by the programmer does run correctly on the hardware. <a rel="nofollow" target="_new" href="http://stackoverflow.com/questions/394898/double-checked-locking-in-net" rel="nofollow">stackoverflow.com/&#8230;/double-checked-locking-in-net</a> .</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023613">
+				<div id="div-comment-1023613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023613">
+			November 30, 2012 at 2:03 pm</a>		</div>
+
+		<p>@Mike Dimmick: You can implement mutexes without bidirectional memory fences? No idea about ARM, but on x86 that *should* make a difference, especially since you also need some further bookkeeping for mutexes (ok you get around the kernel object for CriticalSections afaik, so probably not too bad). But yes double-checked locking is one of those cute tricks that doesn&#39;t make any noticeable difference in 99% of the time and is still easy to get wrong (and even if programmers get it right, they probably have no idea why it works), I&#39;m not really advocating them for general use.</p>
+<p>Anyway, yes I know what a memory model is, but I haven&#39;t really studied the new c++11 one in any detail. Java5+ as well as the C# memory model for volatiles does guarantee that the simple double-checked locking implementation works btw.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023643">
+				<div id="div-comment-1023643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Smitty</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023643">
+			December 1, 2012 at 5:07 am</a>		</div>
+
+		<p>To this experienced multi-threaded developer the example code looks naive, and so there is no wonder it failed.</p>
+<p>Furthermore, the amazement that the crash-dumper or debugger can lie to you (especially in a multi-threaded application) is laughable. &nbsp;Anyone who has ever tried to debug a SEGV crash-dump knows that what gets written to the crash-dump (aka &#39;core&#39;) file is little more than a hint at what was going on in the process address space at the time of the crash. &nbsp;Multi-threaded crash-dumps are similarly unreliable for similar reasons.</p>
+<p>Why do I get the impression that nobody knows how to code any more ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023663">
+				<div id="div-comment-1023663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023663">
+			December 1, 2012 at 7:04 pm</a>		</div>
+
+		<p>@Smitty: Perhaps you get that impression because you now have quite a bit of experience, and there exist people with less experience, all of whom presumably fit into your &quot;do not know how to code&quot; category.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ricardog odd alt thread-odd thread-alt depth-1" id="comment-1023673">
+				<div id="div-comment-1023673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/RicarDog' rel='external nofollow' class='url'>RicarDog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023673">
+			December 1, 2012 at 10:44 pm</a>		</div>
+
+		<p>&quot;If you actually looked at the memory pointed-to by ESI+8, the value there was not null, yet in the register dump, EAX was zero.&quot;</p>
+<p>I think you meant ECX instead of EAX here, right?</p>
+<div class="post">[<em>Fixed, thanks. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-zlynx even thread-even depth-1" id="comment-1023703">
+				<div id="div-comment-1023703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Zan+Lynx%27' rel='external nofollow' class='url'>Zan Lynx'</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023703">
+			December 2, 2012 at 4:21 pm</a>		</div>
+
+		<p>@Smitty: In my experience you can trust the register state for the crashed thread from a crash dump. That means you can trust the instruction pointer and the values in the registers.</p>
+<p>All else, such as the stack trace and other threads is, yes, just a hint.</p>
+<p>But my point was that there *are* things that are trustworthy in the crash dump.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1023773">
+				<div id="div-comment-1023773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023773">
+			December 3, 2012 at 7:16 am</a>		</div>
+
+		<p>@Joshua:</p>
+<blockquote><p>
+  @Mike Dimmick: Yes, but not the Windows CriticalSection API which is dog slow.
+</p></blockquote>
+<p>An equivalent of a single interlocked operation (in the case of non-contention) is slow? Are you confusing it with a mutex?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023873">
+				<div id="div-comment-1023873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023873">
+			December 3, 2012 at 9:38 am</a>		</div>
+
+		<p>@alegrl: It will contend relatively frequently and most of the time for no good reason. I use the critical section once inside the first check of the double-check and it&#39;s no issue there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1023883">
+				<div id="div-comment-1023883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023883">
+			December 3, 2012 at 9:44 am</a>		</div>
+
+		<p>@Joshua:</p>
+<blockquote><p>
+  @alegrl: It will contend relatively frequently and most of the time for no good reason.
+</p></blockquote>
+<p>Why would a critical section have a contention if there is no good reason (a good reason being the CS is already owned)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023923">
+				<div id="div-comment-1023923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023923">
+			December 3, 2012 at 12:14 pm</a>		</div>
+
+		<p>@Raymond</p>
+<p>Precisely. &nbsp;Essentially you&#39;re balancing the cost of spins vs. kernel transitions (and really more, with getting the scheduler involved). &nbsp;And as you say, minimizing the use of synchronization primitives is the hallmark of threaded development&#8211;although it takes care for obvious and many non-obvious reasons.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-rat odd alt thread-odd thread-alt depth-1" id="comment-1023953">
+				<div id="div-comment-1023953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/hacksoncode' rel='external nofollow' class='url'>hacksoncode</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023953">
+			December 3, 2012 at 1:07 pm</a>		</div>
+
+		<p>Worrying about the expense of a CriticalSection in this instance is one of the more severe cases of premature optimization I&#39;ve encountered. It&#39;s stated that updating is an expensive operation, and from the shape of the code it appears to be an infrequent one as well.</p>
+<p>If ever there were a time to not worry about that cost, this would be it. Worry about it after profiling, if necessary.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023973">
+				<div id="div-comment-1023973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023973">
+			December 3, 2012 at 2:57 pm</a>		</div>
+
+		<p>@hacksoncode: 80 threads, one singleton initialized once, fetched every RPC call. That&#39;s 200 times per minute. The code is /almost/ a candidate for InitOnceExecuteOnce.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023903">
+				<div id="div-comment-1023903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1023903">
+			December 3, 2012 at 10:38 am</a>		</div>
+
+		<p>@Joshua</p>
+<p>The only downside to critical sections is if they&#39;re used in areas of continuously high contention&#8230;then they spin for a while before sleeping, thus wasting CPU cycles. &nbsp;But, as alegr1 stated previously, under low contention, there should be significant speed improvements.</p>
+<p>It&#39;s not like critical sections cause *more* contention than mutexes, they just tend to waste CPU resources when there is significant contention, whereas a mutex will sleep until contention subsides. &nbsp;If anything, avoiding a user-kernel-user round trip is usually worthwhile.</p>
+<div class="post">[<em>You can disable spinning with <code>Initialize&shy;Critical&shy;Section&shy;And&shy;Spin&shy;Count</code>, but spinning is a win for low-duration locks since it lets the waiter grab the critical section as soon as the owner exits, rather than waiting for the scheduler. If you see lots of wasted spins, then your critical section is too broad. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1024143">
+				<div id="div-comment-1024143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1024143">
+			December 4, 2012 at 1:29 pm</a>		</div>
+
+		<p>@Joshua:</p>
+<p>Fetching a pointer to a singleton 200 times for minute (once every 300 ms, or every 1000000000 CPU clock cycles) is as likely to cause a contention, as you contending to pass through a door with one randomly selected US citizen at at given day.</p>
+<p>My guess is you made some mistake in the implementation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1024193">
+				<div id="div-comment-1024193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121130-00/?p=5943#comment-1024193">
+			December 4, 2012 at 3:20 pm</a>		</div>
+
+		<p>@alegrl: I got tired of the critical section showing up in the profiler.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

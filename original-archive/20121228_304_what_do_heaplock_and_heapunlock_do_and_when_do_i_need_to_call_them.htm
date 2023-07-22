@@ -1,0 +1,434 @@
+<html>
+<head>
+<title>What do HeapLock and HeapUnlock do, and when do I need to call them?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What do HeapLock and HeapUnlock do, and when do I need to call them?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 28, 2012 / year-entry #305</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">You never need to call the Heap­Lock and Heap­Unlock functions under normal operation. Assuming the heap is serialized (which is the default), all the standard heap functions like Heap­Allocate and Heap­Free will automatically serialize. In fact, the way they serialize is by calling the¹ Heap­Lock and Heap­Unlock functions! Nearly all heap operations complete in a...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+You never need to call the <code>Heap&shy;Lock</code> and
+<code>Heap&shy;Unlock</code> functions under normal operation.
+Assuming the heap is serialized
+(which is the default),
+all the standard heap functions like
+<code>Heap&shy;Allocate</code> and <code>Heap&shy;Free</code>
+will automatically serialize.
+</p>
+<p>
+In fact, the way they serialize is by calling
+the&sup1; <code>Heap&shy;Lock</code> and
+<code>Heap&shy;Unlock</code> functions!
+</p>
+<p>
+Nearly all heap operations complete in a single call.
+If your heap is serialized, this means that the heap operation
+takes the heap lock,
+does its work,
+and then releases the heap lock and returns.
+If <i>all</i> heap operations were like this,
+then there would be no need for
+<code>Heap&shy;Lock</code> or
+<code>Heap&shy;Unlock</code>.
+</p>
+<p>
+Unfortunately, there is also the
+<code>Heap&shy;Walk</code> function,
+which does a little bit of work, and then returns
+with a partial result.
+The design for <code>Heap&shy;Walk</code> is that
+the application calls the function repeatedly
+until it either gets all the results it wants, or gets bored and gives up.
+But wait, what if the heap changes while the application is
+trying to walk through it?
+To prevent that from happening,
+the program can call
+<code>Heap&shy;Lock</code> before starting the enumeration,
+and
+<code>Heap&shy;Unlock</code> when it is done.
+During the time the heap is locked,
+other threads which attempt to call a
+<code>Heap&shy;Xxx</code> function with that same heap
+will block until the heap is unlocked.
+</p>
+<p>
+The ability to lock the heap creates a lot of potential for craziness,
+because the heap is a high-traffic area.
+As a result, it is very important that any code which calls
+<code>Heap&shy;Lock</code> do very little while the lock is held.
+Take the lock, do your thing, and get out quickly.
+</p>
+<p>
+But wait, there's more.
+Holding the heap lock blocks all other threads from
+allocating or freeing memory.
+This puts the heap lock very low in your lock hierarchy.
+Therefore,
+while you hold the heap lock,
+you cannot block on synchronization objects whose owners might
+try to access the heap you just locked.
+Consider the following:
+</p>
+<pre>
+<i>// Code in italics is wrong.
+void BadIdea()
+{
+ HeapLock(GetProcessHeap());
+ SendMessage(...);
+ HeapUnlock(GetProcessHeap());
+}</i>
+</pre>
+<p>
+Sending a message is a big deal.
+The thread that is the target of the message
+may be waiting for the heap lock,
+and now you've created a deadlock.
+You won't proceed until that thread processes the message,
+but that thread can't process the message until you unlock the heap.
+</p>
+<p>
+You might accidentally do something wrong while hold the heap lock
+if you happen to trigger a delay-loaded DLL,
+in which case your call into that other DLL turns into a call
+to <code>Load&shy;Library</code>, and now you've lost control.
+In practice,
+the only thing you should be doing while holding the heap lock
+is calling <code>Heap&shy;Walk</code> and saving the results
+locally, and in a way that doesn't allocate or free memory
+on the heap you are walking!
+Wait until after you unlock the heap to
+start studying the results you
+collected or transfer the raw data into a more suitable data structure.
+</p>
+<p>
+<b>Bonus chatter</b>
+</p>
+<p>
+Note that if you call
+<code>Heap&shy;Lock</code> or <code>Heap&shy;Unlock</code>
+on a heap that was created without serialization
+(<code>HEAP_<wbr>NO_<wbr>SERIALIZATION</code>),
+then the results are undefined.
+That's because passing the
+<code>HEAP_<wbr>NO_<wbr>SERIALIZATION</code> flag means
+"Hey, Heap Manager,
+don't bother locking this heap.
+I will take responsibility for ensuring that only one thread
+operates on this heap at a time."
+If you later call
+<code>Heap&shy;Lock</code> on a no-serialization heap,
+the heap manager will say,
+"Wha?
+You said that <i>you</i> would take care of serialization, not me!"
+</p>
+<p>
+It's like ordering a car and saying,
+"Don't bother installing door locks.
+I will take responsibility for ensuring the safety of the car.
+(Say, by never letting the car leave a secured facility.)"
+And then a month later, calling OnStar and saying,
+"Hi, can you remotely lock my car for me? Thanks."
+Dude, you explicitly opted out of door locks.
+</p>
+<p>
+(Amazingly, I encountered one developer who thought that
+calling <code>Heap&shy;Lock</code> on a no-serialization heap
+would cause other heap operations on the heap to be blocked,
+even if they passed the
+<code>HEAP_<wbr>NO_<wbr>SERIALIZATION</code> flag to those operations.
+Um, no, the <code>Heap&shy;Lock</code> function cannot lock a
+no-serialization heap because a no-serialization heap <i>doesn't have
+lock in the first place, at your request</i>.)
+</p>
+<p>
+<b>Nitpicker's corner</b>
+</p>
+<p>
+&sup1; s/the/the functional equivalents of/</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1028963">
+				<div id="div-comment-1028963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1028963">
+			December 28, 2012 at 8:31 am</a>		</div>
+
+		<p>Next up on crazy shenanigans found in code: manually digging up a reference to the heap lock and manually locking the heap.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1028973">
+				<div id="div-comment-1028973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1028973">
+			December 28, 2012 at 10:35 am</a>		</div>
+
+		<p>Should be s/the/functional equivalents of the/</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-chris-j-leonard even thread-even depth-1" id="comment-1028983">
+				<div id="div-comment-1028983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Veltas' rel='external nofollow' class='url'>Veltas</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1028983">
+			December 28, 2012 at 10:47 am</a>		</div>
+
+		<p>&quot;Amazingly, I encountered one developer who thought that calling HeapÂ­Lock on a no-serialization heap would cause other heap operations on the heap to be blocked, even if they passed the HEAP_NO_SERIALIZATION flag to those operations.&quot;</p>
+<p>Well that&#39;s not the biggest crime in the world. &nbsp;They sound similar, but I wouldn&#39;t necessarily know until I looked it up in the documentation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1028993">
+				<div id="div-comment-1028993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DSN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1028993">
+			December 28, 2012 at 2:47 pm</a>		</div>
+
+		<p>Just from the name, it is not unreasonable to assume that the HEAP_NO_SERIALIZATION flag means that there is no <em>automatic</em> serialization, and that any required serialization must use the lock/unlock functions. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1029003">
+				<div id="div-comment-1029003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodr&#237;guez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029003">
+			December 28, 2012 at 3:59 pm</a>		</div>
+
+		<p>@Veltas: IMHO, you shouldn&#39;t use the HEAP_NO_SERIALIZATION flag (or any other one) without reading the documentation about it&#8230; I know, I know, it usually goes like this: 1) Write code 2) Test it 3) If it doesn&#39;t work, look up documentation. But it shouldn&#39;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1029013">
+				<div id="div-comment-1029013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029013">
+			December 28, 2012 at 10:52 pm</a>		</div>
+
+		<p>@DSN I agree, that was actually my assumption as well before reading the documentation: HEAP_NO_SERIALIZATION means don&#39;t give me any synchronization except if explicitly demanded by the Lock function.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1029023">
+				<div id="div-comment-1029023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029023">
+			December 29, 2012 at 2:29 am</a>		</div>
+
+		<p>@DSN: On the other hand, if HeapLock on NO_SERIALIZATION heap worked, it would give someone false impression that they still somehow locked the heap (it&#39;s called HeapLock after all). Maybe it really is better to fail and make sure people just can&#39;t do anything ambiguous.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1029033">
+				<div id="div-comment-1029033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Leibovich</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029033">
+			December 29, 2012 at 9:15 am</a>		</div>
+
+		<p>It would be nice if the library would abort the program if it request locking the heap after passing HEAP_NO_LOCK, if the overhead isn&#39;t too great. Better fail early than later.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1029043">
+				<div id="div-comment-1029043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029043">
+			December 29, 2012 at 5:35 pm</a>		</div>
+
+		<p>It would appear that your comments section doesn&#39;t load properly on android 2.3, leading me to, for the second time in the past week, see that nobody had commented and offer some brilliant insight only to then go visit the page on my desktop machine and discover that my insight was less unique than I originally thought. &nbsp;I stand by its brilliance, though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1029053">
+				<div id="div-comment-1029053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">cburn11</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029053">
+			December 29, 2012 at 6:25 pm</a>		</div>
+
+		<p>@NT I have the same e/perien e with the stock android browser. Mozilla`s Android browser seems to display the comments correctly though-</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1029063">
+				<div id="div-comment-1029063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wiseass</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029063">
+			December 30, 2012 at 3:53 am</a>		</div>
+
+		<p>I want to nitpick the comment that led to the nitpicker&#39;s corner, and point out that his correction changes way too many lines :)</p>
+<p>&quot;You never need to call functional equivalents of the HeapLock and HeapUnlock functions under normal operation.&quot;</p>
+<p>&quot;But wait, functional equivalents of there&#39;s more. Holding the heap lock blocks all other threads&#8230;&quot;</p>
+<p>:D</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1029083">
+				<div id="div-comment-1029083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029083">
+			December 30, 2012 at 7:01 am</a>		</div>
+
+		<p>I actually used HEAP_NO_SERIALIZATION once, on a private heap that was being used as an arena allocator so I didn&#39;t have to free memory in error condition (the normal path freed its memory anyway as it happened to avoid excessive memory consumption). It also had the nice side effect of making the code trivially provably leak free.</p>
+<p>I suppose there could be another reasonable use of HEAP_NO_SERIALIZATION besides known single-thread heap but I&#39;m not currently aware of one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1029113">
+				<div id="div-comment-1029113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/paulb_4000_rochester.rr.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>paulb@rochester.rr.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029113">
+			December 31, 2012 at 5:30 am</a>		</div>
+
+		<p>I agree mostly with all the comments about Raymond&#39;s comment &quot;I encountered one developer who thought that&#8230;&quot;. In summary, holding beliefs about the behaviour of a call without reading the documentation, especially about a non-standard flag you decided to use, is most certainly poor practice. I don&#39;t agree with Raymond&#39;s tone implying that it is laughable, though.</p>
+<div class="post">[<em>The laughable part was following the logic through to its conclusion: &quot;If I manually call <code>Heap&shy;Lock</code>, then that means that even when I pass the <code>HEAP_NO_SERIALIZATION</code> flag, the call will wait for the heap lock. Which means that all heap operations block on the heap lock even if I pass the no-serialization flag. In other words, the no-serialization flag has no effect.&quot; -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1029503">
+				<div id="div-comment-1029503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1029503">
+			January 1, 2013 at 4:50 pm</a>		</div>
+
+		<p>I think the incorrect mental model that allowed HeapLock to work with HEAP_NO_SERIALIZATION was that asking for no serialization actually used a R/W lock. Normal operations invoke the R-lock while HeapLock invokes the W-lock. This model would allow a HeapLock operation to block while a HeapAlloc or HeapFree were going on (or another operation protected by HeapLock), while not serializing HeapAlloc or HeapFree operations.</p>
+<p>Of course, I can&#39;t explain why you would want those semantics or why somebody would assume them.</p>
+<div class="post">[<em>Of course, HeapLock/Unlock existed decades before R/W locks, and W locks are not recursive, so you end up deadlocking against yourself. And I still don&#39;t understand why people think &quot;If I pass the no-serialization flag, I will get serialization (just not as much as usual).&quot; What would be the point of partial serialization? (Concurrent access to a no-serialization heap is expressly forbidden.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1030643">
+				<div id="div-comment-1030643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1030643">
+			January 3, 2013 at 4:11 pm</a>		</div>
+
+		<p>Yes, that would be my expectation. &nbsp;I agree that the expectation that other calls will be blocked is bogus. &nbsp;You ask for no-serialization, you do the serialization yourself. &nbsp;I would just have expected to be able to implement my own serialization using HeapLock and HeapUnlock. &nbsp;Guess not.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1030633">
+				<div id="div-comment-1030633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121228-00/?p=5703#comment-1030633">
+			January 3, 2013 at 3:59 pm</a>		</div>
+
+		<p>The thinking isn&#39;t &quot;If I pass the no-serialization flag, I will get serialization (just not as much as usual),&quot; it&#39;s &quot;If I pass the no-serialization flag, no serialization is done *for me*, so obviously I need to manually lock and unlock the heap.&quot; &nbsp;What&#39;s not obvious is that &quot;no serialization&quot; means &quot;don&#39;t serialize (and also make manually calling lock/unlock fail to do anything).&quot;</p>
+<div class="post">[<em>Okay, I can see how one might think that the &#39;no serialization&#39; flag means &quot;Do not call <code>Heap&shy;Lock</code> automatically. I have to call it manually if I want to serialize heap access.&quot; But then where does the expectation that calling <code>Heap&shy;Lock</code> will block other calls into the heap (even if they pass the no-serialization flag)? Wouldn&#39;t the expectation be &quot;I have to call <code>Heap&shy;Lock</code> manually if I want to serialize heap access&quot;? -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

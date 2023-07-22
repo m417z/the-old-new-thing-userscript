@@ -1,0 +1,234 @@
+<html>
+<head>
+<title>Hey there token, long time no see! (Did you do something with your hair?)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Hey there token, long time no see! (Did you do something with your hair?)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 10, 2010 / year-entry #255</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Consider a system where you have a lot of secured objects, and suppose further that checking whether a user has access to an object is a slow operation. This is not as rare as you might think: Even though a single access check against a security descriptor with a small number of ACEs might be...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Consider a system where you have a lot of secured objects, and suppose further that checking whether a user has access to an object is a slow operation. This is not as rare as you might think: Even though a single access check against a security descriptor with a small number of ACEs might be fast, you can have objects with complicated security descriptors or (more likely) users who belong to hundreds or thousands of security groups. Since checking whether a security descriptor grants access to a token is potentially&sup1; <i>O</i>(<i>nm</i>) in the number of ACEs in the security descriptor and the number of groups the user belongs to (since each ACE needs to be checked to see if it matches each group), even a check against a small security descriptor can multiply out to a slow operation when the user belongs to thousands of groups.</p>
+<p> Suppose your profiling shows that you spend a lot of time checking tokens against security descriptors. How can you create a cache of access/no-access results so you can short-circuit the expensive security check when a user requests access to an object? (And obviously, you can't have any false positives or false negatives. Security is at stake here!) </p>
+<p> First, let's look at things that don't solve the problem: One option is to query the SID from the token and cache the access/no-access result with the SID. This option is flawed because between the two checks, the user's group membership may have changed. For example, suppose object&nbsp;X is accessible to members of Group&nbsp;G. Bob starts out as a member of Group&nbsp;G, asks you for access, and you grant it and cache the fact that <i>Bob has access to object&nbsp;X</i>. Later that day, Bob's membership in Group&nbsp;G is revoked, and when Bob logs on the next day, his token won't include Group&nbsp;G. If you had merely cached Bob's SID, you would have seen the entry in the cache and said, "Welcome back, Bob. Have fun with object&nbsp;X!" Bob then rubs his hands together and mutters <i>Excellent!</i> and starts making unauthorized changes to object&nbsp;X. </p>
+<p> Now, Bob's membership in Group&nbsp;G might have been revoked at Bob's request. <a href="http://en.wikipedia.org/wiki/Principle_of_least_privilege"> Reducing one's privileges</a> is a common safety measure. For example, Bob might remove his membership in the Administrators group so he won't accidentally delete an important file. <a href="http://blogs.msdn.com/ie/archive/2005/06/09/427410.aspx"> Low Rights Internet Explorer</a> intentionally removes a slew of privileges from its token so that the scope of damage of an attack from a malicious site is limited. </p>
+<p> Okay, so how can we recognize that the Bob that comes back has different group membership from the Bob that visited us the first time? You can do this with the help of the <code>TOKEN_STATISTICS</code> structure. This structure contains a number of locally-unique values which can be used to recognize and correlate tokens. A locally-unique value is a value that is <a href="http://msdn.microsoft.com/en-us/library/aa379261.aspx"> unique on the local machine until the operating system is shut down or restarted</a>. You request the statistics for a token by calling <code>GetTokenInformation</code> function, passing <code>TokenStatistics</code> as the information class. </p>
+<p> The <code>AuthenticationId</code> is known in some places as the <code>LogonId</code> because it is assigned to the logon session that the access token represents. There can be many tokens representing a single logon session, so that won't work for our purposes. </p>
+<p> The <code>TokenId</code> is a little closer. It is a locally-unique value assigned to a token when it is created. This value remains attached to that token until it is destroyed. This is closer, but still not perfect, because Bob can enable or disable privileges, and that doesn't change the token, but it sure changes the result of a security check! </p>
+<p> The <code>ModifiedId</code> is a value which is updated each time a token is modified. Therefore, when you want to cache that <i>This particular token has access to this security descriptor</i>, you should use the <code>ModifiedId</code> as the key. (Remember, locally-unique values are good only until the system shuts down or restarts, so don't cache them across reboots!) </p>
+<p> Now, <a href="http://blogs.msdn.com/oldnewthing/archive/2006/05/02/588350.aspx"> a cache with a bad policy is another name for a memory leak</a>, so be careful how much and how long you cache the results of previous security checks. You don't want somebody who goes into a loop alternatively calling <code>AdjustTokenPrivileges</code> and your function to cause your cache to consume all the memory in the system. (Each call to <code>AdjustTokenPrivileges</code> updates the <code>ModifiedId</code>, which causes your code to create a new cache entry.) </p>
+<p> Now, you might decide to use as your lookup key the <code>ModifiedId</code> and some unique identifier associated with the object. This means that if Bob accesses 500 objects, you have 500 cache entries saying <i>Bob has access to object&nbsp;1</i> through <i>Bob has access to object&nbsp;500</i>. (And you have to remembering to purge all cached results for an object if the object's security descriptor changes.) </p>
+<p> It turns out you can do better. </p>
+<p> Even though you may have millions of objects, you probably don't have millions of security descriptors. For example, consider your hard drive: Most of the files on that hard drive use one of just a handful of security descriptors. In particular, it's nearly always the case that all files in a directory share the same security descriptor, because they start out with the security descriptor inherited from the directory, and most people don't bother customizing it. Even if your hard drive is on a server with hundreds of users connecting and creating files, you will probably only have a few thousand unique security descriptors. </p>
+<p> A better cache key would be the <code>ModifiedId</code> of the token being checked and the self-relative security descriptor that the token was checked against. If Bob accesses 500 objects, there will probably be only around five unique security descriptors. That's only five cache entries for Bob. It also saves you the trouble of remember to purge the cache when an object's security descriptor changes, since a new security descriptor changes one of the lookup keys, so it gets a new cache entry. Since security descriptors tend to be shared among many objects, you get two bonus benefits: The old security descriptor is probably still being used by some other object, so you may as well leave it in the cache and let it age out naturally. And second, there's a good chance the new security descriptor is already in your cache because it's probably already being used by some other object. </p>
+<p> &sup1;I use the word <i>potentially</i> because Windows Vista introduced an optimization which preprocesses the token to reduce the complexity of the access check operation. In practice, the access check is linear in the number of ACEs in the security descriptor. </p>
+<p> <b>Bonus chatter</b>: Note that even though Bob can remove his membership in a group, the system still knows that he's just pretending. This is important, because the security descriptor might contain a Deny ACE for people on <a href="http://blogs.msdn.com/oldnewthing/archive/2006/09/21/764634.aspx"> Project Nosebleed</a>. Even if Bob removes the Nosebleed group membership from his token in an attempt to get around the Deny ACE, the operating system won't be fooled: "Nice try, Bob. I know it's still you." </p>
+<p> <b>Sponsorship message</b>: I'd like to thank my pals over in the security team for reviewing this article and making suggestions and corrections. This article is sponsored by the <code>AuthzAccessCheck</code> function, which supports caching the results of an access check. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-860273">
+				<div id="div-comment-860273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">hagenp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860273">
+			September 10, 2010 at 7:14 am</a>		</div>
+
+		<p>Thank you, Raymond. Excellent reading material, as always.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-860303">
+				<div id="div-comment-860303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ex-DonH</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860303">
+			September 10, 2010 at 9:26 am</a>		</div>
+
+		<p>To be pedantic, though, you should note that shortcircuiting access checks can also play havoc with SACL based auditing. You keep referring to &quot;the ACEs in the security descriptor&quot;, but you&#39;re really referring to &quot;the ACEs in the DACL in the security descriptor&quot;, and you&#39;re caching the results of that comparison. You&#39;re ignoring the ACEs in the SACL in the security descriptor and the fact that you can&#39;t cache those comparisons, because each evaluation may result in an audit entry. If an attacker is cruising around in your file system checking for access to your files you don&#39;t want to know just that he got write access to a file (and potentially hundreds more after that), but rather which files he got access to.</p>
+<div class="post">[<i>Good point. You can cache AccessCheck but not AccessCheckAndAuditAlarm. (Well, you can cache AccessCheckAndAuditAlarm if there is no SACL, and in practice, most ACLs have no SACL.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-860333">
+				<div id="div-comment-860333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860333">
+			September 10, 2010 at 11:36 am</a>		</div>
+
+		<p>ex-DonH: When you cache whether access was granted, can&#39;t you also cache whether an audit entry has to be generated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-860363">
+				<div id="div-comment-860363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Krunch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860363">
+			September 10, 2010 at 2:57 pm</a>		</div>
+
+		<blockquote><p>
+  potentially¹ O(nm)
+</p></blockquote>
+<p>So, technically it always O(nm).</p>
+<p>&lt;/nitpicking&gt;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-860373">
+				<div id="div-comment-860373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.softwire.com/recruitment.htm' rel='external nofollow' class='url'>configurator</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860373">
+			September 10, 2010 at 3:57 pm</a>		</div>
+
+		<p>@Krunch</p>
+<p>&quot;In practice, the access check is linear in the number of ACEs in the security descriptor&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-860393">
+				<div id="div-comment-860393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860393">
+			September 11, 2010 at 3:21 am</a>		</div>
+
+		<p>Of course, some operating systems don&#39;t require you to wait for Bob to log on again before noticing that he&#39;s no longer a member of group G.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-860403">
+				<div id="div-comment-860403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">@DavidJuddDove</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860403">
+			September 12, 2010 at 11:15 am</a>		</div>
+
+		<p>Of course, some operating systems also don&#39;t support the concept of nested security groups. &nbsp;I&#39;m not a math geek, but recursing through nested groups is not something that you want to do on a regular basis because of the performance issues mentioned at the start of the article. &nbsp;Therefore, the computation of the TokenGroups attribute occurs only at logon. (Written by someone who once increased logon script processing time from 2-5 seconds up to 4+ minutes by introducing a recursive-nested-groups-lookup function).</p>
+<div class="post">[<i>You also don&#39;t want to hit the domain controller each time you want to make a security check. (What if the network is down? Do you just say &quot;ACCESS DENIED&quot; to all requests to play it safe?) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-860433">
+				<div id="div-comment-860433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860433">
+			September 13, 2010 at 8:08 am</a>		</div>
+
+		<p>To evade the security, pull the ethernet cable if you have been ousted from AD groups.</p>
+<div class="post">[<i>Noting of course that lets you evade the security <a href="http://technet.microsoft.com/en-us/magazine/2009.07.windowsconfidential.aspx" rel="nofollow">only on the local machine</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-860483">
+				<div id="div-comment-860483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Boris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860483">
+			September 13, 2010 at 9:47 am</a>		</div>
+
+		<p>Why does this sound like an answer to an MS interview question? (well, it&#39;s similar enough to what I was asked and I had no idea how to answer it. That&#39;s probably one of the reasons I didn&#39;t get the job)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-860823">
+				<div id="div-comment-860823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">token</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100910-00/?p=12903#comment-860823">
+			September 14, 2010 at 12:36 pm</a>		</div>
+
+		<p>[Hey there token, long time no see! (Did you do something with your hair?)]</p>
+<p>Thanks for noticing! &nbsp;It&#39;s great to be back. I&#39;d tell you all about what I was up to and what I&#39;m going to be working on, but you no longer have access rights.</p>
+<p>Sorry.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

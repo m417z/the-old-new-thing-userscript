@@ -1,0 +1,830 @@
+<html>
+<head>
+<title>If you say that your buffer can hold 200 characters, then it had better hold 200 characters</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>If you say that your buffer can hold 200 characters, then it had better hold 200 characters</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 23, 2018 / year-entry #118</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>35</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Otherwise the mistake is on you.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A security vulnerability report claimed that there was
+a vulnerability in the <code>Get&shy;Doodad&shy;Name</code>
+function (not the actual function name):
+</p>
+<blockquote CLASS="q"><p>
+There is a buffer overflow bug in the
+<code>Get&shy;Doodad&shy;Name</code> function.
+If the doodad's name is 10 characters long,
+and the caller provides a buffer of size 11 characters,
+but specifies a buffer size of 200,
+then the
+<code>Get&shy;Doodad&shy;Name</code> function
+will write more than 11 characters (10 characters for the name,
+plus the null terminator).
+Even though the caller passed an incorrect buffer size,
+the overflow should not happen because the caller's buffer
+was large enough to hold the actual result.
+</p>
+</blockquote>
+<p>
+The original report was difficult to understand,
+probably because English was not the finder's native language,
+and there are parts of the report where I couldn't figure
+out what the finder was trying to say.
+</p>
+<p>
+Going back to the issue at hand:
+If you pass a buffer to a function and say that it can
+hold up to 200 characters,
+then the function is welcome to use the entire buffer,
+even if the final result doesn't require full use of the
+buffer.
+This is just part of the
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20060320-13/?p=31853">
+basic ground rules for programming</a>:
+</p>
+<blockquote CLASS="m"><p>
+A function is permitted to write
+to the full extent of the buffer provided
+by the caller,
+even if not all of the buffer is required to hold the result. 
+</p>
+</blockquote>
+<p>
+In this case, what happens is that the
+<code>Get&shy;Doodad&shy;Name</code> function
+relies upon an internal function,
+let's call it
+<code>Get&shy;Doodad&shy;Full&shy;Name</code>,
+which returns a fully-qualified name.
+It then removes the unnecessary qualifications,
+resulting in the final doodad name for the caller.
+</p>
+<p>
+The simple implementation of this would go something
+like this:
+</p>
+<pre>
+DWORD GetDoodadName(
+    HANDLE doodad,
+    PWSTR buffer, UINT bufferSize,
+    UINT* actualSize)
+{
+ *actualSize = 0;
+
+ UINT actualFullSize;
+ DWORD result = GetDoodadFullName(doodad,
+   nullptr, 0, &amp;actualFullSize);
+
+ // If something went wrong other than "buffer too small",
+ // then give up.
+ if (result != ERROR_MORE_DATA) return result;
+
+ PWSTR fullName = (PWSTR)HeapAlloc(
+    GetProcessHeap(), 0, actualFullSize);
+ if (!fullName) return ERROR_NOT_ENOUGH_MEMORY;
+ result = GetDoodadFullName(doodad,
+    fullName, actualFullSize, &amp;actualFullSize);
+ if (result == ERROR_SUCCESS) {
+  *actualSize = ExtractLocalNameFromFullName(
+    fullName, buffer, bufferSize);
+ }
+ HeapFree(GetProcessHeap(), 0, fullName);
+ return result;
+}
+</pre>
+<p>
+Since you're going to have to call
+<code>Get&shy;Doodad&shy;Full&shy;Name</code> anyway,
+you may as well see if you're lucky, 
+and the full name fits inside the caller-provided buffer.
+In that case, you need only call
+<code>Get&shy;Doodad&shy;Full&shy;Name</code> once,
+and you don't need to allocate the temporary buffer either.
+That saves you a memory allocation and two calls to the doodad server.
+</p>
+<pre>
+DWORD GetDoodadName(HANDLE doodad, PWSTR buffer, UINT bufferSize,
+    UINT* actualSize)
+{
+ *actualSize = 0;
+
+ UINT actualFullSize;
+ DWORD result = GetDoodadFullName(doodad,
+    <font COLOR="blue">buffer, bufferSize</font>, &amp;actualFullSize);
+ <font COLOR="blue">if (result == ERROR_SUCCESS) {
+  // The caller's buffer is big enough to hold the full name.
+  *actualSize = ExtractLocalNameFromFullName(
+    buffer, buffer, bufferSize);
+  return result;
+ }</font>
+
+ // If something went wrong other than "buffer too small",
+ // then give up.
+ if (result != ERROR_MORE_DATA) return result;
+
+ PWSTR fullName = (PWSTR)HeapAlloc(
+    GetProcessHeap(), 0, actualFullSize);
+ if (!fullName) return ERROR_NOT_ENOUGH_MEMORY;
+ result = GetDoodadFullName(doodad,
+    fullName, actualFullSize, &amp;actualFullSize);
+ if (result == ERROR_SUCCESS) {
+  *actualSize = ExtractLocalNameFromFullName(
+    fullName, buffer, bufferSize);
+ }
+ HeapFree(GetProcessHeap(), 0, fullName);
+ return result;
+}
+</pre>
+<p>
+This is a legitimate optimization because the
+function has free use of the caller-provided buffer,
+for the full extent of the caller-specified size of the buffer,
+until the function returns.
+And this function takes advantage of this freedom by using
+the caller-provided buffer as a temporary buffer for holding
+the full name.
+</p>
+<p>
+If the caller provides a buffer of size 200, then that
+buffer had better be 200 characters in size,
+and all 200 of those characters had better be expendable.
+</p>
+<p>
+What's even more dangerous about this is that the caller
+cannot guarantee the length of the doodad's local name.
+A doodad's name can be changed by anybody who can find the
+doodad in the system doodad table,
+so you can't say,
+"Well, my code created the doodad with a local name whose
+length I know to be exactly 10, so it's safe to overstate
+the buffer size because I know that the result won't use
+more than 11 characters."
+Some other program may have changed the doodad's name,
+and your "knowledge" that
+the result will require only 11 of those characters
+is no longer valid.
+</p>
+<p>
+Curiously,
+the finder even acknowledged the fact that the name could
+change for reasons outside the program's control,
+and noted that if the new name requires more than 11 characters,
+then more than 11 characters will be modified.
+</p>
+<p>
+So I don't know what the finder was trying to say.
+Since the length of the name cannot be known ahead of time,
+the caller doesn't know how much of the putatively 200-character buffer
+will be used, so the caller needs to be prepared for the case that
+<i>all of it</i> will be used.
+If the caller had important data at character 12,
+the caller may be in for an unpleasant surprise.
+</p>
+<p>
+The buffer overflow in the report is
+not a vulnerability in the
+<code>Get&shy;Doodad&shy;Name</code>
+function.
+It is a vulnerability in the caller,
+for passing the wrong buffer size.
+</p>
+<p>
+We asked the finder to clarify why they considered this
+a flaw in the <code>Get&shy;Doodad&shy;Name</code> function,
+but the response was not readily comprehensible.
+They seemed to be more interested in the change in behavior
+when the incorrectly-specified buffer size
+is large enough to hold the full name,
+as opposed to when it isn't.
+</p>
+<p>
+One part that was sort of understandable went like this
+(after correcting grammar):
+</p>
+<blockquote CLASS="q"><p>
+According to the design principle,
+even if I have provided an incorrect buffer size,
+a crash should not happen,
+because the user provided an actual buffer
+large enough to hold the (undecorated) doodad name.
+</p>
+</blockquote>
+<p>
+I'm not sure what design principle says that if a caller
+provides an incorrect buffer size, we should somehow
+detect and avoid overflowing the buffer.
+If that were possible, then why have buffer size parameters
+at all?
+Just detect the correct buffer size automatically for all callers!
+</p>
+<p>
+The changing or missing antecedents makes the clarification
+hard to decipher as well.
+Sometimes the invalid parameter came from
+"me", sometimes it was provided by "the user",
+and sometimes the agent that crashed is left unspecified.
+</p>
+<p>
+The crash is interesting if it occurs at a different security
+level from the caller who passed invalid (or malicious) parameters.
+In this case, the invalid parameters are coming from the calling
+application,
+and the buffer overflow occurs in the calling application,
+and the crash occurs in the calling application.
+So everything happens at the same security level,
+and there is no elevation.
+What you found is a way for a malicious caller to corrupt
+its own memory in a very roundabout way.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (35)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1342015">
+				<div id="div-comment-1342015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">florian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342015">
+			May 23, 2018 at 7:24 am</a>		</div>
+
+		<p>It&#8217;s a good pattern for Win32 functions returning strings to call them the first time with a likely-to-fit buffer, and the second time (only if necessary) with a tailored buffer. But you need to watch closely whether or not the NULL terminator is already included if copied or required sizes are returned, this is not always consistent.</p>
+<p>One such function I have been using recently was ExpandEnvironmentStrings, and MSDN says:</p>
+<p>The size of the lpSrc and lpDst buffers is limited to 32K.</p>
+<p>But on Windows 10 1803, the function seems to accept larger buffers. Where can I file the security vulnerability, I mean, hey, this could eat up all my computer memory!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1342105">
+				<div id="div-comment-1342105" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342105">
+			May 23, 2018 at 8:38 am</a>		</div>
+
+		<p>Eating up all of your computer&#8217;s memory is not actually a security flaw.  After all, in this case, it&#8217;s what you asked the system to do.  It&#8217;s not a security vulnerability, it&#8217;s a self-inflicted local DoS.</p>
+<p>It&#8217;s also, in terms of environment strings, incredibly difficult to see how this would happen in real life.  But if you have an example of it happening, then by all means, write a simple program, explain the environment, and submit a report. (I&#8217;m going to get hell from Microsoft for suggesting this, but then again I really don&#8217;t see it as a likely eventuality.)</p>
+<p>Interestingly, on an old (Unix, not MS) system, I did once trip over a security vulnerability to do with expanding environment strings, but in fact it was the absolute inverse of this.  The API call in question took the 32KB buffer (it was about that size) and blithely expanded all the strings using the abbreviations in .rc files until they overran the 32KB&#8230;</p>
+<p>That&#8217;s the sort of &#8220;security vulnerability&#8221; you need to worry about. (And thankfully it was solved by the Unix system in question.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1342125">
+				<div id="div-comment-1342125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://geelaw.blog/' rel='external nofollow' class='url'>Gee Law</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342125">
+			May 23, 2018 at 9:41 am</a>		</div>
+
+		<p>The other thing is that you want to call these functions in a loop. For example, call <code>RegQueryValueEx</code> in a loop to avoid copying partial data to the buffer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip odd alt depth-2" id="comment-1342335">
+				<div id="div-comment-1342335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342335">
+			May 23, 2018 at 4:24 pm</a>		</div>
+
+		<p>About the size of the buffers of ExpandEnvironmentStrings, this may also just be a documentation bug. You see, the environment block had a 32k limit prior to Windows Vista, this meant that the environment variables had to be less than 32k to find into a block.<br />
+With Windows Vista, each environment variable had a maximum size of 32k and a block didn&#8217;t have a maximum fixed size. So if the documentation for ExpandEnvironmentStrings hasn&#8217;t been touched for a long time, then this may just not be true. It&#8217;s not like the documentation in the MSDN is perfect.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-koldude even thread-odd thread-alt depth-1 parent" id="comment-1342035">
+				<div id="div-comment-1342035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342035">
+			May 23, 2018 at 7:45 am</a>		</div>
+
+		<p>Not only would I assume as a caller that the buffer for the passed in size is mutatable I&#8217;d assume it&#8217;s almost certainly mutated. I know quite a few reasons that functions would deliberately <code>memset</code> the buffer after checking initial arguments to <code>nullptr</code> just to ensure that they don&#8217;t have to go back and null terminate if the value fits within buffersize &#8211; 1. It might be worth specifying in the documentation if the function will fail if it can&#8217;t write a null terminator explicitly though.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1342055">
+				<div id="div-comment-1342055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Torsten Kammer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342055">
+			May 23, 2018 at 7:58 am</a>		</div>
+
+		<p>That doesn&#8217;t really apply here, though. As far as the function knows, it can write a null terminator. The person in charge of providing the space said the space is there, after all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1342085">
+				<div id="div-comment-1342085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342085">
+			May 23, 2018 at 8:30 am</a>		</div>
+
+		<p>That would be an awful lot of documentation updates, to cover the one single thing that any C/C++ programmer should know instinctively.  If you are dealing with strings, you need to allow (at least*) one extra byte for the null.  And no, supplying a malloced/newed byte buffer of length N with a length parameter of N+1 doesn&#8217;t really absolve you of a charge of very basic and utter incompetence.  And even if it did, I doubt the sort of programmer who does this (or submits a &#8220;bug report&#8221;) would bother to read the documentation.</p>
+<p>* There are some (I don&#8217;t know how many) API calls that deal with arrays-of-arrays, which I believe are terminated by a double null in all cases.  These are a bit trickier and not necessarily what a C/C++ programmer would expect (although they should be able to spot the necessity).  If the documentation for said API calls doesn&#8217;t mention the double null, then I&#8217;d agree &#8212; it should.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fjeldse odd alt depth-3" id="comment-1342385">
+				<div id="div-comment-1342385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Erik+F' rel='external nofollow' class='url'>Erik F</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342385">
+			May 23, 2018 at 6:25 pm</a>		</div>
+
+		<p>Minor observation: that should be one extra *element*, as strings are generally UTF-16 nowadays in Windows (and an array of pointers would have 4- or 8-byte elements if NULL terminated.) That said, I always have to double-check after writing array-handling code (and string handling code in particular) because it&#8217;s easy to miscount (on a good day, the program will crash after reading past the end, but it often doesn&#8217;t), and misinterpret (did that length include the terminator, or didn&#8217;t it?), and C doesn&#8217;t help with functions like strncpy(), which has a hidden gotcha if you&#8217;re not careful! I do love programming in C, but sometimes I hate it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mzzt even thread-even depth-1 parent" id="comment-1342065">
+				<div id="div-comment-1342065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/The+MAZZTer' rel='external nofollow' class='url'>The MAZZTer</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342065">
+			May 23, 2018 at 8:01 am</a>		</div>
+
+		<p>&gt; Just detect the correct buffer size automatically for all callers!</p>
+<p>This is the whole point of .NET, and other managed languages, yes? If you want .NET, code in .NET (or your language of choice that does this).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1342135">
+				<div id="div-comment-1342135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Clockwork-Muse</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342135">
+			May 23, 2018 at 10:13 am</a>		</div>
+
+		<p>Yes and no.  Being a managed language is more about automatically handling buffer (and other object) allocation/deallocation &#8211; but since you generally need to know the size of such a buffer to free it correctly, size is handled &#8220;for free&#8221; (and, since most of these languages were trying to eliminate foot-guns, this makes detecting such index-out-of-bounds errors much easier for programmers).</p>
+<p>C++ has an Array class type: <a href="http://en.cppreference.com/w/cpp/container/array" rel="nofollow">http://en.cppreference.com/w/cpp/container/array</a> &#8211; this brings the size along with it.  What&#8217;s often useful in the case of buffers, however, is _slicing_ the buffer; that is, providing a view of a section of the buffer as if it were the entire thing.  For the C++ Array type, you&#8217;d do that with start/end iterators, but other languages (such as C#) provide explicit Slice objects.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1342175">
+				<div id="div-comment-1342175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bretkuhns.com/' rel='external nofollow' class='url'>Bret Kuhns</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342175">
+			May 23, 2018 at 11:12 am</a>		</div>
+
+		<p>&gt; For the C++ Array type, you’d do that with start/end iterators, but other languages (such as C#) provide explicit Slice objects.</p>
+<p>Span (<a href="http://en.cppreference.com/w/cpp/container/span" rel="nofollow">http://en.cppreference.com/w/cpp/container/span</a>) is coming to C++20 or can be used today via the &#8220;Guideline Support Library&#8221; (<a href="https://github.com/microsoft/gsl" rel="nofollow">https://github.com/microsoft/gsl</a>). A span acts like a &#8220;slice object&#8221; rather than having to deal with iterator pairs.</p>
+<p>Example: <a href="https://godbolt.org/g/dqneAM" rel="nofollow">https://godbolt.org/g/dqneAM</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt depth-3" id="comment-1342395">
+				<div id="div-comment-1342395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342395">
+			May 23, 2018 at 6:55 pm</a>		</div>
+
+		<p>Let&#8217;s not forget there is BSTR that is a mix of both Pascal string (length denoted) and null terminated string.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1342075">
+				<div id="div-comment-1342075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342075">
+			May 23, 2018 at 8:19 am</a>		</div>
+
+		<p>Today&#8217;s example is an example of an unintended poor design. Not because the caller specified a buffer shorter than the declared buffer, but because something that doesn&#8217;t look like a bottom-level API function expects the caller to allocate the buffer.</p>
+<p>The correct design choice is almost always to have the API itself allocate and return the buffer, and have the caller free it. (Ok. I&#8217;ll make an exception for the File I/O and Registry functions.) But unfortunately on Windows the only good functions for allocating memory in one DLL and freeing it in another are LocalAlloc and GlobalAlloc, both of which are marked as for backwards compatibility.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-koldude odd alt depth-2" id="comment-1342245">
+				<div id="div-comment-1342245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342245">
+			May 23, 2018 at 12:19 pm</a>		</div>
+
+		<p><code>CoTaskMemAlloc</code> isn&#8217;t deprecated and uses the COM heap, not sure if it requires <code>CoInitialize</code> though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1342285">
+				<div id="div-comment-1342285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Clockwork-Muse</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342285">
+			May 23, 2018 at 1:30 pm</a>		</div>
+
+		<p>While that&#8217;s nice (and would allow more &#8220;immutable language&#8221;-like behavior), the problem is that it means you&#8217;re allocating additional memory.  If the API is sufficiently old, using pre-allocated buffers was mostly the default.  It also supposes the possibility of dynamic memory allocation, which isn&#8217;t always possible (embedded systems, for example).<br />
+Even in modern, managed languages there&#8217;s some effort to write into existing buffers, especially if those buffers can be reused.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1342295">
+				<div id="div-comment-1342295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342295">
+			May 23, 2018 at 1:53 pm</a>		</div>
+
+		<p>FTFY: The correct design choice is NEVER to have the API itself allocate the buffer unless the function&#8217;s one and only purpose is allocation.</p>
+<p>Proof: Apply the Single Responsibility Principle.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1342365">
+				<div id="div-comment-1342365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342365">
+			May 23, 2018 at 5:24 pm</a>		</div>
+
+		<p>I know you do C# programming a lot. Besides, don&#8217;t you get tired of the call twice pattern?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1342925">
+				<div id="div-comment-1342925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Denis Silvestre</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342925">
+			May 28, 2018 at 7:15 am</a>		</div>
+
+		<p>Well no. I want MY result allocated in MY memory space which could be a member of a structure or a variable on the stack (thus free of allocation/deallocation costs).</p>
+<p>Having the API allocating its own memory is extremely heavier on resources and time plus it requires a lot more complexity on the API side to track object handles (you *do not* want static memory allocated on a multithreaded environment).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1343365">
+				<div id="div-comment-1343365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1343365">
+			May 29, 2018 at 6:01 pm</a>		</div>
+
+		<p>How do you allocate unknown sized objects on the stack? I get really tired of the ERROR_MORE_DATA loop.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1342095">
+				<div id="div-comment-1342095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342095">
+			May 23, 2018 at 8:33 am</a>		</div>
+
+		<p>In other news, if you say your buffer can hold 200 characters, then it had better hold at least 800 bytes, in case every one of those 200 is an astral plane Unicode character such as U+1F4A9 PILE OF POO that is represented with 4 bytes in UTF-8 or a surrogate pair in UTF-16.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1342145">
+				<div id="div-comment-1342145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342145">
+			May 23, 2018 at 11:07 am</a>		</div>
+
+		<p>The measurement unit is &#8220;code units&#8221;, not &#8220;code points&#8221;. A 400-byte buffer holds 200 UTF-16 code units.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1342585">
+				<div id="div-comment-1342585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Maggan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342585">
+			May 24, 2018 at 10:44 am</a>		</div>
+
+		<p>Actually a 400-byte buffer isn&#8217;t enough for both 200 utf-16 and ucs-2 characters. Windows can use either.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip even depth-4" id="comment-1342665">
+				<div id="div-comment-1342665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342665">
+			May 24, 2018 at 12:40 pm</a>		</div>
+
+		<p>Considering UCS-2 is UTF-16 without the surrogates, isn&#8217;t mentioning UCS-2 redundant? If something can handle UTF-16 then it can handle UCS-2 by default.<br />
+Also, Raymond didn&#8217;t say UTF-16 characters, he said code units. So basically a UTF-8 code unit is 8 bits/1 byte, a UTF-16 code unit is 16 bits/2 bytes. So this means that a 400 byte buffer is large enough to hold 200 UTF-16 code units. Whether those 200 code units represent 200 characters depends on the code units in the string.<br />
+Sometimes it helps to actually read what someone writes before you comment.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1342235">
+				<div id="div-comment-1342235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">florian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342235">
+			May 23, 2018 at 11:52 am</a>		</div>
+
+		<p>Many functions * to cut strings to a certain length can produce split surrogate pairs. But from a user perspective, with &#8220;graphemes&#8221; as the superior concept possibly consisting of multiple &#8220;characters&#8221; (code points), this doesn&#8217;t even matter, you can still end up with a split &#8220;grapheme&#8221; even without split surrogates. And yes, there&#8217;s even combining characters beyond the basic multilingual plane. **</p>
+<p>For example, programming a simple console utility with column-aligned (and truncated if necessary) output can be quite challenging with Unicode support. Sometimes I&#8217;m tempted to believe the best approach to abbreviate a string is to measure its display length &#8230;</p>
+<p>* I have tested: _snwprintf lstrcpynW PathCompactPathExW StrCatBuffW StrCatChainW StrCpyNW StringCchCopyW StringCchPrintfW wnsprintfW</p>
+<p>** <a href="http://unicode.org/cldr/utility/list-unicodeset.jsp?a=%5B:M:%5D&#038;g=&#038;i=" rel="nofollow">http://unicode.org/cldr/utility/list-unicodeset.jsp?a=%5B:M:%5D&#038;g=&#038;i=</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1342495">
+				<div id="div-comment-1342495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342495">
+			May 24, 2018 at 3:11 am</a>		</div>
+
+		<p>Re: combining astral plane characters</p>
+<p>I’m stumped that the U+1F607 SMILING FACE WITH HALO was included in Unicode only as a precomposed character. Imagine if it was SMILING FACE + COMBINING HALO. You could then use the aforementioned U+1F4A9 with the combining halo to mean “holy crap”.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1342565">
+				<div id="div-comment-1342565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">florian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342565">
+			May 24, 2018 at 8:51 am</a>		</div>
+
+		<p>What looks like relaxed associativity was just my thoughts about measuring buffer lengths in code units.</p>
+<p>By the way, CharNextW * is not helpful for detecting &#8220;grapheme&#8221; boundaries, as the underlying GetStringTypeW merely returns C3_HIGHSURROGATE or C3_LOWSURROGATE for non-BMP code points, without any more in-depth hints about the code point type.</p>
+<p>* Apart from being broken:</p>
+<p>Michael S. Kaplan, 2008/12/16 &#8211; UCS-2 to UTF-16, Part 9: The torrents of breaking CharNext/CharPrev &#8211; <a href="http://archives.miloush.net/michkap/archive/2008/12/16/9223301.html" rel="nofollow">http://archives.miloush.net/michkap/archive/2008/12/16/9223301.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1342165">
+				<div id="div-comment-1342165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342165">
+			May 23, 2018 at 11:11 am</a>		</div>
+
+		<p>Raymond, has these sorts of optimizations caused security issues/data leakage in the past that have had to be fixed?</p>
+<p>Eg: API returns a list of items that are subject to access controls, API grabs all of the items and uses the user-supplied buffer as a scratch space then processes and filters the items before returning.</p>
+<p>The caller could then copy off the intermediate data on another thread.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-the-wench odd alt depth-2 parent" id="comment-1342355">
+				<div id="div-comment-1342355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Monochrome+Wench' rel='external nofollow' class='url'>Monochrome Wench</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342355">
+			May 23, 2018 at 4:57 pm</a>		</div>
+
+		<p>I don&#8217;t see it making a big difference, unless the kernel was using a caller supplied buffer as scratch space. I would be quite concerned if it was. Any API that&#8217;s doing security checks in userspace is just asking for trouble from the beginning. You could just directly call the offending internal function that&#8217;s returning the unchecked secured objects instead of having to mess around with watching a buffer changing while the security checks are being done.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1342555">
+				<div id="div-comment-1342555" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342555">
+			May 24, 2018 at 8:29 am</a>		</div>
+
+		<p>It was this post that twigged the thought. <a href="https://blogs.msdn.microsoft.com/oldnewthing/20110512-00/?p=10683" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20110512-00/?p=10683</a></p>
+<p>Which is basically the same thing over the UserKernel fence.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1342405">
+				<div id="div-comment-1342405" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342405">
+			May 23, 2018 at 7:16 pm</a>		</div>
+
+		<p>The real question is &#8211; why did the caller want to tell the GetDoodadName function that the buffer size was 200, if the real buffer size was 11? Why not just tell the truth?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1342485">
+				<div id="div-comment-1342485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342485">
+			May 24, 2018 at 3:05 am</a>		</div>
+
+		<p>Possibly someone had a financial liability for bugs in the code (e.g. a contractor or outsourcer) so they were desperately casting round for an explanation of how this failure wasn&#8217;t their fault.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1342645">
+				<div id="div-comment-1342645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Iverson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342645">
+			May 24, 2018 at 12:27 pm</a>		</div>
+
+		<p>That would explain why they went through the trouble of making a report with Microsoft over this, but not why they lied about the buffer in the first place.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1343115">
+				<div id="div-comment-1343115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1343115">
+			May 29, 2018 at 7:26 am</a>		</div>
+
+		<p>If they had a non-technical motive to defend the code there is no reason to believe the code was deliberate.  It was probably just a bug.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt thread-odd thread-alt depth-1 parent" id="comment-1342415">
+				<div id="div-comment-1342415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342415">
+			May 23, 2018 at 10:06 pm</a>		</div>
+
+		<p>I am not sure I understand. What happened when the customer wrote 11 characters to the supposedly 200-characters-long buffer? Did his/her app crash?</p>
+<p>Also, how did the customer attack anything here?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1342545">
+				<div id="div-comment-1342545" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Aged .Net Guy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180523-00/?p=98815#comment-1342545">
+			May 24, 2018 at 8:18 am</a>		</div>
+
+		<p>The customer didn&#8217;t write anything anywhere.  The customer passed the Windows API function an 11 char buffer expecting a 10 char+NULL response.  But the customer / caller told the Win API the buffer was 200 chars long and so the function clobbered some or all of the next 189 chars of memory after the first 11.  Which surprised the customer / caller.</p>
+<p>In other words, he enticed the Win API to scribble into his other data.  What happened next in his program is undefined.  But almost certainly not what he wanted.</p>
+<p>Then the customer doubled down on the mistake by thinking that somehow this was a vulnerability that malicious code could exploit.  Nope.  The customer / caller could have trashed his own memory without the API&#8217;s help.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

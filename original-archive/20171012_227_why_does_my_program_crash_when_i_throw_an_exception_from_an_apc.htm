@@ -1,0 +1,295 @@
+<html>
+<head>
+<title>Why does my program crash when I throw an exception from an APC?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does my program crash when I throw an exception from an APC?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 12, 2017 / year-entry #228</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Because c'mon.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Consider the following code fragment:
+</p>
+<pre>
+class thread_exit_exception
+{
+};
+
+DWORD CALLBACK WorkerThreadProc(void* parameter)
+{
+  try {
+    while (true) {
+      SleepEx(INFINITE, TRUE); // alertable
+    }
+  } catch (thread_exit_exception&amp; e) {
+  }
+  return 0;
+}
+
+void CALLBACK ExitWorkerThreadApcProc(ULONG_PTR parameter)
+{
+  throw thread_exit_exception();
+}
+
+void MakeTheWorkerThreadExit()
+{
+    QueueUserAPC(ExitWorkerThreadApcProc, WorkerThreadHandle, 0);
+}
+</pre>
+<p>
+In this case, the worker thread just sits around waiting to be
+told to exit,
+but in the general case,
+it would be doing work and check in periodically to see if somebody
+told it to exit.
+</p>
+<p>
+The problem is that this sample program crashes.
+Why?
+</p>
+<p>
+Well, this is similar to the issue of
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170728-00/?p=96706">
+throwing a C++ exception from a structured exception</a>,
+because you're throwing an exception from an operating system callback.
+The C++ compiler isn't expecting that,
+and it might optimize out the
+<code>try</code>/<code>catch</code>,
+in which case the exception you throw from the APC goes unhandled
+and terminates the process.
+</p>
+<p>
+But wait, even before you get to this point, you're already in
+trouble, because
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20120910-00/?p=6653">
+you're throwing an exception across frames,
+even though not all of the frames in between are in on the joke</a>.
+</p>
+<p>
+So this plan is double-broken.
+</p>
+<p>
+The correct way to do this is to set a flag from the APC,
+and the worker thread checks this flag after every alertable
+wait.
+If the flag is set, then an APC wants the thread to exit,
+and the thread can exit on its own terms.
+This avoids raising exceptions across foreign frames:
+Instead of raising the exception, you merely set a variable
+that says "I'd really like to raise an exception, but I can't,
+so can you pretend that I raised an exception? Thanks."
+</p>
+<p>
+Alternatively, you could have the alertable wait check the flag,
+and if the flag is set,
+then it does a <code>throw thread_exit_exception()</code>.
+With this design, the variable means
+"I'd really like to raise an exception, but I can't,
+so can you raise the exception when it's safe to do so? Thanks."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-koldude even thread-even depth-1" id="comment-1312146">
+				<div id="div-comment-1312146" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312146">
+			October 12, 2017 at 7:24 am</a>		</div>
+
+		<p>Honestly it&#8217;s undefined behavior as you don&#8217;t know that the calling code is exception safe, anyone who wants to try is already playing with nasal demons. If anything I&#8217;d be tempted to ask the windows SDK team to add a preprocessor flag that marks all callbacks from the OS as <code>noexcept</code> in C++. This would break existing code if you opt in but it would allow you to also tell the compiler that your callbacks should never throw and if they do to just terminate.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1312155">
+				<div id="div-comment-1312155" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312155">
+			October 12, 2017 at 8:14 am</a>		</div>
+
+		<p>Exceptions used for flow control, that&#8217;s asking for trouble.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1312176">
+				<div id="div-comment-1312176" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312176">
+			October 12, 2017 at 10:19 am</a>		</div>
+
+		<p>But I really do have to write try { var fs = new FileStream(pathname, &#8230;); /* &#8230; */ } catch (FileNotFoundException) { /* code for file doesn&#8217;t exist */ }</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong odd alt depth-3 parent" id="comment-1312185">
+				<div id="div-comment-1312185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312185">
+			October 12, 2017 at 7:40 pm</a>		</div>
+
+		<p>File.Exists() exists for a reason. I&#8217;d rather reserve the use of FileNotFoundException for situations less obvious, such as when loading DLLs (where you can load from multiple places).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1312195">
+				<div id="div-comment-1312195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312195">
+			October 12, 2017 at 8:30 pm</a>		</div>
+
+		<p>if (File.Exists(pathanme) { var fs = new FileStream(pathname, …); } is slower and can still throw FileNotFoundException. See <a href="https://blogs.msdn.microsoft.com/oldnewthing/20071109-00/?p=24553" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20071109-00/?p=24553</a> for why checking if a file exists before opening it is pointless.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1312365">
+				<div id="div-comment-1312365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Fred</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312365">
+			October 13, 2017 at 10:52 am</a>		</div>
+
+		<p>But a file disappearing between the check and the open() *is* an exceptional condition, for which the exception is legitimate. The File.Exists() check is merely to avoid cluttering the debugger with the cases where one *expects* the file to be missing (like, say, a DLL whose generation at compile-time is optional&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1312205">
+				<div id="div-comment-1312205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312205">
+			October 13, 2017 at 12:30 am</a>		</div>
+
+		<p>I meant, a thread that terminates is hardly an exceptional situation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1312175">
+				<div id="div-comment-1312175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312175">
+			October 12, 2017 at 9:24 am</a>		</div>
+
+		<p>@kantos: forget exception safety. Calling code is most likely C, so it&#8217;s100% oblivious to exceptions. Even if it was C++, it would need to use the same exception implementation as me, which is not a given. And imagine doing it from some other language&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1312177">
+				<div id="div-comment-1312177" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312177">
+			October 12, 2017 at 2:49 pm</a>		</div>
+
+		<p>If the callback code calls any library, all bets are off (there&#8217;s no checked exceptions in c++, no guarantees are given). Most, if not all, file system accesses, or even most things dealing with handles, are no-no. And forget logging! The allowed set of language features allowed in these cases is a very small subset of c++, not really c++ or even c. More similar to what&#8217;s allowed in DllMain.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1312215">
+				<div id="div-comment-1312215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171012-00/?p=97215#comment-1312215">
+			October 13, 2017 at 3:26 am</a>		</div>
+
+		<p>Well, it could have been worse, they could have deliberately dereferenced a null pointer in their APC hoping to catch it with SEH&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

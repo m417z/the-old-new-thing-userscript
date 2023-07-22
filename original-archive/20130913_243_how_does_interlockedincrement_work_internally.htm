@@ -1,0 +1,520 @@
+<html>
+<head>
+<title>How does InterlockedIncrement work internally?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How does InterlockedIncrement work internally?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 13, 2013 / year-entry #244</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>23</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The Interlocked family of functions perform atomic operations on memory. How do they do it? It depends on the underlying CPU architecture. For some CPUs, it's easy: The x86, for example, has direct support for many interlocked operations by means of the LOCK prefix (with the bonus feature that LOCK is implied for the XCHG...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The
+<a HREF="http://msdn.microsoft.com/en-us/library/ms684122.aspx">
+Interlocked</a>
+family of functions perform atomic operations
+on memory.
+How do they do it?
+</p>
+<p>
+It depends on the underlying CPU architecture.
+For some CPUs, it's easy:
+The x86, for example, has direct support for many interlocked operations
+by means of the
+<a HREF="http://www.cs.ucla.edu/~kohler/class/04f-aos/ref/i386/LOCK.htm">
+<code>LOCK</code> prefix</a>
+(with the bonus feature that <code>LOCK</code> is implied for the
+<code>XCHG</code> opcode.)
+The ia64 and x64 also have
+direct support for atomic load-modify-store operations.
+</p>
+<p>
+Most other architectures break the operation into two parts,
+known as
+<a HREF="http://en.wikipedia.org/wiki/Load-Link/Store-Conditional">
+Load-link/store-conditional</a>.
+The first part (load-link) reads a value from memory and instructions
+the processor to monitor the memory address to see if any other
+processors modify that same memory.
+The second part (store-conditional) stores a value to memory
+provided that no other processors have written to the memory
+in the meantime.
+An atomic load-modify-store operation is therefore performed by
+reading the value via load-link,
+performing the desired computation,
+then
+attempting a store-conditional.
+If the store-conditional fails,
+then start all over again.
+</p>
+<pre>
+LONG InterlockedIncrement(LONG volatile *value)
+{
+  LONG lOriginal, lNewValue;
+  do {
+    // Read the current value via load-link so we will know if
+    // somebody has modified it while we weren't looking.
+    lOriginal = load_link(value);
+
+    // Calculate the new value
+    lNewValue = lOriginal + 1;
+
+    // Store the value conditionally. This will fail if somebody
+    // has updated the value in the meantime.
+  } while (!store_conditional(value, lNewValue));
+  return lNewValue;
+}
+</pre>
+<p>
+(If this looks familiar, it should.
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/09/15/229915.aspx">
+You've seen this pattern before</a>.)
+</p>
+<p>
+Now, asking the CPU to monitor a memory address comes with its own
+gotchas.
+For one thing, the CPU can monitor only one memory address at a time,
+and its memory is very short-term.
+If your code gets pre-empted or if a hardware interrupt comes in
+after your <code>load_link</code>, then your
+<code>store_conditional</code> will fail because the CPU got distracted
+by the shiny object known as <i>hardware interrupt</i> and totally
+forgot about that memory address it was supposed to be monitoring.
+(Even if it managed to remember it, it won't remember it for long,
+because the hardware interrupt will almost certainly execute its own
+<code>load_link</code> instruction, thereby replacing the monitored
+address with its own.)
+</p>
+<p>
+Furthermore, the CPU might be a little sloppy in its monitoring
+and monitor not the address itself but
+<a HREF="http://drdobbs.com/go-parallel/article/showArticle.jhtml?articleID=217500206">
+the cache line</a>.
+If somebody modifies a different memory location which happens to
+reside in the same cache line, the <code>store_conditional</code>
+might fail even though you would expect it to succeed.
+The ARM architecture allows a processor to be so sloppy that
+any write in the same block of 2048 bytes can cause a
+<code>store_conditional</code> to fail.
+</p>
+<p>
+What this means for you, the assembly-language coder who is
+implementing an interlocked operation, is that you need to minimize
+the number of instructions between the
+<code>load_link</code> and <code>store_conditional</code>.
+For example,
+<code>InterlockedIncrement</code> merely adds&nbsp;1 to the value.
+The more instructions you insert between the
+<code>load_link</code> and <code>store_conditional</code>,
+the greater the chance that your <code>store_conditional</code> will fail
+and you will have to retry.
+And if you put too much code in between, your 
+<code>store_conditional</code> will <i>never</i> succeed.
+As an extreme example, if you put code that
+takes five seconds to calculate the new value,
+you will certainly receive several hardware interrupts during those
+five seconds, and your
+<code>store_conditional</code> will always fail.
+</p>
+<p>
+<b>Bonus reading</b>:
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/05/06/127141.aspx">
+Why did InterlockedIncrement/Decrement only return the sign of the result</a>?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (23)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1077623">
+				<div id="div-comment-1077623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Axel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077623">
+			September 13, 2013 at 7:24 am</a>		</div>
+
+		<p>ARM is always hyped as being so much better than x86 but the relaxed memory semantics of it just make everything so much more difficult to code for in the age of multicores.</p>
+<p>Intel made the right choice of being very strict about that even if it means you lose a bit of performance.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077633">
+				<div id="div-comment-1077633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077633">
+			September 13, 2013 at 7:31 am</a>		</div>
+
+		<p>What&#39;s really annoying is the old Dekker&#39;s algorithm and friends don&#39;t work on ARM.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1077663">
+				<div id="div-comment-1077663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077663">
+			September 13, 2013 at 8:44 am</a>		</div>
+
+		<p>@Joshua. &nbsp;Dekker&#39;s algorithm doesn&#39;t work on Intel either, but it fails less frequently than on ARM so you might not notice:</p>
+<p><a rel="nofollow" target="_new" href="http://jakob.engbloms.se/archives/65">jakob.engbloms.se/&#8230;/65</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077713">
+				<div id="div-comment-1077713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">j b</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077713">
+			September 13, 2013 at 11:33 am</a>		</div>
+
+		<p>My favorite hardware solution in terms of low conceptual complexity (and I would think implementation was fairly simple, too): The Norsk Data ND-5000 superminis (&quot;VAX class&quot; machines) had a SOLO instruction that turned off all interrupts and started an 8-bit counter incremented every clock cycle. A TUTTI instruction reenabled interrupts and stopped the counter. &nbsp;A counter overflow caused a fatal interrupt to the current process, so it had at most 255 clock cycles to complete its protected operations. The overhead was one clock cycle each for the SOLO and TUTTI instructions; all instructions executed at full speed. If the protected operations were to complex to complete in 255 cycles, you would have to build some sort of critical region or monitor, protected by a semaphore read/update in SOLO-TUTTI sequences, and the overhead would double to 4 clock cycles, 2 for entering the region, 2 for leaving. Still quite moderate.</p>
+<p>Interrupts signaled between SOLO and TUTTI were queued up. In theory the worst case extra latency was 256 cycles, but in pracice, duration of SOLO-TUTTI sequences were more like a dozen clock cycles or less (and usually, external interrupts were processed by a 16-bit front end with super-low interrupt latency, down to 900 ns for a complete context switch). </p>
+<p>The best thing was that even though SOLO disabled interrupts (for a few clock cycles), these instructions were unprivileged and could be useed by any process in user space, without incurring any context switch &#8211; not even a function call, if you didn&#39;t want to. SOLO and TUTTI were available as keywords in the systems programming language to any application programmer (other languages usually had a macro facility and could use inline assembly, looking very much the same), making the cost of protecting updates of shared data structures very low. </p>
+<p>Even the Intel LOCK prefix is unprivileged, but you need help from your compiler to generate it, you can use it only with specific instructions and you can&#39;t extend the lock to an instruction sequence e.g. relinking a linked list, which requires several instructions. And it complicates instruction decoding by making the instruction format even more complex in structure.</p>
+<p>In principle, SOLO-TUTTI could be abused by &quot;terrorists&quot; creting a loop of a SOLO instruction, do dummy work for 230-240 cycles, before a TUTTI. Then then could keep interrupts disabled for a significant fraction of their time slice. However, the SOLO would allow handling of all interrupts arriving during this loop iteration, before the next loop iteration, so the effect would probably be far less than expected by the students trying to show their cleverness. (Who else would care to do antyning of that sort?)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1077723">
+				<div id="div-comment-1077723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077723">
+			September 13, 2013 at 11:34 am</a>		</div>
+
+		<p>The IA32 implements interlocked operations for multiple nodes/CPU, using the cache coherency protocol. The data being modified is in the local cache only. The cache coherency protocol makes sure no other processor contains a copy of the stale cache line.</p>
+<p>This makes interlocked operations no more expensive than a simple non-interlocked load-store-modify operation. There is a bit of cost, though, because interlocked operations are serializing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077743">
+				<div id="div-comment-1077743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077743">
+			September 13, 2013 at 12:42 pm</a>		</div>
+
+		<p>InterlockedIncrement on x86-32 is lock xadd, then inc to give the caller the result it expects.</p>
+<p>Somewhat relevant: On x88-32, InterlockedIncrement64 is implemented using a loop that reads the variable into two registers, increments the 64-bit value, then attempts to do a lock cmpxchg8b (i.e., InterlockedCompareExchange64) to write the new value if the old value has not changed since it was read. &nbsp;If the cmpxchg8b fails, it retries the loop. &nbsp;This works because livelock is essentially impossible (probability tends toward zero) in modern environments. &nbsp;The ABA problem is there, but is irrelevant because you&#39;re merely incrementing an integer. &nbsp;You generally aren&#39;t going to mess up if another thread manages to wrap the counter between you reading the value and writing the incremented version (and with a 64-bit counter, good luck with that anyway).</p>
+<p>Intel has new processors coming (or out?) with transactional memory features that look a lot like load-linked/store-conditional but for multiple memory locations. &nbsp;It&#39;s hard to say what&#39;s going to happen with that. &nbsp;It&#39;s certainly not going to be widely used any time soon.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1077753">
+				<div id="div-comment-1077753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077753">
+			September 13, 2013 at 1:04 pm</a>		</div>
+
+		<p>@Axel: Yes, strict memory ordering is nice, but it is really only an x86 thing these days. &nbsp;I&#39;d much rather have my code able to run on many different systems.</p>
+<p>@j b: &quot;TUTTI&quot;? &nbsp;That&#39;s just as bad as PowerPC&#39;s &quot;EIEIO&quot; instruction =^_^=</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077783">
+				<div id="div-comment-1077783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077783">
+			September 13, 2013 at 1:48 pm</a>		</div>
+
+		<p>Wow, this article is particularly relevant to me today, as we are reviewing customer code that is misusing InterlockedIncrement on an ARM Windows CE platform.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1077793">
+				<div id="div-comment-1077793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077793">
+			September 13, 2013 at 1:53 pm</a>		</div>
+
+		<p>@Myria:</p>
+<p>I don&#39;t see ABA problem in that implementation of II64. Where it is?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077803">
+				<div id="div-comment-1077803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">j b</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077803">
+			September 14, 2013 at 9:40 am</a>		</div>
+
+		<p>@Myria, </p>
+<p>You never played in an orchestra, I presume.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1077813">
+				<div id="div-comment-1077813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077813">
+			September 14, 2013 at 11:42 am</a>		</div>
+
+		<p>&gt;Then then could keep interrupts disabled for a significant fraction of their time slice.</p>
+<p>I suppose TUTTI will handle all pending interrupt requests, so the only effect will be 240 clocks of interrupt latency (and timeslice occasionally extended by up to 240 clocks).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1077823">
+				<div id="div-comment-1077823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077823">
+			September 15, 2013 at 7:47 am</a>		</div>
+
+		<p>@Myria On Win95 it is LOCK INC and not XADD, this is also why the COM rules for the AddRef/Release return value are the way they are&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1077833">
+				<div id="div-comment-1077833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">j b</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077833">
+			September 15, 2013 at 9:04 am</a>		</div>
+
+		<p>@alegr,</p>
+<p>I meant to write exactly what you point out, but wrote SOLO instead of TUTTI, which messed the thing up. Sorry. Your are right; the only &quot;damage&quot; would be as you say. But when this machine came out, me and my fellow students were hoping for much more&#8230;</p>
+<p>One point that came to mind: Each CPU had a private cache and usually private RAM. &quot;Multiport&quot; RAM could also be shared between several CPUs, managed by dedicated arbiting hardware. I take for granted that during a SOLO-TUTTI sequence, an access to the shared memory would lock it for access through other ports until TUTTI; that could actually slow down other CPUs competing for access to the same shared memory. I never heard this being raised as an issue, so programmers probably avoided it by not accessing the shared RAM in SOLO-TUTTI sequnces. (I think all customers running mulitport RAM modules were highly specialized single-application environments with expert programners who knew what they were doing :-).)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077843">
+				<div id="div-comment-1077843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/arcangelpip_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>arcangelpip@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077843">
+			September 15, 2013 at 3:24 pm</a>		</div>
+
+		<p>@skSdnW:</p>
+<p>Because as we both know, XADD was added with the 486, COM predates that, and Windows 95 could run on a 386.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1077873">
+				<div id="div-comment-1077873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077873">
+			September 16, 2013 at 4:37 am</a>		</div>
+
+		<p>@Axel If you care about the underlying platform memory model you&#39;re most likely doing it wrong anyhow. Most modern languages have their own memory model by now that dictates what you can and can&#39;t expect. By the same definition no, Dekker&#39;s algorithm is not broken the author of the linked article just doesn&#39;t understand what volatile does and does not do in C/C++. If your language tells you that volatile reads/writes also have a uni-directional memory barrier the algorithm will work just fine. C++ doesn&#39;t, Java5+ and .NET do.</p>
+<p>Really the only people that have to care about memory models these days are compiler writer and now let me go back to reading the Aarch64 specification, because some people actually have to write those backends for the rest ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077953">
+				<div id="div-comment-1077953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077953">
+			September 16, 2013 at 11:14 am</a>		</div>
+
+		<p>I always thought that the silicon itself could be engineered to be able to increment a value at a storage location. &nbsp;But I suppose that involves actually changing some bits in memory (RAM) with the appropriate semantics (carries, etc). &nbsp;Is it true that the only things that RAM chips can do is allow read and write?</p>
+<p>Still, if this could be implemented directly in RAM hardware, wouldn&#39;t that be useful?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman even thread-even depth-1" id="comment-1077973">
+				<div id="div-comment-1077973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077973">
+			September 16, 2013 at 12:02 pm</a>		</div>
+
+		<p>@DWalker: If you mean the actual RAM attached to the processor (whether internal RAM, external RAM) and not processor registers, then No, the RAM cannot do anything but store and retrieve the bit value.</p>
+<p>Now, theoretically, could a memory chip be designed to increment and decrement a value in place? Sort of. The chip could internally do a read/modify/write without exposing the value on the bus to run it through some add/subtract block. But there are a couple of issues:</p>
+<p>&nbsp;1) how do you instruct the memory to do this? There would need to be some standard that specified how to make this work. That might be ok for DRAM-based memory systems such as DDRx but is practically impossible if your memory is SRAM (as some embedded systems use)</p>
+<p>&nbsp;2) how does the memory know the correct width of the element you want to increment?</p>
+<p>I am sure there are more issues that I am too lazy to think of at the moment.</p>
+<div class="post">[<em>The biggest issue is that the increment doesn&#39;t happen in RAM. It happens on the CPU itself inside the L1 cache. So make your RAM as fancy as you like. It doesn&#39;t matter. The value will be incremented inside the CPU&#39;s L1, and then it will get flushed out some unspecified time later. I guess you could design a CPU that, when it sees an increment instruction, flushes out the cache line, instructs other CPUs to flush out the cache line, then issues the &quot;increment directly in RAM&quot; instruction. But I think it&#39;ll be much slower than what they do now. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077983">
+				<div id="div-comment-1077983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1077983">
+			September 16, 2013 at 12:22 pm</a>		</div>
+
+		<p>@Brian: Right, I realize that the RAM would have to know the expected width of the element, and there would need to be a new RAM or memory bus &quot;instruction&quot; defined in addition to &quot;read&quot; and &quot;write&quot;, and so on. &nbsp;The increment (or decrement) instruction would have to specify the width.</p>
+<p>I was just speculating that it might be an interesting thing to do.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1078013">
+				<div id="div-comment-1078013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1078013">
+			September 16, 2013 at 1:06 pm</a>		</div>
+
+		<p>@Raymond. &nbsp;Yes, there&#39;s that too. &nbsp;:-) &nbsp;Oh, the good old days of uniprocessors with no shared memory.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1078023">
+				<div id="div-comment-1078023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1078023">
+			September 16, 2013 at 3:06 pm</a>		</div>
+
+		<p>Of course, the compare-exchange is also comparing what&#39;s in the CPU&#39;s L1 cache with &#8230; what&#39;s in every other CPU&#39;s L1 cache? &nbsp;Isn&#39;t a flush or a memory barrier required anyway, for a compare-and-swap (or for any compare with memory)?</p>
+<div class="post">[<em>A cache invalidation occurs on all CPUs other than the one performing the operation. How this is accomplished varies from processor to processor. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1078033">
+				<div id="div-comment-1078033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1078033">
+			September 16, 2013 at 4:34 pm</a>		</div>
+
+		<p>@Dwalker:</p>
+<p>&gt;Of course, the compare-exchange is also comparing what&#39;s in the CPU&#39;s L1 cache with &#8230; what&#39;s in every other CPU&#39;s L1 cache?</p>
+<p>As I mentioned above, interlocked operations in IA32 processors are based on the cache coherency protocol. The cache coherency protocol guarantees that for a dirty cache line, there is no other copy in other nodes. The processor only needs to read and modify its local cache line atomically.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1078283">
+				<div id="div-comment-1078283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1078283">
+			September 18, 2013 at 10:26 am</a>		</div>
+
+		<p>&gt;but &#8230; couldn&#39;t the CPU doing an &quot;Atomic increment&quot; use the cache coherency protocol to make sure that there is no other copy in other nodes, and then increment the value in its own cache?</p>
+<p>This is exactly what happens. If the cache line is marked as &quot;shared&quot;, any modification on it will cause invalidation.</p>
+<p>Flushing it to RAM every time would be slow. Because RAM is slow.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1078263">
+				<div id="div-comment-1078263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130913-00/?p=3243#comment-1078263">
+			September 18, 2013 at 7:54 am</a>		</div>
+
+		<p>@Alegr1: I am not a chip engineer, but &#8230; couldn&#39;t the CPU doing an &quot;Atomic increment&quot; use the cache coherency protocol to make sure that there is no other copy in other nodes, and then increment the value in its own cache? &nbsp;Then, when that cache line gets flushed to RAM, the value will be incremented. &nbsp;</p>
+<p>Raymond said that would likely be slower than what&#39;s done now, but I don&#39;t see how. &nbsp;Does the Compare-exchange function actually compare a register with what&#39;s in its own cache line, rather than what&#39;s actually in RAM?</p>
+<div class="post">[<em>No, what I said would probably be slower is for *all* CPUs to invalidate their cache lines (even the one doing the incrementing) so that the RAM could do a hardware increment. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

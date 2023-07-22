@@ -1,0 +1,326 @@
+<html>
+<head>
+<title>Investigating an app compat problem: Part 2: Digging in</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Investigating an app compat problem: Part 2: Digging in</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 9, 2016 / year-entry #121</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160609-00/?p=93635</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Understanding the scenario a little more.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+We left our story with the conclusion that the program crashed because
+its TLS slot was null.
+But how can we figure out who sets the TLS slot
+and why it failed to set the TLS slot?
+</p>
+<p>
+Let's hope that the reason is close to the failure
+(because debugging is an exercise in optimism)
+and see if we can find the code that is supposed to set the TLS value
+and figure out why it failed.
+</p>
+<p>
+This is where we roll up our sleeves and get our hands dirty.
+</p>
+<p>
+Here is the function that crashed.
+Let's do some reverse-compilation.
+My personal convention is as follows:
+</p>
+<ul>
+<li>
+Register-sized variables are left untyped until I figure
+out what type it really is.
+If I must specify a type for a variable declaration,
+I use <code>int</code> or <code>void*</code>.
+(If the type turns out really to be an <code>int</code>,
+I use <code>int32_t</code>.)
+</li>
+<li>Local variables are named
+<code>localXX</code> where <code>XX</code> is the offset of the variable
+relative to the frame pointer.</li>
+<li>Member variables are named <code>m_XX</code> where <code>XX</code> is the offset
+of the member relative to the start of the object.</li>
+<li>Functions are named <code>f_XXXXXXXX</code> where <code>XXXXXXXX</code> is the address of the
+first instruction.</li>
+</ul>
+<pre>
+contoso!ContosoInitialize+0x4d40:
+314259a0 push    ebp
+314259a1 mov     ebp, esp
+314259a3 sub     esp, 10h                   // 16 bytes of local variables
+314259a6 mov     dword ptr [ebp-10h], ecx   // local10 = this
+314259a9 mov     eax, dword ptr [ebp+8]     // arg1
+314259ac mov     dword ptr [ebp-8], eax     // local8 = arg1
+314259af lea     ecx, [ebp-0Ch]             // &amp;localc
+314259b2 push    ecx
+314259b3 lea     edx, [ebp-4]               // &amp;local4
+314259b6 push    edx
+314259b7 mov     eax, dword ptr [ebp-8]     // local8
+314259ba push    eax
+314259bb call    contoso!ContosoInitialize+0x4db0 (31425a10)
+314259c0 add     esp, 0Ch
+314259c3 mov     edx, 1
+314259c8 mov     ecx, dword ptr [ebp-0Ch]   // localc
+314259cb shl     edx, cl                    // 1 &lt;&lt; localc
+314259cd mov     eax, dword ptr [ebp-4]     // local4
+314259d0 mov     ecx, dword ptr [ebp-10h]   // this
+314259d3 mov     eax, dword ptr [ecx+eax*4] // this->m_0[local4]
+314259d6 and     eax, edx                   // this->m_0[local4] &amp; (1 &lt;&lt; localc)
+314259d8 test    eax, eax
+314259da je      contoso!ContosoInitialize+0x4d83 (314259e3) // jump if bit was clear
+314259dc mov     eax, 1                     // return 1
+314259e1 jmp     contoso!ContosoInitialize+0x4da3 (31425a03)
+314259e3 mov     edx, 1
+314259e8 mov     ecx, dword ptr [ebp-0Ch]   // localc
+314259eb shl     edx, cl                    // 1 &lt;&lt; localc
+314259ed mov     eax, dword ptr [ebp-4]     // local4
+314259f0 mov     ecx, dword ptr [ebp-10h]   // this
+314259f3 mov     eax, dword ptr [ecx+eax*4] // this->m_0[local4]
+314259f6 or      eax, edx                   // this->m_0[local4] | (1 &lt;&lt; localc)
+314259f8 mov     ecx, dword ptr [ebp-4]     // local4
+314259fb mov     edx, dword ptr [ebp-10h]   // this
+314259fe mov     dword ptr [edx+ecx*4], eax // this->m_0[local4] = this->m_0[local4] | (1 &lt;&lt; localc)
+31425a01 xor     eax, eax                   // return 0
+31425a03 mov     esp, ebp
+31425a05 pop     ebp
+31425a06 ret     4
+0:000></pre>
+<p>
+The lack of common subexpression elimination and the frequent
+spilling and reloading of registers tells me that this code was compiled
+with optimizations disabled.
+Bad for performance, but it makes reverse-engineering so much easier.
+We end up with this, after renaming some variables and propagating stores.
+</p>
+<pre>
+BOOL Class1::f_314259a0(int arg1)
+{
+    int elementIndex;
+    int relativeBitIndex;
+    f_31425a10(arg1, &amp;elementIndex, &amp;relativeBitIndex);
+    if (this->m_0[elementIndex] &amp; (1 &lt;&lt; relativeBitIndex))
+    {
+        return TRUE;
+    }
+    else
+    {
+        this->m_0[elementIndex] =
+        this->m_0[elementIndex] | (1 &lt;&lt; relativeBitIndex);
+        return FALSE;
+    }    
+}
+</pre>
+<p>
+This function calculates a bit in a buffer,
+and if the bit is not set, it sets the bit.
+The function then returns the previous state of the bit.
+Let's look at the function that calculates which bit to set.
+</p>
+<pre>
+contoso!ContosoInitialize+0x4db0:
+31425a10 push    ebp
+31425a11 mov     ebp,esp
+31425a13 mov     eax,dword ptr [ebp+8]      // arg1
+31425a16 shr     eax,5                      // arg1 / 32 (unsigned)
+31425a19 mov     ecx,dword ptr [ebp+0Ch]    // arg3
+31425a1c mov     dword ptr [ecx],eax        // *arg3 = arg1 / 32
+31425a1e mov     eax,dword ptr [ebp+8]      // arg1
+31425a21 xor     edx,edx                    // zero-extend to 64 bits
+31425a23 mov     ecx,20h
+31425a28 div     eax,ecx                    // arg1 / 32
+31425a2a mov     eax,dword ptr [ebp+10h]    // arg2
+31425a2d mov     dword ptr [eax],edx        // *arg2 = arg1 / 32
+31425a2f pop     ebp
+31425a30 ret
+</pre>
+<p>
+Okay, so the bit index is nothing fancy.
+The buffer at <code>m_0</code> is treated
+as a giant bit array, and this function figures out
+which element holds that bit and where that bit is.
+We also learned that the incoming and outgoing parameters are
+unsigned 32-bit integers
+because the arithmetic operations are consistent with
+unsigned operations rather than signed.
+We don't know how big the bit array is, but at least
+we can give the function a nicer name.
+</p>
+<p>
+We can capture what we've learned as follows:
+</p>
+<pre>
+class SomeBitArrayClass1
+{
+public:
+    BOOL SetBit(uint32_t bitIndex);
+
+private:
+    static void CalcBitPosition(
+        uint32_t bitIndex,
+        uint32_t* elementIndex,
+        uint32_t* relativeBitIndex);
+
+    uint32_t buffer[unknown_size];
+};
+
+BOOL SomeBitArrayClass1::SetBit(uint32_t bitIndex)
+{
+    uint32_t elementIndex;
+    uint32_t relativeBitIndex;
+    CalcBitPosition(bitIndex, &amp;elementIndex, &amp;relativeBitIndex);
+    if (this->buffer[elementIndex] &amp; (1 &lt;&lt; relativeBitIndex))
+    {
+        return TRUE;
+    }
+    else
+    {
+        this->buffer[elementIndex] =
+        this->buffer[elementIndex] | (1 &lt;&lt; relativeBitIndex);
+        return FALSE;
+    }    
+}
+</pre>
+<p>
+Sure, the code that sets the bit could have been written as
+</p>
+<pre>
+this->buffer[elementIndex] |= (1 &lt;&lt; relativeBitIndex);
+</pre>
+<p>
+but I'm just repeating the code that was written, and what they
+wrote calculates the indexed element address twice.
+</p>
+<p>
+We're off to a good start, but we haven't really learned much yet.
+Much more interesting is the function that produced the null pointer
+that caused us to crash.
+</p>
+<p>
+We'll pick that up next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-raykoopa even thread-even depth-1" id="comment-1252005">
+				<div id="div-comment-1252005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ray+Koopa' rel='external nofollow' class='url'>Ray Koopa</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160609-00/?p=93635#comment-1252005">
+			June 9, 2016 at 7:38 am</a>		</div>
+
+		<p>It&#8217;s quite nice to see professionals writing C code out of assembly. I&#8217;m too lazy for that, nor good enough&#8230; To me, Raymond is a living and better IDA decompiler!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1252035">
+				<div id="div-comment-1252035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wear</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160609-00/?p=93635#comment-1252035">
+			June 9, 2016 at 9:01 am</a>		</div>
+
+		<p>I&#8217;m confused by the assembly for CalcBitPosition.  Half way though there&#8217;s a &#8220;xor edx,edx&#8221; instruction which I believe clears edx. Then edx doesn&#8217;t come up against until the end where there&#8217;s a &#8220;mov dword ptr [eax],edx&#8221; so wouldn&#8217;t that set *arg2 = 0?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1252045">
+				<div id="div-comment-1252045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160609-00/?p=93635#comment-1252045">
+			June 9, 2016 at 9:26 am</a>		</div>
+
+		<p>The division opcode takes a wide dividend in edx:eax and a normal-width divisor in whichever register is mentioned as the operand (ecx in this case). It then calculates the quotient and the remainder and puts them in eax and edx respectively.</p>
+<p>An optimizing compiler will notice that you are using both a / b and a % b and will generate a single division instruction for both. Here, though, the code calculates n &gt;&gt; 5 separately, discards the quotient from the division opcode, and uses n % 32 from edx.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1252055">
+				<div id="div-comment-1252055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160609-00/?p=93635#comment-1252055">
+			June 9, 2016 at 9:43 am</a>		</div>
+
+		<p>My decompilation techniques are very similar. In the more hairy cases, it also helps to track which registers currently the result of which expression.</p>
+<p>I also annotate control structures. E.g. if I see a fragment compute some condition, then jump over a section of code if zero, I write “if (condition) {” at the jump site, and “}” at the jump target. (If the section that is jumped over ends in an unconditional jump, it becomes an “} else {” with a “}” at the target of that jump.)</p>
+<p>Knowing the ABI (and having *an* ABI) helps. Sometimes one gets to decompile code written for an architecture that does not have a Base Pointer register, or has unstated assumptions on which registers are preserved across a subroutine call, or passes arguments via whichever registers are available, or via global variables. In those cases, there’s much more to track and cross-reference.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,431 @@
+<html>
+<head>
+<title>If I issue a second overlapped I/O operation without waiting for the first one to complete, are they still guaranteed to complete in order?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>If I issue a second overlapped I/O operation without waiting for the first one to complete, are they still guaranteed to complete in order?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 5, 2016 / year-entry #27</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Of course not. That's why it's called "overlapped."</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had a question about the order in which overlapped I/O
+will complete.
+</p>
+<pre>
+WriteFile(hFile, buffer1, buffer1Length, ..., &amp;overlapped1);
+WriteFile(hFile, buffer2, buffer2Length, ..., &amp;overlapped2);
+</pre>
+<p>
+Assume that the <code>hFile</code> handle is opened as
+<code>FILE_FLAG_OVERLAPPED</code>.
+Is it guaranteed that <code>buffer1</code> will be written to the
+file before <code>buffer2</code>?
+</p>
+<p>
+The file system team replied that there is no such guarantee.
+That defeats the point of opening the file as
+<code>FILE_FLAG_OVERLAPPED</code>.
+</p>
+<p>
+The point of overlapped operations is that you can have multiple
+operations in flight,
+and they will be performed
+in whatever order the I/O subsystem chooses.
+The second write may be performed before the first if the I/O subsystem
+thinks that would be faster.
+For example, maybe the second write can be coalesced with another
+write to the same sector.
+Or the disk head happens to be positioned such that seeking to
+the first buffer position causes it to pass the second buffer position,
+so the drive figures, "Well, while I'm here, I may as well write
+out this data, so I don't have to seek back later."
+</p>
+<p>
+The customer clarified.
+"Our application uses overlapped I/O for performance purposes.
+Our actual scenario is more complicated than what we wrote,
+but the basic idea is that we are receiving data and writing
+it to a file.
+We require that the data be written to the file in the order issued.
+Do we have to wait for the first I/O to complete before we issue
+the second one?"
+</p>
+<p>
+Yes.
+If the order in which the operations are performed is important,
+then you need to serialize them yourself.
+But assuming that the two writes are to non-overlapping ranges
+in the file,
+why do you care what order they are performed?
+At the end of the day, <code>buffer1</code>
+will be written to the location
+specified by
+<code>overlapped1</code>,
+and <code>buffer2</code>
+will be written to the location
+specified by
+<code>overlapped2</code>.
+</p>
+<p>
+The customer explained some more:
+"In both calls to <code>Write&shy;File</code>, the offset is
+set to <code>0xFFFFFFFF`FFFFFFFF</code>, which means that the
+writes append to the file.
+Does this change the answer?"
+</p>
+<p>
+Sort of, but not in a good way.
+The two I/O operations race into the I/O subsystem,
+and there's no guarantee that the first one will reach the I/O
+subsystem first.
+That part hasn't changed.
+On the other hand, since both operations are writing to the end
+of the file,
+the operations will be serialized once they reach the file system,
+so you are getting the worst of both worlds:
+Not only are the results unpredictable,
+you lose parallelism.
+</p>
+<p>
+Note also that the completion callbacks may be called in an order
+different from the order in which the operations actually completed.
+In other words, it's possible that operation 1 completes before
+operation 2,
+but your completion callback for the second operation is called
+before the completion callback for the first operation.
+There is no serialization of completion callbacks.
+They race out of the I/O subsystem the same way that they race in!
+</p>
+<p>
+Curiously,
+the customer says that they are using overlapped operations for
+performance,
+but then they end up not wanting all the benefits that overlapped
+operations offer in the first place, namely letting the I/O subsystem
+reorder operations to improve performance.
+It's possible that they read somewhere that overlapped operations
+offer higher performance, but didn't understand what that meant.
+"We pass this flag because the flag means GO FASTER."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1226002">
+				<div id="div-comment-1226002" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226002">
+			February 5, 2016 at 7:38 am</a>		</div>
+
+		<p>If they insist on using async I/O they should switch from the -1 offset trick to just storing the offset themselves and use InterlockedCompareExchange to grab free blocks in the file. I bet that they don&#8217;t actually log that much data that fast and could just write it out synchronously on a background thread or something like that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1226011">
+				<div id="div-comment-1226011" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vilx-</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226011">
+			February 5, 2016 at 7:39 am</a>		</div>
+
+		<p>Perhaps the performance gains they are hoping for aren&#8217;t from executing two IO requests in parallel, but rather having an IO request execute in parallel to their own code.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1226121">
+				<div id="div-comment-1226121" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226121">
+			February 6, 2016 at 5:42 am</a>		</div>
+
+		<p>That&#8217;s a sign that they&#8217;ve misunderstood the programming model &#8211; I/O requests go to/from cache that&#8217;s flushed out in the background, not directly to/from the device. Writes should only block if you&#8217;re issuing enough of them that you&#8217;re overwhelming the device that you&#8217;re writing to &#8211; in which case, you need a more sophisticated I/O strategy anyway.</p>
+<p>Overlapped I/O is useful when you can issue multiple independent requests, and don&#8217;t care about ordering &#8211; you might as well pass on the information about requests to a lower level, and let it care if it&#8217;s got reason to care about ordering.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip odd alt thread-even depth-1" id="comment-1226022">
+				<div id="div-comment-1226022" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226022">
+			February 5, 2016 at 9:56 am</a>		</div>
+
+		<p>The only time I ever used -1 in an OVERLAPPED structure was when I wanted to write to a file, but not rely on the current file pointer, (note, the file wasn&#8217;t even opened with FILE_FLAG_OVERLAPPED). But to this day, I still feel that if I had more time, I would have come up with a better solution.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1226062">
+				<div id="div-comment-1226062" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nico</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226062">
+			February 5, 2016 at 12:53 pm</a>		</div>
+
+		<p>I laughed out loud at the snippet for this entry on the index page: &#8220;Of course not. That’s why it’s called &#8220;overlapped.&#8221;&#8221;   That pretty much sums it up! :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-even depth-1 parent" id="comment-1226091">
+				<div id="div-comment-1226091" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226091">
+			February 5, 2016 at 3:01 pm</a>		</div>
+
+		<p>A WriteFile that extends the file written length is synchronous anyway and serialized against another such operation. It&#8217;s completely pointless to use OVERLAPPED I/O. Moreover, if the file is cached, WriteFile is synchronous in most cases anyway.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong even depth-2" id="comment-1226251">
+				<div id="div-comment-1226251" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226251">
+			February 8, 2016 at 8:02 am</a>		</div>
+
+		<p>Agreed. If the writes are not that big, just write them all to buffer and let the SATA controller do the reordering.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1226101">
+				<div id="div-comment-1226101" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226101">
+			February 5, 2016 at 3:50 pm</a>		</div>
+
+		<p>Has there been any discussion of the IO system exposing an API similar to a CPU&#8217;s memory barriers (or cache coherence protocol in general)? And by barriers I mean control over the order the device commits it to permanent storage (as opposed to an intermediate a ram buffer).</p>
+<p>Fsync is often too much and you have devices pretending to fsync to gain speed at the expense of correctness but something that controls the order of reads or writes is often adequate enough and probably wont encourage device vendors to play such stupid tricks.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1226122">
+				<div id="div-comment-1226122" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226122">
+			February 6, 2016 at 5:57 am</a>		</div>
+
+		<p>Barriers don&#8217;t really exist at this level. Taking SCSI (which I know more about), each command gets a tag (which can be up to 64 bits in size, depending on the implementation &#8211; parallel SCSI was 8 bits), and you&#8217;ve got three relevant command groups:</p>
+<p> * Normal reads and writes; these just transfer data, and have no special behaviour. It&#8217;s legal for such a command to complete when it has put data in the cache.<br />
+ * Cache flushes; these ensure that the cache and the disk are in sync.<br />
+ * Forced Unit Access writes; these commands are special because they cannot complete until the data is on the disk.</p>
+<p>You then have two relevant queueing modes:</p>
+<p> * Normal command queueing &#8211; device is free to reorder, as long as it eventually executes the command.<br />
+ * Ordered command queueing &#8211; all commands queued before an ordered command must complete before it does, all commands queued after an ordered command must wait for the ordered command to complete.</p>
+<p>Within the rules provided by SCSI, a drive can do as it sees fit; so, for example, if I send 100 normal writes, then a single ordered write, then 100 normal reads, I can guarantee that the reads will see the data as written by the preceding 101 writes, but the data may not be on disk. If I send 100 FUA writes, then a single ordered FUA write, then 100 reads, I can guarantee that all 101 writes are on disk before any of the reads start. If I send 100 normal writes, an ordered cache flush, 100 normal reads, then one FUA write, I can guarantee that the writes before the flush are on disk before the reads, and that the FUA write either never completes, or hits disk.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1226132">
+				<div id="div-comment-1226132" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226132">
+			February 6, 2016 at 7:24 am</a>		</div>
+
+		<p>Of course, this doesn&#8217;t help with cheating &#8211; FUA costs time, as does cache flushing, and it&#8217;s cheaper to NOP cache flushes and turn FUAs into normal accesses than it is to do the right thing, and vendors will try and get away with as much as they can.</p>
+<p>At least one vendor (no longer extant) has had their SCSI HDDs treat FUA as &#8220;complete command when in cache, schedule cache write back to take place immediately&#8221;. If you had power loss shortly after the FUA completed, the drive didn&#8217;t write to disk, and the &#8220;safe&#8221; data was lost; the correct implementation would be to move the &#8220;complete command&#8221; action until after the cache write back completed, but the vendor didn&#8217;t want to do that because their implementation had no way for them to wait for a part of the cache to be written back.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1226162">
+				<div id="div-comment-1226162" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://killprog.com' rel='external nofollow' class='url'>Killer{R}</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226162">
+			February 7, 2016 at 5:29 am</a>		</div>
+
+		<p>What you&#8217;re telling contradicts to what MSDN tells for overlapped sockets:<br />
+&#8220;wand the send functions can be invoked several times to queue multiple buffers to send. While the application can rely upon a series of overlapped send buffers being sent in the order supplied, the corresponding completion indications might occur in a different order&#8221;<br />
+&#8230; and though sockets are not filesystem, but stream sockets mostly use same IO subsystem. So actual IO operations appears in same order as requested, but completion routine can be called in any order. Thats sounds logical..</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip odd alt depth-2" id="comment-1226172">
+				<div id="div-comment-1226172" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226172">
+			February 7, 2016 at 4:42 pm</a>		</div>
+
+		<p>Still, you can&#8217;t infer what should happen with disk i/o based on the documentation for socket i/o.<br />
+In fact, the lack of documentation on what happens for disk files itself is important, because it means that it is undefined. So yes, the documentation does allow for reordered operations if it wants.<br />
+One final thing to remember is that that just because sockets and files have handles that can be used by WriteFile, the objects backing them can be vastly different, and they will eventually get serviced by totally different drivers, each having different capabilities and requirements.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip even depth-2 parent" id="comment-1226182">
+				<div id="div-comment-1226182" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226182">
+			February 7, 2016 at 5:19 pm</a>		</div>
+
+		<p>As a bit of an addendum, the closest I have even gotten to documentation on this is in the WDK. On the page <a href="https://msdn.microsoft.com/en-us/library/windows/hardware/ff565534(v=vs.85)" rel="nofollow">https://msdn.microsoft.com/en-us/library/windows/hardware/ff565534(v=vs.85)</a>.aspx there is the statement:<br />
+&#8220;By default, the I/O manager does not maintain a current file-position pointer. This default provides efficiency—because correctly maintaining the current file position requires the I/O manager to synchronize every read and write operation on the file object.&#8221;<br />
+This pretty much says that the synchronization and ordering is only guaranteed when the file pointer is being maintained (synchronous i/o). For asynchronous i/o, it isn&#8217;t even documented properly in the WDK whether it will even synchronize the operation.<br />
+So the only thing we can get from this is that there is inferred documentation that the disk i/o is documented as undocumented. This is specific to file access too.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1226191">
+				<div id="div-comment-1226191" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://killprog.com' rel='external nofollow' class='url'>Killer{R}</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226191">
+			February 8, 2016 at 12:29 am</a>		</div>
+
+		<p>Notes about file pointer and lock are also sounds logical from common sense point of view.. OK lets consider question from other side. Let think I&#8217;m implementing some disk driver, that does its job by responding on SCSI commands, like SCSIOP_READ/SCSIOP_READ16/SCSIOP_WRITE/SCSIOP_WRITE16. So question from the other side sounds so: should my SCSI driver do actual IO in same order as requested by kernel or it doesn&#8217;t matter and kernel surely cared about that before sending that requests to me?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1226192">
+				<div id="div-comment-1226192" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://killprog.com' rel='external nofollow' class='url'>Killer{R}</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226192">
+			February 8, 2016 at 12:36 am</a>		</div>
+
+		<p>And considering answer is &#8216;you may execute requests in any order&#8217; &#8211; why in this case are there so special parameters to handle IO requests queueing  (if device support it) in SCSI_REQUEST_BLOCK?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip odd alt depth-5" id="comment-1226282">
+				<div id="div-comment-1226282" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226282">
+			February 8, 2016 at 1:20 pm</a>		</div>
+
+		<p>For me at least, the most logical and common sense answer would be to offload the synchronization onto hardware, otherwise the kernel would have to do this by using some kind of synchronization object in software. So it is for efficiency gains in dealing with synchronous access.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1226363">
+				<div id="div-comment-1226363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Chilvers</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160205-00/?p=92981#comment-1226363">
+			February 9, 2016 at 6:11 am</a>		</div>
+
+		<p>Though there could be 2 meanings to performance here, either faster I/O or non-blocking asynchronous operations on the GUI. I could see a case for wanting single threaded asynchronous writes if the writes are being issued from a GUI thread. If that&#8217;s the case I guess they were hoping the kernel was providing some sort of FIFO queue for a simple producer/consumer scenario.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

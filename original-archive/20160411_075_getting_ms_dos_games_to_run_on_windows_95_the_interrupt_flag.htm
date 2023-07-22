@@ -1,0 +1,636 @@
+<html>
+<head>
+<title>Getting MS-DOS games to run on Windows 95: The interrupt flag</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Getting MS-DOS games to run on Windows 95: The interrupt flag</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 11, 2016 / year-entry #76</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>28</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Incomplete virtualization strikes again.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+In the flags register of the 80386 processor is a flag
+called the interrupt flag.
+If the flag is set, then the CPU will respond to hardware
+interrupts.
+If the flag is clear, then the CPU will ignore hardware
+interrupts.
+It was common for a game that used an MS-DOS extender
+to disable interrupts
+temporarily by doing this:
+</p>
+<pre>
+    pushf   ; save flags (including whether interrupts are enabled)
+    cli     ; disable interrupts
+    ..do something..
+    popf    ; restore original flags
+            ; (this re-enables interrupts if interrupts were previously enabled)
+</pre>
+<p>
+There were other variations of this pattern,
+but most of them boiled down to the same basic idea.
+</p>
+<p>
+One of the quirks of the 80386 architecture is that
+if the application does not have I/O privilege,
+the <code>popf</code> instruction
+does not restore the interrupt flag.
+Furthermore, the instruction doesn't trap,
+so the operating system doesn't know that the
+application tried and failed to change the interrupt flag.
+<a HREF="https://en.wikipedia.org/wiki/Interrupt_flag#Old_DOS_programs">
+It just silently fails</a>.
+This means that the above code fragment behaves differently
+depending on whether the application has I/O privilege.
+If it has I/O privilege, then the <code>popf</code> will
+restore interrupts to their previous state.
+But if it doesn't, then
+the <code>popf</code> instruction has no effect on the interrupt flag,
+and interrupts remain disabled.
+</p>
+<p>
+MS-DOS extenders typically granted the client I/O privilege
+because they were designed to run in a single-tasking environment,
+so the client was allowed full control of the system.
+Windows, on the other hand, did not grant the client I/O privilege
+because it had to worry about multitasking.
+This means that in Windows, programs that used the above technique
+would hang because they disabled interrupts and never re-enabled them.
+</p>
+<p>
+The DPMI specification specifically calls out this
+coding pattern as problematic
+and provides special services for
+managing the interrupt flag so that a client application
+can manipulate its interrupt flag in a way that the
+DPMI server understands.
+In practice, however, client applications were written on
+the assumption that they were running under the MS-DOS
+extender that they were packaged with,
+and they took shortcuts and just used
+the <code>popf</code> instruction
+because they knew that
+it would work.
+It never occurred to them that their preferred
+DPMI extender would not actually be the one in charge.
+</p>
+<p>
+Except, of course, that it didn't work when the DPMI
+server was Windows.
+</p>
+<p>
+One of my colleagues came up with a clever solution that
+addressed many cases of this
+problem.
+Since the <code>cli</code> instruction is privileged,
+it will trap.
+The trap handler for the <code>cli</code> instruction inspects
+the code preceding the <code>cli</code> instruction to see
+if it matches the pattern above or one of the common variations.
+If so, and the value on the top of the stack matches the virtual
+machine's current flags,
+then it assumes that the instruction that most recently executed
+was in fact the <code>pushf</code>.
+In that case,
+it copies the pushed interrupt flag to the pushed
+<i>trap</i> flag.
+In other words, if interrupts were previously enabled,
+then set the trap flag in the pushed flags.
+</p>
+<p>
+In the 80386 architecture, the trap flag causes the processor
+to raise a trap exception
+after one instruction is executed.
+Its intended purpose is to allow debuggers to single-step
+through assembly code.
+The trick is to repurpose the flag:
+When the <code>popf</code> occurrs,
+the processor doesn't pop the interrupt flag,
+but it does pop the trap flag.
+After one instruction, the trap interrupt fires,
+and the kernel regains control.
+It recognizes
+that this trap interrupt is being used
+to regain
+control when somebody does a <code>popf</code> instruction
+in a failed attempt to re-enable interrupts.
+The kernel would then re-enable interrupts.
+</p>
+<p>
+Result: As far as the application is concerned,
+the <code>popf</code> instruction successfully
+restored the interrupt flag
+despite all the warnings that said it wouldn't work.
+It was restored one instruction late,
+but it did eventually get restored.
+</p>
+<p>
+That one weird trick rescued a lot of games
+from the "Doesn't work" category.
+</p>
+<p>
+<b>Related reading</b>:
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20140912-00/?p=44083">
+What did Windows 3.1 do when you hit Ctrl+Alt+Del?</a>,
+another case where the operating system used the trap flag.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (28)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-bboorman even thread-even depth-1 parent" id="comment-1232821">
+				<div id="div-comment-1232821" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232821">
+			April 11, 2016 at 7:06 am</a>		</div>
+
+		<p>To me, it seems fundamentally broken that the 80386 would allow an application that lacks I/O privilege to disable the interrupt if it doesn&#8217;t allow it to re-enable the interrupt. Is there some reason why the handling of the interrupt flag was not symmetric?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1232823">
+				<div id="div-comment-1232823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Falcon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232823">
+			April 11, 2016 at 7:12 am</a>		</div>
+
+		<p>I think this sentence answers your question:</p>
+<p>&#8220;Since the cli instruction is privileged, it will trap.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1232824">
+				<div id="div-comment-1232824" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232824">
+			April 11, 2016 at 7:14 am</a>		</div>
+
+		<p>If my reading of Raymond&#8217;s article is correct, the application is in fact not allowed to disable the interrupt. &#8220;Since the cli instruction is privileged, it will trap.&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1232833">
+				<div id="div-comment-1232833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://bretkuhns.com' rel='external nofollow' class='url'>bkuhns</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232833">
+			April 11, 2016 at 7:52 am</a>		</div>
+
+		<p>&gt; &#8220;But if it doesn’t, then the popf instruction has no effect on the interrupt flag, and interrupts remain disabled.&#8221;</p>
+<p>That makes it sound like interrupts were allowed to be disabled, but not re-enabled. Though, I suspect there may have been an instruction to explicitly enable interrupts, but the code was being lazy. The pushf starts off by saving whether or not interrupts were /already/ disabled. The cli ensures interrupts are now disabled regardless of whether they were already so. The popf then re-enables interrupts if they were enabled before entry of that code fragment.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3 parent" id="comment-1232843">
+				<div id="div-comment-1232843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Boris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232843">
+			April 11, 2016 at 8:38 am</a>		</div>
+
+		<p>No, it did disable interrupts:</p>
+<p>&#8220;If it has I/O privilege, then the popf will restore interrupts to their previous state. But if it doesn’t, then the popf instruction has no effect on the interrupt flag, and interrupts ________remain disabled________.&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1232853">
+				<div id="div-comment-1232853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232853">
+			April 11, 2016 at 8:53 am</a>		</div>
+
+		<p>This is how I read it. Note that I&#8217;m not an x86 expert, so I might have some details wrong.</p>
+<p>cli seems to be a privileged instruction, as Raymond mentioned that there is a cli trap. The DPMI extender would receive the trap and oblige to clear interrupts on behalf of the client. So in this case, cli &#8220;works&#8221; because the extender allows it to. The DPMI extender could just as well do nothing.</p>
+<p>popf, on the other hand, is unprivileged. This is reasonable: there are lots of unprivileged flags a program might want to save and restore, such as the zero flag. Therefore, instead of having a separate popf instruction for privileged flags, the x86 architecture simply only pops whatever flags the currently executing code has privilege to.</p>
+<p>Because of this, there&#8217;s no &#8220;need&#8221; for a popf trap from the perspective of the CPU designer. However, this lack of a trap means that the bad code block above becomes a bug that&#8217;s difficult for the OS author to fix (and the OS author must fix, because the game developer likely won&#8217;t, or worse, can&#8217;t), hence that &#8220;one weird trick.&#8221; (&#8220;Phar Lap hates them!&#8221;)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1232914">
+				<div id="div-comment-1232914" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232914">
+			April 11, 2016 at 12:05 pm</a>		</div>
+
+		<p>&gt;Because of this, there’s no “need” for a popf trap from the perspective of the CPU designer</p>
+<p>There is a need, you tried to do something that you didn&#8217;t have permission to do. Popf should trap in that circumstance.</p>
+<p>I assume there was a performance or cost reason why it doesn&#8217;t trap, because if it was just down to the whim of the CPU designer then that would be disappointing.</p>
+<p>At the point where the chip exists then you have to work round all the stupid bugs. Turning on tracing is inspired, to me it seems weird that popf has permission to turn trace on but not turn irq&#8217;s on.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4" id="comment-1232884">
+				<div id="div-comment-1232884" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232884">
+			April 11, 2016 at 9:48 am</a>		</div>
+
+		<p>You&#8217;re both right. CLI traps, and then the VMM disables virtual interrupts for that virtual machine, then resumes execution. The program then does a POPF, which does not trap and therefore has no effect on virtual interrupts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1232851">
+				<div id="div-comment-1232851" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232851">
+			April 11, 2016 at 8:50 am</a>		</div>
+
+		<p>What is really broken is that one method of setting the flag (STI/CLI) triggers an exception, while the other (POPF) fails silently. The POPF instruction should have trapped if the IF bit were to be changed.</p>
+<p>Now, processors in 1985 (the year the 80386 was introduced) were simpler and silicon more limited, but failures like those make difficult creating a complete virtual machine, as it clearly was the 80386&#8217;s engineering team intention.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1232892">
+				<div id="div-comment-1232892" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://stackoverflow.com/users/2230/euro-micelli' rel='external nofollow' class='url'>Euro Micelli</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232892">
+			April 11, 2016 at 10:03 am</a>		</div>
+
+		<p>We&#8217;re not seeing the big picture. The processor&#8217;s architecture assumes that a program running without I/O privilege is DESIGNED to run without I/O privileges &#8212; why wouldn&#8217;t it? If such a program tried to change Interrupt Flag, it would &#8220;obviously&#8221; be a bug in the program. The processor is not necessarily designed with the idea of fooling a program intended to run with I/O privileges so that it runs without them.</p>
+<p>With that in mind, let&#8217;s look at what happens:</p>
+<p>PUSHF   ; Flags pushed. Maybe IF is pushed too, but probably not. Irrelevant. Nothing wrong here<br />
+CLI     ; Raise trap! OS should terminate the program because it issued an invalid instruction. Windows instead simulates/changes the flag on behalf of the program and resumes<br />
+.. do something ..<br />
+POPF    ; Restore flags, except leave IF alone. Nothing wrong with this. Of course the program didn&#8217;t mean to restore IF &#8211; &#8220;it&#8217;s not privileged code&#8221;.</p>
+<p>The trick described by Raymond allows Windows to be notified when the program &#8220;meant&#8221; to restore the Interrupt Flag (which obviously it couldn&#8217;t do)</p>
+<p>(Note that under the more direct approach of calling CLI, doing something and then calling STI, both instructions would have trapped)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1232893">
+				<div id="div-comment-1232893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.silverbacknetworks.tech' rel='external nofollow' class='url'>Josh B</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232893">
+			April 11, 2016 at 11:07 am</a>		</div>
+
+		<p>Obviously, it would be more correct for a game to write:<br />
+pushf<br />
+cli<br />
+&#8230;.<br />
+pop ax<br />
+and ax, 0x200<br />
+test ax, 0x200<br />
+jz SkipSTI<br />
+sti<br />
+SkipSTI:<br />
+&#8230;.</p>
+<p>But most games are creaky hacks piled on top of hacks already, and future-proof correctness isn&#8217;t a big virtue, especially when it&#8217;s a bit slower and more complicated.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1232901">
+				<div id="div-comment-1232901" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232901">
+			April 11, 2016 at 11:24 am</a>		</div>
+
+		<p>If you&#8217;re gonna do that you might as well write cli/sti. The reason you do pushf/cli/popf is handling the case of called with interrupts already disabled.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1232924">
+				<div id="div-comment-1232924" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232924">
+			April 11, 2016 at 12:15 pm</a>		</div>
+
+		<p>&gt;Obviously, it would be more correct for a game to write:</p>
+<p>No it wouldn&#8217;t, you are throwing away all the other flags too. You can&#8217;t restore the flags first and then do the and check because you&#8217;re still going to mess up the flags. You could probably enable the interrupt and then restore the flags, as long as your interrupt handler doesn&#8217;t do anything funky. You&#8217;re much better off using pushf/cli/popf. </p>
+<p>It&#8217;s just unfortunate that Intel forgot to make popf trap if you tried to change the interrupt state, I think modern day Intel wouldn&#8217;t have made that mistake.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1232941">
+				<div id="div-comment-1232941" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://stackoverflow.com/users/2230/euro-micelli' rel='external nofollow' class='url'>Euro Micelli</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232941">
+			April 11, 2016 at 12:57 pm</a>		</div>
+
+		<p>@smf:<br />
+&gt; Intel forgot to make popf trap if you tried to change the interrupt state</p>
+<p>The processor has no way to know. If the IF bit in the DWORD is 0, does that mean that the program is trying to clear the flag? And if it&#8217;s 1, does that mean that the program trying to set IF? You can&#8217;t put &#8220;null&#8221; in a bit.</p>
+<p>What actually happens &#8212; the only thing that can happen &#8212; is that the processor ignores the IF bit when doing POPF.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-5" id="comment-1232951">
+				<div id="div-comment-1232951" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232951">
+			April 11, 2016 at 1:30 pm</a>		</div>
+
+		<p>&gt; No it wouldn’t, you are throwing away all the other flags too.</p>
+<p>In practice, the game doesn&#8217;t care about the other flags. All it wants to do is disable interrupts temporarily.</p>
+<p>&gt; If the IF bit in the DWORD is 0, does that mean that the program is trying to clear the flag?</p>
+<p>Yes. Because that&#8217;s what happens in real mode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fjeldse odd alt depth-5" id="comment-1232963">
+				<div id="div-comment-1232963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Erik+F' rel='external nofollow' class='url'>Erik F</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232963">
+			April 11, 2016 at 2:49 pm</a>		</div>
+
+		<p>As this game was already written to run inside a DPMI server, if the programmers really wanted to have DPMI portability they should be using the INT 31h/090[01]h services. This particular sequence of code was called out as being problematic by the DPMI Committee itself and they released this document (<a href="http://www.tenberry.com/web/dpmi/02.html#03" rel="nofollow">http://www.tenberry.com/web/dpmi/02.html#03</a>) in 1990!</p>
+<p>Realizing this, my best guess is that programmers didn&#8217;t read the spec, and really I can&#8217;t blame them too much as this is supposed to be a low-level interface. The compiler suite should have had a fix for this however, because the extender libraries basically had to re-implement the whole language library in any case AFAICT.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even depth-5" id="comment-1232974">
+				<div id="div-comment-1232974" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232974">
+			April 11, 2016 at 5:55 pm</a>		</div>
+
+		<p>As I said before, I think most DOS games were deliberately not supporting anything other than running under pure DOS without Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1232982">
+				<div id="div-comment-1232982" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pseudonym</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232982">
+			April 11, 2016 at 9:41 pm</a>		</div>
+
+		<p>@smf &#8220;I think modern day Intel wouldn’t have made that mistake.&#8221;</p>
+<p>Modern day Intel supports actual virtualisation, so the whole question is moot.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1232994">
+				<div id="div-comment-1232994" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232994">
+			April 12, 2016 at 4:04 am</a>		</div>
+
+		<p>&gt; In practice, the game doesn’t care about the other flags. All it wants to do is disable interrupts temporarily.</p>
+<p>Sure, that is what the programmer was thinking when he wrote those lines of code. What the code relies on is another matter. I certainly wouldn&#8217;t suggest changing them without doing a code review and putting the game through QA again.</p>
+<p>The performance overhead of a branch on such an old cpu is also worth considering, as is overwriting ax.</p>
+<p>I&#8217;m curious how often this patching didn&#8217;t work. If you really wanted your code to not work on windows you could easily create false positives.</p>
+<p>jmp x<br />
+pushf<br />
+x: sti</p>
+<p>I still blame intel.</p>
+<p>&gt;If the IF bit in the DWORD is 0, does that mean that the program is trying to clear the flag?</p>
+<p>Yes, why wouldn&#8217;t it? What circumstance would there be any ambiguity?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1233011">
+				<div id="div-comment-1233011" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://adamrosenfield.com' rel='external nofollow' class='url'>Adam Rosenfield</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1233011">
+			April 12, 2016 at 7:18 am</a>		</div>
+
+		<p>&gt; Modern day Intel supports actual virtualisation, so the whole question is moot.</p>
+<p>Let&#8217;s go fire up that time machine and add VT-x support to the 80386.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-5" id="comment-1233033">
+				<div id="div-comment-1233033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1233033">
+			April 12, 2016 at 9:17 am</a>		</div>
+
+		<p>&gt; jmp x; pushf;  x: sti</p>
+<p>That wouldn&#8217;t be a false positive because the value on the top of the stack doesn&#8217;t match the current flags.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1233083">
+				<div id="div-comment-1233083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1233083">
+			April 13, 2016 at 3:09 am</a>		</div>
+
+		<p>There is a 1 in 65536 chance that it will &amp; you can improve the odds further if you are purposefully trying to deceive it, although I admit it&#8217;s contrived. It would only be useful if you were trying to obsfucate a check for running under windows.</p>
+<p>More importantly, were there any games doing something similar that weren&#8217;t able to be detected?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1233084">
+				<div id="div-comment-1233084" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1233084">
+			April 13, 2016 at 7:23 am</a>		</div>
+
+		<p>The processor can make a reasonable guess, though (albeit at the expense of added complexity). If POPF would change the value of IF, then it can trap; thus, if the saved value of IF is 1, and the current value is also 1, don&#8217;t trap &#8211; similarly, if the saved value is 0, and the current value is also 0, don&#8217;t trap.</p>
+<p>That way, you trap on implicit attempts to change IF, just as you do on explicit attempts. It does need more logic (you end up calculating the moral equivalent of (SAVED_FLAGS ^ FLAGS) &amp; FLAGS_TRAP_MASK == 0), but it would have avoided the need for the clever workaround.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1233121">
+				<div id="div-comment-1233121" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1233121">
+			April 13, 2016 at 12:24 pm</a>		</div>
+
+		<p>Yeah, IMO it should have done that. However there may be reasons why it would have been a bad idea &amp; we unfortunately can&#8217;t know that. I don&#8217;t know how complex the 386 pipelining is, but it&#8217;s possible that popf would be slower if it could be restarted after the value is fetched from the stack.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1232931">
+				<div id="div-comment-1232931" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232931">
+			April 11, 2016 at 12:46 pm</a>		</div>
+
+		<p>This problem was solved on later revisions of the 486, but Intel kept it secret for years, requiring an NDA to find out about it (&#8220;Appendix H&#8221;).  The feature, &#8220;Protected Virtual Interrupts&#8221;, makes it so that attempts to do cli/sti in user mode change a &#8220;virtual interrupt flag&#8221; instead of the real one.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-yuhong-bao odd alt depth-2" id="comment-1232971">
+				<div id="div-comment-1232971" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232971">
+			April 11, 2016 at 5:52 pm</a>		</div>
+
+		<p>AFAIK PVI don&#8217;t change PUSHF/POPF unlike VME.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-hankhein even thread-even depth-1 parent" id="comment-1232953">
+				<div id="div-comment-1232953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Henri+Hein' rel='external nofollow' class='url'>Henri Hein</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1232953">
+			April 11, 2016 at 1:41 pm</a>		</div>
+
+		<p>I like all these Games-savior techniques and your articles on them.  For some reason, I found this particularly neat.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1233041">
+				<div id="div-comment-1233041" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160411-00/?p=93281#comment-1233041">
+			April 12, 2016 at 11:18 am</a>		</div>
+
+		<p>Agreed!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

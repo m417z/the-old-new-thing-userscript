@@ -1,0 +1,581 @@
+<html>
+<head>
+<title>Using fibers to simplify enumerators, part 2: When life is easier for the caller</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using fibers to simplify enumerators, part 2: When life is easier for the caller</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 30, 2004 / year-entry #439</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Last time, we looked at how a directory tree enumerator function would have been written if the person writing the enumerator (the producer) got to write the spec. Now let's look at what it would look like if the person consuming the enumerator wrote the spec: #include <windows.h> #include <shlwapi.h> #include <stdio.h> #include <strsafe.h> enum...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p><a HREF="/oldnewthing/archive/2004/12/29/343664.aspx">
+Last time</a>,
+we looked at how a directory tree enumerator function
+would have been written if the person writing the
+enumerator (the producer)
+got to write the spec.  Now let's look at what
+it would look like if the person consuming the enumerator
+wrote the spec:</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;shlwapi.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;strsafe.h&gt;
+
+enum FEFOUND {
+ FEF_FILE,          // found a file
+ FEF_DIR,           // found a directory
+ FEF_LEAVEDIR,      // leaving a directory
+ FEF_DONE,          // finished
+};
+
+enum FERESULT {
+ FER_CONTINUE,      // continue enumerating
+                    // (if directory: recurse into it)
+ FER_SKIP,          // skip directory (do not recurse)
+};
+
+class DirectoryTreeEnumerator {
+public:
+  DirectoryTreeEnumerator(LPCTSTR pszDir);
+
+  FEFOUND Next();
+  void SetResult(FERESULT fer);
+  void Skip() { SetResult(FER_SKIP); }
+
+  LPCTSTR GetCurDir();
+  LPCTSTR GetCurPath();
+  const WIN32_FIND_DATA* GetCurFindData();
+private:
+    ... implementation ...
+};
+</pre>
+<p>
+Under this design, the enumerator spits out files,
+and the caller tells the enumerator when to move on
+to the next one, optionally indicating that an
+enumerated directory should be skipped rather than
+recursed into.
+</p>
+<p>
+Notice that there is no <code>FER_STOP</code> result code.
+If the consumer wants to stop enumerating, it will merely
+stop calling <code>Next()</code>.
+</p>
+<p>
+With this design, our test function that computes
+the inclusive and exclusive sizes of each directory
+is quite simple:
+</p>
+<pre>
+ULONGLONG FileSize(const WIN32_FIND_DATA *pwfd)
+{
+  return 
+    ((ULONGLONG)pwfd-&gt;nFileSizeHigh &lt;&lt; 32) +
+    pwfd-&gt;nFileSizeLow;
+}
+
+ULONGLONG TestWalk(DirectoryTreeEnumerator* penum)
+{
+ ULONGLONG ullSizeSelf = 0;
+ ULONGLONG ullSizeAll = 0;
+ for (;;) {
+  FEFOUND fef = penum-&gt;Next();
+  switch (fef) {
+  case FEF_FILE:
+   ullSizeSelf += FileSize(penum-&gt;GetCurFindData());
+   break;
+
+  case FEF_DIR:
+   ullSizeAll += TestWalk(penum);
+   break;
+
+  case FEF_LEAVEDIR:
+   ullSizeAll += ullSizeSelf;
+   printf("Size of %s is %I64d (%I64d)\n",
+    penum-&gt;GetCurDir(), ullSizeSelf, ullSizeAll);
+   return ullSizeAll;
+
+  case FEF_DONE:
+   return ullSizeAll;
+  }
+ }
+ /* notreached */
+}
+
+int __cdecl main(int argc, char **argv)
+{
+ DirectoryTreeEnumerator e(TEXT("."));
+ TestWalk(&amp;e);
+ return 0;
+}
+</pre>
+<p>
+Of course, this design puts all the work on the enumerator.
+Instead of letting the producer walking
+the tree and calling the callback as it finds things,
+the caller calls Next() repeatedly, and each time, the
+enumerator has to find the next file and return it.
+Since the enumerator returns, it can't store its state in the
+call stack; instead it has to mimic the call stack manually
+with a stack data structure.
+</p>
+<pre>
+class DirectoryTreeEnumerator {
+public:
+ DirectoryTreeEnumerator(LPCTSTR pszDir);
+ ~DirectoryTreeEnumerator();
+
+ FEFOUND Next();
+ void SetResult(FERESULT fer)
+  { m_es = fer == FER_SKIP ? ES_SKIP : ES_NORMAL; }
+ void Skip() { SetResult(FER_SKIP); }
+
+ LPCTSTR GetCurDir()
+    { return m_pseCur-&gt;m_szDir; }
+ LPCTSTR GetCurPath()
+    { return m_szPath; }
+ const WIN32_FIND_DATA* GetCurFindData()
+    { return &amp;m_pseCur-&gt;m_wfd; }
+
+private:
+ struct StackEntry {
+  StackEntry *m_pseNext;
+  HANDLE m_hfind;
+  WIN32_FIND_DATA m_wfd;
+  TCHAR m_szDir[MAX_PATH];
+ };
+
+ StackEntry* Push(LPCTSTR pszDir);
+ void StopDir();
+ bool Stopped();
+ void Pop();
+
+ enum EnumState {
+  ES_NORMAL,
+  ES_SKIP,
+  ES_FIRST,
+ };
+
+ StackEntry *m_pseCur;
+ EnumState m_es;
+ TCHAR m_szPath[MAX_PATH];
+};
+
+DirectoryTreeEnumerator::StackEntry*
+DirectoryTreeEnumerator::Push(
+    LPCTSTR pszDir)
+{
+ StackEntry* pse = new StackEntry();
+ if (pse &amp;&amp;
+     SUCCEEDED(StringCchCopy(pse-&gt;m_szDir,
+                 MAX_PATH, pszDir)) &amp;&amp;
+     PathCombine(m_szPath, pse-&gt;m_szDir,
+                  TEXT("*.*")) &amp;&amp;
+     (pse-&gt;m_hfind = FindFirstFile(m_szPath,
+       &amp;pse-&gt;m_wfd)) != INVALID_HANDLE_VALUE) {
+  pse-&gt;m_pseNext = m_pseCur;
+  m_es = ES_FIRST;
+  m_pseCur = pse;
+ } else {
+  delete pse;
+  pse = NULL;
+ }
+ return pse;
+}
+
+void DirectoryTreeEnumerator::StopDir()
+{
+ StackEntry* pse = m_pseCur;
+ if (pse-&gt;m_hfind != INVALID_HANDLE_VALUE) {
+  FindClose(pse-&gt;m_hfind);
+  pse-&gt;m_hfind = INVALID_HANDLE_VALUE;
+ }
+}
+
+bool DirectoryTreeEnumerator::Stopped()
+{
+ return m_pseCur-&gt;m_hfind == INVALID_HANDLE_VALUE;
+}
+
+void DirectoryTreeEnumerator::Pop()
+{
+ StackEntry* pse = m_pseCur;
+ m_pseCur = pse-&gt;m_pseNext;
+ delete pse;
+}
+
+DirectoryTreeEnumerator::~DirectoryTreeEnumerator()
+{
+ while (m_pseCur) {
+  StopDir();
+  Pop();
+ }
+}
+
+DirectoryTreeEnumerator::
+    DirectoryTreeEnumerator(LPCTSTR pszDir)
+ : m_pseCur(NULL)
+{
+ Push(pszDir);
+}
+
+FEFOUND DirectoryTreeEnumerator::Next()
+{
+ for (;;) {
+  /* Anything to enumerate? */
+  if (!m_pseCur) return FEF_DONE;
+
+  /* If just left a directory, pop */
+  if (Stopped()) {
+   Pop();
+   m_es = ES_NORMAL;
+  }
+
+  /* If accepted a directory, recurse */
+  else if (m_es == ES_NORMAL &amp;&amp;
+      (m_pseCur-&gt;m_wfd.dwFileAttributes &amp;
+                      FILE_ATTRIBUTE_DIRECTORY)) {
+   Push(m_szPath);
+  }
+
+  /* Any more files in this directory? */
+  if (m_es != ES_FIRST &amp;&amp;
+       !FindNextFile(m_pseCur-&gt;m_hfind,
+             &amp;m_pseCur-&gt;m_wfd)) {
+   StopDir();
+   return FEF_LEAVEDIR;
+  }
+
+  /* Don't recurse into . or .. */
+  if (lstrcmp(m_pseCur-&gt;m_wfd.cFileName,
+                   TEXT(".")) == 0 ||
+      lstrcmp(m_pseCur-&gt;m_wfd.cFileName,
+                   TEXT("..")) == 0 ||
+      !PathCombine(m_szPath, m_pseCur-&gt;m_szDir,
+                   m_pseCur-&gt;m_wfd.cFileName)) {
+   m_es = ES_NORMAL;
+   continue;
+  }
+
+  /* Return this found item */
+  m_es = ES_NORMAL; /* default state */
+  if (m_pseCur-&gt;m_wfd.dwFileAttributes &amp;
+                      FILE_ATTRIBUTE_DIRECTORY) {
+   return FEF_DIR;
+  } else {
+   return FEF_FILE;
+  }
+ }
+ /* notreached */
+}
+</pre>
+<p>
+Yuck-o-rama. The simple recursive function has
+turned into this horrible mess of state management.
+</p>
+<p>
+Wouldn't it be great if we could have it both ways?
+The caller would see a simple enumerator that spits out
+files (or directories).  But the enumerator sees a
+callback that it can throw files into.
+</p>
+<p>
+We'll build that next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-238623">
+				<div id="div-comment-238623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nate</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238623">
+			December 30, 2004 at 7:24 am</a>		</div>
+
+		<p>I&#8217;ve always been baffled by the purpose of fibers, but it seems pretty clear where Raymond is going and I like what I see.</p>
+<p>Do other platforms (UNIX, Mac) have constructs comparable to fibers?  I suppose that you could build fibers on top of threads using a couple of semaphores but that seems pretty roundabout.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238633">
+				<div id="div-comment-238633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor Tandetnik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238633">
+			December 30, 2004 at 8:56 am</a>		</div>
+
+		<p>&quot;it seems pretty clear where Raymond is going&quot;</p>
+<p>Probably the same place Matthew Wilson has gone in C++ Users Journal&#8217;s February 2004 article &quot;Callback Enumeration APIs &amp; the Input Iterator Concept&quot;</p>
+<p><a target="_new" href="http://www.cuj.com/documents/s=8188/cuj0402wilson/0402wilson.htm" rel="nofollow">http://www.cuj.com/documents/s=8188/cuj0402wilson/0402wilson.htm</a></p>
+<p>(paid subscription required).</p>
+<p>In this article, Matthew uses fibers to wrap EnumWindows API into STL-like iterator.</p>
+<p>&quot;Do other platforms (UNIX, Mac) have constructs comparable to fibers?&quot;</p>
+<p>POSIX has (deprecated) functions getcontext, setcontext, swapcontext and makecontext. These are effectively equivalent to fibers.</p>
+<p>Then there&#8217;s GNU Pth library that supports non-preemtive cooperatively scheduled &quot;threads&quot; (which are closer to Windows fibers than to Windows or POSIX threads)</p>
+<p><a target="_new" href="http://www.gnu.org/software/pth/" rel="nofollow">http://www.gnu.org/software/pth/</a></p>
+<p>Disclaimer: I have not personally used Windows fibers, nor getcontext et al, nor Pth</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238643">
+				<div id="div-comment-238643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238643">
+			December 30, 2004 at 9:37 am</a>		</div>
+
+		<p>I&#8217;m getting a hankering for co-routines.</p>
+<p>(I&#8217;m also starting to get the idea that Fibers are basically just co-routines, but I&#8217;ll wait until tomorrow to see if I&#8217;m right!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238683">
+				<div id="div-comment-238683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Memet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238683">
+			December 30, 2004 at 10:19 am</a>		</div>
+
+		<p>Amen Raymond. I&#8217;ve been waiting to see a use of Fibers all my (programming) life.<br />
+<br /> Enough with the previews already, Get on with the show! =)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238693">
+				<div id="div-comment-238693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.studentclub.ro/ovidiupl/' rel='external nofollow' class='url'>Ovidiu</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238693">
+			December 30, 2004 at 10:30 am</a>		</div>
+
+		<p>Besides SQL Server, is there any other product on the market that can actually use fibers for something useful?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238703">
+				<div id="div-comment-238703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://david.acz.org/' rel='external nofollow' class='url'>David Phillips</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238703">
+			December 30, 2004 at 10:33 am</a>		</div>
+
+		<p>UNIX has ucontext, but it is not implemented everywhere:</p>
+<p><a target="_new" href="http://www.opengroup.org/onlinepubs/007908799/xsh/ucontext.h.html" rel="nofollow">http://www.opengroup.org/onlinepubs/007908799/xsh/ucontext.h.html</a></p>
+<p>This paper describes a portable method to do the above:</p>
+<p><a target="_new" href="http://xmailserver.org/rse-pmt.pdf" rel="nofollow">http://xmailserver.org/rse-pmt.pdf</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238723">
+				<div id="div-comment-238723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.excastle.com/blog/' rel='external nofollow' class='url'>Joe White</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238723">
+			December 30, 2004 at 11:13 am</a>		</div>
+
+		<p>Indy can use fibers. Indy is an open-source TCP/IP library (with classes for just about every Internet protocol you&#8217;ve ever heard of, both clients and servers), written in Delphi, usable from both Win32 (in Delphi) and .NET (from any .NET language). Last I knew, though, the fiber support was only in the Win32 version. I&#8217;m pretty sure Indy-with-fibers is used in some high-end products, because the fiber support took them a lot of engineering. I couldn&#8217;t offhand tell you which high-end apps it&#8217;s used in, but you could check out their Web site (<a target="_new" href="http://www.indyproject.org/" rel="nofollow">http://www.indyproject.org/</a>).</p>
+<p>I heard Kudzu (Chad Hower, one of the main coders on Indy) talk about this stuff at last year&#8217;s BorCon, so I know a decent bit about it. If you compile Indy with fiber support, then it uses manually-scheduled fibers together with some sort of low-level OS calls (might be I/O completion ports, but don&#8217;t quote me on that) to build very high-performance TCP servers. (Transparent, too &#8212; you write the same code either way, then just compile Indy with fibers or not.) I don&#8217;t remember all the details, but if you&#8217;ve got hundreds or thousands of simultaneous connections, it&#8217;s supposed to be a substantial performance boost. (On the other hand, if you&#8217;ve only got a few connections, it actually slows things down compared to the non-fiber implementation, so you have to plan accordingly. Why can&#8217;t optimization ever be easy? (grin))</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238733">
+				<div id="div-comment-238733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://david.acz.org/' rel='external nofollow' class='url'>David Phillips</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238733">
+			December 30, 2004 at 12:17 pm</a>		</div>
+
+		<p>I&#8217;m looking forward to seeing tomorrows blog.  While we are waiting, here is a way to do this sort of thing in C cleanly using the preprocessor.  It still requires a state machine, but the state machine is generated for you automatically:</p>
+<p><a target="_new" href="http://www.chiark.greenend.org.uk/~sgtatham/coroutines.html" rel="nofollow">http://www.chiark.greenend.org.uk/~sgtatham/coroutines.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238773">
+				<div id="div-comment-238773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/2004/12/31/344799.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-238773">
+			December 31, 2004 at 10:00 am</a>		</div>
+
+		<p>Fibers let both sides think they&#8217;re in control.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-239043">
+				<div id="div-comment-239043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-239043">
+			January 3, 2005 at 10:44 am</a>		</div>
+
+		<p>Joe:<br />
+<br />(On the other hand, if you&#8217;ve only got a few connections, it actually slows things down compared to the non-fiber implementation, so you have to plan accordingly. Why can&#8217;t optimization ever be easy? (grin))</p>
+<p>Is it really a problem? With 10 connections, the relative overhead may be more, but does it impact performance?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-239183">
+				<div id="div-comment-239183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://thor.prohosting.com/bmm6o' rel='external nofollow' class='url'>Brian</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-239183">
+			January 4, 2005 at 4:47 pm</a>		</div>
+
+		<p>David:  An interesting article.  A downside not addressed there is that by using static storage instead of a second stack, you pick up reentrancy issues.  But if that&#8217;s not a concern, it&#8217;s a clever hack.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-241833">
+				<div id="div-comment-241833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-241833">
+			January 11, 2005 at 5:25 am</a>		</div>
+
+		<blockquote><p>
+  I&#8217;m getting a hankering for co-routines. </p>
+<p>You have seen this&#8230; using fibers to implement co-routines?</p>
+<p><a target="_new" href="http://msdn.microsoft.com/msdnmag/issues/03/09/CoroutinesinNET/default.aspx" rel="nofollow">http://msdn.microsoft.com/msdnmag/issues/03/09/CoroutinesinNET/default.aspx</a>
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-241933">
+				<div id="div-comment-241933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-241933">
+			January 11, 2005 at 7:30 am</a>		</div>
+
+		<p>Noting that the article uses undocumented CLR functions and even admits that it can deadlock with the garbage collector. Makes you wonder why anybody would follow the advice in that article in a real program. The last sentence of the article should scare everybody.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-247843">
+				<div id="div-comment-247843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.wisniewski-online.com/cs/blogs/wizzys_world/archive/2005/01/20/4.aspx' rel='external nofollow' class='url'>Wizzy's World</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-247843">
+			January 20, 2005 at 6:32 pm</a>		</div>
+
+		<p>A while back there was an article in MSDN magazine about wrapping up the unmaged fibers API to implement&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-460353">
+				<div id="div-comment-460353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://excastle.com/blog/archive/2007/01/11/10280.aspx' rel='external nofollow' class='url'>Joe White's Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-460353">
+			January 11, 2007 at 10:19 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-460383">
+				<div id="div-comment-460383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://excastle.com/blog/archive/0001/01/01/10280.aspx' rel='external nofollow' class='url'>Joe White's Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041230-00/?p=36843#comment-460383">
+			January 11, 2007 at 10:21 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

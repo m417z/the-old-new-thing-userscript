@@ -1,0 +1,718 @@
+<html>
+<head>
+<title>A function pointer cast is a bug waiting to happen</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A function pointer cast is a bug waiting to happen</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 6, 2011 / year-entry #113</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>35</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer reported an application compatibility bug in Windows. We have some code that manages a Win32 button control. During button creation, we subclass the window by calling Set­Window­Subclass. On the previous version of Windows, the subclass procedure receives the following messages, in order: WM_WINDOWPOSCHANGING WM_NCCALCSIZE WM_WINDOWPOSCHANGED We do not handle any of these messages...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer reported an application compatibility bug in Windows.
+</p>
+<blockquote CLASS=q>
+<p>
+We have some code that manages a Win32 button control.
+During button creation, we subclass the window by calling
+<code>Set&shy;Window&shy;Subclass</code>.
+On the previous version of Windows, the subclass procedure
+receives the following messages, in order:
+</p>
+<ul>
+<li><code>WM_<wbr>WINDOW<wbr>POS<wbr>CHANGING</code>
+<li><code>WM_<wbr>NC<wbr>CALC<wbr>SIZE</code>
+<li><code>WM_<wbr>WINDOW<wbr>POS<wbr>CHANGED</code>
+</ul>
+<p>
+We do not handle any of these messages and pass them through
+to <code>Def&shy;Subclass&shy;Proc</code>.
+On the latest version of Windows,
+we get only the first two messages,
+and <code>comctl32</code> crashes while it's handling
+the third message before it gets a chance to call us.
+It looks like it's reading from invalid memory.
+</p>
+<p>
+The callback function goes like this:
+</p>
+<pre>
+LRESULT ButtonSubclassProc(
+    HWND hwnd,
+    UINT uMsg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR idSubclass,
+    DWORD_PTR dwRefData);
+</pre>
+<p>
+We install the subclass function like this:
+</p>
+<pre>
+SetWindowSubclass(
+    hwndButton,
+    reinterpret_cast&lt;SUBCLASSPROC&gt;(ButtonSubclassProc),
+    id,
+    reinterpret_cast&lt;DWORD_PTR&gt;(pInfo));
+</pre>
+<p>
+We found that if we changed the callback function declaration to
+</p>
+<pre>
+LRESULT <font COLOR=blue>CALLBACK</font> ButtonSubclassProc(
+    HWND hwnd,
+    UINT uMsg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR idSubclass,
+    DWORD_PTR dwRefData);
+</pre>
+<p>
+and install the subclass function like this:
+</p>
+<pre>
+SetWindowSubclass(
+    hwndButton,
+    <font COLOR=blue>ButtonSubclassProc</font>,
+    id,
+    reinterpret_cast&lt;DWORD_PTR&gt;(pInfo));
+</pre>
+<p>
+then the problem goes away.
+It looks like the new version of Windows introduced
+a compatibility bug; the old code works fine on all previous
+versions of Windows.
+</p>
+</blockquote>
+<p>
+Actually, you had the problem on earlier versions of Windows, too.
+You were just lucky that the bug wasn't a crashing bug.
+But now it is.
+</p>
+<p>
+This is a classic case of
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/01/15/58973.aspx">
+mismatching the calling convention</a>.
+The <code>SUB&shy;CLASS&shy;PROC</code> function is declared as requiring
+the <code>CALLBACK</code> calling convention (which on x86
+maps to <code>__stdcall</code>),
+but the code declared it without any calling convention at all,
+and the ambient calling convention was <code>__cdecl</code>.
+When they went to compile the code, they got a compiler error
+that said something like this:
+</p>
+<p>
+<code>
+error C2664: 'SetWindowSubclass' : cannot convert parameter 2 from
+ 'LRESULT (__cdecl *)<wbr>(HWND,<wbr>UINT,<wbr>WPARAM,<wbr>LPARAM,<wbr>UINT_PTR,<wbr>DWORD_PTR)'
+ to 'SUBCLASSPROC'
+</code>
+</p>
+<p>
+"Since the compiler was unable to convert the parameter,
+let's give it some help and stick a cast in front.
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/10/23/9911891.aspx#9912158">
+There, that shut up the compiler</a>.
+Those compiler guys are so stupid.
+They can't even figure out how to convert one function pointer
+to another.
+I bet they need help wiping their butts when they go to the bathroom."
+</p>
+<p>
+And there you go, you inserted a cast to shut up the compiler
+and masked a bug instead of fixing it.
+</p>
+<p>
+The only thing you can do with a function pointer after casting it
+is to cast it back to its original type.&sup1;
+If you try to use it as the cast type, you will crash.
+Maybe not today,
+maybe not tomorrow, but
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/01/19/60162.aspx">
+someday</a>.
+</p>
+<p>
+In this case, the calling convention mismatch resulted in
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/01/16/59415.aspx">
+the stack being mismatched when the function returns</a>.
+It looks like earlier versions of Windows managed to hobble
+along long enough before things got resynchronized
+(by an <code>EBP</code> frame restoration, most likely)
+so the damage didn't spread very far.
+But the new version of Windows, possibly one compiled with
+more aggressive optimizations,
+ran into trouble before things resynchronized, and thus occurred
+the crash.
+</p>
+<p>
+The compiler was yelling at you for a reason.
+</p>
+<p>
+It so happened that the Windows application compatibility team
+had already encountered this problem in their test labs,
+and a shim had already been developed to auto-correct this
+mistake.
+(Actually, the shim also corrects another mistake they hadn't noticed
+yet:
+They forgot to call <code>Remove&shy;Window&shy;Subclass</code>
+when they were done.)
+</p>
+<p>
+&sup1;I refer here to pointers to static functions.
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/02/09/70002.aspx">
+Pointers to member functions are entirely different animals</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (35)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-joshuaganes even thread-even depth-1" id="comment-911543">
+				<div id="div-comment-911543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Joshua+Ganes' rel='external nofollow' class='url'>Joshua Ganes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911543">
+			May 6, 2011 at 7:47 am</a>		</div>
+
+		<p>I suppose I knew that I could reinterpret any pointer as any type, but it simply never occurred to me to try to cast a function pointer. Imagine trying to cast a functor &#8212; now that would really be something.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911553">
+				<div id="div-comment-911553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Random Coder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911553">
+			May 6, 2011 at 8:23 am</a>		</div>
+
+		<p>They even figured out their own problem, yet they still thought it was a Windows bug. &nbsp;Did they think &quot;CALLBACK&quot; had no meaning? &nbsp;It boggles the mind.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911563">
+				<div id="div-comment-911563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911563">
+			May 6, 2011 at 8:32 am</a>		</div>
+
+		<p>Nice. Since when is &quot;Windows is compiled with frame pointers&quot; part of the ABI?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911573">
+				<div id="div-comment-911573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911573">
+			May 6, 2011 at 8:40 am</a>		</div>
+
+		<p>Joshua, your question does not compute. &nbsp;Casting away compiler errors != making things work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911583">
+				<div id="div-comment-911583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">cast away</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911583">
+			May 6, 2011 at 9:00 am</a>		</div>
+
+		<p>Only use cast when you KNOW you have the right type. If you using cast because it doesn&#39;t crash when executing, you&#39;re doing it wrong.</p>
+<p>But as usual, the real fail is the lousy msdl lib. It doesn&#39;t mention the CALLBACK calling convention at all:</p>
+<p><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/bb762102.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/bb762102.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911593">
+				<div id="div-comment-911593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911593">
+			May 6, 2011 at 9:01 am</a>		</div>
+
+		<p>Sure it does. The code works if Windows is compiled with frame pointers. But that&#39;s not part of the ABI so don&#39;t depend on it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-911603">
+				<div id="div-comment-911603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911603">
+			May 6, 2011 at 9:08 am</a>		</div>
+
+		<p>You cannot put of 100% of the blame on these idiots, Visual Studio also used to ship with a wizard that would generate code for you with casts.</p>
+<p>You can still find code samples on MSDN that casts the proc used by CreateDialog and DialogBox: <a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/ms644996%28v=vs.85%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/ms644996%28v=vs.85%29.aspx</a> has two samples with casts: CreateDialog(&#8230;(DLGPROC)GoToProc) and DialogBoxIndirect(&#8230;(DLGPROC)DialogProc);</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911623">
+				<div id="div-comment-911623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">blah</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911623">
+			May 6, 2011 at 9:14 am</a>		</div>
+
+		<p>&quot;Actually, the shim also corrects another mistake they hadn&#39;t noticed yet&quot;</p>
+<p>So MS found this second bug and didn&#39;t notify the vendor at the time? Sounds like they masked a bug instead of facilitating a fix.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jader3rd even thread-even depth-1" id="comment-911633">
+				<div id="div-comment-911633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/jader3rd' rel='external nofollow' class='url'>jader3rd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911633">
+			May 6, 2011 at 9:21 am</a>		</div>
+
+		<p>If only there were a language which would cause an error on an invalid cast&#8230;..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911653">
+				<div id="div-comment-911653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sunil Joshi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911653">
+			May 6, 2011 at 9:47 am</a>		</div>
+
+		<p>@jader3rd</p>
+<p>The compiler raised an error, the programmer told it to buzz off because he knew better; only he really didn&#39;t.</p>
+<p>In general having the power to shut the compiler up is an advantage; but you have to know what you&#39;re doing.</p>
+<p>A language where you couldn&#39;t do that would be limiting.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911673">
+				<div id="div-comment-911673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CarlD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911673">
+			May 6, 2011 at 10:57 am</a>		</div>
+
+		<p>@jader3rd, @Sunil Joshi</p>
+<p>That is exactly why reinterpret_cast was given such a long and ugly name: to call out explicitly that you&#39;re doing something inherently dangerous and you&#39;d better know exactly what you&#39;re doing. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911683">
+				<div id="div-comment-911683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">prshaw</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911683">
+			May 6, 2011 at 11:21 am</a>		</div>
+
+		<p>&quot;Actually, you had the problem on earlier versions of Windows, too. You were just lucky that the bug wasn&#39;t a crashing bug.&quot;</p>
+<p>I always thought that was unlucky. I was lucky when it did crash on my dev box and I found it then.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911693">
+				<div id="div-comment-911693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911693">
+			May 6, 2011 at 12:03 pm</a>		</div>
+
+		<p>In the next standard for C++, reinterpret_cast&lt;T&gt;() will be renamed reinterpret_cast_i_know_what_i_am_doing_i_promise&lt;T&gt;() ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911703">
+				<div id="div-comment-911703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911703">
+			May 6, 2011 at 12:11 pm</a>		</div>
+
+		<p>@Tim</p>
+<p>Unfortunately reinterpret_cast_i_know_what_i_am_doing_i_promise&lt;T&gt;() will do us no good as long as the abomination known as C-Style casts exists.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911713">
+				<div id="div-comment-911713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911713">
+			May 6, 2011 at 12:44 pm</a>		</div>
+
+		<p>Agree with cast away. <a target="_new" href="http://msdn.microsoft.com/en-us/library/bb776774.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/bb776774.aspx</a> actually defines the call exactly as they did. Sure it says &quot;defines the prototype for a callback function&quot; which I&#39;m sure is defined somewhere as having to have the CALLBACK calling convention, but really who thought it&#39;d be a good idea to not mention such an important detail anywhere? </p>
+<div class="post">[<i>It looks like the docs are inconsistent whether they include the calling convention or not. my guess is that at some point there was an editorial decision to remove clutter from the prototypes, so functions added during the &quot;no clutter&quot; era were missing calling convention declarations. In retrospect, I should have chosen an example that didn&#39;t involve SDK headers. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911723">
+				<div id="div-comment-911723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Semi Essessi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911723">
+			May 6, 2011 at 2:34 pm</a>		</div>
+
+		<p>Actually its kind of cool to cast a char array to a void (*)() function pointer for the sake of executing byte code &#8211; although you have to be careful to allocate the memory as executable &#8211; and of course make sure your bytes are good code and not a crash waiting to happen. :)</p>
+<p>This might be a lazy way to implement a compiled scripting language for instance&#8230; not that I&#39;ve ever done that&#8230; ( <a rel="nofollow" target="_new" href="http://code.google.com/p/fridgescript/" rel="nofollow">code.google.com/&#8230;/fridgescript</a> )</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911733">
+				<div id="div-comment-911733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Seva</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911733">
+			May 6, 2011 at 3:00 pm</a>		</div>
+
+		<p>Had a similar issue once. The compiler did not complain, because the code in question started its life in Win16, and there was a GetProcAddress() call.</p>
+<p>Around year 1994, casting callback function pointers back and forth was the norm. The one backed by by full faith and credit of Microsoft Corp., no less.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911753">
+				<div id="div-comment-911753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Burak KALAYCI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911753">
+			May 7, 2011 at 6:47 am</a>		</div>
+
+		<p>So there was a compatibility bug in an unmentioned version of Windows. A customer reported it but the Application Compatibility Team already had a shim. Kudos to Microsoft!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911793">
+				<div id="div-comment-911793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">davep</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911793">
+			May 8, 2011 at 2:41 pm</a>		</div>
+
+		<p>voo: &quot;actually defines the call exactly as they did. Sure it says &quot;defines the prototype for a callback function&quot; which I&#39;m sure is defined somewhere as having to have the CALLBACK calling convention, but really who thought it&#39;d be a good idea to not mention such an important detail anywhere?&quot;</p>
+<p>So, the documentation and the header disagree. Which one is used to compile the program?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911803">
+				<div id="div-comment-911803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911803">
+			May 8, 2011 at 3:45 pm</a>		</div>
+
+		<p>@davep: So your solution is.. &quot;Just ignore the documentation and always look at the header&quot;? Well, while that&#39;ll surely work, it somehow makes me doubt the value of the documentation. Sure the compiler error should be obvious, but it&#39;s such an easy fix in the documentation and would avoid quite some headaches, not just for developers but for those poor people having to write the comp. shims for that (and I bet there are dozens of functions where such shims do exist).</p>
+<p>I&#39;m sure that there was quite some discussion in the team responsible for the documentation and they surely had valid arguments (less clutter, compiler error [at least in most scenarios] if you get it wrong, ..), I think including the calling convention would lessen such problems and would hardly annoy people who&#39;d get it right anyway.</p>
+<p>Although looking at ThreadProc it seems, there&#39;ll always be some ingenious bastards that get around even the best documentation.. I cite:</p>
+<p>&quot;Do not declare this callback function with a void return type and cast the function pointer to LPTHREAD_START_ROUTINE when creating the thread. Code that does this is common, but it can crash on 64-bit Windows.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911813">
+				<div id="div-comment-911813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911813">
+			May 8, 2011 at 4:05 pm</a>		</div>
+
+		<p>@davep, Voo: If we assume what is implied by old blogs that Windows itself is compiled with the SDK then we should trust the header files over the docs. I&#39;m used to wrong docs but wrong headers is a stretch for my imagination when they&#39;re used like this.</p>
+<p>Personally I&#39;d like to know what version of Windows this was from/to. My guess based on other things would be NT4-&gt;2000 but that&#39;s just a guess.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911823">
+				<div id="div-comment-911823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GWO</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911823">
+			May 9, 2011 at 1:42 am</a>		</div>
+
+		<p>If &quot;a function pointer cast is a bug waiting to happen&quot;, how is one supposed to use GetProcAddress() in a bug free manner? Only use functions that are &quot;int fn(void)&quot;?</p>
+<div class="post">[<i>Great, now I have to put footnotes in the <span style="text-decoration:underline;">title</span>? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-911833">
+				<div id="div-comment-911833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bulletmagnet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911833">
+			May 9, 2011 at 3:37 am</a>		</div>
+
+		<p>A reinterpret_cast is a lie to the compiler.</p>
+<p>&quot;If you lie to the compiler, it will get its revenge.&quot; &#8211;Henry Spencer</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-911873">
+				<div id="div-comment-911873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-911873">
+			May 9, 2011 at 7:30 am</a>		</div>
+
+		<p>@SimonRev &#8211; that&#39;s what -Wold-style-cast is for. :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-912003">
+				<div id="div-comment-912003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">davep</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912003">
+			May 9, 2011 at 9:26 am</a>		</div>
+
+		<p>voo: &quot;@davep: So your solution is.. &#39;Just ignore the documentation and always look at the header&#39;?&quot;</p>
+<p>No. It&#39;s your job as a programmer to be -smart- about it. In this case, the compiler was basically telling you the documentation was wrong. It&#39;s bad practice to ignore the compiler. And the header -is- documentation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-912043">
+				<div id="div-comment-912043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912043">
+			May 9, 2011 at 10:28 am</a>		</div>
+
+		<p>Here raymond makes fun of people looking i header files (or tools using them) instead of reading the docs:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2008/11/28/9148951.aspx" rel="nofollow">blogs.msdn.com/&#8230;/9148951.aspx</a></p>
+<p>Great work dude!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-912083">
+				<div id="div-comment-912083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">davep</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912083">
+			May 9, 2011 at 11:13 am</a>		</div>
+
+		<p>640k: &quot;Here raymond makes fun of people looking i header files (or tools using them) instead of reading the docs:&quot;</p>
+<p>No, it&#39;s another example of not being smart.</p>
+<p>Chen: &quot;But you don&#39;t even need to read the documentation to know that Process.Refresh has no chance of working.&quot;</p>
+<p>That link is another example (like this post) of &quot;wishful thinking&quot; instead of understanding how things work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-912093">
+				<div id="div-comment-912093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912093">
+			May 9, 2011 at 11:36 am</a>		</div>
+
+		<p>Ofcourse Process.Refresh doesn&#39;t refresh the process in explorer, that&#39;s obvious long before even looking in either headers or docs. And that wasn&#39;t the point.</p>
+<p>The point was that reading headers, or using tools which read them, was discouraged by raymond. But now he made a 180, by recommending using headers instead of docs.</p>
+<div class="post">[<i>Reading headers <span style="text-decoration:underline;">and ignoring the documentation</span> is discouraged. Do not interpret this to mean &quot;never read the headers&quot; any more than saying &quot;Don&#39;t use an air bag without wearing your seat belt&quot; should be interpreted as &quot;never use an air bag.&quot; -Raymond</i>]<span></span></div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-912283">
+				<div id="div-comment-912283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912283">
+			May 9, 2011 at 1:56 pm</a>		</div>
+
+		<p>@davep: Sure I&#39;m not disputing that you can do without a complete documentation, my point is that it&#39;s unnecessary and can only lead to bugs. Or as a quite far-fetched example: Raymond posted about assembly instructions for toys or something a while ago and on some weird level it&#39;s similar: Sure they could just tell you to &quot;insert screw there&quot; and let you find out which of the different variants fits, but that&#39;s an unnecessary indirection that would only need to some quite strangely looking things. If you have to look at the implementation to understand the documentation, that&#39;s a sign that the documentation could be clearer (ah I know how Raymond feels, I can already see people finding some rare edge cases).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-912313">
+				<div id="div-comment-912313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Slapout</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912313">
+			May 9, 2011 at 2:25 pm</a>		</div>
+
+		<p>&quot;The compiler was yelling at you for a reason.&quot; &nbsp; I love that line.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-912343">
+				<div id="div-comment-912343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912343">
+			May 9, 2011 at 5:18 pm</a>		</div>
+
+		<p>Reading headers &amp; docs is the easy part. Guessing which is right is the hard part.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-912333">
+				<div id="div-comment-912333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AZ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912333">
+			May 9, 2011 at 4:01 pm</a>		</div>
+
+		<p>WndSks: &quot;You cannot put of 100% of the blame on these idiots, Visual Studio also used to ship with a wizard that would generate code for you with casts.&quot;</p>
+<p>That wasn&#39;t due to idiocy. In the old days (before STRICT), you *had* to use casts because the header definitions for DLGPROC etc. didn&#39;t include the parameter lists (they were simply aliases for FARPROC).</p>
+<p><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/aa280394%28v=VS.60%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/aa280394%28v=VS.60%29.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-912413">
+				<div id="div-comment-912413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GWO</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912413">
+			May 10, 2011 at 5:35 am</a>		</div>
+
+		<p>[Great, now I have to put footnotes in the title? -Raymond]</p>
+<p>That doesn&#39;t answer the question. &nbsp;Or even address the question. Or even make any point besides an implicit statement of how smart you are (which doesn&#39;t wash in the slightest) together with an implicit admission that the answer is &quot;You can&#39;t&quot;.</p>
+<div class="post">[<i>Would you have preferred the subject line &quot;Calling through a function pointer that has been cast to a type different from the original function prototype is a bug waiting to happen&quot;? Man, you really like to take the fun out of life. (I expect people to be able to apply rules like <a href="http://blogs.msdn.com/b/oldnewthing/archive/2009/11/04/9917052.aspx" rel="nofollow">this one</a>.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-912433">
+				<div id="div-comment-912433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WndSks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912433">
+			May 10, 2011 at 6:21 am</a>		</div>
+
+		<p>@AZ: Even if you define STRICT, the VC6 Hello World sample application will not compile without a cast since the DLGPROC return type is not LRESULT but INT_PTR (or BOOL back then)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-912493">
+				<div id="div-comment-912493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian G.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110506-00/?p=10723#comment-912493">
+			May 10, 2011 at 7:49 am</a>		</div>
+
+		<p>@GWO: or maybe it&#39;s yet another case where he makes a bold headline which is not to be taken literally as Gospel truth in 100% of all situations without exception.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

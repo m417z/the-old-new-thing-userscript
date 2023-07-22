@@ -1,0 +1,545 @@
+<html>
+<head>
+<title>Coding in-place tooltips</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Coding in-place tooltips</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 26, 2006 / year-entry #212</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today we'll look at how to implement in-place tooltips. These are tooltips that appear when the user hovers the mouse over a string that cannot be displayed in its entirety. The tooltip overlays the partially-displayed text and provides the remainder of the text that had been truncated. The keys to this technique are the TTN_SHOW...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today we'll look at how to implement in-place tooltips.
+These are tooltips that appear when the user hovers the mouse
+over a string that cannot be displayed in its entirety.
+The tooltip overlays the partially-displayed text and provides
+the remainder of the text that had been truncated.
+The keys to this technique are the
+<code>TTN_SHOW</code> notification (which lets you adjust
+the positioning of a tooltip before it is shown) and
+the <code>TTM_ADJUSTRECT</code> message which tells you
+precisely where you need the tooltip to be.
+</p>
+<p>
+Start with our
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2003/07/23/54576.aspx">
+scratch program</a>
+and add the following:
+</p>
+<pre>
+HFONT g_hfTT;
+HWND g_hwndTT;
+RECT g_rcText;
+LPCTSTR g_pszText = TEXT("<a HREF="http://www.lipsum.com/">Lorem ipsum</a> dolor sit amet.");
+const int c_xText = 50;
+const int c_yText = 50;
+
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ g_hwndTT = CreateWindowEx(WS_EX_TRANSPARENT, TOOLTIPS_CLASS, NULL,
+                           TTS_NOPREFIX,
+                           0, 0, 0, 0,
+                           hwnd, NULL, g_hinst, NULL);
+ if (!g_hwndTT) return FALSE;
+
+ g_hfTT = GetStockFont(ANSI_VAR_FONT);
+ SetWindowFont(g_hwndTT, g_hfTT, FALSE);
+
+ HDC hdc = GetDC(hwnd);
+ HFONT hfPrev = SelectFont(hdc, g_hfTT);
+ SIZE siz;
+ GetTextExtentPoint(hdc, g_pszText, lstrlen(g_pszText), &amp;siz);
+ SetRect(&amp;g_rcText, c_xText, c_yText,
+                    c_xText + siz.cx, c_yText + siz.cy);
+ SelectFont(hdc, hfPrev);
+ ReleaseDC(hwnd, hdc);
+
+ TOOLINFO ti = { sizeof(ti) };
+ ti.uFlags = TTF_TRANSPARENT | TTF_SUBCLASS;
+ ti.hwnd = hwnd;
+ ti.uId = 0;
+ ti.lpszText = const_cast&lt;LPTSTR&gt;(g_pszText);
+ ti.rect = g_rcText;
+ SendMessage(g_hwndTT, TTM_ADDTOOL, 0, (LPARAM)&amp;ti);
+
+ return TRUE;
+}
+
+void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+ HFONT hfPrev = SelectFont(pps-&gt;hdc, g_hfTT);
+ TextOut(pps-&gt;hdc, g_rcText.left, g_rcText.top,
+         g_pszText, lstrlen(g_pszText));
+ SelectFont(pps-&gt;hdc, hfPrev);
+}
+</pre>
+<p>
+After declaring a few variables, we dig into our
+computations at window creation.
+We create the tooltip window, passing ourselves as the
+owner window.
+(Passing ourselves as the owner window is important in order
+to get proper Z-order behavior.
+I refer the reader to the fifth of my "Five Things Every
+Win32 Developer Should Know" topics for further details.)
+We then obtain our font and set it into the tooltip control
+so that the tooltip renders in the same font we do.
+(I'll take up more complex font manipulation in a future entry.)
+We then measure our text in the target font and set
+the <code>g_rcText</code> rectangle to the dimensions of
+that text.
+We use that rectangle to establish the boundaries of a tool
+in the tooltip control.
+By setting the <code>TTF_SUBCLASS</code> flag,
+we indicate that the tooltip control should subclass
+our window in order to intercept mouse messages.
+This is a convenience to avoid us having to use the
+<code>TTM_RELAYEVENT</code> message to forward the mouse
+messages manually.
+This hooks up the tooltip.
+</p>
+<p>
+Painting the content is a simple matter of selecting the
+font and drawing the text.
+</p>
+<p>
+Run this program and hover over the text.
+The tooltip appears, but it's in the wrong place.
+Aside from that, though, things are working as expected.
+The tooltip has the correct font,
+it fires only when the mouse is over the text itself,
+and it dismisses when the mouse leaves the text.
+Let's position the tooltip:
+</p>
+<pre>
+LRESULT
+OnTooltipShow(HWND hwnd, NMHDR *pnm)
+{
+ RECT rc = g_rcText;
+ MapWindowRect(hwnd, NULL, &amp;rc);
+ SendMessage(pnm-&gt;hwndFrom, TTM_ADJUSTRECT, TRUE, (LPARAM)&amp;rc);
+ SetWindowPos(pnm-&gt;hwndFrom, 0, rc.left, rc.top, 0, 0,
+   SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+ return TRUE; // suppress default positioning
+}
+
+LRESULT
+OnNotify(HWND hwnd, int idFrom, NMHDR *pnm)
+{
+ if (pnm-&gt;hwndFrom == g_hwndTT) {
+  switch (pnm-&gt;code) {
+  case TTN_SHOW:
+   return OnTooltipShow(hwnd, pnm);
+  }
+ }
+ return 0;
+}
+
+// Add to WndProc
+    HANDLE_MSG(hwnd, WM_NOTIFY, OnNotify);
+</pre>
+<p>
+The <code>TTN_SHOW</code> notification is sent
+when the tooltip is about to be displayed.
+We respond to the notification by mapping the
+text rectangle to screen coordinates and
+using the <code>TTM_ADJUSTRECT</code> message
+to expand the rectangle to include all the
+margins and borders that the tooltip control
+will place around the text.
+That way, when we position the tooltip at that
+location, the margins and borders match up
+precisely, and the text appears at the desired location.
+It is important to return <code>TRUE</code>
+to indicate to the tooltip control that we
+took care of positioning the window
+and it should not do its default positioning.
+</p>
+<p>
+When you run this program, you will find one more problem:
+Tooltip animations are still taking place,
+which is particularly distracting if
+the animation is a slide animation.
+This is easy to fix:
+Tweak the way we create the tooltip control.
+</p>
+<pre>
+ g_hwndTT = CreateWindowEx(WS_EX_TRANSPARENT, TOOLTIPS_CLASS, NULL,
+                           TTS_NOPREFIX <font COLOR=blue>| TTS_NOANIMATE</font>,
+                           0, 0, 0, 0,
+                           hwnd, NULL, g_hinst, NULL);
+</pre>
+<p>
+The <code>TTS_NOANIMATE</code> style suppress animations,
+which means that the tooltip simply pops into place,
+exactly what we want.
+</p>
+<p>
+So there you have it&mdash;the basics of in-place tooltips.
+Of course, there are many details you may wish to deal with,
+such as showing the tooltip only if the string is clipped.
+But those issues are independent of in-place tooltips,
+so I won't go into them here.
+We'll look at selected aspects of tooltips in future installments.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-395603">
+				<div id="div-comment-395603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Filteau</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395603">
+			June 26, 2006 at 1:44 pm</a>		</div>
+
+		<p>The tooltip doesn&#8217;t have a black border on Windows 2000. &nbsp;Any clue ?</p>
+<p>Worst on Vista, the tooltip has a black border once out of four&#8230;<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-395613">
+				<div id="div-comment-395613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gregory</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395613">
+			June 26, 2006 at 1:45 pm</a>		</div>
+
+		<p>Why not in C++ style? Did you forget about your new scratch program? :)</p>
+<div CLASS=post>[<i>None of the samples yet are so complicated that they need the C++ version of the scratch program. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-395633">
+				<div id="div-comment-395633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">macbirdie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395633">
+			June 26, 2006 at 2:23 pm</a>		</div>
+
+		<p>As a note regarding GetTextExtentPoint at MSDN says:<br />
+<br />&quot;This function is provided only for compatibility with 16-bit versions of Windows. Applications should call the GetTextExtentPoint32 function, which provides more accurate results.&quot;</p>
+<p>So why not use the &quot;proper&quot; one? [besides not needing the increased accurancy]<br />
+<br />Do you suggest to still be compatible with 16-bit Windows or did you use it just for simplicity&#8217;s sake? Just curious of your point of view.</p>
+<p>Anyway thanks for the tip, Raymond!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-395723">
+				<div id="div-comment-395723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anthony Wieser</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395723">
+			June 26, 2006 at 4:51 pm</a>		</div>
+
+		<p>So, how did they get it so wrong in Microsoft Document Explorer for the tree view in the left pane, bundled with VS 2005? </p>
+<p>If the pane is narrow (or the text is wide) the entire pane flickers when the tooltip is displayed. </p>
+<p>Or are you still building with VC 6 Raymond, so haven&#8217;t had the japanese style flashing animations? </p>
+<div CLASS=post>[<i>I don&#8217;t see why you would reasonably expect me to explain why VS 2005 behaves any particular way. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-395803">
+				<div id="div-comment-395803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395803">
+			June 26, 2006 at 11:23 pm</a>		</div>
+
+		<blockquote><p>
+  Of course, there are many details you may<br />
+  <br />&gt; wish to deal with, such as showing the<br />
+  <br />&gt; tooltip only if the string is clipped.</p>
+<p>If your subsequent articles include an example for &#8220;if and only if&#8221;<br />
+  instead of just &#8220;only if&#8221;, please consider sending it to your<br />
+  colleagues who work on Outlook Express.</p>
+<p>(I&#8217;m not asking you to explain OE to readers, but please consider<br />
+  explaining Windows to your colleagues. &nbsp;They successfully avoid<br />
+  displaying unnecessary tips but they miss some necessary ones.)</p>
+<div CLASS=post>[<i>I have neither the time nor inclination to talk to people about everything you suggest I talk to them about. -Raymond</i>]</div>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-395843">
+				<div id="div-comment-395843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anthony Wieser</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395843">
+			June 27, 2006 at 1:55 am</a>		</div>
+
+		<p>Raymond,</p>
+<p>I didn&#8217;t expect you to know. &nbsp;It was more of a rhetorical discussion point; just wondered if you had noticed, and had perhaps applied your &quot;psychic powers&quot; of debugging as you&#8217;ve mentioned before.</p>
+<p>Sorry if it came over the wrong way.</p>
+<p>Your timing is spookily weird though sometimes. &nbsp;Just the other day I built a DDE server for a client, and what pops up, but an article on DDE from you.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-395863">
+				<div id="div-comment-395863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Serge Wautier</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395863">
+			June 27, 2006 at 3:37 am</a>		</div>
+
+		<p>Raymond,</p>
+<p>This kind of posts are worth gold. Straight to the point, solving real-world programming problems.<br />
+<br />The thing I just can&#8217;t understand is how many hours you can pack in 24! Keep up with the great blog.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-395933">
+				<div id="div-comment-395933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/06/27/648493.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-395933">
+			June 27, 2006 at 10:00 am</a>		</div>
+
+		<p>Changing the font is the most common customization.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-396073">
+				<div id="div-comment-396073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396073">
+			June 27, 2006 at 9:20 pm</a>		</div>
+
+		<blockquote><p>
+  [I have neither the time</p>
+<p>Understood. &nbsp;In order to fix all the bugs in Windows, we&#8217;d need crackpot science:</p>
+<p>First, imagine we could fix a bug in Windows in one day.</p>
+<p>On the second day, imagine we fix two bugs in Windows. &nbsp;On the<br />
+  third day, four bugs. &nbsp;Each day, imagine we double the number of<br />
+  bugs we fix.</p>
+<p>By the end of the twenty-seventh day, we would imagine that we&#8217;ve fixed all of the bugs in Windows.</p>
+<p>I understand. &nbsp;In the real world, it isn&#8217;t going to happen.</p>
+<p>&gt; nor inclination</p>
+<p>Therefore we fix zero.</p>
+<p>For this I almost have less understanding, but actually enough<br />
+  experience working for other companies that prohibit bugfixing does<br />
+  make me understand. &nbsp;After a while, everyone who has the<br />
+  capability to fix bugs loses interest in trying to buck the system.<br />
+  &nbsp;You even mentioned how you were penalized for your efforts to<br />
+  help improve bug reduction in Windows 98. &nbsp;OK, I understand.</p>
+<p>Time for a brainstorm.</p>
+<p>Suppose you imagine that Outlook Express isn&#8217;t a crucial integral<br />
+  component of a crucial integral component of Windows. &nbsp;Then you<br />
+  could put an appcompat hack into Windows to work around the bug in the<br />
+  third-party app. &nbsp;Oops sorry, this is more crackpot science,<br />
+  requiring imagination. &nbsp;There&#8217;s no solution.</p>
+<p>OK, I give up. &nbsp;Sorry for disturbing you.</p>
+<div CLASS=post>[<i>I&#8217;m impressed with your conclusion that because I don&#8217;t have the time and inclination to fix one bug in a component owned by a team I am not a member of means that I&#8217;m not fixing any bugs at all. -Raymond</i>]</div>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-396113">
+				<div id="div-comment-396113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396113">
+			June 27, 2006 at 11:27 pm</a>		</div>
+
+		<blockquote><p>
+  I&#8217;m impressed with your conclusion</p>
+<p>Be as impressed as you wish. &nbsp;Customers are located even farther away from that crucial component of a crucial component of your company&#8217;s product than you are. &nbsp;Somehow I have a feeling that even if a customer paid Microsoft&#8217;s fee to report a bug, the customer wouldn&#8217;t be able to get it fixed either.</p>
+<p>While reading your article, I noticed its relevance to a long-standing bug. &nbsp;Temporarily I forgot that your company discourages bug fixing internally as much as it does with customers, therefore I made a worthless suggestion. &nbsp;Again I apologize to you for this lapse.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-396133">
+				<div id="div-comment-396133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vince P</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396133">
+			June 28, 2006 at 1:26 am</a>		</div>
+
+		<p>I love how Norman uses your blog as his personal bitch-at-Microsoft forum</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-396213">
+				<div id="div-comment-396213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nuno Campos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396213">
+			June 28, 2006 at 9:39 am</a>		</div>
+
+		<p>I&#8217;ve implemented something very similar to this some time ago. I<br />
+respond to TTN_SHOW just like you do, but instead of using<br />
+SendMessage(&#8230;, TTM_ADJUSTRECT, &#8230;), I call SetWindowPos() without<br />
+SWP_NOSIZE and with the desired size. It works fine, but is it wrong?</p>
+<div CLASS=post>[<i>Without TTM_ADJUSTRECT, how do you know how big the tooltip should be (relative to your desired size) and how it should be positioned? Do you just hard-code a number? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-396313">
+				<div id="div-comment-396313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">J</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396313">
+			June 28, 2006 at 1:43 pm</a>		</div>
+
+		<p>&quot;therefore I made a worthless suggestion.&quot;</p>
+<p>Maybe it&#8217;s not that your suggestions are worthless, but instead it&#8217;s just that you complain so much that everything you say starts to become this annoying buzz that people try to ignore. &nbsp;Perhaps you can try to be constructive once in your life and you&#8217;ll actually get people who want work with you instead of wanting nothing to do with you.</p>
+<p>Nobody likes a chronic complainer.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-396333">
+				<div id="div-comment-396333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nuno Campos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396333">
+			June 28, 2006 at 2:17 pm</a>		</div>
+
+		<p>Sorry, I&#8217;ve never heard of TTM_ADJUSTRECT and I should have read the documentation before bothering you with this&#8230; You are right, I am &#8220;hard-coding&#8221; a number: it&#8217;s an owner-drawn list with an owner-drawn tooltip, so I know exactly how big the tooltip should be. Before reading about TTM_ADJUSTRECT on MSDN, I thought it was being used only to set the tooltip&#8217;s size.</p>
+<div CLASS=post>[<i>Owner-draw gives you control over the insides of the tooltip, but not the outsides (the border, the margin, etc.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-396363">
+				<div id="div-comment-396363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-396363">
+			June 28, 2006 at 11:18 pm</a>		</div>
+
+		<p>Wednesday, June 28, 2006 1:43 PM by J<br />
+<br />&gt; Perhaps you can try to be constructive once<br />
+<br />&gt; in your life</p>
+<p>Well obviously I wasn&#8217;t constructive with this one:<br />
+<br />&gt;&gt; If your subsequent articles include an<br />
+<br />&gt;&gt; example for &quot;if and only if&quot; instead of just<br />
+<br />&gt;&gt; &quot;only if&quot;, please consider sending it to<br />
+<br />&gt;&gt; your colleagues who work on Outlook Express.</p>
+<p>so I think I&#8217;m genetically incapable of it, sorry. &nbsp;The only constructive things I get to do are code.</p>
+<p>&gt; Nobody likes a chronic complainer.</p>
+<p>Right. &nbsp;Even I don&#8217;t. &nbsp;I wish that the number of causes for complaint would go down.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-400023">
+				<div id="div-comment-400023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/07/13/664448.aspx' rel='external nofollow' class='url'>The Old New Thing : Glass houses are great places to throw stones</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-400023">
+			July 13, 2006 at 10:00 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2006/07/13/664448.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2006/07/13/664448.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-576373">
+				<div id="div-comment-576373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://cardboxeverywhere.wordpress.com/2007/12/11/programming-note-tooltips-again/' rel='external nofollow' class='url'>Programming note: tooltips again &laquo; Cardbox Everywhere</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060626-11/?p=30743#comment-576373">
+			December 11, 2007 at 8:05 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://cardboxeverywhere.wordpress.com/2007/12/11/programming-note-tooltips-again/" rel="nofollow">http://cardboxeverywhere.wordpress.com/2007/12/11/programming-note-tooltips-again/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

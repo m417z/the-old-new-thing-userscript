@@ -1,0 +1,242 @@
+<html>
+<head>
+<title>Corrections to Patterns for using the InitOnce functions</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Corrections to Patterns for using the InitOnce functions</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 20, 2011 / year-entry #98</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110420-00/?p=10873</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>3</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Adam Rosenfield pointed out that it is not possible to fail an asynchronous initialization; if you pass INIT_ONCE_INIT_FAILED when completing an asynchronous initialization, the function fails with ERROR_INVALID_PARAMETER. (Serves me right for writing an article the night before it goes up.) A more correct version is therefore ITEMCONTROLLER *SingletonManager::Lookup(DWORD dwId) { ... same as before...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/08/10151258.aspx#10151421">
+Adam Rosenfield pointed out</a>
+that it is not possible to fail an
+asynchronous initialization;
+if you pass
+<code>INIT_<wbr>ONCE_<wbr>INIT_<wbr>FAILED</wbr></wbr></wbr></code>
+when completing an asynchronous initialization,
+the function fails with
+<code>ERROR_<wbr>INVALID_<wbr>PARAMETER</wbr></wbr></code>.
+(Serves me right for writing an article the night before it goes up.)
+A more correct version is therefore
+</p>
+<pre>
+ITEMCONTROLLER *SingletonManager::Lookup(DWORD dwId)
+{
+ ... same as before until we reach the "singleton constructor pattern"
+
+ void *pv = NULL;
+ BOOL fPending;
+ if (!InitOnceBeginInitialize(&amp;m_rgio[i], INIT_ONCE_ASYNC,
+                              &amp;fPending, &amp;pv)) return NULL;
+
+ if (fPending) {
+  ITEMCONTROLLER *pic = m_rgsi[i].pfnCreateController();
+  <font COLOR=blue>if (!pic) return NULL;
+  if (InitOnceComplete(&amp;m_rgio[i], INIT_ONCE_ASYNC, pic)) {</font>
+   pv = pic;
+  } else {
+   // lost the race - discard ours and retrieve the winner
+   delete pic;
+   InitOnceBeginInitialize(&amp;m_rgio[i], INIT_ONCE_CHECK_ONLY,
+                           X&amp;fPending, &amp;pv);
+  }
+ }
+ return static_cast&lt;ITEMCONTROLLER *&gt;(pv);
+}
+</pre>
+<p>
+In other words, the pattern is as follows:
+</p>
+<ul>
+<li>Call <code>Init&shy;Once&shy;Begin&shy;Initialize</code>
+    in async mode.
+</li>
+<li>If it returns <code>fPending == FALSE</code>,
+    then initialization has already been performed and you can
+    go ahead and use the result passed back in the final parameter.
+</li>
+<li>Otherwise, initialization is pending.
+    Do your initialization, but remember that since this is a lock-free
+    algorithm, there can be many threads trying to initialize
+    simultaneously, so you have to be careful
+    <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/07/10150728.aspx">
+    how you manipulate global state</a>.
+    This pattern works best if initialization takes the form of
+    creating a new object (because that means multiple threads
+    performining initialization are each creating independent objects).
+</li>
+<li><font COLOR=blue>If initialization fails, then abandon the operation.</font>
+</li>
+<li>Call <code>Init&shy;Once&shy;Complete</code> with the result
+    of your initialization.
+</li>
+<li>If <code>Init&shy;Once&shy;Complete</code> succeeds,
+    then you won the initialization race, and you're done.
+</li>
+<li>If <code>Init&shy;Once&shy;Complete</code> fails,
+    then you lost the initialization race and should clean up your
+    failed initialization.
+    In that case, you should call
+    <code>Init&shy;Once&shy;Begin&shy;Initialize</code>
+    one last time to get the answer from the winner.
+</li>
+</ul>
+<p>
+While I'm here, I may as well answer the exercises.
+</p>
+<p>
+<b>Exercise</b>: Instead of calling
+<code>Init&shy;Once&shy;Complete</code> with
+<code>INIT_<wbr>ONCE_<wbr>INIT_<wbr>FAILED</wbr></wbr></wbr></code>,
+what happens if the function simply returns
+without ever completing the init-once?
+</p>
+<p>
+<b>Answer</b>: The <code>INIT_<wbr>ONCE</wbr></code> structure is left
+in an <i>asynchronous initialization pending</i> state.
+This is fine, because the next attempt to initialize will simply
+join the race.
+(And it will win since we already quit the race!)
+</p>
+<p>
+<b>Exercise</b>:
+What happens if two threads try to perform
+asynchronous initialization and the first one
+to complete fails?
+</p>
+<p>
+<b>Answer</b>:
+If two threads both begin initialization and the first one to
+come to a result concludes that the initialization fails, then
+it will abandon the initialization.
+The second thread will then come to its own conclusion.
+If that conclusion is also failure, then it too will
+abandon the initialization as well.
+If that conclusion is that initialization was successful,
+then its completion will succeed and the <code>INIT_<wbr>ONCE</wbr></code>
+will enter the <i>initialized</i> state.
+</p>
+<p>
+<b>Exercise</b>:
+Combine the results of the first two exercises
+and draw a conclusion.
+</p>
+<p>
+<b>Answer</b>:
+It is fine to abandon a failed initialization (and indeed,
+given what we learned above, it is indeed mandatory).
+</p>
+<p>
+There is a documentation update coming soon to clarify that
+you cannot combine
+<code>INIT_<wbr>ONCE_<wbr>ASYNC</wbr></wbr></code> and
+<code>INIT_<wbr>ONCE_<wbr>INIT_<wbr>FAILED</wbr></wbr></wbr></code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (3)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-908233">
+				<div id="div-comment-908233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110420-00/?p=10873#comment-908233">
+			April 20, 2011 at 7:41 am</a>		</div>
+
+		<p>With quantum computing, asynchronous initialization will both succeed and fail simultaneously (both synchronously and asynchronously). &nbsp;Write a doctoral thesis on the implications for faster-than-light travel along the inverted negative timeline axis.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-908243">
+				<div id="div-comment-908243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110420-00/?p=10873#comment-908243">
+			April 20, 2011 at 9:30 am</a>		</div>
+
+		<p>Lock-free is hard. Let&#39;s go shopping!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-908293">
+				<div id="div-comment-908293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110420-00/?p=10873#comment-908293">
+			April 20, 2011 at 4:41 pm</a>		</div>
+
+		<p>Even Raymond makes mistakes. Live with it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

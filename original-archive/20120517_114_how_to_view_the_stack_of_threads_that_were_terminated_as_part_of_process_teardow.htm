@@ -1,0 +1,340 @@
+<html>
+<head>
+<title>How to view the stack of threads that were terminated as part of process teardown from the kernel debugger</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to view the stack of threads that were terminated as part of process teardown from the kernel debugger</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 17, 2012 / year-entry #115</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">As we saw some time ago, process shutdown is a multi-phase affair. After you call ExitProcess, all the threads are forcibly terminated. After that's done, each DLL is sent a DLL_PROCESS_DETACH notification. You may be debugging a problem with DLL_PROCESS_DETACH handling that suggests that some of those threads were not cleaned up properly. For example,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+As we saw some time ago,
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2007/05/03/2383346.aspx">
+process shutdown is a multi-phase affair</a>.
+After you call <code>ExitProcess</code>,
+all the threads are forcibly terminated.
+After that's done, each DLL is sent a <code>DLL_PROCESS_DETACH</code>
+notification.
+You may be debugging
+a problem with <code>DLL_PROCESS_DETACH</code> handling
+that suggests that some of those threads were not cleaned up properly.
+For example, you might assert that a reference count is zero,
+and you find during process shutdown that this assertion sometimes fires.
+Maybe you terminated a thread before it got a chance to release
+its reference?
+How can you test this theory if the thread is already gone?
+</p>
+<p>
+It so happens that when all the threads are terminated during the
+early phase of process shutdown,
+the kernel is a bit lazy and doesn't free their stacks.
+It figures, hey, the entire process is going away soon,
+so the stack memory is going to be cleaned up as part of process
+termination.
+(It's sort of the kernel equivalent of
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/01/05/10253268.aspx">
+not bothering to sweep the floor
+of a building that's about to be demolished</a>.)
+You can use this to your advantage by <i>grovelling the stacks
+that were left behind</i>.
+</p>
+<p>
+Hey, this is why you get called in to debug the hard stuff, right?
+</p>
+<blockquote CLASS=m><p>
+Before continuing, I need to emphasize that this information is
+<b>for debugging purposes only</b>.
+The structures and offsets are all implementation details
+which can change from release to release.
+</p>
+</blockquote>
+<p>
+The first step is to identify where all the stacks are.
+The direct approach is difficult because the stacks can be all
+different sizes, so it's not easy to pick them out of a line-up.
+But one thing does come in a consistent size: The
+<a HREF="http://msdn.microsoft.com/en-us/library/ff565433.aspx">
+TEB</a>.
+</p>
+<p>
+From the kernel debugger, use the <code>!process</code> command
+to dump the process you are interested in,
+and from the header information, extract the <code>VadRoot</code>.
+</p>
+<pre>
+1: kd&gt; !process -1
+PROCESS 8731bd40  SessionId: 1  Cid: 0748    Peb: 7ffda000  ParentCid: 0620
+    DirBase: 4247b000  ObjectTable: 96f66de0  HandleCount: 104.
+    Image: oopsie.exe
+    <font COLOR=red><u>VadRoot 893de570</u></font> Vads 124 Clone 0 Private 518. Modified 643. Locked 0.
+    DeviceMap 995628c0
+</pre>
+<p>
+Dump this VAD root with the <code>!vad</code> command,
+and pay attention only to the entries which say
+<code>1 Private READWRITE</code>.
+</p>
+<pre>
+1: kd&gt; !vad <u>893de570</u>
+VAD     level      start      end    commit
+... ignore everything except "1 Private READWRITE" ...
+8730a5f0 ( 6)         50       50         1 Private      READWRITE
+9ab0cb40 ( 5)         60       7f         1 Private      READWRITE
+893978b0 ( 6)         80       9f         1 Private      READWRITE
+87302d30 ( 5)        110      110         1 Private      READWRITE
+889693f8 ( 6)        120      121         1 Private      READWRITE
+872f3fb8 ( 6)        170      170         1 Private      READWRITE
+87089a80 ( 6)        1a0      1a0         1 Private      READWRITE
+8cbf1cb0 ( 5)        1c0      1df         1 Private      READWRITE
+88c079d0 ( 6)        1e0      1e0         1 Private      READWRITE
+9abc33e0 ( 6)        410      48f         1 Private      READWRITE
+873173b0 ( 7)        970      970         1 Private      READWRITE
+8ca1c158 ( 7)      7ffd5    7ffd5         1 Private      READWRITE
+88c02a78 ( 6)      7ffd6    7ffd6         1 Private      READWRITE
+872f9298 ( 5)      7ffd7    7ffd7         1 Private      READWRITE
+8750d210 ( 7)      7ffd8    7ffd8         1 Private      READWRITE
+87075ce8 ( 6)      7ffda    7ffda         1 Private      READWRITE
+87215da0 ( 4)      7ffdc    7ffdc         1 Private      READWRITE
+872f2200 ( 6)      7ffdd    7ffdd         1 Private      READWRITE
+8730a670 ( 5)      7ffdf    7ffdf         1 Private      READWRITE
+</pre>
+<p>
+(If you are debugging from user mode, then you can use
+<code>!vadump</code> but the output format is different.)
+</p>
+<p>
+Each of these is a candidate TEB.
+In practice, TEBs tend to be allocated at the high end of memory,
+so the ones with a low <code>start</code> value are probably
+red herrings.
+Therefore, you should investigate these candidates in reverse order.
+</p>
+<p>
+For each candidate, take the <code>start</code> address and append
+three zeroes.
+(Each page on x86 is 4KB, which conveniently maps to 1000 in hex.)
+Dump the first seven
+pointers of the TEB with the <code>dp xxxxx000 L7</code>
+command.
+</p>
+<pre>
+1: kd&gt; dp 7ffdf000 L7
+7ffdf000  0016fbb0 00170000 0016b000 00000000
+7ffdf010  00001e00 00000000 7ffdf000 &larr; hit
+</pre>
+<p>
+If the TEB is valid, then the seventh pointer points back
+to the start of the TEB.
+In a valid TEB,
+the second and third values are the
+stack limits; in this case, the candidate stack lives between
+<code>0016b000</code> and <code>00170000</code>.
+(As a double-check, you can verify that the upper limit of the
+stack, <code>00170000</code> in this case, matches up with
+the end of a VAD allocation in the <code>!vad</code> output above.)
+</p>
+<p>
+Now that you know where the stack is, you can <code>dps</code> it
+and
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/03/09/10138401.aspx">
+look for EBP frames</a>.
+(I usually start about two to four pages below the upper limit of the stack.)
+Test out each candidate EBP frame with the <code>k=</code> command
+until you find one that seems to be solid.
+Record this candidate stack trace in a text file for further study.
+</p>
+<p>
+Repeat for each candidate TEB, and you will eventually reconstruct
+what each thread in the process was doing at the moment it was
+terminated.
+If you're really lucky, you might even see the code that incremented
+the reference count
+but was terminated before it could release it.
+</p>
+<p>
+The above discussion also applies to debugging 64-bit processes.
+However, instead of looking for
+<code>1 Private READWRITE</code> pages, you want to look for
+<code>2 Private READWRITE</code> pages.
+As an additional wrinkle, if you are debugging ia64, then converting
+a page frame to a linear address is sadly not as simple as appending
+three zeroes.
+Pages on ia64 are 8KB, not 4KB, so you need to shift the value left
+by 25 bits: Add three zeroes and then multiply by two.
+</p>
+<p>
+And finally, if you are debugging a 32-bit process on x64,
+then you want to look for <code>3 Private READWRITE</code> pages,
+but add 2 before appending the three zeroes.
+That's because the TEB for a 32-bit process on x64 is really two
+TEBs glued together: A 64-bit TEB followed by a 32-bit TEB.
+</p>
+<p>
+<b>Note</b>:
+I did not come up with this debugging technique on my own.
+I learned it from an even greater debugging genius.
+</p>
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/05/18/10306501.aspx">
+Next time</a>, we'll look at debugging this issue from a user-mode
+debugger.
+</p>
+<p>
+<b>Trivia</b>:
+The informal term for these terminated-but-not-yet-completely-destroyed
+threads is <i>ghost threads</i>.
+The term was coined by the Exchange support team,
+because they often have to study server failures
+that require them to do this type of investigation,
+and they needed a cute name for it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-985673">
+				<div id="div-comment-985673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603#comment-985673">
+			May 17, 2012 at 8:05 am</a>		</div>
+
+		<p>If the threads are terminated (not just suspended, which probably would have made more sense), XP used to keep their stacks still allocated (and probably TEB). Then Vista frees the stacks now.</p>
+<p>So is this technique still valid for Vista+?</p>
+<div class="post">[<i>I guess in your excitement to be the first comment, you decided to skip the entire second paragraph. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-985683">
+				<div id="div-comment-985683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603#comment-985683">
+			May 17, 2012 at 8:12 am</a>		</div>
+
+		<p>alegr1: the TEB has had a field with an address to VirtualFree on thread termination since Windows Server 2003 (5.1 kernel, meaning 64-bit Windows XP counts, too); before then, TerminateThread used to leak stacks (ExitThread didn&#39;t). This applies to regular thread termination, though, not thread termination caused by process termination</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-985693">
+				<div id="div-comment-985693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603#comment-985693">
+			May 17, 2012 at 8:20 am</a>		</div>
+
+		<p>&#8230; in fact, I&#39;m surprised that it doesn&#39;t even free the TEBs</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-985743">
+				<div id="div-comment-985743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603#comment-985743">
+			May 17, 2012 at 10:01 am</a>		</div>
+
+		<p>@KJK:</p>
+<p>I think it doesn&#39;t free TEB because each takes just one page, and it&#39;s not possible to call VirtualFree for that. It&#39;s posible to call VirtualProtect to uncommit them, though, but it may not make much sense, because then you have to keep track of those free pages to reuse that space. It&#39;s possible that the freed TEB during normal ExitThread may be set aside for future started threads.</p>
+<p>@Raymond: FRIST!!!!11!!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-985883">
+				<div id="div-comment-985883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SDL</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603#comment-985883">
+			May 18, 2012 at 3:04 am</a>		</div>
+
+		<p>Just writing to say thanks for this post. I tend to find your &quot;most technical&quot; posts the most interesting and it&#39;s content like this that makes me look forward to checking for new posts in my Atom feed at the end of the day. These kind of tips from geniuses in their fields are truly invaluable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-986153">
+				<div id="div-comment-986153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joakim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120517-00/?p=7603#comment-986153">
+			May 19, 2012 at 6:18 pm</a>		</div>
+
+		<p>I&#39;m with SDL. :) I always look forward to reading this blog.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

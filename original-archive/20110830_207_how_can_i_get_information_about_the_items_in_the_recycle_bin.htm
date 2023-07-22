@@ -1,0 +1,550 @@
+<html>
+<head>
+<title>How can I get information about the items in the Recycle Bin?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I get information about the items in the Recycle Bin?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 30, 2011 / year-entry #208</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">For some reason, a lot of people are interested in programmatic access to the contents of the Recycle Bin. They never explain why they care, so it's possible that they are looking at their problem the wrong way. For example, one reason for asking, "How do I purge an item from the Recycle Bin given...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+For some reason, a lot of people are interested in programmatic
+access to the contents of the Recycle Bin.
+They never explain why they care,
+so it's possible that they are looking at their problem the wrong way.
+</p>
+<p>
+For example, one reason for asking,
+"How do I purge an item from the Recycle Bin given a path?"
+is that
+some operation in their program results in the files going
+into the Recycle Bin and they want them to be deleted entirely.
+The correct solution is to clear the <code>FOF_<wbr>ALLOW&shy;UNDO</code> flag
+when deleting the items in the first place.
+Moving to the Recycle Bin and then purging is the wrong solution because
+your search-and-destroy mission may purge more items than just the
+ones your program put there.
+</p>
+<p>
+The Recycle Bin is somewhat strange in that it can have multiple items
+with the same name.
+Create a text file called <code>TEST.TXT</code> on your desktop,
+then delete it into the Recycle Bin.
+Create another text file called <code>TEST.TXT</code> on your desktop,
+then delete it into the Recycle Bin.
+Now open your Recycle Bin.
+Hey look, you have two <code>TEST.TXT</code> files with the same path!
+</p>
+<p>
+Now look at that original problem:
+Suppose the program, as part of some operation, moves
+the file <code>TEST.TXT</code> from the desktop to the Recycle Bin,
+and then the second half of the program goes into the Recycle Bin,
+finds <code>TEST.TXT</code> and purges it.
+Well, there are actually three copies of <code>TEST.TXT</code> in the
+Recycle Bin, and only one of them is the one you wanted to purge.
+</p>
+<p>
+Okay, I got kind of sidetracked there.
+Back to the issue of getting information about the items in the
+Recycle Bin.
+</p>
+<p>
+The Recycle Bin is a shell folder,
+and the way to enumerate the contents of a shell folder is to
+bind to it and enumerate its contents.
+The low-level interface to the shell namespace is via
+<code>IShell&shy;Folder</code>.
+There is an easier-to-use medium-level interface based on
+<code>IShell&shy;Item</code>,
+and there's a high-level interface based on <code>Folder</code>
+designed for scripting.
+</p>
+<p>
+I'll start with the low-level interface.
+As usual, the program starts with a bunch of header files.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;tchar.h&gt;
+#include &lt;shlobj.h&gt;
+#include &lt;shlwapi.h&gt;
+#include &lt;propkey.h&gt;
+</pre>
+<p>
+The <code>Bind&shy;To&shy;Csidl</code> function binds to a folder specified
+by a <code>CSIDL</code>.
+The modern way to do this is via <code>KNOWN&shy;FOLDER</code>,
+but just to keep you old fogeys happy, I'm doing things the
+classic way since you refuse to upgrade from Windows&nbsp;XP.
+(We'll look at the modern way later.)
+</p>
+<pre>
+HRESULT BindToCsidl(int csidl, REFIID riid, void **ppv)
+{
+ HRESULT hr;
+ PIDLIST_ABSOLUTE pidl;
+ hr = SHGetSpecialFolderLocation(NULL, csidl, &amp;pidl);
+ if (SUCCEEDED(hr)) {
+  IShellFolder *psfDesktop;
+  hr = SHGetDesktopFolder(&amp;psfDesktop);
+  if (SUCCEEDED(hr)) {
+   if (pidl->mkid.cb) {
+    hr = psfDesktop-&gt;BindToObject(pidl, NULL, riid, ppv);
+   } else {
+    hr = psfDesktop-&gt;QueryInterface(riid, ppv);
+   }
+   psfDesktop-&gt;Release();
+  }
+  CoTaskMemFree(pidl);
+ }
+ return hr;
+}
+</pre>
+<p>
+The subtlety here is in the test for <code>pidl-&gt;mkid.cb</code>.
+The <code>IShell&shy;Folder::<wbr>Bind&shy;To&shy;Object</code>
+method is for binding
+to child objects (or grandchildren or deeper descendants).
+If the object you want is the desktop itself, then you can't use
+<code>IShell&shy;Folder::<wbr>Bind&shy;To&shy;Object</code>
+since the desktop is not
+a child of itself.
+In fact, if the object you want is the desktop itself,
+then <i>you already have the desktop</i>,
+so we just <code>Query&shy;Interface</code> for it.
+It's an annoying special case which usually lurks in your code
+until somebody tries something like "Save file to desktop"
+or changes the location of a special folder to the desktop,
+and then
+boom you trip over the fact that the desktop is not a child of itself.
+(See further discussion below.)
+</p>
+<p>
+Another helper function prints the display name of a shell namespace item.
+There isn't much interesting here either.
+</p>
+<pre>
+void PrintDisplayName(IShellFolder *psf,
+    PCUITEMID_CHILD pidl, SHGDNF uFlags, PCTSTR pszLabel)
+{
+ <a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/08/23/218837.aspx">STRRET</a> sr;
+ HRESULT hr = psf-&gt;GetDisplayNameOf(pidl, uFlags, &amp;sr);
+ if (SUCCEEDED(hr)) {
+  PTSTR pszName;
+  hr = StrRetToStr(&amp;sr, pidl, &amp;pszName);
+  if (SUCCEEDED(hr)) {
+   _tprintf(TEXT("%s = %s\n"), pszLabel, pszName);
+   CoTaskMemFree(pszName);
+  }
+ }
+}
+</pre>
+<p>
+Our last helper function retrieves a property from the shell namespace
+and prints it.
+(Obviously, if we wanted to do something other than print it,
+we could coerce the type to something other than <code>VT_<wbr>BSTR</code>.)
+</p>
+<pre>
+void PrintDetail(IShellFolder2 *psf, PCUITEMID_CHILD pidl,
+    const SHCOLUMNID *pscid, PCTSTR pszLabel)
+{
+ VARIANT vt;
+ HRESULT hr = psf-&gt;GetDetailsEx(pidl, pscid, &amp;vt);
+ if (SUCCEEDED(hr)) {
+  hr = VariantChangeType(&amp;vt, &amp;vt, 0, VT_BSTR);
+  if (SUCCEEDED(hr)) {
+   _tprintf(TEXT("%s: %ws\n"), pszLabel, V_BSTR(&amp;vt));
+  }
+  VariantClear(&amp;vt);
+ }
+}
+</pre>
+<p>
+Okay, now we can get down to business.
+The properties we will display from each item in the Recycle Bin
+are the item name and path,
+the original location (before the item was deleted),
+the date the item was deleted,
+and the size of the item.
+</p>
+<p>
+Getting the name and path are done with
+various combinations of flags to
+<code>IShell&shy;Folder::<wbr>Get&shy;Display&shy;Name&shy;Of</code>,
+whereas getting the other properties involve talking to the
+shell property system.
+(My colleague
+<a HREF="http://blogs.msdn.com/benkaras/">
+Ben Karas</a>
+covers the
+<a HREF="http://blogs.msdn.com/benkaras/archive/tags/Property+System/default.aspx">
+shell property system</a> on his blog.)
+The
+<a HREF="http://msdn.microsoft.com/en-us/library/bb759748(VS.85).aspx">
+<code>SHCOLUMN&shy;ID</code> documentation</a>
+says that the displaced property set applies to items which have been
+moved to the Recycle Bin,
+so we can define those column IDs based on the values provided in
+<code>shlguid.h</code>:</p>
+<pre>
+const SHCOLUMNID SCID_OriginalLocation =
+   { <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/08/29/10201372.aspx">PSGUID_DISPLACED</a>, PID_DISPLACED_FROM };
+const SHCOLUMNID SCID_DateDeleted =
+   { PSGUID_DISPLACED, PID_DISPLACED_DATE };
+</pre>
+<p>
+The other property we want is
+<a HREF="http://msdn.microsoft.com/en-us/library/bb787566(VS.85).aspx">
+<code>System.<wbr>Size</code></a>,
+which the documentation says is defined as
+<code>PKEY_<wbr>Size</code> by the
+<code>propkey.h</code> header file.
+</p>
+<p>
+Okay, let's roll!
+</p>
+<pre>
+int __cdecl _tmain(int argc, PTSTR *argv)
+{
+ HRESULT hr = CoInitialize(NULL);
+ if (SUCCEEDED(hr)) {
+  IShellFolder2 *psfRecycleBin;
+  hr = BindToCsidl(CSIDL_BITBUCKET, IID_PPV_ARGS(&amp;psfRecycleBin));
+  if (SUCCEEDED(hr)) {
+   IEnumIDList *peidl;
+   hr = psfRecycleBin-&gt;EnumObjects(NULL,
+     <a HREF="http://blogs.msdn.com/oldnewthing/archive/2010/04/02/9989235.aspx">SHCONTF_FOLDERS | SHCONTF_NONFOLDERS</a>, &amp;peidl);
+   if (<font COLOR=blue>hr == S_OK</font>) {
+    PITEMID_CHILD pidlItem;
+    while (peidl-&gt;Next(1, &amp;pidlItem, NULL) == S_OK) {
+     _tprintf(TEXT("------------------\n"));
+
+     PrintDisplayName(psfRecycleBin, pidlItem,
+                      SHGDN_INFOLDER, TEXT("InFolder"));
+     PrintDisplayName(psfRecycleBin, pidlItem,
+                      SHGDN_NORMAL, TEXT("Normal"));
+     PrintDisplayName(psfRecycleBin, pidlItem,
+                      SHGDN_FORPARSING, TEXT("ForParsing"));
+
+     PrintDetail(psfRecycleBin, pidlItem,
+                 &amp;SCID_OriginalLocation, TEXT("Original Location"));
+     PrintDetail(psfRecycleBin, pidlItem,
+                 &amp;SCID_DateDeleted, TEXT("Date deleted"));
+     PrintDetail(psfRecycleBin, pidlItem,
+                 &amp;PKEY_Size, TEXT("Size"));
+
+     CoTaskMemFree(pidlItem);
+    }
+   }
+   psfRecycleBin-&gt;Release();
+  }
+  CoUninitialize();
+ }
+ return 0;
+}
+</pre>
+<p>
+The only tricky part is the test for whether the call to
+<code>IShell&shy;Folder::<wbr>Enum&shy;Objects</code> succeeded,
+highlighted above.
+According to
+<a HREF="http://msdn.microsoft.com/en-us/library/bb775066(VS.85).aspx">
+the rules for
+<code>IShell&shy;Folder::<wbr>Enum&shy;Objects</code></a>,
+the method is allowed to
+return <code>S_FALSE</code> to indicate that there are no
+children, in which case it sets <code>peidl</code> to <code>NULL</code>.
+</p>
+<p>
+If you are willing to call functions new to Windows Vista,
+you can simplify the <code>Bind&shy;To&shy;Csidl</code> function
+by using the helper function <code>SHBind&shy;To&shy;Object</code>.
+This does the work of getting the desktop folder and handling the
+desktop special case.
+</p>
+<pre>
+HRESULT BindToCsidl(int csidl, REFIID riid, void **ppv)
+{
+ HRESULT hr;
+ PIDLIST_ABSOLUTE pidl;
+ hr = SHGetSpecialFolderLocation(NULL, csidl, &amp;pidl);
+ if (SUCCEEDED(hr)) {
+  <font COLOR=blue>hr = SHBindToObject(NULL, pidl, NULL, riid, ppv);</font>
+  CoTaskMemFree(pidl);
+ }
+ return hr;
+}
+</pre>
+<p>
+But at this point, I'm starting to steal from the topic I scheduled
+for next time, namely modernizing this program to take advantage of
+some new helper functions and interfaces.
+We'll continue next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-932883">
+				<div id="div-comment-932883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932883">
+			August 30, 2011 at 7:31 am</a>		</div>
+
+		<p>It is not that we refuse to upgrade from Windows XP; it is that, while people still use Windows XP, and it is still supported by Microsoft, we have to make the software we develop work on it too. After 2014, this will not be an issue anymore.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-932893">
+				<div id="div-comment-932893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">woodswan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932893">
+			August 30, 2011 at 7:34 am</a>		</div>
+
+		<p>Before reading the post, I was thinking that the Recycle Bin folder is specially managed as the logging file system, so that it can have items with the same name and path. But it seems that I was wrong.</p>
+<div class="post">[<i>That would have been a neat trick, since Windows 95 had a Recycle Bin but FAT doesn&#39;t support logging. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-932913">
+				<div id="div-comment-932913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932913">
+			August 30, 2011 at 8:31 am</a>		</div>
+
+		<p>Yep, that&#39;s a lot of trouble. &nbsp;I just ignore the recycle bin most of the time. &nbsp;I delete things to the recycle bin, but I clear it out several times a day. &nbsp;Seeing trash in the recycle bin is mildly annoying.</p>
+<p>As for Windows XP, I know a lot of companies that plan to wait until 2013 or 2014 and then upgrade to Windows 7. &nbsp;Some of my relatives will likely do the same thing (but most of them are on Windows 7 already). &nbsp;I have mostly moved to Windows 7 on my 5 main computers, but I keep XP around in a virtual machine for testing things that my customers use.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-932923">
+				<div id="div-comment-932923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932923">
+			August 30, 2011 at 9:23 am</a>		</div>
+
+		<p>Neat trick, but real men <a href="a rel=&quot;nofollow&quot; target=&quot;_new&quot; href=&quot;http://www.garyshood.com/root/&quot; rel="nofollow"></a><a href="http://www.garyshood.com/root/&lt;/a" rel="nofollow">http://www.garyshood.com/root/&lt;/a</a>&#8220;>1 just call DeleteFile().</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-932933">
+				<div id="div-comment-932933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932933">
+			August 30, 2011 at 9:25 am</a>		</div>
+
+		<p>Actually, it is a refusal to upgrade by our IT administrator, rather than by me. &nbsp;Not that our IT guy has any sort of coherent reason to ban Windows 7 and Vista (this is the same guy that blocked IMAP access to our corporate email from our PCs inside the building because he thinks the web client is &quot;very nice&quot;).</p>
+<p>In the end, Cesar nailed things on the head though &#8212; as long as OUR customers use XP, we have to write software than runs under XP. &nbsp;As nice and cool as the new APIs are, they are irrelevant until our customer base migrates.</p>
+<div class="post">[<i>That&#39;s fair. In the past, though, I get flamed for not providing Windows XP ways of doing things as if it no right-thinking person would run anything else. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-932943">
+				<div id="div-comment-932943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932943">
+			August 30, 2011 at 9:38 am</a>		</div>
+
+		<p>Alternative solution, which is less efficient but I doubt it matters much for this kind of thing, is to use the Shell32 library object model which does the same thing under the hood, but it makes your code shorter because you don&#39;t have to do all the management yourself:</p>
+<hr />
+<p>Private Sub Form_Load()</p>
+<p>Dim S As New Shell32.Shell, I As FolderItem2</p>
+<p>With S.NameSpace(ssfBITBUCKET)</p>
+<p>&nbsp; &nbsp;Caption = .Title</p>
+<p>&nbsp; &nbsp;For Each I In .Items</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;List1.AddItem I.Path &amp; &quot; = &quot; &amp; _</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;I.ExtendedProperty(&quot;{9B174B33-40FF-11D2-A27E-00C04FC30871}2&quot;) &amp; _</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;&quot; &amp; I.Name</p>
+<p>&nbsp; &nbsp;Next</p>
+<p>End With</p>
+<p>End Sub</p>
+<hr />
+<p>Visual Basic code because I can&#39;t be arsed to write C++ GUI code for a reply to a blog post. To test, draw a widish listbox on the form.</p>
+<p>P.S. Thanks for providing XP compatible code, Raymond, it is appreciated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-932953">
+				<div id="div-comment-932953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932953">
+			August 30, 2011 at 10:34 am</a>		</div>
+
+		<blockquote><p>
+  so it&#39;s possible that they are looking at their problem the wrong way.
+</p></blockquote>
+<p>I&#39;d say &quot;probable&quot; !</p>
+<p>I look upon the recycle bin as being something that&#39;s there for the user, and is not an application programmer&#39;s concern.</p>
+<p>If the file that&#39;s being deleted &quot;belongs to the user&quot;, then use the API that might put the file in the recycle bin, depending on the user&#39;s preferences, and forget about it. &nbsp; If the file that&#39;s being deleted is some internal application thing that shouldn&#39;t end up in the recycle bin, then don&#39;t use the API that might put the file in the recycle bin. &nbsp;How hard is that?</p>
+<p>Even if an app can reliably purge its own file from the recycle bin after putting it there, that&#39;s not always an operation without side-effects. &nbsp;The recycle bin is limited in total capacity.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-932983">
+				<div id="div-comment-932983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">TC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932983">
+			August 30, 2011 at 10:30 pm</a>		</div>
+
+		<p>AC&#39;s simple method easily demo&#39;d from (gasp) vbscript (thus requiring only notepad):</p>
+<p>option explicit</p>
+<p>const ssfBITBUCKET = 10</p>
+<p>dim sh, item, s</p>
+<p>set sh = createobject (&quot;shell.application&quot;)</p>
+<p>s = &quot;&quot;</p>
+<p>with sh.nameSpace (ssfBITBUCKET)</p>
+<p>&nbsp; for each item in .items</p>
+<p>&nbsp; &nbsp; &nbsp;s = s &amp; item.Path &amp; &quot; = &quot; &amp; _</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; item.ExtendedProperty(&quot;{9B174B33-40FF-11D2-A27E-00C04FC30871}2&quot;) &amp; _</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &quot;&quot; &amp; item.Name &amp; vblf</p>
+<p>&nbsp; next</p>
+<p>&nbsp; msgbox s,, .title</p>
+<p>end with</p>
+<p>wscript.quit</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-932993">
+				<div id="div-comment-932993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">TC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-932993">
+			August 30, 2011 at 10:32 pm</a>		</div>
+
+		<p>Oops, sorry for silly double spacing, not sure why it did that to me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-933013">
+				<div id="div-comment-933013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-933013">
+			August 31, 2011 at 1:00 am</a>		</div>
+
+		<p>@TC: That happened because this blog doesn&#39;t have a concept of line breaks (as opposed to paragraph breaks). The reason for this is probably that most of the replies are prose, and people press enter a variable number of times when all they really want is a paragraph break. Just be happy our spaces are preserved.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-933023">
+				<div id="div-comment-933023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xpclient</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-933023">
+			August 31, 2011 at 1:29 am</a>		</div>
+
+		<p>And another bug in Windows 7: Custom Recycle Bin icons for full and empty do not refresh automatically, only the default icons do. You have to either refresh manually or tweak the registry to fix it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-933033">
+				<div id="div-comment-933033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">TC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110830-00/?p=9773#comment-933033">
+			August 31, 2011 at 3:42 am</a>		</div>
+
+		<p>@TC: That happened because &#8230;</p>
+<p>Thanks AC. 5 seconds after posting, I was thinking &quot;drink less cheap white wine!&quot;, and looking for an edit post button!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

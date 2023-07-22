@@ -1,0 +1,467 @@
+<html>
+<head>
+<title>How to rescue a broken stack trace on x64: Recovering the stack pointer</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to rescue a broken stack trace on x64: Recovering the stack pointer</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 6, 2013 / year-entry #238</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130906-00/?p=3303</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>1</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Recovering a broken stack on x64 machines on Windows is trickier because the x64 uses unwind codes for stack walking rather than a frame pointer chain. When you dump the stack, all you're going to see is return addresses sprinkled in amongst the stack data. Begin digression: According to the x64 ABI, each function must...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Recovering a broken stack on x64 machines on Windows is trickier
+because the x64 uses unwind codes for stack walking rather than
+a frame pointer chain.
+When you dump the stack, all you're going to see is return addresses
+sprinkled in amongst the stack data.
+</p>
+<p>
+<b>Begin digression</b>:
+According to the x64 ABI,
+each function must begin with a prologue which sets up the stack
+frame.
+It traditionally goes something like this:
+</p>
+<pre>
+    push rbx ;; save registers
+    push rsi ;; save registers
+    push rdi ;; save registers
+    sub rsp, 0x20 ;; allocate space for local variables and outbound calls
+</pre>
+<p>
+Suppose we have functions
+</p>
+<pre>
+void Top(int a, int b)
+{
+ int toplocal = b + 5;
+ Middle(a, local);
+}
+
+void Middle(int c, int d)
+{
+ Bottom(c+d);
+}
+
+void Bottom(int e)
+{
+ int bottomlocal1, bottomlocal2;
+ ...
+}
+</pre>
+<p>
+When execution reaches the <code>...</code> inside function <code>Bottom</code>
+the stack looks like the following.
+(I put higher addresses at the top; the stack grows downward.
+I also assume that
+the code is compiled with absolutely no optimization.)
+</p>
+<table CELLPADDING=3 CELLSPACING=0>
+<tr>
+<td ROWSPAN=4 VALIGN=middle>
+    </td>
+<td ROWSPAN=4>&nbsp;</td>
+<td ROWSPAN=24>&nbsp;</td>
+<td ROWSPAN=4 STYLE="border-top: solid .75pt black;
+                         border-left: solid .75pt black;
+                         ">&nbsp;</td>
+<td VALIGN=baseline><code>0040F8E8</code></td>
+<td VALIGN=baseline>parameter 4 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8E0</code></td>
+<td VALIGN=baseline>parameter 3 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8D8</code></td>
+<td VALIGN=baseline>parameter <code>b</code> passed to <code>Top</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8D0</code></td>
+<td VALIGN=baseline>parameter <code>a</code> passed to <code>Top</code></td>
+</tr>
+<tr>
+<td ROWSPAN=2 VALIGN=middle>
+    <code>Top</code>'s stack frame</code>
+    </td>
+<td ROWSPAN=2>&nbsp;</td>
+<td ROWSPAN=2 STYLE="border-left: solid .75pt black;
+                         ">&nbsp;</td>
+<td VALIGN=baseline><code>0040F8C8</code></td>
+<td VALIGN=baseline>return address of <code>Top</code>'s caller</td>
+<td VALIGN=bottom ROWSPAN=6>During execution of <code>Top</code>,<br>&larr;<code>rsp = 0040F8A0</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8C0</code></td>
+<td VALIGN=baseline><code>toplocal</code></td>
+</tr>
+<tr>
+<td ROWSPAN=4 VALIGN=middle>
+    </td>
+<td ROWSPAN=4 STYLE="border-top: solid .75pt black;
+                         border-left: solid .75pt black;
+                         ">&nbsp;</td>
+<td ROWSPAN=4 STYLE="border-left: solid .75pt black;
+                         border-bottom: solid .75pt black;">&nbsp;</td>
+<td VALIGN=baseline><code>0040F8B8</code></td>
+<td VALIGN=baseline>parameter 4 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8B0</code></td>
+<td VALIGN=baseline>parameter 3 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8A8</code></td>
+<td VALIGN=baseline>parameter <code>d</code> passed to <code>Middle</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8A0</code></td>
+<td VALIGN=baseline>parameter <code>c</code> passed to <code>Middle</code></td>
+</tr>
+<tr>
+<td ROWSPAN=2 VALIGN=middle>
+    <code>Middle</code>'s stack frame</code>
+    </td>
+<td ROWSPAN=2 STYLE="border-left: solid .75pt black;
+                         ">&nbsp;</td>
+<td ROWSPAN=2>&nbsp;</td>
+<td VALIGN=baseline><code>0040F898</code></td>
+<td VALIGN=baseline>return address of <code>Middle</code>'s caller</td>
+<td VALIGN=bottom ROWSPAN=6>During execution of <code>Middle</code>,<br>&larr;<code>rsp = 0040F870</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F890</code></td>
+<td VALIGN=baseline>padding for alignment</td>
+</tr>
+<tr>
+<td ROWSPAN=4 VALIGN=middle>
+    </td>
+<td ROWSPAN=4 STYLE="border-left: solid .75pt black;
+                         border-bottom: solid .75pt black;">&nbsp;</td>
+<td ROWSPAN=4 STYLE="border-top: solid .75pt black;
+                         border-left: solid .75pt black;
+                         ">&nbsp;</td>
+<td VALIGN=baseline><code>0040F888</code></td>
+<td VALIGN=baseline>parameter 4 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F880</code></td>
+<td VALIGN=baseline>parameter 3 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F878</code></td>
+<td VALIGN=baseline>parameter 2 (unused)</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F870</code></td>
+<td VALIGN=baseline>parameter <code>e</code> passed to <code>Bottom</code></td>
+</tr>
+<tr>
+<td ROWSPAN=4 VALIGN=middle>
+    <code>Bottom</code>'s stack frame</code>
+    </td>
+<td ROWSPAN=4>&nbsp;</td>
+<td ROWSPAN=4 STYLE="border-left: solid .75pt black;
+                         ">&nbsp;</td>
+<td VALIGN=baseline><code>0040F868</code></td>
+<td VALIGN=baseline>return address of <code>Bottom</code>'s caller</td>
+<td VALIGN=bottom ROWSPAN=8>During execution of <code>Bottom</code>,<br>&larr;<code>rsp = 0040F830</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F860</code></td>
+<td VALIGN=baseline>padding for alignment</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F858</code></td>
+<td VALIGN=baseline><code>bottomlocal1</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F850</code></td>
+<td VALIGN=baseline><code>bottomlocal2</code></td>
+</tr>
+<tr>
+<td ROWSPAN=4 VALIGN=middle>
+    </td>
+<td ROWSPAN=4>&nbsp;</td>
+<td ROWSPAN=4 STYLE="border-left: solid .75pt black;
+                         border-bottom: solid .75pt black;">&nbsp;</td>
+<td VALIGN=baseline><code>0040F848</code></td>
+<td VALIGN=baseline>parameter 4</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F840</code></td>
+<td VALIGN=baseline>parameter 3</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F838</code></td>
+<td VALIGN=baseline>parameter 2</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F830</code></td>
+<td VALIGN=baseline>parameter 1</td>
+</tr>
+</table>
+<p>
+Of course,
+once the optimizer kicks in,
+there will also be saved registers in the stack frame,
+the unused space will start getting used as scratch variables,
+and the parameters will almost certainly not be spilled into their
+home locations.
+<b>End digression</b>.
+</p>
+<p>
+Consider this crash where we started executing random instructions
+(data in the code segment)
+and finally trapped.
+</p>
+<pre>
+0:000&gt; r
+rax=0000000000000000 rbx=0000000000000005 rcx=0000000000000042
+rdx=0000000000000010 rsi=00000000000615d4 rdi=00000000043f48e0
+rip=0000000000000000 rsp=00000000001ebf68 rbp=00000000043f32d0
+ r8=00000000001ebfd0  r9=0000000000000000 r10=000000007fff3cae
+r11=0000000000000000 r12=0000000000000002 r13=0000000000517050
+r14=0000000000000000 r15=00000000043f55c0
+iopl=0         nv up ei pl nz na pe nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000202
+ABC!RandomFunction+0x1234:
+00000000`ff6ebaad test    byte ptr [rax+rdx*4],ah ds:00000000`00000040=??
+0:000&gt; k
+Child-SP          RetAddr           Call Site
+00000000`001ebf70 00000000`00000004 ABC!RandomFunction+0x1234
+00000000`001ebf78 00000000`0000000e 0x4
+00000000`001ebf80 00000000`00000000 0xe
+</pre>
+<p>
+Not very helpful.
+Let's try to reconstruct the call stack.
+Here's what we have right now:
+</p>
+<pre>
+001ebf70  00000000`00000004
+001ebf78  00000000`0000000e
+001ebf80  00000000`00000000
+001ebf88  00000000`77ba21bc ntdll!RtlAllocateHeap+0x16c
+001ebf90  00000000`00000000
+001ebf98  00000000`ff6e1fa1 ABC!operator new[]+0x20
+001ebfa0  00000000`00000000
+001ebfa8  00000000`ff6e28ae ABC!DoesUserPreferMetricUnits+0x2a
+001ebfb0  00000000`000615d4
+001ebfb8  00000000`043f48e0
+001ebfc0  00000000`00000002
+001ebfc8  00000000`00517050
+001ebfd0  00000000`00000010
+001ebfd8  00000000`00000000
+001ebfe0  00000000`00000005
+001ebfe8  00000000`ff6e2b9b ABC!CUIController::UpdateTwoLineDisplay+0x156
+001ebff0  00000000`00000002
+001ebff8  00000000`005170f0
+001ec000  00000000`043f55c0
+001ec008  00000000`00510000
+001ec010  00000000`00000000
+001ec018  00000000`00000000
+001ec020  00000000`00000002
+001ec028  00000000`005170f0
+001ec030  00000000`00000000
+001ec038  00000000`00000000
+001ec040  00000000`00000002
+001ec048  00000000`005170f0
+001ec050  00000000`005170f8
+001ec058  00000000`ff6e2a94 ABC!CUIController::displayEvent+0xea
+001ec060  00000000`00750ed0
+001ec070  00000000`00517118
+001ec078  00000000`043f5aa0
+001ec080  00000000`005170f8
+001ec088  00000000`ff6e2f70 ABC!CEventRegistry::fire+0x34
+001ec090  00000000`00518090
+001ec098  00000000`00517118
+001ec0a0  00000000`043f5aa0
+001ec0a8  00000000`0000000e
+001ec0b0  00000000`00000000
+001ec0b8  00000000`00000000
+001ec0c0  00000000`043f2f00
+001ec0c8  00000000`ff6e2eef ABC!CCalculatorState::storeAndFire+0x126
+001ec0d0  00000000`043f5aa0
+001ec0d8  00000000`00000000
+001ec0e0  00000000`001ec180
+001ec0e8  00000000`00000000
+</pre>
+<p>
+(Note that this dump shows addresses increasing <i>downward</i>,
+whereas the previous diagram had them increasing <i>upward</i>.
+Being able to read stack dumps comfortably in both directions is one of those
+skills you develop as you gain experience.)
+</p>
+<p>
+There is no frame pointer chain here to help you see if what you
+found is a call frame.
+You just have to use your intuition based on the function names.
+For example, it sounds perfectly reasonable for
+<code>operator new[]</code> to call
+<code>Rtl&shy;Allocate&shy;Heap</code>
+(to allocate memory),
+but <code>DoesUserPreferMetric&shy;Units</code> is probably not
+going to call
+<code>operator new[]</code>.
+</p>
+<p>
+Some disassembling around of candidate return addresses suggests that
+the
+<code>DoesUserPreferMetric&shy;Units</code>
+is the
+one likely to have jumped into space, because it is calling
+through a function pointer variable,
+whereas the other candidate return addresses used a direct call
+(or a call to an import table entry, which is unlikely to be invalid).
+</p>
+<p>
+How do we reconstruct the stack based on this assumption?
+You trick the debugger into thinking that execution stopped
+inside the
+<code>DoesUserPreferMetric&shy;Units</code>
+just before or after the fateful jump.
+It's easier to do "just after", since that's just the return address.
+We're going to pretend that instead of jumping into space,
+we jumped to a <code>ret</code> instruction.
+</p>
+<p>
+Since we don't know what the junk code did before it finally crashed,
+the current value of <code>rsp</code> is probably not accurate.
+We'll have to think backward to a point in time whose stack pointer
+we can infer, and then replay the code forward.
+</p>
+<p>
+From our knowledge of stack frames,
+we see that the <code>rsp</code> register had the value
+<code>001ebfb0</code>
+during the execution of
+<code>DoesUserPreferMetric&shy;Units</code>
+just before it called
+the bad function pointer.
+Let's temporarily set our <code>rsp</code> and <code>rip</code>
+to simulate the return from the function.
+</p>
+<pre>
+0:000&gt; r rsp=1ebfb0
+0:000&gt; r rip=ff6e28ae 
+0:000&gt; k
+Child-SP          RetAddr           Call Site
+00000000`001ebfb0 00000000`ff6e2b9b ABC!DoesUserPreferMetricUnits+0x2a
+00000000`001ebff0 00000000`ff6e2a94 ABC!CUIController::UpdateDisplay+0x156
+00000000`001ec060 00000000`ff6e2f70 ABC!CUIController::displayEvent+0xea
+00000000`001ec090 00000000`ff6e2eef ABC!CEventRouter::fire+0x34
+00000000`001ec0d0 00000000`ff6e3469 ABC!CEngineState::storeAndFire+0x126
+00000000`001ec110 00000000`ff6e4149 ABC!CEngine::SetDisplayText+0x39
+00000000`001ec140 00000000`ff6ea48d ABC!CEngine::DisplayResult+0x648
+00000000`001ec3c0 00000000`ff6e49c6 ABC!CEngine::ProcessCommandWorker+0xa1a
+00000000`001ec530 00000000`ff6e4938 ABC!CEngine::ProcessCommand+0x2a
+00000000`001ec560 00000000`ff6e460a ABC!CUIController::ProcessInput+0xaa
+00000000`001ec5a0 00000000`ff6e4744 ABC!CContainer::ProcessInputs+0x7a1
+00000000`001ec700 00000000`77a6c3c1 ABC!CContainer::WndProc+0xa12
+00000000`001ecbe0 00000000`77a6a6d8 USER32!UserCallWinProcCheckWow+0x1ad
+00000000`001ecca0 00000000`77a6a85d USER32!SendMessageWorker+0x682
+00000000`001ecd30 00000000`ff70c5d8 USER32!SendMessageW+0x5c
+00000000`001ecd80 00000000`77a5e53b ABC!CMainDlgFrame::MainDlgProc+0x87
+00000000`001ecdc0 00000000`77a5e2f2 USER32!UserCallDlgProcCheckWow+0x1b6
+00000000`001ece80 00000000`77a5e222 USER32!DefDlgProcWorker+0xf1
+00000000`001ecf00 00000000`77a6c3c1 USER32!DefDlgProcW+0x36
+00000000`001ecf40 00000000`77a6a6d8 USER32!UserCallWinProcCheckWow+0x1ad
+00000000`001ed000 00000000`77a6a85d USER32!SendMessageWorker+0x682
+00000000`001ed090 000007fe`fc890ba3 USER32!SendMessageW+0x5c
+00000000`001ed0e0 000007fe`fc8947e2 COMCTL32!Button_ReleaseCapture+0x157
+00000000`001ed120 00000000`77a6c3c1 COMCTL32!Button_WndProc+0xcde
+00000000`001ed1e0 00000000`77a6c60a USER32!UserCallWinProcCheckWow+0x1ad
+00000000`001ed2a0 00000000`ff6e1a76 USER32!DispatchMessageWorker+0x3b5
+00000000`001ed320 00000000`ff6fa00f ABC!WinMain+0x1db4
+00000000`001efa10 00000000`7794f33d ABC!__mainCRTStartup+0x18e
+00000000`001efad0 00000000`77b82ca1 kernel32!BaseThreadInitThunk+0xd
+00000000`001efb00 00000000`00000000 ntdll!RtlUserThreadStart+0x1d
+0:000&gt; r rsp=001ebf68
+0:000&gt; r rip=ff6ebaad
+</pre>
+<p>
+After getting what we want, we restore the registers to their original
+values at the time of the crash so that future investigation won't
+be misled by our editing.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (1)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1076493">
+				<div id="div-comment-1076493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130906-00/?p=3303#comment-1076493">
+			September 6, 2013 at 12:14 pm</a>		</div>
+
+		<p>I still like my trick of just walking down calling everything in the right range and alignment a stack frame. Using a call lattace and checking the instruction right before seems to eliminate all false positives.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

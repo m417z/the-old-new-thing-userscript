@@ -1,0 +1,423 @@
+<html>
+<head>
+<title>Debugging walkthrough: Access violation on nonsense instruction, episode 2</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Debugging walkthrough: Access violation on nonsense instruction, episode 2</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 13, 2015 / year-entry #54</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A colleague of mine asked for help debugging a strange failure. Execution halted on what appeared to be a nonsense instruction. eax=0079f850 ebx=00000000 ecx=00000113 edx=00000030 esi=33ee06ef edi=74b9b8ad eip=00c0ac74 esp=0079f82c ebp=0079f86c iopl=0 nv up ei pl zr na pe nc cs=0023 ss=002b ds=002b es=002b fs=0053 gs=002b efl=00000246 00c0ac74 0000 add byte ptr [eax],al ds:002b:0079f850=74 If you've...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A colleague of mine asked for help debugging a strange failure.
+Execution halted on what appeared to be a nonsense instruction.
+</p>
+<pre>
+eax=0079f850 ebx=00000000 ecx=00000113 edx=00000030 esi=33ee06ef edi=74b9b8ad
+eip=00c0ac74 esp=0079f82c ebp=0079f86c iopl=0         nv up ei pl zr na pe nc
+cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000246
+00c0ac74 0000            add     byte ptr [eax],al          ds:002b:0079f850=74
+</pre>
+<p>
+If you've been debugging x86 code for a while, you immediately
+recognize this instruction as "executing a page of zeroes".
+If you haven't been debugging x86 code for a while,
+you can see this from the code bytes in the second column.
+</p>
+<p>
+So how did we end up at this nonsense instruction?
+</p>
+<p>
+The instruction is not near a page boundary, so we didn't fall
+through to it.
+We must have jumped to it or returned to it.
+</p>
+<p>
+Since debugging is an exercise in optimism, let's assume
+that we jumped to it via a <code>call</code> instruction,
+and the return address is still on the stack.
+</p>
+<pre>
+0:000&gt; dps esp l2
+0079f82c  74b9b8b1 user32!GetMessageW+0x4
+0079f830  008f108b CONTOSO!MessageLoop+0xe7
+0:000&gt; u user32!GetMessageW l3
+USER32!GetMessageW:
+74b9b8ad cc              int     3
+74b9b8ae ff558b          call    dword ptr [ebp-75h]
+74b9b8b1 ec              in      al,dx
+</pre>
+<p>
+Well, that explains it.
+The code bytes for the <code>Get&shy;MessageW</code>
+function were overwritten, causing us to execute garbage,
+and one of the garbage instructions was a <code>call</code>
+that took us to page of zeroes.
+</p>
+<p>
+But look more closely at the overwritten bytes.
+</p>
+<p>
+The first byte is <code>cc</code>, which is a breakpoint
+instruction.
+Hm...
+</p>
+<p>
+Since
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/09/21/10214405.aspx">
+Windows functions begin with a <code>MOV EDI, EDI</code> instruction</a>
+for hot patching purposes,
+the first two bytes are always <code>8b ff</code>.
+If we unpatch the <code>cc</code> to <code>8b</code>,
+we see that the rest of the code bytes are intact.
+</p>
+<pre>
+USER32!GetMessageW:
+74b9b8ad 8bff            mov     edi,edi
+74b9b8af 55              push    ebp
+74b9b8b0 8bec            mov     ebp,esp
+</pre>
+<p>
+After a brief discussion,
+we were able to piece together what happened:
+</p>
+<p>
+Somebody was trying to debug the <code>CONTOSO</code> application,
+so they connected a user-mode debugger to the application.
+Meanwhile, they set a breakpoint on <code>user32!GetMessageW</code>
+from the kernel debugger.
+Setting a breakpoint in a debugger is typically performed by
+patching an <code>int 3</code> at the point where you want the breakpoint.
+When the <code>int 3</code> fires,
+the debugger regains control and says,
+"Oh, thanks for stopping.
+Let me unpatch all the <code>int 3</code>'s I put in the program
+to put things back the way they were."
+</p>
+<p>
+When the breakpoint hit, it was caught by the user-mode debugger,
+but since the user-mode debugger didn't set that breakpoint,
+it interpreted the <code>int 3</code> as a hard-coded breakpoint
+in the application.
+At this point, the developer saw a spurious breakpoint, didn't
+know what it meant, and simply resumed execution.
+This executed the second half of the <code>MOV EDI, EDI</code>
+instruction as the start of a new instruction,
+and havoc ensued.
+</p>
+<p>
+That developer then asked his friend what happened, and his friend
+asked me.
+</p>
+<p>
+TL;DR:
+Be careful if you have more than one debugger active.
+Breakpoints set by one debugger will not be recognized by the other.
+If the breakpoint instruction is caught by the wrong debugger,
+things will go downhill fast unless you take corrective action.
+(In this case, it would be restoring the original byte.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-bboorman even thread-even depth-1" id="comment-1179863">
+				<div id="div-comment-1179863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179863">
+			March 13, 2015 at 7:05 am</a>		</div>
+
+		<p>There&#39;s an old saying &quot;Two wrongs don&#39;t make a right.&quot;</p>
+<p>This is a case of &quot;Two debuggers make a bug.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1179873">
+				<div id="div-comment-1179873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179873">
+			March 13, 2015 at 7:07 am</a>		</div>
+
+		<p>eip = unmapped</p>
+<p>esp = unmapped</p>
+<p>That sucked.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1179883">
+				<div id="div-comment-1179883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Boris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179883">
+			March 13, 2015 at 7:26 am</a>		</div>
+
+		<p>I can&#39;t help but read MOV EDI, EDI as &quot;Move, Eddie-Eddie.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1179893">
+				<div id="div-comment-1179893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179893">
+			March 13, 2015 at 8:43 am</a>		</div>
+
+		<p>Why was the developer using 2 debuggers in the first place? &nbsp;I can sort of see why they expected a BP set in one to work in the other, but it&#39;s a very odd way of doing things.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle even thread-even depth-1" id="comment-1179903">
+				<div id="div-comment-1179903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179903">
+			March 13, 2015 at 8:48 am</a>		</div>
+
+		<p>@Paul: They may have been debugging a program that interacts with a kernel-mode driver. &nbsp;It would probably make more sense to stick with the kernel debugger then for both programs, but maybe they wanted to utilize the user-mode debugger for additional features, like profiling or event tracing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1179913">
+				<div id="div-comment-1179913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179913">
+			March 13, 2015 at 9:21 am</a>		</div>
+
+		<p>I&#39;m now curious as to how, out of the domain of 2-byte NOP instructions, MOV EDI,EDI was chosen.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1179923">
+				<div id="div-comment-1179923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179923">
+			March 13, 2015 at 9:24 am</a>		</div>
+
+		<p>Another kind of mysterious exceptions happens when a debugger remembers a breakpoint by its code offset in a function, and then the function gets modified, and the offset is now pointing to the middle of an instruction.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1179933">
+				<div id="div-comment-1179933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179933">
+			March 13, 2015 at 9:32 am</a>		</div>
+
+		<p>@Gabe:</p>
+<p>Raymond discusses MOV EDI,EDI as the NOP in these posts:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2011/09/21/10214405.aspx">blogs.msdn.com/&#8230;/10214405.aspx</a></p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2013/01/02/10381672.aspx">blogs.msdn.com/&#8230;/10381672.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1179943">
+				<div id="div-comment-1179943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179943">
+			March 13, 2015 at 10:04 am</a>		</div>
+
+		<p>I&#39;ve had occasion to use two debuggers on the same process a few times. &nbsp;One was for debugging a C++ game engine (UnrealEngine 3), and the other was for debugging the scripting language embedded in the engine (UnrealScript). &nbsp;The UnrealScript debugger was a janky Visual Studio extension, which has its share of problems, but it got the job done for stepping into and through script code and viewing variable values.</p>
+<p>However, one instance of Visual Studio couldn&#39;t debug both native C++ and UnrealScript at the same time, so when I wanted to debug both, I had to boot up the game using the UnrealScript debugger extension, and then attach a second instance of Visual Studio to the already-running process. &nbsp;Surprisingly, I didn&#39;t run into any crazy problems from doing so like the one described in this post.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1179953">
+				<div id="div-comment-1179953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179953">
+			March 13, 2015 at 3:02 pm</a>		</div>
+
+		<p>I&#39;m going to be emailing this to some coworkers, to help in explaining how debuggers actually work. &nbsp;It&#39;s interesting how many senior-level developers don&#39;t know how debuggers actually set breakpoints and such.</p>
+<p>On a side note, I wish /functionpadmin worked properly in x64 builds&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1179963">
+				<div id="div-comment-1179963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179963">
+			March 13, 2015 at 3:38 pm</a>		</div>
+
+		<p>But is&#39;nt kernel debugger get notified about breakpoint exceptions before user-mode debugger?</p>
+<p>However breakpoints can be used to implement API hooking, and (another however) GetMessageW &nbsp;is a potential target for keylogging malwate.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fjeldse odd alt thread-odd thread-alt depth-1" id="comment-1179993">
+				<div id="div-comment-1179993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Erik+F' rel='external nofollow' class='url'>Erik F</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1179993">
+			March 13, 2015 at 6:11 pm</a>		</div>
+
+		<p>@Killer: According to <a rel="nofollow" target="_new" href="https://msdn.microsoft.com/en-us/library/windows/hardware/ff560042(v=vs.85).aspx">msdn.microsoft.com/&#8230;/ff560042(v=vs.85).aspx</a> , the kernel debugger gets notified first. As the article mentions, the &quot;breakpoint breaks into the user-mode debugger, even though the breakpoint was actually set from the kernel debugger.&quot;</p>
+<p>As an aside, I&#39;ve never considered running two debuggers at the same time before, so this is a situation that&#39;s never crossed my mind before.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1180043">
+				<div id="div-comment-1180043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Erkin Alp G&#252;ney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1180043">
+			March 15, 2015 at 3:02 am</a>		</div>
+
+		<p>[Hot-patching is not an application feature. It&#39;s an OS internal feature for servicing. Who are these people who keep trying to patch code they didn&#39;t write?! -Raymond]</p>
+<p>Some [redacted] software uses them. The ReactOS team has encountered such a thing. ReactOS is a clean-room FLOSS reverse-engineering of Windows XP.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1180063">
+				<div id="div-comment-1180063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1180063">
+			March 15, 2015 at 1:44 pm</a>		</div>
+
+		<p>I remember having to use two debuggers at the same time once. One for actionscript and one for C. And for additional irony, I was debugging a debugging plugin.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-davebacher even thread-even depth-1" id="comment-1180093">
+				<div id="div-comment-1180093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dave+Bacher' rel='external nofollow' class='url'>Dave Bacher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1180093">
+			March 16, 2015 at 7:07 am</a>		</div>
+
+		<p>@Adam Rosenfield:</p>
+<p>I cannot speak for the Unreal Engine debugger implementation &#8212; however the Torque and Unity 3D visual studio extensions just use a network call for the debugger, and that was a common tactic around when Unreal originally came out. &nbsp;I seem to recall one of the Torque IDE shells also supporting Unreal 2004, but I might be mistaken on that (and I don&#39;t remember the specific editor involved enough to do a good search for it).</p>
+<p>But if you have the classic VM implementation of some byte codes invoking function pointers (or a giant switch table), it&#39;s really easy to track the breakpoints. &nbsp;At that point, you use the console parser for the debugger &#8212; and it already has the commands to go get the value and set the value of a variable, for example. &nbsp;You just tag the messages somehow (XML, JSON, CSV, w/e) and then make sure they&#39;re machine readable. &nbsp;If you need to, you might even have something like &quot;set connection json&quot; or w/e as a console command, and keep the network console&#39;s state separate from the in-game console&#39;s state. &nbsp;(which likely is necessary depending on how you&#39;re doing it, anyway &#8212; e.g. a TCP console probably wouldn&#39;t hold onto the last N messages, and would instead allow whatever client is attached to manage that part, while the in-game console probably needs a buffer of previous messages in order to maintain its UI state)</p>
+<p>But anyway &#8212; point is &#8212; they wouldn&#39;t need to do anything that conflicts here, so they probably don&#39;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1180133">
+				<div id="div-comment-1180133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1180133">
+			March 16, 2015 at 9:08 am</a>		</div>
+
+		<p>[Hot-patching is not an application feature. It&#39;s an OS internal feature for servicing. Who are these people who keep trying to patch code they didn&#39;t write?! -Raymond]</p>
+<p>Those who fix your bugs because you will not.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1180153">
+				<div id="div-comment-1180153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150313-00/?p=44473#comment-1180153">
+			March 16, 2015 at 11:19 am</a>		</div>
+
+		<p>&gt; But anyway &#8212; point is &#8212; they wouldn&#39;t need to do anything that conflicts here, so they probably don&#39;t.</p>
+<p>Exactly. &nbsp;I don&#39;t remember the exact transport mechanism (it might have TCP, or maybe local named pipes), but the script debugger always functioned within a small set of well-defined hooks in the VM implementation. &nbsp;If you were stepping through script code, the C++ code was just running in a small modal loop inside the VM, while if you were stepping through C++ code, the script debugger was patiently waiting for you to hit the next of its hooks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

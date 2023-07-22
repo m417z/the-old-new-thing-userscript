@@ -1,0 +1,1464 @@
+<html>
+<head>
+<title>Everybody thinks about garbage collection the wrong way</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Everybody thinks about garbage collection the wrong way</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 9, 2010 / year-entry #225</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>89</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Welcome to CLR Week 2010. This year, CLR Week is going to be more philosophical than usual. When you ask somebody what garbage collection is, the answer you get is probably going to be something along the lines of "Garbage collection is when the operating environment automatically reclaims memory that is no longer being used...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Welcome to CLR Week 2010. This year, CLR Week is going to be more philosophical than usual.</p>
+<p> When you ask somebody what garbage collection is, the answer you get is probably going to be something along the lines of "Garbage collection is when the operating environment automatically reclaims memory that is no longer being used by the program. It does this by tracing memory starting from roots to identify which objects are accessible." </p>
+<p> This description confuses the mechanism with the goal. It's like saying the job of a firefighter is "driving a red truck and spraying water." That's a description of what a firefighter does, but it misses the point of the job (namely, putting out fires and, more generally, fire safety). </p>
+<p> Garbage collection is <i>simulating a computer with an infinite amount of memory</i>. The rest is mechanism. And naturally, the mechanism is "reclaiming memory that the program wouldn't notice went missing." It's one giant application of the <i>as-if</i> rule.&sup1; </p>
+<p> Now, with this view of the true definition of garbage collection, one result immediately follows: </p>
+<blockquote class="m"><p> If the amount of RAM available to the runtime is greater than the amount of memory required by a program, then a memory manager which employs the null garbage collector (which never collects anything) is a valid memory manager. </p>
+</blockquote>
+<p> This is true because the memory manager can just allocate more RAM whenever the program needs it, and by assumption, this allocation will always succeed. A computer with more RAM than the memory requirements of a program has effectively infinite RAM, and therefore no simulation is needed. </p>
+<p> Sure, the statement may be obvious, but it's also useful, because the null garbage collector is both very easy to analyze  yet very different from garbage collectors you're more accustomed to seeing. You can therefore use it to produce results like this: </p>
+<blockquote class="m"><p> A correctly-written program cannot assume that finalizers will ever run at any point prior to program termination. </p>
+</blockquote>
+<p> The proof of this is simple: Run the program on a machine with more RAM than the amount of memory required by program. Under these circumstances, the null garbage collector is a valid garbage collector, and the null garbage collector never runs finalizers since it never collects anything. </p>
+<p> Garbage collection simulates infinite memory, but there are things you can do even if you have infinite memory that have visible effects on other programs (and possibly even on your program). If you open a file in exclusive mode, then the file will not be accessible to other programs (or even to other parts of your own program) until you close it. A connection that you open to a SQL server consumes resources in the server until you close it. Have too many of these connections outstanding, and you may run into a connection limit which blocks further connections. If you don't explicitly close these resources, then when your program is run on a machine with "infinite" memory, those resources will accumulate and never be released. </p>
+<p> <b>What this means for you</b>: Your programs cannot rely on finalizers keeping things tidy. Finalizers are a safety net, not a primary means for resource reclamation. When you are finished with a resource, you need to release it by calling <code>Close</code> or <code>Disconnect</code> or whatever cleanup method is available on the object. (The <code>IDisposable</code> interface codifies this convention.) </p>
+<p> Furthermore, it turns out that not only can a correctly-written program not assume that finalizers will run during the execution of a program, it cannot even assume that finalizers will run when the program terminates: Although the .NET Framework will try to run them all, <a href="http://nitoprograms.blogspot.com/2009/08/finalizers-at-process-exit.html"> a bad finalizer will cause the .NET Framework to give up and abandon running finalizers</a>. This can happen through no fault of your own: There might be a handle to a network resource that the finalizer is trying to release, but network connectivity problems result in the operation taking longer than two seconds, at which point the .NET Framework will just terminate the process. Therefore, the above result can be strengthened in the specific case of the .NET Framework: </p>
+<blockquote class="m"><p> A correctly-written program cannot assume that finalizers will ever run. </p>
+</blockquote>
+<p> Armed with this knowledge, you can solve this customer's problem. (Confusing terminology is preserved from the original.) </p>
+<blockquote class="q"><p> I have a class that uses <code>Xml&shy;Document</code>. After the class is out of scope, I want to delete the file, but I get the exception <code>System.IO.Exception: The process cannot access the file 'C:\path\to\file.xml' because it is being used by another process.</code> Once the progam exits, then the lock goes away. Is there any way to avoid locking the file? </p>
+</blockquote>
+<p> This follow-up might or might not help: </p>
+<blockquote class="q"><p> A colleague suggested setting the <code>Xml&shy;Document</code> variables to null when we're done with them, but shouldn't leaving the class scope have the same behavior? </p>
+</blockquote>
+<p> <b>Bonus chatter</b>: Finalizers are weird, since they operate "behind the GC." There are also lots of classes which operate "at the GC level", such as <code>Weak&shy;Reference</code> <code>GC&shy;Handle</code> and of course <code>System.GC</code> itself. Using these classes properly requires understanding how they interact with the GC. We'll see more on this later. </p>
+<p> <b>Related reading</b> </p>
+<ul>
+<li><a href="http://blogs.msdn.com/b/ericlippert/archive/2009/04/27/the-stack-is-an-implementation-detail.aspx">     The stack is an implementation detail</a>.     Another case where people confuse the mechanism with the goal. </li>
+<li><a href="http://blogs.msdn.com/b/abhinaba/archive/2009/01/25/back-to-basic-series-on-dynamic-memory-management.aspx">     Back to basics: Series on dynamic memory management</a>.     When I wrote a garbage collector for a toy project,     I used     <a href="http://blogs.msdn.com/abhinaba/archive/2009/02/02/back-to-basics-copying-garbage-collection.aspx">     the twospace algorithm</a> for its simplicity. </li>
+</ul>
+<p> <b>Unrelated reading</b>: <a href="http://blogs.msdn.com/b/ericlippert/archive/2008/05/23/precedence-vs-associativity-vs-order.aspx"> Precedence vs. Associativity Vs. Order</a>. </p>
+<p> <b>Footnote</b> </p>
+<p> &sup1; Note that by definition, the simulation extends only to garbage-collected resources. If your program allocates external resources those external resources continue to remain subject to whatever rules apply to them. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (89)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-851603">
+				<div id="div-comment-851603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851603">
+			August 9, 2010 at 7:14 am</a>		</div>
+
+		<p>I seem to recall reading about issues where under heavy load, an app would allocate objects faster than the finalizer could clean them up resulting in OK memory performance most of the time, with spikes (and occasional crashes) under heavy load. Of course, the solution was to have the app clean up the objects, so the GC could do its job normally.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851613">
+				<div id="div-comment-851613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marquess</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851613">
+			August 9, 2010 at 7:14 am</a>		</div>
+
+		<p>“A correctly-written program cannot assume that finalizers will ever run at any point prior to program termination.”</p>
+<p>Not quite. When instantiating a class that implements IDisposable in a C# “using” statement, one can reasonably assume that its Dispose method will be called at the end of the using statement.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851633">
+				<div id="div-comment-851633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henning Makholm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851633">
+			August 9, 2010 at 7:23 am</a>		</div>
+
+		<p>@Marquess: IDisposable.Dispose is not a finalizer, and a finalizer is not IDisposable.Dispose.</p>
+<p>C# uses the same syntax for finalizers as C++ does for destructors, but the similarity does not go any further than syntax. IDisposable is much more like a destructor in C++. If I understand correctly, Visual C++ will translate the destructor syntax into Dispose calls when generating managed code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851643">
+				<div id="div-comment-851643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Bugglin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851643">
+			August 9, 2010 at 7:27 am</a>		</div>
+
+		<p>We now know once the XmlDocument (or perhaps the underlying FileStream the customer used to read the document with) goes out of scope, the finalizer may be called at any time the garbage collector sees fit (or may never be called). &nbsp;Thus the customer must explicitly close the file when they are done with it in order to unlock the file.</p>
+<p>&quot;A colleague suggested setting the Xml Document variables to null when we&#39;re done with them, but shouldn&#39;t leaving the class scope have the same behavior?&quot;</p>
+<p>Yes. &nbsp;Yes it will. &nbsp;&quot;Nothing&quot; is a valid behavior&#8230;</p>
+<p>@Marquess .Dispose is not a finalizer, so his point is still valid. &nbsp;The created object may still hang around for any amount of time before its destructor/finalizer is called.</p>
+<p>The destructor/finalizer of any IDisposable should only call .Dispose so they would end up doing the same stuff, but it&#39;s not strongly enforced any an implementor can still do whatever they want.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851653">
+				<div id="div-comment-851653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Random832</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851653">
+			August 9, 2010 at 7:30 am</a>		</div>
+
+		<p>Marquess, a Dispose method is not a finalizer.</p>
+<p>There is some confusion due to the use of syntax similar to C++ destructors, whereas an actual C++ destructor acts a lot closer to a dispose method than a finalizer</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/ericlippert/archive/2010/01/21/what-s-the-difference-between-a-destructor-and-a-finalizer.aspx" rel="nofollow">blogs.msdn.com/&#8230;/what-s-the-difference-between-a-destructor-and-a-finalizer.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851663">
+				<div id="div-comment-851663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">C# noob</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851663">
+			August 9, 2010 at 7:48 am</a>		</div>
+
+		<p>I have a naive question &#8211; if the finalizers are not guaranteed to run, why have them? What useful thing can you do in a finalizer?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851673">
+				<div id="div-comment-851673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851673">
+			August 9, 2010 at 7:55 am</a>		</div>
+
+		<p>So there&#39;s no point at all in finalizers? If whatever you plan on doing there is important, you can&#39;t rely on a finalizer running and thus have to go with an explicit cleanup. Cleaning up again in those &quot;safety nets&quot; only makes it worse, because this hides the fact that somebody forgot to perform the explicit clean up properly. The only legit use for a finalizer is to put &#39;if (!resourcesReleased()) throw &quot;Call Cleanup() before releasing the object, you dimwit&quot;&#39;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851683">
+				<div id="div-comment-851683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mquander</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851683">
+			August 9, 2010 at 7:56 am</a>		</div>
+
+		<p>Finalizers are useful as a stopgap measure to call &quot;Dispose&quot;-like functionality if it isn&#39;t otherwise called.</p>
+<p>For example, it&#39;s best practice to Dispose an XmlDocument, and release the lock on the file; but the finalizer for XmlDocument should also call Dispose (if it&#39;s not disposed already), so that even if the caller doesn&#39;t call it, the lock will probably get released when the GC comes by, rather than waiting for the program to terminate.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851693">
+				<div id="div-comment-851693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mquander</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851693">
+			August 9, 2010 at 7:58 am</a>		</div>
+
+		<p>@asdbsd: (I guess whether it&#39;s best to clean up quietly or complain somehow is up to your philosophy of API design, but in .NET the former is typically done.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851703">
+				<div id="div-comment-851703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stewart</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851703">
+			August 9, 2010 at 7:59 am</a>		</div>
+
+		<p>@C# Noob, because sometimes they run. They can be used as a safety net to clean up after yourself if you forget to call dispose, which can make the infinite memory illusion last for longer. This means that anything you do in a finalizer must be something the OS is going to do anyway when the process goes away (closing sockets or files, freeing native memory etc.). If the OS won&#39;t do it, you need a stronger guarantee than a finalizer.</p>
+<p>In modern C# it is very very very rare to need to write a finalizer, and you should carefully scrutinize any code that has one which passes through your code review list.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851713">
+				<div id="div-comment-851713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851713">
+			August 9, 2010 at 8:06 am</a>		</div>
+
+		<p>As a long time C++ programmer, I tend to agree with asdbsd &#8212; Finalizers tend to obscure program logic bugs rather than help you.</p>
+<p>Of course, I much prefer rigorous use of RIAA to garbage collection as you have full control when you release your resource, yet if you use RIAA right, you never have to remember to clean up at the end. &nbsp;And that applies to any kind of resource, not just a memory resource.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851723">
+				<div id="div-comment-851723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">C# noob</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851723">
+			August 9, 2010 at 8:11 am</a>		</div>
+
+		<p>@mquander: But then the lock will be released when the app runs out of memory. That&#39;s just silly. The two things are unrelated and shouldn&#39;t be tied together.</p>
+<p>If you are Disposing in a finalizer you are covering up bugs, and they WILL make it into the final product. Unlike most bugs that show when the system is low on resources, these bugs will surface when the system is high on resources, like on a machine 2 years from now.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-leo-davidson even thread-even depth-1" id="comment-851733">
+				<div id="div-comment-851733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Leo+Davidson' rel='external nofollow' class='url'>Leo Davidson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851733">
+			August 9, 2010 at 8:13 am</a>		</div>
+
+		<p>Finalizers are not pointless unless you can prove your code (including libraries, etc.) is 100% bug-free. As the root post says, they shouldn&#39;t be relied upon but they can still lessen the impact of bugs.</p>
+<p>If I&#39;m using a program and a bug causes it miss a Close/Dispose call, leaving a file open, then I&#39;d rather that file was closed a while later than have it stay open for the life of the program.</p>
+<p>If I&#39;m developing or testing a program then, sure, I want to know when that goes wrong, but if I&#39;m using it I&#39;ll have the safety net, please.</p>
+<p>The syntax used for them is unfortunate but it&#39;s too late to change that and, even switching between C++ at home and C# at work, it never caused me any real problems. Just one of those language/syntax differences you have to be aware of (like reference semantics between C++ and C# or the big == operator differences between C++, C# and Java.).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851743">
+				<div id="div-comment-851743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851743">
+			August 9, 2010 at 8:13 am</a>		</div>
+
+		<p>mquander: and this ties into simulating an infinite amount of memory, because releasing the lock on the file will release a little bit more memory, which is the reason the GC&#39;s aim. &nbsp;It has the unfortunate side-effect of closing a handle that should already have been closed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk even thread-even depth-1" id="comment-851753">
+				<div id="div-comment-851753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851753">
+			August 9, 2010 at 8:18 am</a>		</div>
+
+		<p>Fascinating. &nbsp;These kinds of posts and comments are what I like most about this blog. &nbsp;Thanks, Raymond.</p>
+<div class="post">[<i>Days like today are why I leave comments open. Good discussion, everybody. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851773">
+				<div id="div-comment-851773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger Lipscombe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851773">
+			August 9, 2010 at 8:25 am</a>		</div>
+
+		<p>@SimonRev</p>
+<p>I think you mean RAII, rather than RIAA?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851793">
+				<div id="div-comment-851793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul Gunn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851793">
+			August 9, 2010 at 8:29 am</a>		</div>
+
+		<p>RIAA means &#39;Resource Acquisition Is Initialization&#39;</p>
+<p><a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Resource_Acquisition_Is_Initialization" rel="nofollow">en.wikipedia.org/&#8230;/Resource_Acquisition_Is_Initialization</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851803">
+				<div id="div-comment-851803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">benski</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851803">
+			August 9, 2010 at 8:29 am</a>		</div>
+
+		<p>@Marquess</p>
+<p>He meant RAII &#8211; Resource Acquisition is Initialization</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851813">
+				<div id="div-comment-851813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">@Marquess</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851813">
+			August 9, 2010 at 8:30 am</a>		</div>
+
+		<p>RIAA = Resource Acquisition is Initialization</p>
+<p>Personally I feel that this is a dumb name because if you ask me, the hallmark of it (and what most people are talking about) is the use of destructors to ensure a deterministic release of resources. It does have additional connotations &#8212; in particular that you acquire the resource at the variable declaration (which is where the name comes from) &#8212; but I think that they are far subservient to the destructor-release portion.</p>
+<p>Google for &quot;C++ RIAA&quot; and you&#39;ll have a little more success, or see <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Resource_Acquisition_Is_Initialization" rel="nofollow">en.wikipedia.org/&#8230;/Resource_Acquisition_Is_Initialization</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851823">
+				<div id="div-comment-851823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851823">
+			August 9, 2010 at 8:33 am</a>		</div>
+
+		<p>@Marquess he means RAII (Resource Acquisition Is Initialization)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851833">
+				<div id="div-comment-851833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gibwar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851833">
+			August 9, 2010 at 8:34 am</a>		</div>
+
+		<p>Raymond, what an awesome way to describe garbage collection. I&#39;ve always understood it this way but this will help explain it to other programmers. Thanks for that!</p>
+<p>Everyone else with the &quot;what&#39;s the point&quot; comments: There is a subtle difference between finalizers and IDisposable.Dispose(). Finalizers are meant to release unmanaged resources only when called. In fact, if you&#39;re cleaning up managed objects in your finalizer you could potentially throw an exception because your child objects may have already been disposed or finalized. You can think of them as a way to guarantee that unmanaged resources are cleaned up and that you don&#39;t leak those resources. When .Dispose() is called, you clean up BOTH unmanaged and managed resources and mark yourself as finalized since you just did the work of both. This allows you to make sure that all child objects are disposed of properly and that everything is closed.</p>
+<p>Here&#39;s an example of a proper finalizer/dispose pattern: (not thread safe)</p>
+<p>public class Test {</p>
+<p>bool disposed = false;</p>
+<p>~Test() {</p>
+<p>&nbsp;Dispose(false);</p>
+<p>}</p>
+<p>public void DoSomething() {</p>
+<p>&nbsp;if (disposed) {</p>
+<p>&nbsp; throw new ObjectDisposedException();</p>
+<p>&nbsp;}</p>
+<p>&nbsp;// do something&#8230;</p>
+<p>}</p>
+<p>protected override void Dispose() {</p>
+<p>&nbsp;Dispose(true);</p>
+<p>}</p>
+<p>private void Dispose(bool disposeManagedResources) {</p>
+<p>&nbsp;if (disposed) return; // calling disposed more than once should not throw an exception.</p>
+<p>&nbsp;if (disposeManagedResources) {</p>
+<p>&nbsp; &nbsp;// dispose of all objects in this class, including child managed objects.</p>
+<p>&nbsp;}</p>
+<p>&nbsp;// clean up unmanaged resources</p>
+<p>&nbsp;// such as Win32 handles and the like.</p>
+<p>}</p>
+<p>}</p>
+<p>I hope the above formats correctly. Some good reading on the disposable pattern: <a rel="nofollow" target="_new" href="http://kleahy-technical.blogspot.com/2009/01/idisposable-and-garbage-collection.html" rel="nofollow">kleahy-technical.blogspot.com/&#8230;/idisposable-and-garbage-collection.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851873">
+				<div id="div-comment-851873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gibwar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851873">
+			August 9, 2010 at 8:45 am</a>		</div>
+
+		<p>@Evan: that&#39;s a good point, I should be more careful in choosing my wording. Obviously, as described, it isn&#39;t a guarantee but if your program is still running you aren&#39;t really leaking resources. If you need to access a file you left open but let drift away you need to adjust your program to release that resource. Same thing when acquiring HBRUSHes and the like. You&#39;re suppose to dispose of them to clean up resources but the finalizer, if called, will clean them up for you, helping keep the resource use down. Pretty much the rule of thumb is, if it has a .Dispose() method, call it when you&#39;re done. (Not in all cases, especially ASP.Net controls)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851883">
+				<div id="div-comment-851883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851883">
+			August 9, 2010 at 8:45 am</a>		</div>
+
+		<p>There are several related things garbage collection can achieve, and each of these might be the goal that motivates its use:</p>
+<ol>
+<li>
+<p>Elimination of use-after-free bugs.</p>
+</li>
+<li>
+<p>Mitigation of memory leaks. (Memory leaks are still possible since reachability does not imply that an object will ever be used again.)</p>
+</li>
+<li>
+<p>Reduction of memory management code, and consequent increase in programmer productivity.</p>
+</li>
+</ol>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851903">
+				<div id="div-comment-851903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ooh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851903">
+			August 9, 2010 at 9:01 am</a>		</div>
+
+		<p>Starting with .NET 2.0 and the availability of SafeHandles, a VERY good rule of thumb is: &quot;If you see a finalizer, it&#39;s most likely a bug.&quot;</p>
+<p>Reasons: 1. Do NOT release any managed resources in a finalizer (as gibwar wrote). In fact you can&#39;t even access any other managed objects in a finalizer since those could have been collected already. So, the only things you can safely access are value-typed fields. 2. The only thing you can store in a value-typed field which needs to be released is some sort of unmanaged handle. For exactly this use case the BCL introduced SafeHandles, which receive special treatment of the CLR.</p>
+<p>So, treat every finalizer as bug. Except if you really know what you&#39;re doing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851913">
+				<div id="div-comment-851913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephen Cleary</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851913">
+			August 9, 2010 at 9:07 am</a>		</div>
+
+		<p>Excellent article, Raymond.</p>
+<p>Addressing some confusion in the comments:</p>
+<p>Finalizers and IDisposable are completely different. Finalizers may only free unmanaged resources and do not support RAII; IDisposable enables RAII, which means one can do other things besides just &quot;free resources.&quot; Examples range from flushing file output (FileStream) to cancelling an asynchronous event subscription (IObservable).</p>
+<p>I&#39;ve written up 3 simple rules for implementing IDisposable and Finalizers for freeing resources: <a rel="nofollow" target="_new" href="http://nitoprograms.blogspot.com/2009/08/how-to-implement-idisposable-and.html" rel="nofollow">nitoprograms.blogspot.com/&#8230;/how-to-implement-idisposable-and.html</a> &nbsp;This is a lot easier to understand than Microsoft&#39;s official IDisposable code pattern.</p>
+<p>Regarding the &quot;set variables to null&quot; idea, I address this rather completely here: <a rel="nofollow" target="_new" href="http://nitoprograms.blogspot.com/2010/02/q-should-i-set-variables-to-null-to.html" rel="nofollow">nitoprograms.blogspot.com/&#8230;/q-should-i-set-variables-to-null-to.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851933">
+				<div id="div-comment-851933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jader3rd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851933">
+			August 9, 2010 at 9:34 am</a>		</div>
+
+		<p>The .Net 4.0 Garbage Collector only cleans up memory and assemblies. So if there are resources which are not memory (handles) they should be cleaned up properly (ie, Disposed). If you Dispose of your object, it&#39;s memory isn&#39;t cleaned up. That&#39;s something for the Garbage Collector to do. I disagree with the statement that the Garbage Collector is to give the illusion of infinite memory, but it still is an interesting thought to ponder none the less.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851943">
+				<div id="div-comment-851943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">blah</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851943">
+			August 9, 2010 at 9:35 am</a>		</div>
+
+		<p>What a longwinded way of illustrating the need for using() {}.</p>
+<div class="post">[<i>You&#39;re focusing on the example (finalizers) and not the principle (GC philosophy). It&#39;s fascinating seeing how people take away from an article something didn&#39;t even consider to be part of the topic! -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851953">
+				<div id="div-comment-851953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dominik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851953">
+			August 9, 2010 at 9:44 am</a>		</div>
+
+		<p>Does this blog software work? Sometimes? Now?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851963">
+				<div id="div-comment-851963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Edward Z. Yang</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851963">
+			August 9, 2010 at 9:48 am</a>		</div>
+
+		<p>There is an interesting parallel between stack-based allocation schemes and garbage-collected schemes; in particular, if I put something on the stack I rightfully can assume that it gets &quot;deallocated&quot; as soon as I return. Of course, C stacks tend not to have finalizers either, so the analogy breaks there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851973">
+				<div id="div-comment-851973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dominik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851973">
+			August 9, 2010 at 9:49 am</a>		</div>
+
+		<p>Sorry Raymond.</p>
+<p>What&#39;s the solution to the customers problem? I can&#39;t find a Dispose or Close method on XmlDocument. Is XmlDocument locking the file?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851983">
+				<div id="div-comment-851983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Obvious joke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851983">
+			August 9, 2010 at 9:51 am</a>		</div>
+
+		<blockquote><p>
+  you can solve this customer&#39;s problem
+</p></blockquote>
+<p>Tell the customer to start removing DIMMs from the system until the GC is running all the time.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851993">
+				<div id="div-comment-851993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rob K</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851993">
+			August 9, 2010 at 9:52 am</a>		</div>
+
+		<p>This is why I do not care for garbage collection at all. It solves (and I&#39;m being generous) only one specific type of a general problem &#8211; dynamic resource allocation. RAII is a much better way to handle the issue. Garbage collection, since it doesn&#39;t actually destroy objects when they go out of scope, gets in the way of doing RAII and becomes a huge pain in the butt. IDisposable is a hack work-around on that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852003">
+				<div id="div-comment-852003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dalek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852003">
+			August 9, 2010 at 10:04 am</a>		</div>
+
+		<p>In C# destructors are translated to a Finalizer so if I understand correctly there is no guarantee the destructor of a C# object is called?</p>
+<p>If so I propose a modification to the rule of Ooh: &quot;If you see a finalizer or a destructor, it&#39;s most likely a bug.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852013">
+				<div id="div-comment-852013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852013">
+			August 9, 2010 at 10:07 am</a>		</div>
+
+		<p>Apologies to all, I meant RAII not RIAA (was just talking about the recording industry earlier, which no doubt contributed to the slip).</p>
+<p>Several folks made the point that RAII can be achieved with using(){}. &nbsp;And if I am using C# (which I do on occasion) I am grateful for it. &nbsp;I have found (dislcaimer: &nbsp;this is my experience, your mileage will vary) that because 90% of the time you don&#39;t need to worry about releasing a resource in C#, it is easy to forget to do a &quot;using&quot; the remaining 10%. &nbsp;In C++ you always need to worry about it, which makes it real easy to remember that when obtaining a resource make sure you have taken care of its release as well. (In essence, make sure it is stored in something whose destructor will free it). &nbsp;I have found this pattern a lot harder to follow in C# than in C++.</p>
+<p>Having said all that, there is a lot to like about .NET and C# as well. &nbsp;I just personally find that the whole &quot;garbage collector saves you&quot; aspect that is pitched in every intro to the language I have encountered more of a trap than a salvation.</p>
+<p>Actually Rob K expressed my feelings very succinctly</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852043">
+				<div id="div-comment-852043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zxc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852043">
+			August 9, 2010 at 10:27 am</a>		</div>
+
+		<p>Getting back to the example, as a poster already pointed out, XmlDocument does not implement IDispose. &nbsp;So what&#39;s the answer? &nbsp;Just don&#39;t use XmlDocument.Save(filename)? &nbsp;Seems like you would need to use a mechanism where you COULD force the file write and file close, like using an XmlWriter.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852053">
+				<div id="div-comment-852053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gibwar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852053">
+			August 9, 2010 at 10:35 am</a>		</div>
+
+		<p>@Dominik, @zxc: Judging from the error provided they are probably using the XmlDocument.Load(stream) overload. Using that method they would have had to open up a stream to the file itself (probably a FileStream, possibly a StreamReader even) and passed that in. If they didn&#39;t close the underlying stream the file would still have been locked.</p>
+<p>The documentation on XmlDocument.Load(string) doesn&#39;t specify if it leaves the file open so it would probably be safe to assume that the file is closed after loading the file (especially since it accepts a URL as an option).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852073">
+				<div id="div-comment-852073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zan Lynx</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852073">
+			August 9, 2010 at 11:49 am</a>		</div>
+
+		<p>I agree f0dder. C# should have kept the C++ style destructor. &nbsp;Or it should at least have promised to call finalizers on scope exit even if it never promised to call them on GC of heap objects.</p>
+<p>The &quot;using&quot; statement is far too easy to forget.</p>
+<div class="post">[<i>I think you wouldn&#39;t like it if object references were finalized on scope exit.</i></p>
+<pre>MyThing thing = new MyThing();
+return thing; // oops, returning reference to object that has been finalized
+</pre>
+<p><i>-Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852083">
+				<div id="div-comment-852083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marquess</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852083">
+			August 9, 2010 at 11:56 am</a>		</div>
+
+		<p>@fodder</p>
+<p>You must be one of those programmers who think C is better than Ada just because the source code takes up less disk space. There&#39;s nothing wrong with having to write more if you gain expressiveness. The way C# handles Dispose gives you the option of explicitly disposing or leaving it to the GC. Forcing a disposal/finalization at the end of a block is a good way of increasing an algorithm&#39;s runtime by an order of magnitude; on the other hand, it may be necessary to force a big object out of memory or release a lock. C# gives you that choice.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852093">
+				<div id="div-comment-852093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pulp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852093">
+			August 9, 2010 at 12:03 pm</a>		</div>
+
+		<p>Maybe the programer should give the GC a hint with a attribute like that:</p>
+<p>[Dispose]</p>
+<p>class ClassWhichOpensAFile</p>
+<p>{</p>
+<p>&#8230;</p>
+<p>}</p>
+<p>now the GC could call the destructor of the class immediately after leaving scope if this attribute is set.</p>
+<div class="post">[<i>You&#39;re replaced one bug with another.</i></p>
+<pre>ClassWhichOpensAFile OpenAndInitialize(string filename)
+{
+ ClassWhichOpensAFile o = new ClassWhichOpensAFile(filename);
+ o.Initialize(x, y, z);
+ return o; // bug here
+}
+</pre>
+<p><i>-Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852123">
+				<div id="div-comment-852123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zxc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852123">
+			August 9, 2010 at 12:17 pm</a>		</div>
+
+		<p>To follow up on the example in the OP, you put a FileStream in a &quot;using&quot; block and call XmlDocument.Save(stream).</p>
+<p>@gibwar &#8211; XmlDocument.Save(string) is the problem child that does not release the file</p>
+<p>@f0dder &#8211; You would enjoy the wonders of Objective C memory management with it&#39;s mishmash of deallocation strategies and secret lore (as I&#39;m sure all iPhone developers currently are&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852133">
+				<div id="div-comment-852133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Random832</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852133">
+			August 9, 2010 at 12:32 pm</a>		</div>
+
+		<p>&quot;@gibwar &#8211; XmlDocument.Save(string) is the problem child that does not release the file&quot;</p>
+<p>Says who? No indication in the OP that they are calling either that or Load(string).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852143">
+				<div id="div-comment-852143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zxc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852143">
+			August 9, 2010 at 12:39 pm</a>		</div>
+
+		<p>@Random832 &#8211; Umm, because I tried it. &nbsp;Empirical beats speculative.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852153">
+				<div id="div-comment-852153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zxc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852153">
+			August 9, 2010 at 1:41 pm</a>		</div>
+
+		<p>@Random832 &#8211; Whoops, I blew it! &nbsp;XmlDocument.Save(string) is fine, I was seeing a different issue. &nbsp;My apologies.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852163">
+				<div id="div-comment-852163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jeff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852163">
+			August 9, 2010 at 1:42 pm</a>		</div>
+
+		<p>The analogy doesn&#39;t work for me. &nbsp;It&#39;s like saying a city bus simulates having an infinite number of seats because people sometimes get back off the bus. &nbsp;It doesn&#39;t provide any additional seats during rush hour. &nbsp;All the GC does is automatically identify which seats are empty so you don&#39;t have to keep track in your program. &nbsp;It&#39;s a much faster way to program, but still has its own problems &#8211; and the framework does not provide any coherent way to manually manage memory when the automation fails.</p>
+<p>What is really missing is that IDisposable does not require (or imply) a Using block. &nbsp;Any local variable that is IDisposable should dispose itself when it goes out of scope &#8211; whether a Using statement is provided or not.</p>
+<p>If .NET provided that functionality, any class that implements IDisposable could function as if it really had a destructor &#8211; knowing that the users could not forget to clean it up when done.</p>
+<p>There is already a compiler warning if your class owns an IDisposable member but is itself not IDisposable, but the compiler does not extend this to locally scoped variables.</p>
+<p>But alas, more and more of the .NET framework neither implements IDisposable nor supports classes that do. &nbsp;The entire WPF framework intentionally avoids IDisposable &#8211; and MS claims it is not needed &#8211; yet the WPF framework also leaks memory as an almost direct result of this omission.</p>
+<div class="post">[<i>All you folks who are suggesting that local variables should be auto-disposed are forgetting that you&#39;re working with <span style="text-decoration:underline;">references</span>, not objects. It&#39;s like saying that in C++ all pointers should be auto-delete&#39;d when they go out of scope. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851623">
+				<div id="div-comment-851623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henning Makholm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851623">
+			August 9, 2010 at 7:14 am</a>		</div>
+
+		<p>Garbage collection is ONE PARTICULAR implementation strategy for simulating infinite memory. It seems to be the one that works best in practice for a very large range of realistic programs, and is therefore the dominant strategy in actual use. But there are various alternatives considered in programming-language research, generally involving some amount of static analysis of the program to avoid or minimize the trace-through-everything overhead of garbage collections. These alternatives are spoken of as *alternatives* to garbage collection for achieving the infinite-memory illusion, not as *forms* of garbage collection</p>
+<div class="post">[<i>Point well-taken. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852193">
+				<div id="div-comment-852193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jeff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852193">
+			August 9, 2010 at 2:26 pm</a>		</div>
+
+		<p>@Raymond: Obfuscating references and letting the developer treat them as instances is the true purpose of the GC. &nbsp;It allows developers to write more code faster (cheaper).</p>
+<p>But that obfuscation itself becomes a problem whenever situations arise where the difference is actually important, and the GC provides no support at all to help in those situations.</p>
+<p>IDisposable is a tiny fix that only helps when your disposable class is used and disposed in a single function. &nbsp;There&#39;s no &quot;last one out, turn off the lights&quot; capability when a single disposable object is owned by many others. &nbsp;And trying to implement your own on top of the GC is much more difficult than it was in unmanaged code.</p>
+<p>And C++ &quot;smart&quot; pointers did just that &#8211; they auto-delete&#39;d when they went out of scope, yet could still be copied into members or returned from functions just fine.</p>
+<p>The .NET GC does tree-walking only. C++ smart pointers used reference counting only. &nbsp;I think adding reference counting to the GC could improve the behavior of classes that implement IDisposable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852203">
+				<div id="div-comment-852203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">malloc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852203">
+			August 9, 2010 at 3:08 pm</a>		</div>
+
+		<p>What does that even mean to simulate an infinite amount of memory???</p>
+<p>I would argue that a correctly written program using malloc and free is simulating an infinite amount of memory&#8230;</p>
+<p>And the &quot;more RAM than the program needs&quot; situation is particularly useless, as the behavior will be exactly the same for a leaking malloc only program that terminates before exhausting the memory resource&#8230;</p>
+<p>So I would argue that what define garbage collection is precisely the mecanism (of your article) not the goal (of your article). And that the <em>true</em> goal is indeed to free the programmer from the burden of programming it&#39;s own memory management.</p>
+<p>Now memory management really is the point, and you are right on reminding beginners that a kind of automatic memory management is NOT automatic generalized resource management. But I could not make sense of the way you introduced that. The thing that probably made lot of beginners mistake memory management for automatic generalized resource management in the first place is the confusion coming from C++ between resource finalization and freeing memory &#8212; which is fine as soon as RAII (traditional C++ one) is in place but should have been exterminated in derivative languages more clearly that it has been, and replaced by clearly identifiable constructs both fitting the same safety target and memory management environment.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851763">
+				<div id="div-comment-851763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marquess</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851763">
+			August 9, 2010 at 8:19 am</a>		</div>
+
+		<p>@SimonRev</p>
+<p>What is RIAA? Googling is pointless, what with the *other* RIAA hogging the first two million results.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-leo-davidson even thread-even depth-1" id="comment-851783">
+				<div id="div-comment-851783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Leo+Davidson' rel='external nofollow' class='url'>Leo Davidson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851783">
+			August 9, 2010 at 8:26 am</a>		</div>
+
+		<p>@C# noob: Think of it from the user&#39;s point of view.</p>
+<p>Most software companies take years to fix non-critical bugs (if they fix them at all and especially if they&#39;re hard to reproduce). Wouldn&#39;t you want the framework to reduce the impact of bugs when it can detect them and can deal with them in a way which provably has no ill effect on the user/environment, where ignoring the bug (or crashing mid-operation over something that was entirely recoverable) is never better and often worse than fixing it?</p>
+<p>We&#39;re not talking about blindly ignoring access violation exceptions or reaching into other apps and closing their file handles here; we&#39;re talking about things like the framework knowing that no part of the process could ever possibly access a file handle again nor (according to the language&#39;s rules) expect that file to remain open, and thus cleanly closing the file handle.</p>
+<p>Yes, *debug* builds should scream when finalizers have to do anything. Maybe release builds should inform the user and ask them to send a bug report, too.</p>
+<p>That doesn&#39;t make the concept of finalizers wrong unless we&#39;re going to pretend that all bugs get found and fixed during development or promptly after being reported, which a fantasy in most cases.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852213">
+				<div id="div-comment-852213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">POKE53280,0</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852213">
+			August 9, 2010 at 3:29 pm</a>		</div>
+
+		<p>When we combine C++ smart pointers like shared_ptr with STL containers like std::vector, we can achieve a kind of &quot;deterministic garbage collector&quot; (without the overhead of a .NET-like GC), and this works fine for both memory resources and non-memory resources (e.g. files, sockets, textures&#8230;) assuming that class destructors do their job right.</p>
+<p>A mature language like C++ and proper smart pointer classes and container libraries easily outperform a .NET-like (or Java-like) GC, IMHO.</p>
+<p>In modern C++, with proper RAII use, I think it is quite hard to have memory (or other non-memory resource) leaks.</p>
+<p>(And I find C++ destructors and stack semantics much easier and more elegant than C# IDispose/using(){}&#8230;).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-851843">
+				<div id="div-comment-851843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gibwar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851843">
+			August 9, 2010 at 8:37 am</a>		</div>
+
+		<p>*sigh* I knew I missed something. At the last line of if (disposedManagedResources) should be &quot;GC.SupressFinalize(this)&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-851853">
+				<div id="div-comment-851853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-851853">
+			August 9, 2010 at 8:40 am</a>		</div>
+
+		<p>@gibwar: &quot;You can think of them as a way to guarantee that unmanaged resources are cleaned up and that you don&#39;t leak those resources.&quot;</p>
+<p>A big part of this thread is that you *can&#39;t* use finalizers to guarantee *anything*.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852023">
+				<div id="div-comment-852023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852023">
+			August 9, 2010 at 10:20 am</a>		</div>
+
+		<p>@Ooh: There&#39;s one other thing you can do. You can call a P/Invoke function to clean up a native library. My *one* finalizer does exactly that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852033">
+				<div id="div-comment-852033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ShuggyCoUk</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852033">
+			August 9, 2010 at 10:26 am</a>		</div>
+
+		<p>@RobK</p>
+<p>&quot;RAII is a much better way to handle the issue. Garbage collection, since it doesn&#39;t actually destroy objects when they go out of scope, gets in the way of doing RAII and becomes a huge pain in the butt. IDisposable is a hack work-around on that. &quot;</p>
+<p>Try implementing full (arbitrary lifetime, not stack bound) closures without something doing GC, or it&#39;s moral equivalent&#8230;</p>
+<p>IDisposable is fine for RAII except for you being obliged to do it yourself (i.e put in the using statements or chaining the dispose of one class to dispose it&#39;s others). More compile time sanity checking would be nice (the FxCop rule for checking it is not ideal being over zealous in obvious cases (like the disposable object being returned from the function) but it is fundamentally quite hard.</p>
+<p>Incidentally if your programming language exposes the concept of deterministic lifetime for objects then it is no longer simulating infinite memory&#8230;</p>
+<p>On another note Finalizers can be very useful for people using many app domains in long running processes. If an app domain goes down due to a crash there is a reasonable chance that things protected by SafeHandles and Finalizers might get cleaned up. Not guaranteed but it makes it much more likely. That said the number of people who should actually write a Finalizer is *very* low and should be intimately aware of the very special rules regarding them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852233">
+				<div id="div-comment-852233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">steveg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852233">
+			August 9, 2010 at 6:18 pm</a>		</div>
+
+		<p>I&#39;m a big fan of GC, and I&#39;m from a C++ background. It&#39;s a joy to spend time solving a problem without the time spent fighting implementation details (don&#39;t get me started on the STL, it&#39;s hardly written from the joy of code maintenance perspective). However, as others have observed you need to pay attention to what you&#39;re doing; under load you can run into issues (especially if you&#39;re not being rigorous with IDisposable objects).</p>
+<p>One suggestion I have for the C# Visual Studio team is to visually indicate a variable is an IDisposable object, which might be easier than the potentially non-deterministic analysis required for a warning. (yes, yes, yes, I should tell them).</p>
+<p>Of course some objects in the framework implement IDisposable that don&#39;t need to, so you&#39;d need a [DontWarnAboutIDisposable] or something to work around those.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852063">
+				<div id="div-comment-852063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f0dder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852063">
+			August 9, 2010 at 11:35 am</a>		</div>
+
+		<p>@SimonRev: RAII is also sometimes called RIIA, which doesn&#39;t really sound different from RIAA when pronouncing &#8211; but oh boy is the concept different :)</p>
+<p>I&#39;m a big fan of RAII in C++, and I wish C# would have a &quot;exiting scope destructor&quot;, instea of having to do explicit &quot;using&quot; statements &#8211; I do realize that this would have a lot of potential problems, but it&#39;s a bit sad you have to do *more* work than in C++. As it is, the only real use finalizers have is to scream bloody murder if Dispose hasn&#39;t been called.</p>
+<p>Garbage collection seems nice enough for reclaiming *memory*, though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852103">
+				<div id="div-comment-852103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f0dder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852103">
+			August 9, 2010 at 12:07 pm</a>		</div>
+
+		<p>@Marquess: my problem with the C# way is that for &quot;some objects&quot; you can just fire-and-forget, whereas with &quot;other objects&quot; you need the manual cleanup. This, imho, makes it easier to miss cleanup than when you either have to do *all* cleanup manually (C) or can be guaranteed your destructors run when going out of scope (C++).</p>
+<p>I&#39;m not arguing against GC, it can be advantageous to defer a bunch of memory cleanups until a later time &#8211; but imho a scope-destructor *as an option* would have been nice.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852113">
+				<div id="div-comment-852113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marquess</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852113">
+			August 9, 2010 at 12:10 pm</a>		</div>
+
+		<p>“but imho a scope-destructor *as an option* would have been nice.”</p>
+<p>That&#39;s what “using” is for!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852243">
+				<div id="div-comment-852243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852243">
+			August 9, 2010 at 9:01 pm</a>		</div>
+
+		<p>There are plenty of reasons why it might not be a bug if your finalizer runs. Weak pointers are perhaps the best example.</p>
+<p>Furthermore, there are plenty of cases where a &quot;using&quot; block is probably an indication of a bug. The Reactive Framework&#39;s IObservable is the first example of this that pops to mind.</p>
+<p>Quite frankly, I think it&#39;s easier to determine whether I need a &quot;using&quot; or not, than to try to figure out whether I need an auto_ptr, shared_ptr, or scoped_ptr.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852173">
+				<div id="div-comment-852173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852173">
+			August 9, 2010 at 2:21 pm</a>		</div>
+
+		<p>@Marquess: &quot;There&#39;s nothing wrong with having to write more if you gain expressiveness.&quot;</p>
+<p>Writing *more* is fine&#8230; having to write stuff that is easy to forget and *almost* works if you get it wrong isn&#39;t.</p>
+<p>@Marquess: &quot;Forcing a disposal/finalization at the end of a block is a good way of increasing an algorithm&#39;s runtime by an order of magnitude; on the other hand, it may be necessary to force a big object out of memory or release a lock. C# gives you that choice.&quot;</p>
+<p>If only you could get the same choices in, say, C++ with a little API design. Oh well.</p>
+<p>@Marquess: &quot;That&#39;s what “using” is for!&quot;</p>
+<p>It&#39;s just not a great substitute. Sure, it&#39;s better way of doing resource management than what C gives you. But with proper destructors, you write the destructors and they Just Work &#8212; there&#39;s no need to use them every single time you create an object to be destructed. With using, you are requiring the programmer to know that &quot;using&quot; is necessary and to call it each time you use your object.</p>
+<p>C#&#39;s &quot;using&quot; is little more than some syntactic sugar for an extra try..finally block, whereas I personally feel that RAII is much more. I strongly feel the distinction is important enough that some explicit language support would be a good idea. Make structs automatically destructed or something like that. (Note: I don&#39;t know enough about C# to know whether this would actually work, but it&#39;s the sort of line I&#39;m thinking along.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852263">
+				<div id="div-comment-852263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Drak</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852263">
+			August 9, 2010 at 10:54 pm</a>		</div>
+
+		<p>Thanks for an interesting article Raymond!</p>
+<p>By the way, to all the people saying that it&#39;s hard to know when to use &#39;using&#39;: it comes with experience. I use lots of the same objects every day, and have &#39;muscle memory&#39; as to whether or not they need &#39;using&#39;. If I use a new type of object, I just try &#39;using&#39; and see if I get an error about it. If not, I keep &#39;using&#39;, if there&#39;s an error, I stop &#39;using&#39;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852223">
+				<div id="div-comment-852223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852223">
+			August 9, 2010 at 4:54 pm</a>		</div>
+
+		<p>(Apologies if this is a dupe; the Post button appears to be on the fritz)</p>
+<p>Your point about the unreliability of finalizers is a good one, but I&#39;m a little uneasy about the philosophical approach: X simulates Y, and Y implies Z, so if X then you have to assume Z. The trouble is that this argument is only as strong as the simulation is accurate. Tetris simulates gravity, and gravity causes acceleration, therefore blocks will be moving faster at the bottom of the screen than at the top. It&#39;s like arguing by analogy; the road doesn&#39;t take you very far and you don&#39;t always realize when you&#39;ve gone off the end of it&#8230;</p>
+<p>GC is a *terrible* simulation of infinite memory. Given infinite memory &quot;while (true) myList.Add(new HugeThing());&quot; wouldn&#39;t be any more problematic than &quot;while (true) myvar = new HugeThing();&quot;, but it is, and the difference isn&#39;t some obscure implementation detail. So yes, thinking about GC as magical resource cleanup pixie dust will get you into trouble, but thinking about GC as infinite memory will also get you into trouble. Neither is any substitute for a basic understanding of what&#39;s actually going on.</p>
+<p>I&#39;m not even sure that &quot;simulating infinite memory&quot; is the fundamental value proposition of GC. A better statement to my mind would be &quot;simulating somewhat less than my actual memory (GC needs headroom to work well) but with vastly simpler management&quot;. Or, going even further afield, I recall a fascinating piece by Herb Sutter in which he sang the praises of GC as fundamental to type-safety. That is, the value isn&#39;t so much in the fact that GC cleans up your memory so much as the fact that NOTHING ELSE DOES; that&#39;s what allows the type system to guarantee that a non-null Foo pointer is actually pointing at a Foo as opposed to just dangling. (And interestingly, IDisposable subverts this, because a Dispose()d Foo isn&#39;t really a valid Foo.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852283">
+				<div id="div-comment-852283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852283">
+			August 10, 2010 at 2:20 am</a>		</div>
+
+		<p>@Stephen Cleary:</p>
+<p>IDisposable does not enable RAII. RAII is the automatic and deterministic destruction of resources &#8211; in C# an instance of a class which implements IDisposable will not have Dispose called automatically and deterministically unless that instance is managed by a using statement. That is much weaker than RAII, because using statements can only appear at method scope, not at class scope.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick odd alt thread-odd thread-alt depth-1" id="comment-852303">
+				<div id="div-comment-852303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852303">
+			August 10, 2010 at 2:38 am</a>		</div>
+
+		<p>Another interesting problem with finalizers &#8211; although an implementation detail &#8211; is the fact that they run on a separate thread from any thread that you might have allocated the unmanaged resource on. If your resource has thread affinity, this can either cause corruption, or an attempt to call back to the thread that created it. If you&#39;re not expecting this to happen, the finalizer thread&#39;s callback never gets serviced and then all your finalizers stop working (as they&#39;re all serviced from that one finalizer thread).</p>
+<p>I seem to recall tracing a problem in WiX&#39;s linker back to finalization of a class holding an MSI handle.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852313">
+				<div id="div-comment-852313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger H&#229;gensen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852313">
+			August 10, 2010 at 3:08 am</a>		</div>
+
+		<p>I guess the lesson here is to ALWAYS clean up after yourself.</p>
+<p>For example I do a lot of Windows programming using PureBasic and I also use the Win32 API a lot. <a rel="nofollow" target="_new" href="http://purebasic.com/" rel="nofollow">http://purebasic.com/</a></p>
+<p>Now, PureBasic keeps track of the memory and resources it allocates and frees them automatically when the program ends normally. (if you do Win32 API you need to use the related API&#39;s there for cleaning those things up obviously)</p>
+<p>Now despite that handy feature, I still manually at the end of the program free memory I have allocated and so on. So for me that auto cleanup is a safety net just in case I missed a cleanup somewhere. So in pretty much all my programs my own code frees all that I allocated, then the language itself runs a cleanup, but since all the stuff was cleaned up naturally it doesn&#39;t have to.</p>
+<p>There is a small overhead there that could be avoided I guess but I&#39;d rather have a program spend some extra cycles trying to leave the a system in the same state as when it started.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852323">
+				<div id="div-comment-852323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rs</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852323">
+			August 10, 2010 at 4:00 am</a>		</div>
+
+		<p>Garbage collection vs. &quot;deterministic&quot; memory management: This can also make a difference in user experience. For determistic memory management, there tends to be a more direct correspondence between user&#39;s actions and the program&#39;s response.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-leo-davidson even thread-even depth-1" id="comment-852253">
+				<div id="div-comment-852253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Leo+Davidson' rel='external nofollow' class='url'>Leo Davidson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852253">
+			August 9, 2010 at 10:28 pm</a>		</div>
+
+		<p>Moving between C#/C++, a feature of GC I really miss is being able to throw a managed object into a queue without worrying about who is responsible for freeing it. When the thing processing the queue might be cancelled and shutdown at any moment (including before, during or immediately after you add to the queue) it can get quote complicated in C++.</p>
+<p>Yes, you can (and I have) do it in C++ by having ref-counting on the queue and everything inside it, but doing that is a pain compared to just sticking a reference in a queue and having it done for you.</p>
+<p>No language in the world allows you to do things you couldn&#39;t do in virtually any other language; the differences between them are how easy they make things and which details they force you to concentrate on.</p>
+<p>(I prefer some aspects of C++ but the lack of GC isn&#39;t one of them.)</p>
+<p>@POKE53280,0:</p>
+<p>Are you sure the performance is always better? In some cases, sure, but not all. Most code spends time waiting for the kernel/disk/network/whatever to do things and it can be better to clean up memory in those times than to delay execution to do it earlier.</p>
+<p>GC effectively gives you memory clean-up in parallel rather than in series.</p>
+<p>GC is not *always* better but cleaning up memory ASAP isn&#39;t always better either.</p>
+<p>@Mike:</p>
+<p>Good points, IMO.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852333">
+				<div id="div-comment-852333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matthew</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852333">
+			August 10, 2010 at 5:37 am</a>		</div>
+
+		<p>@zxc: The answer is to Close / Dispose whatever was loaded (<a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/system.xml.xmldocument.load.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/system.xml.xmldocument.load.aspx</a>) into the XmlDocument.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852273">
+				<div id="div-comment-852273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852273">
+			August 9, 2010 at 10:59 pm</a>		</div>
+
+		<p>@POKE53280,0: &quot;A mature language like C++ and proper smart pointer classes and container libraries easily outperform a .NET-like (or Java-like) GC, IMHO.&quot;</p>
+<p>This is probably *usually* true but is certainly not universally true. Reference counted GC has a number of its own problems (even beyond the whole &quot;your program can screw it up by creating a cycle&quot; thing), and it&#39;s not always a clear win performancewise. I think that &quot;C memory management will *always* be faster than GC&quot; is a common enough misconception that I&#39;ll expand upon it a bit even if you don&#39;t fall into that trap.</p>
+<p>A reference counted GC has to increment/decrement on every reference acquire or release &#8212; something the reachability-based garbage collector doesn&#39;t have to do. That&#39;s overhead. Now imagine you have a short-lived process: maybe the GC never needs to run. So the reachability-based GC has *no* overhead! (To be fair, systems that come with a reachability-based GC usually have a substantial startup cost, as well as bytecode interpretation/JIT, that will outweigh the reference counting management of, say, C++; I question how much this actually has to be the case though. It certainly makes a fair comparison of GC methods themselves harder.)</p>
+<p>Further, a compacting collector&#39;s cost is proportional only to the number (&amp;size) of live objects, while a reference-counted GC&#39;s cost is proportional to the number of objects ever allocated. Then on top of that, if you have a compacting collector, the allocation of memory becomes *dirt simple*, whereas the best malloc() implementation for a workload varies. Add in a generational GC and the cost goes even lower. Put these together and, if your program&#39;s behavior is such that it&#39;s allocating and deallocating a lot of short-lived objects, the reachability-based GC may be faster. Read another way, some programs spend a lot of time in the GC, but some programs also spend a lot of time in malloc() and free(); if you&#39;ve *got* such a program that spends a lot of time in malloc(), a compacting GC very well may speed it up.</p>
+<p>(Okay, in full disclosure, you can have a compacting or even generational GC that uses reference-counting. In such a case, you&#39;d still have the per-object overhead of maintaining the reference counts, but you could use the dirt simple malloc() implementation. However, in the specific case of C++ smart pointers, this is basically impossible because you move objects because you can&#39;t identify pointers to them. You *need* language support for a compacting GC, and you need a compacting GC in order to get rid of the cost of malloc().)</p>
+<p>Finally, I strongly suspect that there&#39;s more room for improving a reachability-based GC than there is a reference-counting GC. There&#39;s probably not a lot you could do in order to make the reference count maintenance faster for instance, even if you have a separate thread that actually does the deallocation, I&#39;m hard pressed to come up with something that would be faster than maintaining the reference counts sequentially. By contrast, you could run a moving GC in a different thread, and it may be possible to get the cost of *that* down to near-zero too. I don&#39;t think we&#39;re there yet, but there&#39;s still being a lot of research being done in making GCs faster.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852343">
+				<div id="div-comment-852343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852343">
+			August 10, 2010 at 6:41 am</a>		</div>
+
+		<p>Not sure if this post inspired <a rel="nofollow" target="_new" href="http://apenwarr.ca/log/?m=201008#10" rel="nofollow">apenwarr.ca/log</a> or not, but it sure spells out what I feel about GC</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852353">
+				<div id="div-comment-852353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852353">
+			August 10, 2010 at 6:58 am</a>		</div>
+
+		<p>This has been a fascinating discussion. &nbsp;Even though I fall in the C++/RAII camp, I do tend to think that proponents of C++ do tend throw out the performance card prematurely. &nbsp;Modern GCs are pretty fascinating things. &nbsp;When you consider the overheads for generic use of std::shared_ptr + new / delete I am not sure that it is faster than modern GC. Now, of course in C++ you have the option of lock-free memory pools, custom allocators, overloading new/delete and such if speed is paramount, but in practice very few people do that &#8212; and the complexity of doing so would make C++ more complex than anything in C# or even C.</p>
+<p>Personally I find the strongest arguments to be the ones that run along the lines of &#8212; The fact that C++ makes you always consider resource cleanup and the ability to ensure that every resource allocation is automatically ensured an automatic resource release makes it superior to C# where it is easy to forget you need to have a using statement. &nbsp;In C# if you need and IDisposable object to be shared in many places, I have no idea how you establish a policy to ensure it is cleaned up at some point. (this last point is probably my lack of experience with the language, there is probably a good way to handle that)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852363">
+				<div id="div-comment-852363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852363">
+			August 10, 2010 at 7:00 am</a>		</div>
+
+		<p>&lt;quote&gt;The answer is to Close / Dispose whatever was loaded into the XmlDocument.&lt;/quote&gt;</p>
+<p>That pretty much sums up the problem with garbage collection; after you open you have to remember to close. C has &quot;after you malloc you have to remember to free&quot;. C++ has RAII, which solves the problem for all resources. C# has GC, which solves the problem for memory, but makes the problem more difficult to solve for everything else.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852393">
+				<div id="div-comment-852393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rob K</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852393">
+			August 10, 2010 at 7:25 am</a>		</div>
+
+		<p>What&#39;s being missed in a lot of this discussion, and as Raymond pointed out in a note &quot;[All you folks who are suggesting that local variables should be auto-disposed are forgetting that you&#39;re working with references, not objects. It&#39;s like saying that in C++ all pointers should be auto-delete&#39;d when they go out of scope. -Raymond]&quot;</p>
+<p>He&#39;s exactly right. With garbage collected languages, you don&#39;t have objects on the stack, only references to them. All objects are always dynamically allocated. So how does C# know that you don&#39;t intend for that object to live beyond the life time of the current scope, and that you haven&#39;t passed the reference off somewhere else?</p>
+<p>In C++ on the other hand, you can have an object on the stack if you want. If an object is on the stack and has no destructors, all it takes to get rid of it is incrementing the stack pointer. It just goes away when the function exits. But in C# or Java for instance, you&#39;re forced to have all objects allocated dynamically, and they have to go through garbage collection.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852593">
+				<div id="div-comment-852593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852593">
+			August 10, 2010 at 9:16 am</a>		</div>
+
+		<p>@Stephen Cleary: For RAII, you need to be able to execute actions on creation, copying, assignment and going out of scope. To implement different storage semantics (e.g. shared_ptr) those actions also need to be able to vary independently of the type being stored.</p>
+<p>What &#39;using&#39; gives you is not RAII &#8211; it&#39;s nothing more than syntax sugar for a try/finally/dispose.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852633">
+				<div id="div-comment-852633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f0dder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852633">
+			August 10, 2010 at 10:11 am</a>		</div>
+
+		<p>I&#39;m aware that .NET doesn&#39;t follow stack-based semantics, but that doesn&#39;t mean that C# couldn&#39;t support a special method called when a variable goes out of scope.</p>
+<p>But yes, I&#39;m also aware this has a number of problems &#8211; like what to do in case of exceptions, how to handle this &#39;destruction&#39; when references are held elsewhere (wouldn&#39;t be pretty), et cetera.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852733">
+				<div id="div-comment-852733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Csaboka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852733">
+			August 10, 2010 at 11:46 am</a>		</div>
+
+		<p>C++/CLI can get away with auto-disposing because it has a different syntax for values and references. (Foo is always by value, Foo^ is always by managed reference.) For values, the compiler can be sure that the reference hasn&#39;t been leaked elsewhere, so it can be disposed at the end of the scope.</p>
+<p>For C# to have similar semantics, it would need a syntax that says &quot;pretend this is a value type even though it&#39;s a reference type&quot;. This way, it would be obvious when you want the reference to get out of the method and when you intend it to stay local. Of course, doing this in a backwards-compatible way would be a major pain.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852773">
+				<div id="div-comment-852773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">POKE53280,0</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852773">
+			August 10, 2010 at 2:14 pm</a>		</div>
+
+		<p>@Evan and others who compared &quot;deterministic&quot; memory management vs. garbage collection:</p>
+<p>how does current GC technology scale up? I mean: would it be possible to write a medium-large software system (like e.g. Microsoft Office) using C# and GC technology?</p>
+<p>Of course C# and its GC (and VS IDE support for managed languages) offer better productivity to the programmer than C++ does; but I&#39;m not sure if it is wise to invest in C# code when building a medium-large software system. What about performance? Would the app be responsive, snappy? &#8230;I just don&#39;t know.</p>
+<div class="post">[<i>Visual Studio 2010 is <a href="http://blogs.msdn.com/b/ricom/archive/2009/08/19/visual-studio-2010-performance-part-3-a-technical-update.aspx" rel="nofollow">dominantly managed</a>. And according to Rico, <a href="http://blogs.msdn.com/b/ricom/archive/2009/06/05/visual-studio-2010-performance-part-2-text-editor.aspx" rel="nofollow">WPF is not the performance bottleneck</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852473">
+				<div id="div-comment-852473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephen Cleary</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852473">
+			August 10, 2010 at 7:52 am</a>		</div>
+
+		<p>@Joe: What I mean is that IDisposable *enables* the RAII *design pattern*. You are correct that disposal is not guaranteed; you may be interested in a lengthly article on the subject here: <a rel="nofollow" target="_new" href="http://www.codeproject.com/KB/dotnet/IDisposable.aspx" rel="nofollow">http://www.codeproject.com/&#8230;/IDisposable.aspx</a></p>
+<p>Regarding the whole C++ and C# thing, some people have pointed out smart pointers such as shared_ptr which enable deterministic cleanup via reference counting, and have their own problems (circular references) mitigated by weak_ptr.</p>
+<p>However, I think that C++ has one advantage over C#: a nicer syntax for &quot;using&quot;. This syntax, called &quot;stack semantics for reference types&quot; is equivalent to a &quot;using&quot; iff the object implements IDisposable. It would be nice to have something this clean in C#.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852553">
+				<div id="div-comment-852553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852553">
+			August 10, 2010 at 8:58 am</a>		</div>
+
+		<p>@Stephen Cleary: &quot;What I mean is that IDisposable *enables* the RAII *design pattern*. You are correct that disposal is not guaranteed&quot;</p>
+<p>See, I view guaranteed disposal as an *essential* part of RAII.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852563">
+				<div id="div-comment-852563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852563">
+			August 10, 2010 at 9:01 am</a>		</div>
+
+		<p>And just to support my assertion:</p>
+<p>* The article *you linked to* contains neither &quot;RAII&quot; nor &quot;acquisition&quot;</p>
+<p>* The Wikipedia article on RAII [1] lists several languages with a using-type statement, including C#, under the heading &quot;Resource management without RAII&quot;</p>
+<p>[1] <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Resource_Acquisition_Is_Initialization" rel="nofollow">en.wikipedia.org/&#8230;/Resource_Acquisition_Is_Initialization</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852793">
+				<div id="div-comment-852793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nobugz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852793">
+			August 10, 2010 at 4:19 pm</a>		</div>
+
+		<p>First box, shouldn&#39;t RAM be &quot;virtual memory&quot;? Or am I missing something?</p>
+<div class="post">[<i>Use whatever term you like, as long as you understand the underlying point. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852813">
+				<div id="div-comment-852813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852813">
+			August 10, 2010 at 5:52 pm</a>		</div>
+
+		<p>The suggestion for setting the variable to null is probably a habbit from programming in languages such as VB classic which used reference counting. Objects are immediately cleared up when their reference count drops to 0 (often as soon as they go out of scope). If there are circular dependencies then setting the pointers to null is the only way to prevent a memory leak. This problem is obviously not the cause of this customer&#39;s problem however.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-852833">
+				<div id="div-comment-852833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852833">
+			August 10, 2010 at 9:15 pm</a>		</div>
+
+		<p>Personally I like the &quot;set the variable to null&quot; step just to indicate that there&#39;s some reason I don&#39;t expect that variable to be used any more, and not as any message to the system. (Of course, you don&#39;t do this at the end of a function or something like that, but if your function is 30 lines long and an object has outlived its utility on line 10, I think it&#39;s helpful to null it then.)</p>
+<p>@POKE53280,0:</p>
+<p>Most of the time, today&#39;s GCs don&#39;t prevent a program from being too snappy. Raymond mentions VS 2010, but you can also look at something like Eclipse. Sure, they aren&#39;t the snappiest things out there, and they each have some tasks that can take a little while (like starting Eclipse&#8230;), but both are entirely usable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-852893">
+				<div id="div-comment-852893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-852893">
+			August 11, 2010 at 12:11 am</a>		</div>
+
+		<p>@POKE53280,0: It is difficult and unwsise to write a large scale software system in pure C#. That&#39;s why you find that all systems that appear to do so have small but significant sections written in native code &#8211; either mixed mode C++CLI, implemented using native code via PInvoke or by some other method.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-853743">
+				<div id="div-comment-853743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Earwicker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-853743">
+			August 13, 2010 at 10:11 am</a>		</div>
+
+		<p>Very thought provoking. I&#39;m not convinced by Raymond&#39;s way of describing the goal of GC: &quot;simulating a computer with an infinite amount of memory&quot;.</p>
+<p>That is an unachievable goal. Suppose in my class I have a static field of type List&lt;object&gt;. As my program runs, I add objects to this list. I can&#39;t be bothered to remove them &#8211; why should I have to? I have infinite memory! But no GC algorithm can decide on my behalf to ignore the references represented by my ever-growing list, so I will soon find out that I don&#39;t have infinite memory.</p>
+<p>So it is not true to say that &quot;The rest is mechanism&quot;. The chosen mechanism of GC allows the program to forget about the problem of &quot;leaked objects&quot;, but in return it requires the programmer to avoid &quot;leaked references&quot;. It doesn&#39;t simulate infinite memory, and nor could any general mechanism. If the problem statement is unachievable, is it really a helpful way of characterising our goal?</p>
+<p>This calls into question your corollary that finalizers are not a way to clear up non-infinite resources acquired by the program. On the contrary, memory is just one kind of exhaustible resource, and finalizers are a way of opening up the GC mechanism so it can be used to reclaim other resources besides memory. It makes GC an extensible system in to which you could plug new resource types, effectively converting them into &quot;managed resources&quot; (watch how I casually throw together two hopelessly overloaded terms).</p>
+<p>The problem with finalizers is that they are way too flexible, so there are very many more ways of abusing them than using them correctly. Most of the small number of correct uses for finalizers have since been codified by the SafeHandle class, rendering finalizers largely obsolete as a programming interface.</p>
+<div class="post">[<i>The GC&#39;s goal is to <span style="text-decoration:underline;">simulate</span> a computer with an infinite amount of memory. Sometimes the simulation breaks down. Nobody claimed that it was achievable with 100% success, but that doesn&#39;t invalidate the goal. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-853793">
+				<div id="div-comment-853793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-853793">
+			August 13, 2010 at 10:46 am</a>		</div>
+
+		<p>@Evan: I have in my toolset a powerful construct that can be used to roundly trounce modern GC. It is called arena memory management and cannot be used from the managed world. As it trounces the best malloc()/free() money can buy it will trounce GC.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-853863">
+				<div id="div-comment-853863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">POKE53280,0</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-853863">
+			August 13, 2010 at 2:59 pm</a>		</div>
+
+		<p>@Joshua: I don&#39;t know if what you mean with &quot;arena memory management&quot; is somewhat equivalent to &quot;pool allocator&quot;.</p>
+<p>I found that pool allocators are a powerful and high-performance technique for native C++ development.</p>
+<p>Raymond presented an interesting series on Chinese/English Dictionary, and &#8211; during the development of this series &#8211; there is a post dedicated to a string pool allocator technique here:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2005/05/19/420038.aspx" rel="nofollow">blogs.msdn.com/&#8230;/420038.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-853783">
+				<div id="div-comment-853783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Earwicker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-853783">
+			August 13, 2010 at 10:45 am</a>		</div>
+
+		<p>@Raymond &#8211; Absolutely, just as any piece of software&#39;s goal is to _simulate_ an intelligent friend who carries out your every whim without fail! (And when it fails, you get mad and throw rocks at it, just like you would with a friend.)</p>
+<p>But any rational programmer is going to want to know under what circumstances the simulation will break down. We don&#39;t want to &quot;play dice with the universe&quot;. We want to know the rules we have to follow to get the behaviour we want. Hence we have to know about the mechanism.</p>
+<p>If we think GC is trying to give us infinite memory, then we don&#39;t know enough about GC to develop reliable software with it. If we know that objects are reclaimed when no references exist to them, then we&#39;re good to go (at least, we know enough to learn what constitutes a live reference, which you cover in subsequent articles).</p>
+<p>Given this, I don&#39;t think it&#39;s valid to draw your corollary about finalizers. We have to know more about GC than &quot;infinite memory&quot;. We have to use it in such a way that we do not leak references. And if we do that, then finalizers *can* work as advertised, by reverting temporary state changes represented by &quot;resource objects&quot; when there are no further references to them. Finalizers *are* horrible, but they aren&#39;t fundamentally flawed in the way you suggest.</p>
+<div class="post">[<i>As with any simulation, you should know something about the mechanism so you don&#39;t subvert it, but my point is that in my experience too many people think the mechanism is the goal, when in fact the mechanism is only a mechanism. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-853923">
+				<div id="div-comment-853923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BACON</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100809-00/?p=13203#comment-853923">
+			August 14, 2010 at 11:37 am</a>		</div>
+
+		<p>@POKE53280,0:</p>
+<p><a rel="nofollow" target="_new" href="http://wikipedia.org/wiki/Arena_based_memory_management" rel="nofollow">wikipedia.org/&#8230;/Arena_based_memory_management</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

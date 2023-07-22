@@ -1,0 +1,658 @@
+<html>
+<head>
+<title>The case of the longjmp from nowhere trying to open a registry key</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The case of the longjmp from nowhere trying to open a registry key</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 9, 2017 / year-entry #134</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>29</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Close your eyes and jump.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The crash telemetry team brought our attention to a bug
+a few weeks before the Creators Update was supposed to be released,
+and based on the high hit count of 3 million crashes in the past 30 days,
+the bug was marked "Blocking engineering sign-off".
+</p>
+<p>
+Life is always exciting
+when you get a "Blocking engineering sign-off" bug.
+</p>
+<p>
+Here's the relevant excerpt from
+the crashing stack. Let's see what we can make of it:
+</p>
+<pre>
+ntdll!RtlFailFast2
+ntdll!RtlGuardCheckLongJumpTarget+0x72f9f
+ntdll!RtlGuardRestoreContext+0x360
+ntdll!RtlUnwindEx+0x767
+0x00007ff7`26040a5a
+0x00007ff7`25fcb0c6
+0x00007ff7`25fc9bf8
+0x00007ff7`25fc9d23
+0x00007ff7`25fc9f27
+0x00007ff7`25fe1d17
+0x00007ff7`25fdfd7f
+0x00007ff7`25fca5f1
+0x00007ff7`25fca645
+0x00007ff7`25fcae25
+0x00007ff7`25fca870
+0x00007ff7`25fc27be
+0x00007ff7`25fc6aaf
+0x00007ff7`25fcab3d
+0x00007ff7`25fe11ef
+0x00007ff7`25fca5f1
+0x00007ff7`25fca645
+0x00007ff7`25fcae25
+0x00007ff7`25fca870
+0x00007ff7`25fc27be
+0x00007ff7`25fe949c
+0x00007ff7`25fe93e6
+0x00007ff7`25fe6709
+0x00007ff7`25fe6200
+ntdll!KiUserApcDispatch+0x2e
+ntdll!ZwOpenKeyEx+0x14
+KERNELBASE!Wow64pNtOpenKeyInternal+0x16
+KERNELBASE!Wow64NtOpenKey+0x7c
+KERNELBASE!LocalBaseRegOpenKey+0x1bc
+KERNELBASE!RegOpenKeyExInternalW+0x13b
+KERNELBASE!RegOpenKeyExW+0x19
+windows_storage!SHGetMachineGUID+0x83
+...
+</pre>
+<p>
+Working upward, the storage system is
+trying to read the machine GUID,
+so it's opening the
+<code>HKEY_</code><code>LOCAL_</code><code>MACHINE\</code><code
+>Software\</code><code>Microsoft\</code><code>Cryptography</code>
+registry key.
+That <code>Reg&shy;Open&shy;Key&shy;ExW</code> call
+eventually reached the kernel at
+<code>Zw&shy;Open&shy;Key&shy;Ex</code>,
+and then somehow a user-mode asynchronous procedure call (APC)
+got dispatched back into the
+user-mode thread.
+That user APC executed a lot of code that got injected
+into the process, not associated with a DLL.
+It reached a point where it encountered an exception,
+and the operating system is trying to unwind the exception
+but something goes wrong with the unwind when it wants
+to check a long jump target:
+The jump target is not valid,
+so the process crashes with a
+fail-fast exception:
+Incorrect exception unwind information is not a recoverable error,
+and it may indicate the presence of malware.
+</p>
+<p>
+There are multiple levels of mystery here.
+The first level of mystery is this chunk of code not associated
+with a DLL.
+How did it get into our process?
+This particular process was <code>Runtime&shy;Broker.exe</code>,
+which isn't as promiscuous as <code>explorer.exe</code> with respect
+to shell extensions and other third-party extension points,
+nor is it a common target for code injection.
+</p>
+<p>
+Second, why is opening a registry key dispatching user-mode APCs?
+This is not called out in the documentation,
+and it is not something expected in general.
+Dispatching user-model APCs is not something you do just for fun.
+It creates a situation where
+code is running inside the context of unrelated code.
+If a critical section was held at the time
+<code>Reg&shy;Open&shy;Key&shy;ExW</code> was called,
+that critical sction is still being held when the APC is run,
+and you are now in danger of creating a deadlock.
+This is why functions which processes APCs usually make you
+opt into APCs explicitly:
+<code>SleepEx</code>,
+<code>Wait&shy;For&shy;Single&shy;Object&shy;Ex</code>,
+and
+<code>Msg&shy;Wait&shy;For&shy;Multiple&shy;Objects&shy;Ex</code>
+don't process APCs unless you say
+you want them to,
+and the non-<code>Ex</code> versions never process APCs.
+</p>
+<p>
+The third mystery is why the injected code is performing
+a <code>longjmp</code>.
+The exception being propagated is
+<code>0x80000026</code> which is
+<code>STATUS_</code><code>LONGJUMP</code>:
+"A long jump has been executed."
+</p>
+<p>
+The mystery code is trying to perform a <code>longjmp</code>.
+Thats right, a <code>longjmp</code>.
+Apparently we are still running code written in 1970.
+</p>
+<p>
+We contacted the registry team for assistance, and they
+recognized this issue.
+They suspect that some third-party registry filter driver
+(perhaps a game's anti-cheat software)
+is monitoring attempts to access any registry keys under
+<code>HKEY_</code><code>LOCAL_</code><code>MACHINE\</code><code
+>Software\</code><code>Microsoft\</code><code>Cryptography</code>
+and scheduling user-mode APCs as part of its processing.
+That APC then runs into a situation where it decides to try
+to <code>longjmp</code> out of its normal processing,
+but the <code>longjmp</code> buffer is either corrupted,
+or the long jump target has not been registered as a
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/mt637065(v=vs.85).aspx">
+control flow guard</a>
+jump target,
+so the exception dispatching code says,
+"No way, I'm not dispatching this exception."
+</p>
+<p>
+The registry team noted that the vast majority of the crashes
+are coming from machines running the Anniversary Update,
+not the Creators Update, so this likely not a case of the Creators Update
+making a change that exacerbated a pre-existing problem,
+and the "Blocking engineering sign-off" marking should be removed.
+Furthermore, even though there were three million hits over the past
+30 days, the crashes were not uniformly-distributed.
+Rather, the issue spiked and then died down within a week.
+This suggests that the third party recognized the issue and put out
+their own fix.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (29)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1299225">
+				<div id="div-comment-1299225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299225">
+			June 9, 2017 at 7:14 am</a>		</div>
+
+		<p>Happy end! For once, you did not have to add a compatibility shim for a broken third-party piece of software.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-koldude odd alt thread-odd thread-alt depth-1 parent" id="comment-1299235">
+				<div id="div-comment-1299235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299235">
+			June 9, 2017 at 7:32 am</a>		</div>
+
+		<p>Just curious, are there any viable uses for User Mode APCs other than IO operations? The only thing I can think of is to ensure an operation completes last, or is executed at low priority on a runloop thread as soon as it sleeps.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1299245">
+				<div id="div-comment-1299245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299245">
+			June 9, 2017 at 7:47 am</a>		</div>
+
+		<p>I&#8217;ve used them to queue / trigger settings changes and events in a CPU intensive background thread without locking the UI thread.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1299285">
+				<div id="div-comment-1299285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Clockwork-Muse</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299285">
+			June 9, 2017 at 9:22 am</a>		</div>
+
+		<p>&#8230;which would still be IO (one with a graphical output and random input from one or more hardware devices).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1299256">
+				<div id="div-comment-1299256" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andre</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299256">
+			June 9, 2017 at 8:10 am</a>		</div>
+
+		<p>Better question: are there any viable uses for <code>jongjmp</code>s? That is just scary stuff.</p>
+<p>Unless you&#8217;re trying to roll your own exception handling (or is that implemented the other way round??), that sounds like the worst spaghetti code possible. I thought we left that behind last century.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-zlynx odd alt depth-3 parent" id="comment-1299305">
+				<div id="div-comment-1299305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Zan+Lynx%27' rel='external nofollow' class='url'>Zan Lynx'</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299305">
+			June 9, 2017 at 11:27 am</a>		</div>
+
+		<p>How else are you going to get out of a Unix signal handler for something like SIGSEGV aka segmentation fault? If you just return from the handler you are right back at the fault instruction.</p>
+<p>Yes, yes, I know that all of you are Windows programmers and believe the entire world uses SEH. But it doesn&#8217;t.</p>
+<p>There may be a case for saying that, on Windows, longjmp should be replaced with SEH, but that isn&#8217;t the same as claiming it is no use anywhere.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip even depth-4 parent" id="comment-1299325">
+				<div id="div-comment-1299325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299325">
+			June 9, 2017 at 2:34 pm</a>		</div>
+
+		<p>The Linux equivalent of TerminateProcess?<br />
+Segfaults are an obvious sign of things not going well in the program. This is why the recommendation for access violations in Windows is to just let the process die.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1299365">
+				<div id="div-comment-1299365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299365">
+			June 9, 2017 at 4:33 pm</a>		</div>
+
+		<p>It turns out that most critical software will keep running if you longjump back to the top level loop and just leak all the memory. init does this as init cannot be allowed to die. Interactive shells also do this (non-interactive shells just die).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1299375">
+				<div id="div-comment-1299375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299375">
+			June 9, 2017 at 5:04 pm</a>		</div>
+
+		<p>Under *nix, the default signal handler for SIGSEGV terminates the process.  If you want SIGSEGV to terminate the process, then you would not install an alternate handler in the first place.  But then most reasonable applications have no business catching SIGSEGV anyway.</p>
+<p>My personal favorite use case for longjmp(3) is that, if you call abort(3), catch the SIGABRT, and then longjmp(3) out of the signal handler, the process is not terminated.  This is, in fact, the only way to abort an abort(3).  Also falls into the &#8220;WTF are you doing?&#8221; bucket, but in an entirely different way.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4" id="comment-1299385">
+				<div id="div-comment-1299385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andre</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299385">
+			June 9, 2017 at 5:19 pm</a>		</div>
+
+		<p>Why/how would I ever handle a SIGSEGV instead of crashing?<br />
+Under Linux I can&#8217;t even catch an std::bad_alloc, because it rather overcommits and then OOM kills instead of honoring its API contracts.<br />
+(Yes, I know that can be turned off. But I can&#8217;t tell my customers to tell their IT how to set up the OS.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-4 parent" id="comment-1299397">
+				<div id="div-comment-1299397" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299397">
+			June 9, 2017 at 7:36 pm</a>		</div>
+
+		<p>&gt;How else are you going to get out of a Unix signal handler for something like SIGSEGV aka segmentation fault?</p>
+<p>If you&#8217;re ending up in a Unix SIGSEGV signal handler from a Windows machine then I think you may have longjmp&#8217;d a bit too far&#8230;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1299435">
+				<div id="div-comment-1299435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Markus Schaber</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299435">
+			June 10, 2017 at 5:26 am</a>		</div>
+
+		<p>That one really made my day! :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-4" id="comment-1299445">
+				<div id="div-comment-1299445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299445">
+			June 10, 2017 at 7:45 am</a>		</div>
+
+		<p>&gt; How else are you going to get out of a Unix signal handler for something like SIGSEGV aka segmentation fault?</p>
+<p>You don’t. You dump core, die and respawn (with the help of your supervisor daemon of choice).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1299406">
+				<div id="div-comment-1299406" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299406">
+			June 9, 2017 at 8:43 pm</a>		</div>
+
+		<p>The original documentation gave one use; returning from the final case of a deeply nested recursive call. That use is still valid; but you might want to turn that code into a tail call and from there the while loop.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1299446">
+				<div id="div-comment-1299446" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299446">
+			June 10, 2017 at 12:32 pm</a>		</div>
+
+		<p>I wouldn&#8217;t call that use case &#8220;valid&#8221; by any means. The idea here is to optimise something that is already incredibly cheap (function epilogues). But that ignores two things: a) available compilers already do this optimisation if possible (gcc doesn&#8217;t generate a call but a simple jump when the last action in a function is calling another function) and b) that optimisation is actually a pretty bad pessimisation for modern x86 CPUs since it corrupts the return address predictor stack (<a href="https://blogs.msdn.microsoft.com/oldnewthing/20041216-00/?p=36973" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20041216-00/?p=36973</a> ).</p>
+<p>Just goes to show that such low-level optimisations are better left to the compiler.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf odd alt depth-3 parent" id="comment-1299525">
+				<div id="div-comment-1299525" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299525">
+			June 12, 2017 at 1:47 am</a>		</div>
+
+		<p>I was once told gcc implements its C++ exception handling in terms of longjmp (I&#8217;ve experimented with this kind of thing too, in a &#8220;for fun&#8221; program). Apparently, for the Microsoft C Run-Time Library it&#8217;s &#8220;the other way around&#8221; (only with SEH instead of C++ exceptions). I wonder if MinGW uses the MS CRT&#8217;s longjmp.<br />
+(as far as I know, Visual C++ implements C++ exception handling directly over SEH, which causes some weird interactions between the two, modifiable by the /EHxx compiler switch)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1299546">
+				<div id="div-comment-1299546" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299546">
+			June 12, 2017 at 6:55 am</a>		</div>
+
+		<p>The gcc port for Windows most people use (mingw) has three different exception handling options: sjlj (setjmp/longjmp), dwarf (used by gcc on most other operating systems), and seh (windows-only). See for instance <a href="https://wiki.qt.io/MinGW-64-bit" rel="nofollow">https://wiki.qt.io/MinGW-64-bit</a> for a discussion.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fredericmagnyf odd alt depth-5" id="comment-1299646">
+				<div id="div-comment-1299646" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299646">
+			June 13, 2017 at 5:27 am</a>		</div>
+
+		<p>Thanks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1299315">
+				<div id="div-comment-1299315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Guteniev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299315">
+			June 9, 2017 at 12:07 pm</a>		</div>
+
+		<p>I&#8217;m aware of an use of User Mode APCs other than IO operations.<br />
+It&#8217;s NotifyServiceStatusChange callbacks.</p>
+<p>(They are even an example of User Mode APCs coming from another process. It is Service Control Manager knows that a service status has changed, but not your process)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1299395">
+				<div id="div-comment-1299395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299395">
+			June 9, 2017 at 6:07 pm</a>		</div>
+
+		<p>That&#8217;s a form of IPC, so is arguably I/O from the perspective of the individual processes involved. :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1299485">
+				<div id="div-comment-1299485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Biddlecombe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299485">
+			June 11, 2017 at 1:26 am</a>		</div>
+
+		<p>I first came across QueueUserAPC while tracking down a hang in some code that was being executed in Unity3D on Windows (C# running in Unity&#8217;s implementation of the Mono Runtime) </p>
+<p><a href="https://github.com/Unity-Technologies/mono/blob/unity-staging/mono/mini/debugger-agent.c#L2168" rel="nofollow">https://github.com/Unity-Technologies/mono/blob/unity-staging/mono/mini/debugger-agent.c#L2168</a></p>
+<p>Library routines written in C++ and launched through interop by our &#8216;game code logic&#8217; were calling Sleep, not SleepEx in their idle loop. </p>
+<p>When the code was run with the Mono debugger attached, the debugger&#8217;s UserAPC handler routine that is intended to &#8220;pause the thread by asking it to run a routine that will not return until we release it&#8221; was never getting processed. </p>
+<p>(Triggering a UserAPC call that doesn&#8217;t return right away but instead calls into the debugger code is how the Mono soft-debugger works &#8230;sort of? <a href="http://www.mono-project.com/docs/advanced/runtime/docs/soft-debugger" rel="nofollow">http://www.mono-project.com/docs/advanced/runtime/docs/soft-debugger</a>)</p>
+<p>If the debugger was paused, either manually or as the result of hitting a breakpoint, and the child thread was idling in a loop that used a &#8216;non-Ex&#8217; variation of a sleep/wait, the offending thread will never pause. The debugger, and the Unity Editor host, will live-lock waiting for all of its &#8216;managed Mono threads&#8217; to respond to the pause signal.</p>
+<p>Workers were sad. Managers were angry. Unity was blamed.</p>
+<p>Switching to &#8216;Ex&#8217; calls allowed us to debug what was broken and ultimately remove the offending libraries altogether.</p>
+<p>Threads launched by our &#8216;game code logic&#8217; were calling Sleep, not SleepEx. </p>
+<p>When the code was run with the mono debugger attached, the debugger&#8217;s &#8220;notify signal the thread that we want it to run a UserAPC routine that will not return until we release it&#8221; was never processed. Triggering a UserAPC call that doesn&#8217;t return right away is how the mono soft-debugger works.</p>
+<p>If the debugger was paused, either manually or as the results of a breakpoint, and the child thread was idling in a loop that used a &#8216;non-Ex&#8217; variation of a sleep/wait this thread would never paused, and the debugger will live-lock waiting for all &#8216;mono&#8217; threads to respond.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1299495">
+				<div id="div-comment-1299495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Biddlecombe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299495">
+			June 11, 2017 at 1:38 am</a>		</div>
+
+		<p>Sorry about the cut-and-paste-paste error ^</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1299265">
+				<div id="div-comment-1299265" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299265">
+			June 9, 2017 at 8:21 am</a>		</div>
+
+		<p>The Lua scripting language uses longjmp to bail out of scripts in case of errors. If the scripts are JIT compiled it also explains not being associated with a DLL. A games anti-cheat software may have not been a bad guess considering how common lua scripting is in game engines.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1299275">
+				<div id="div-comment-1299275" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299275">
+			June 9, 2017 at 8:31 am</a>		</div>
+
+		<p>(and yes this is just random speculation, it just fits the symptoms, but that doesn&#8217;t have to mean anything)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1299295">
+				<div id="div-comment-1299295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299295">
+			June 9, 2017 at 10:03 am</a>		</div>
+
+		<p>But wouldn&#8217;t that mean the anti-cheat system was written in Lua too? I find this highly unlikely (it could potentially make the anti-cheat somewhat easier to break, and IIRC most anti-cheat systems are licensed from outside vendors to begin with)&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1299355">
+				<div id="div-comment-1299355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Yates</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299355">
+			June 9, 2017 at 4:31 pm</a>		</div>
+
+		<p>Decent speculation. I guess the registry access hook probably discounts it but otherwise this would be a clever deduction in the context of games</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1299345">
+				<div id="div-comment-1299345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://adamrosenfield.com' rel='external nofollow' class='url'>Adam Rosenfield</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299345">
+			June 9, 2017 at 3:37 pm</a>		</div>
+
+		<p>Last I checked (which admittedly was several years ago), libpng still used longjmp for error handling and required callers to set up and pass in a valid setjmp buffer to certain API calls.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1299415">
+				<div id="div-comment-1299415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henrik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299415">
+			June 9, 2017 at 10:29 pm</a>		</div>
+
+		<p>&#8220;&#8230; Dispatching user-model APCs is not something you do just for fun&#8230;.&#8221;<br />
+Yeah, the might run into a freak gasoline fight accident on the way to their destination. :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-odd thread-alt depth-1" id="comment-1299515">
+				<div id="div-comment-1299515" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170609-00/?p=96366#comment-1299515">
+			June 11, 2017 at 7:14 pm</a>		</div>
+
+		<p>[perhaps a game&#8217;s anti-cheat software]</p>
+<p>Or perhaps a cryptowall malware detector. I think my company is installing something like that to all our client machines. It (is supposed to) intercepts cryptographic functions on Windows then check if it&#8217;s any of the crytowall variant that it knows, and block it if it matches.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

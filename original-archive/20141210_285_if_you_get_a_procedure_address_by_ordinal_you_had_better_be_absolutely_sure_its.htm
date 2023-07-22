@@ -1,0 +1,564 @@
+<html>
+<head>
+<title>If you get a procedure address by ordinal, you had better be absolutely sure it's there, because the failure mode is usually indistinguishable from success</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>If you get a procedure address by ordinal, you had better be absolutely sure it&#8217;s there, because the failure mode is usually indistinguishable from success</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 10, 2014 / year-entry #286</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>18</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer reported that the Get­Proc­Address function was behaving strangely. We have this code in one of our tests: typedef int (CALLBACK *T_FOO)(int); void TestFunctionFoo(HINSTANCE hDLL) { // Function Foo is ordinal 1 in our DLL T_FOO pfnFoo = (T_FOO)GetProcAddress(hDLL, (PCSTR)1); if (pfnFoo) { ... run tests on pfnFoo ... } } Recently, this test...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer reported that the <code>Get&shy;Proc&shy;Address</code>
+function was behaving strangely.
+</p>
+<blockquote CLASS=q>
+<p>
+We have this code in one of our tests:
+</p>
+<pre>
+typedef int (CALLBACK *T_FOO)(int);
+
+void TestFunctionFoo(HINSTANCE hDLL)
+{
+  // Function Foo is ordinal 1 in our DLL
+  T_FOO pfnFoo = (T_FOO)GetProcAddress(hDLL, (PCSTR)1);
+  if (pfnFoo) {
+    ... run tests on pfnFoo ...
+  }
+}
+</pre>
+<p>
+Recently, this test started failing in bizarre ways.
+When we stepped through the code, we discovered that
+<code>pfnFoo</code> ends up calling
+<code>Bar</code> instead of <code>Foo</code>.
+The first time we try to test <code>pfnFoo</code>,
+we get stack corruption because
+<code>Bar</code> has a different function prototype
+from
+<code>Foo</code>,
+and of course on top of that the test fails horribly because
+it's calling the wrong function!
+</p>
+<p>
+When trying to narrow the problem, we found that the issue
+began when the test was run against a version of the DLL
+that was missing the <code>Foo</code> function entirely.
+The line
+</p>
+<pre>
+    Foo @1
+</pre>
+<p>
+was removed from the DEF file.
+Why did the call to
+<code>Get&shy;Proc&shy;Address</code> succeed and return the wrong
+function?
+We expected it to fail.
+</p>
+</blockquote>
+<p>
+Let's first consider the case where a DLL exports no functions
+by ordinal.
+</p>
+<pre>
+EXPORTS
+    Foo
+    Bar
+    <a HREF="http://plugh.com/">Plugh</a>
+</pre>
+<p>
+The linker builds a list of
+all the exported functions (in an unspecified order)
+and fills in two arrays based on that list.
+If you look in the DLL image, you'll see something like this:
+</p>
+<pre>
+Exported Function Table
+
+00049180 address of Bar
+00049184 address of Foo
+0004918C address of Plugh
+
+Exported Names
+
+00049190 address of the string "Bar"
+00049194 address of the string "Foo"
+00049198 address of the string "Plugh"
+</pre>
+<p>
+There are two parallel arrays,
+one with function addresses and one with function names.
+The string <code>"Bar"</code> is the first entry in the
+exported names table,
+and the function <code>Bar</code> is the first entry in the
+exported function table.
+In general, the string in the
+<var>N</var>th entry in the exported names table
+corresponds to the function in the
+<var>N</var>th entry of the exported function table.
+</p>
+<p>
+Since it is only the relative position that matters, let's replace
+the addresses with indices.
+</p>
+<pre>
+Exported Function Table
+
+[1] address of Bar
+[2] address of Foo
+[3] address of Plugh
+
+Exported Names
+
+[1] address of the string "Bar"
+[2] address of the string "Foo"
+[3] address of the string "Plugh"
+</pre>
+<p>
+Okay, now let's introduce functions exported by ordinal.
+When you do that, you're telling the linker,
+"Make sure this function goes into the <var>NN</var>th slot in the exported
+function table."
+Suppose your DEF file went like this:
+</p>
+<pre>
+EXPORTS
+    Foo @1
+    Bar
+    Plugh
+</pre>
+<p>
+This says "<a HREF="http://bartleby.com/73/1017.html">First thing we do</a>
+is put <code>Foo</code> in slot 1.
+Once that's done, fill in the rest arbitrarily."
+</p>
+<p>
+The linker says,
+"Okay, I have a total of three functions, so let me build two tables
+with three entries each."
+</p>
+<pre>
+Exported Function Table
+
+[1] address of ?
+[2] address of ?
+[3] address of ?
+
+Exported Names
+
+[1] address of ?
+[2] address of ?
+[3] address of ?
+</pre>
+<p>
+"Now I place <code>Foo</code> in slot 1."
+</p>
+<pre>
+Exported Function Table
+
+[1] address of Foo
+[2] address of ?
+[3] address of ?
+
+Exported Names
+
+[1] address of the string "Foo"
+[2] address of ?
+[3] address of ?
+</pre>
+<p>
+"Now I fill in the rest arbitrarily."
+</p>
+<pre>
+Exported Function Table
+
+[1] address of Foo
+[2] address of Bar
+[3] address of Plugh
+
+Exported Names
+
+[1] address of the string "Foo"
+[2] address of the string "Bar"
+[3] address of the string "Plugh"
+</pre>
+<p>
+Since you explicitly placed <code>Foo</code> in slot 1,
+when you do a 
+<code>Get&shy;Proc&shy;Address(hDLL, 1)</code>,
+you will get
+<code>Foo</code>.
+On the other hand, if you do a
+<code>Get&shy;Proc&shy;Address(hDLL, 2)</code>,
+you will get <code>Bar</code>,
+or at least you will with this build.
+With the next build, you may get something else,
+because the linker just fills in the slots arbitrarily,
+and next time, it may choose to fill them arbitrarily
+in some other order.
+Furthermore,
+if you do a
+<code>Get&shy;Proc&shy;Address(hDLL, 6)</code>,
+you will get <code>NULL</code> because the table
+has only three functions in it.
+</p>
+<p>
+I hope you see where this is going.
+</p>
+<p>
+If you delete <code>Foo</code> from the <code>EXPORTS</code>
+section,
+this stops exporting <code>Foo</code> but says nothing about
+what goes into slot 1.
+As a result, the linker is free to put anything it wants into that slot.
+</p>
+<pre>
+Exported Function Table
+
+[1] address of Bar
+[2] address of Plugh
+
+Exported Names
+
+[1] address of the string "Bar"
+[2] address of the string "Plugh"
+</pre>
+<p>
+Now, when you do a
+<code>Get&shy;Proc&shy;Address(hDLL, 1)</code>,
+you get <code>Bar</code>,
+since that's the function that happened to fall into slot 1
+this time.
+</p>
+<p>
+The moral of the story is that if you try to obtain a function
+by ordinal,
+then it had better be there,
+because there is no reliable way of being sure that the function
+you got is one that was explicitly placed there,
+as opposed to some other function that happened to be assigned that
+slot arbitrarily.
+</p>
+<p>
+<b>Related reading</b>:
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2006/07/18/669668.aspx">
+How are DLL functions exported in 32-bit Windows?</a></p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (18)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1165923">
+				<div id="div-comment-1165923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1165923">
+			December 10, 2014 at 7:16 am</a>		</div>
+
+		<p>So mingw allows linking directly to DLLs (possibly because LD can&#39;t open .lib files) which I&#39;ve had to use due to the import libraries being super out of date.</p>
+<div class="post">[<em>I hope it links by name and not ordinal. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165933">
+				<div id="div-comment-1165933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1165933">
+			December 10, 2014 at 7:25 am</a>		</div>
+
+		<p>I&#39;d say another take away from this story is: if you&#39;re going to export any one function by ordinal, then export all of them by ordinal.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1165943">
+				<div id="div-comment-1165943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1165943">
+			December 10, 2014 at 7:29 am</a>		</div>
+
+		<p>@Peter:</p>
+<p>No, the rel take is: DON&#39;T import functions by ordinal. This is a rudiment of the times when RAM was scarce and processors were slow.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165953">
+				<div id="div-comment-1165953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1165953">
+			December 10, 2014 at 7:48 am</a>		</div>
+
+		<p>[I hope it links by name and not ordinal. -Raymond]</p>
+<p>It does. Manually verified by strings (locating the function name in the import table).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1165973">
+				<div id="div-comment-1165973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andre</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1165973">
+			December 10, 2014 at 8:18 am</a>		</div>
+
+		<p>So the remaining question is: how is this not obvious?</p>
+<p>I didn&#39;t know anything about importing functions by ordinals and just from the customer report figured out that, well, that can&#39;t possibly work. Why would you expect it to? (It would happen to work if the removed function was the last one exported and thus the deleted entry frees up that slot. But that surely isn&#39;t something you&#39;d rely on)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166023">
+				<div id="div-comment-1166023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kemp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166023">
+			December 10, 2014 at 10:33 am</a>		</div>
+
+		<p>I might be missing something, but why would any person anywhere expect &quot;GetProcAddress(hDLL, (PCSTR)1)&quot; to magically know you wanted the Foo function and to fail if it was a different one? Foo is not mentioned at all in that call. Should that call fail for every other developer in the world who wanted function 1 (non-Foo) in a different DLL?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166033">
+				<div id="div-comment-1166033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger Lipscombe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166033">
+			December 10, 2014 at 11:10 am</a>		</div>
+
+		<p>When I have called GetProcAddress with an ordinal, I&#39;ve always used MAKEINTRESOURCE, rather than a (PCSTR) cast. This is mentioned in a comment on the MSDN page for GetProcAddress, but is it actually a more correct way to do it?</p>
+<p>I almost showed my age there: I originally wrote &quot;(LPCSTR) cast&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166053">
+				<div id="div-comment-1166053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JJJ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166053">
+			December 10, 2014 at 11:53 am</a>		</div>
+
+		<p>@Andre, @Kemp: &nbsp;The developer probably thought there was a separate &quot;Exported by ordinal&quot; table that gets filled in when you use the &quot;@x&quot; directive. &nbsp;When the developer removed &quot;Foo @1&quot;, they probably expected this table to be empty (or at least slot 1 to be empty), and therefore GetProcAddress would fail.</p>
+<p>Not an unreasonable line of thinking, but unfortunately wrong.</p>
+<div class="post">[<em>I agree, that&#39;s probably what they were thinking. And in 16-bit Windows, they&#39;d have been correct! -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166083">
+				<div id="div-comment-1166083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166083">
+			December 10, 2014 at 3:11 pm</a>		</div>
+
+		<p>Also note that other common operating systems don&#39;t have an equivalent to this &quot;ordinal&quot; business; it&#39;s all done by name. Exporting/importing by ordinal is the kind of micro-optimization which doesn&#39;t make much sense nowadays.</p>
+<p>(Besides Win32, I only have experience with operating systems of the Unix sort; AFAIK, all modern Unix-style systems link by name. Win32 is the odd one here, and even on Win32 most programmers pretend linking by ordinal doesn&#39;t exist.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165983">
+				<div id="div-comment-1165983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1165983">
+			December 10, 2014 at 8:54 am</a>		</div>
+
+		<p>@Andre</p>
+<p>If I understood the post above its possible it was just poor testing to not catch unexpected behavior or that the &quot;lucky&quot; function that was called had no side affect that was apparent?</p>
+<p>Another scary thought is that the linker *appears* to be consistent but in reality because there is no guarantee an update/hotfix comes down the pipe and everything stops working on the next build. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166063">
+				<div id="div-comment-1166063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166063">
+			December 10, 2014 at 2:12 pm</a>		</div>
+
+		<p>@Roger: MAKEINTRESOURCE is actually incorrect. &nbsp;If you #define UNICODE, MAKEINTRESOURCE is defined as MAKEINTRESOURCEW, which casts an integer to const wchar_t *. &nbsp;GetProcAddress is one of the few Win32 functions that does not have a wchar_t version &#8211; its string parameter is always const char *. &nbsp;If you use MAKEINTRESOURCE, your code will fail to compile under #define UNICODE. &nbsp;Either use the &quot;A&quot; version MAKEINTRESOURCEA explicitly, or just reinterpret_cast to LPCSTR/PCSTR.</p>
+<p>The reason GetProcAddress only takes &quot;thin&quot; chars as a parameter is because that&#39;s how they&#39;re stored in the image.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-hikari odd alt thread-odd thread-alt depth-1" id="comment-1166113">
+				<div id="div-comment-1166113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Chris+Crowther' rel='external nofollow' class='url'>Chris Crowther</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166113">
+			December 10, 2014 at 10:21 pm</a>		</div>
+
+		<p>Asking for things using a compiled in ordinal always just strikes me as asking for trouble.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166123">
+				<div id="div-comment-1166123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166123">
+			December 10, 2014 at 11:50 pm</a>		</div>
+
+		<p>This reminds me of the story of when the DirectX team had to add explicit export ordinals because programs were linking against ordinals instead of names.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kwadwomi odd alt thread-odd thread-alt depth-1" id="comment-1166153">
+				<div id="div-comment-1166153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Master+Programmer' rel='external nofollow' class='url'>Master Programmer</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166153">
+			December 11, 2014 at 1:49 am</a>		</div>
+
+		<p>For a library with over 10000 exports like MFC with C++ mangled names I imagine export by ordinal would matter more. Another reason to use export by ordinal is for obfuscation purposes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166163">
+				<div id="div-comment-1166163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166163">
+			December 11, 2014 at 2:47 am</a>		</div>
+
+		<p>[And in 16-bit Windows, they&#39;d have been correct!]</p>
+<p>Which begs the question, which ordinals would the 16-bit linker have used&#8230;</p>
+<div class="post">[<em>I don&#39;t see how this begs the question (since 16-bit Windows wasn&#39;t part of the question), so I&#39;m not sure what question you&#39;re asking. Maybe <a href="http://blogs.msdn.com/b/oldnewthing/archive/2006/07/14/665669.aspx">this page</a> answers your question somehow. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166183">
+				<div id="div-comment-1166183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166183">
+			December 11, 2014 at 5:52 am</a>		</div>
+
+		<p>This is really a comment for the â€˜A lie repeated often enough becomes the truth: The continuing saga of the Windows 3.1 blue screen of death (which, by the way, was never called that)â€™ article, but you closed that comment thread, so I have to post it here. Feel free to move it.</p>
+<p>Back when we were still using Windows 3.11 we always called the blue error screens Blue Screens of Death. Because when you got them the system never returned to a state stable enough to save your files. Now, we didn&#39;t have internet at the time, but someone else in the time period did and posted the term on Usenet. In 1993. (Note: the poster was talking about NT, but my family and friends all knew and used the term and most used 3.11 rather than NT.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166193">
+				<div id="div-comment-1166193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166193">
+			December 11, 2014 at 6:44 am</a>		</div>
+
+		<p>AmigaOS used jump tables for shared library calls, but libraries were expected to stay backwards compatible. &nbsp;If anything DLL hell was worse because there was no way to install multiple versions of a library and many of the system libraries were in ROM.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166293">
+				<div id="div-comment-1166293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward 1.1</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141210-00/?p=43433#comment-1166293">
+			December 11, 2014 at 2:21 pm</a>		</div>
+
+		<p>@Chris Crowther</p>
+<p>There are many things in the Win32 API (and most C APIs) that use compiled-in ordinals &#8211; just usually they&#39;re #define&#39;d.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

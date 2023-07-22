@@ -1,0 +1,372 @@
+<html>
+<head>
+<title>Getting a parent and child window to have the same UI states</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Getting a parent and child window to have the same UI states</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 24, 2017 / year-entry #259</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Wrangling them into agreement.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20171123-00/?p=97455">
+Last time</a>,
+we created a program that moved a child window between two parents
+in such a way that the child and parent ended up with different UI states.
+We saw the weird things that result from this mismatch,
+which is why the documentation told us,
+"you should synchronize the UISTATE of both windows."
+So let's try it.
+</p>
+<p>
+Take the program we had from last time and add the following:
+</p>
+<pre>
+<font COLOR="blue">UINT GetWindowUIState(HWND hwnd)
+{
+ return LOWORD(SendMessage(hwnd, WM_QUERYUISTATE, 0, 0));
+}</font>
+
+LRESULT RootWindow::HandleMessage(
+                          UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+...
+  case WM_LBUTTONDOWN:
+   if (GetParent(g_hwndPotato) != m_hwnd) {
+    SetParent(g_hwndPotato, m_hwnd);
+
+    <font COLOR="blue">// Synchronize the potato's UI state with its new parent.
+    auto parentUIState = GetWindowUIState(m_hwnd);
+    ResetUIStateForTree(g_hwndPotato, parentUIState);</font>
+   }
+   break;
+
+...
+}
+</pre>
+<p>
+The first thing we do is introduce a helper function that
+gives a pretty name to the
+<code>WM_</code><code>QUERY&shy;UI&shy;STATE</code> message.
+Since UI states are a 16-bit value,
+we keep only the least-significant word from the message result.
+</p>
+<p>
+Meanwhile, in our window procedure,
+after we reparent the Potato button,
+we call an as-yet-unimplemented function which tries
+to reset the UI state for a window tree to a specified value.
+</p>
+<p>
+Aside:
+Coming up with a name for that function was a bit of a struggle.
+The natural name would be
+<code>Set&shy;UI&shy;State&shy;For&shy;Tree</code>,
+but the
+<code>WM_</code><code>UPDATE&shy;UI&shy;STATE</code> and
+<code>WM_</code><code>CHANGE&shy;UI&shy;STATE</code> messages
+already use the word "set" to mean "turn on some bits
+(but don't turn any bits off)".
+If I had called it
+<code>Set&shy;UI&shy;State&shy;For&shy;Tree</code>,
+then it might have been interpreted to mean that the
+bits in the <code>parent&shy;UI&shy;State</code> are or'd
+into the destination UI state rather than copied.
+</p>
+<p>
+Okay, so let's try to write the
+<code>Reset&shy;UI&shy;State&shy;For&shy;Tree</code>
+function.
+The only interesting operations available are
+<code>UIS_</code><code>SET</code> and
+<code>UIS_</code><code>CLEAR</code>.
+One of the turns bits on and the other turns them off.
+</p>
+<p>
+My first attempt at resetting the UI state went like this:
+</p>
+<pre>
+<i>// Code in italics is wrong
+void ResetUIStateForTree(HWND hwnd, UINT desiredState)
+{
+ SendMessage(hwnd, WM_UPDATEUISTATE,
+  MAKEWPARAM(UIS_SET, desiredState), 0);
+ SendMessage(hwnd, WM_UPDATEUISTATE,
+  MAKEWPARAM(UIS_CLEAR, ~desiredState), 0);
+}</i>
+</pre>
+<p>
+We set all the bits that are set and clear all the bits that are clear.
+We use the
+<code>WM_</code><code>UPDATE&shy;UI&shy;STATE</code> message
+because that is the one that says
+"Start with the specified window,
+apply the changes to it,
+and then propagate the changes to that window's children."
+If we had used the
+<code>WM_</code><code>CHANGE&shy;UI&shy;STATE</code> message,
+then the request would have propagated out to the root window,
+and the root window would have done nothing because we are
+telling the root window to set bits in its UI state that are
+already set (and clear bits that are already clear).
+</p>
+<p>
+Some playing around with this version of the function
+showed that setting the bits that are set
+was working fine, but clearing the bits that are clear was not.
+</p>
+<p>
+Reason: Parameter validation.
+</p>
+<p>
+There are only three bits currently defined for the UI state,
+so <code>~uiState</code> ends up passing a bunch of bits
+that are invalid,
+so the call fails.
+</p>
+<p>
+Okay, so we need to make sure not to try to set or clear
+bits that are not defined.
+But I don't want to hard-code the set of valid bits,
+because a future version of Windows might add a new UI state
+bit, and I want to be able to reset those too.
+</p>
+<p>
+This is what I came up with:
+</p>
+<pre>
+void ResetUIStateForTree(HWND hwnd, UINT desiredState)
+{
+ auto currentState = GetWindowUIState(hwnd);
+ auto missingState = desiredState &amp; ~currentState;
+ if (missingState) {
+  SendMessage(hwnd, WM_UPDATEUISTATE,
+   MAKEWPARAM(UIS_SET, missingState), 0);
+ }
+ auto extraState = currentState &amp; ~desiredState;
+ if (extraState) {
+  SendMessage(hwnd, WM_UPDATEUISTATE,
+   MAKEWPARAM(UIS_CLEAR, extraState), 0);
+ }
+}
+</pre>
+<p>
+We take the current state and compare it to the desired state.
+If there are any bits set in the desired state that aren't set
+in the current state, then set them.
+If there are any bits clear in the desired state that aren't clear
+in the current state, then clear them.
+</p>
+<p>
+Sure,
+this sounds really simple,
+but it took us a few tries to get there.
+</p>
+<p>
+Restricting the operation to bits that need to be set or cleared
+ensures that we operate only on bits that the operating system
+has defined.
+(If they weren't defined, then the operating system wouldn't have
+given them to us when we performed the query.)
+</p>
+<p>
+After making these changes to the program from last time,
+run it again and play around with setting
+the keyboard indicator states and
+moving the Potato window from one window to another.
+This time, whenever the Potato window moves to a new window,
+we make its UI state match that of its new parent.
+</p>
+<p>
+That's quite a lot of complexity packed into the instructions
+"you should synchronize the UISTATE of both windows."
+</p>
+<p>
+<b>Exercise</b>:
+Suppose your UI policy is that the
+window frame should change its UI state to match the potato
+it just stole.
+How would you change our sample program to implement that policy?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1316976">
+				<div id="div-comment-1316976" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1316976">
+			November 24, 2017 at 7:18 am</a>		</div>
+
+		<p>&#8220;There are only three bits currently defined for the UI state&#8221; where is UISF_ACTIVE actually used? Does anybody know?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1316977">
+				<div id="div-comment-1316977" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1316977">
+			November 24, 2017 at 7:47 am</a>		</div>
+
+		<p>My instinct tells me the answer to the exercise is to add</p>
+<p>hwnd = GetAncestor(hwnd, GA_ROOT);</p>
+<p>to the top of ResetUIStateForTree(), but judging from the past three posts, I have a feeling that&#8217;s wrong&#8230; Though reading the WM_CHANGEUISTATE docs tells me that this is correct, so IDK. Also whether it goes before or after the first line of that function (that calls GetWindowUIState()) would affect the correctness, if I *am* on the right track.</p>
+<p>On the subject, is there a situation when we should use WM_CHANGEUISTATE instead of WM_CHANGEUISTATE as in the code above?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1316985">
+				<div id="div-comment-1316985" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1316985">
+			November 24, 2017 at 7:47 am</a>		</div>
+
+		<p>*oops, I meant WM_CHANGEUISTATE instead of WM_UPDATEUISTATE</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1316995">
+				<div id="div-comment-1316995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1316995">
+			November 24, 2017 at 5:15 pm</a>		</div>
+
+		<p>Oh I&#8217;m dumb; I forgot yesterday&#8217;s post used WM_CHANGEUISTATE to actually set the UI state to the state of our choice, independent of any synchronization =P Still wonder what caveats to my potential solution are&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1316986">
+				<div id="div-comment-1316986" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1316986">
+			November 24, 2017 at 9:45 am</a>		</div>
+
+		<p>This confused me because I was trying to understand it as a general solution to reset the UI state in a tree, but it&#8217;s not intended to be.  The Potato window and its children must have a consistent UI state for this to work, and they always will.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1317005">
+				<div id="div-comment-1317005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1317005">
+			November 24, 2017 at 5:16 pm</a>		</div>
+
+		<p>I wonder if the function could be named SyncUIStateForTree() instead, though even that isn&#8217;t obvious because the function gets the state itself, not the window that state comes from.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1317045">
+				<div id="div-comment-1317045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1317045">
+			November 26, 2017 at 4:30 pm</a>		</div>
+
+		<p>I suspect that the parameter validation didn&#8217;t always exist, and when it was added it introduced a breaking change from the first form. A few people noticed and had to fix their stuff.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1317345">
+				<div id="div-comment-1317345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171124-00/?p=97456#comment-1317345">
+			December 1, 2017 at 10:32 am</a>		</div>
+
+		<p>When you&#8217;re worried about &#8220;set&#8221; being interpreted as `|=`, I think the clear way to express you mean `=` would not be &#8220;reset&#8221; but &#8220;assign&#8221;, because &#8220;reset&#8221; could be misinterpreted either as the counterpart of &#8220;set&#8221; (actually &#8220;clear&#8221;) or as re-establishing a default value as in `active_state = (active_state &amp; ~mask) | (default_state &amp; mask)`.</p>
+<p>AssignUIStateForTree(hwnd, newState); seems unambiguous</p>
+<p>&#8220;Replace&#8221; would also be clear.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

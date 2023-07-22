@@ -1,0 +1,514 @@
+<html>
+<head>
+<title>The alertable wait is the non-GUI analog to pumping messages</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The alertable wait is the non-GUI analog to pumping messages</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 3, 2006 / year-entry #154</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">When you are doing GUI programming, you well know that the message pump is the primary way of receiving and dispatching messages. The non-GUI analog to the message pump is the alertable wait. A user-mode APC is a request for a function to run on a thread in user mode. You can explicitly queue an...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When you are doing GUI programming, you well know that
+the message pump is the primary way of receiving and dispatching
+messages.
+The non-GUI analog to the message pump is the alertable wait.
+</p>
+<p>
+A user-mode APC is a request for a function to run on a thread
+in user mode.
+You can explicitly queue an APC to a thread with the
+<code>QueueUserAPC</code> function,
+or you can do it implicitly by passing a completion function to
+a waitable timer or asynchronous I/O.
+(That's why the code that indicates that a wait was interrupted
+by an APC is <code>WAIT_IO_COMPLETION</code>:
+Originally, the only thing that queued APCs was asynchronous I/O.)
+</p>
+<p>
+Of course, when an APC is queued, the function cannot run immediately.
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/12/23/331246.aspx">
+Imagine what the world would be like if it did</a>:
+The function would interrupt the thread in the middle of whatever
+it was doing,
+possibly with unstable data structures,
+leaving the APC function to run at a point where the program
+is in an inconsistent state.
+If APCs really did run this way,
+it would be pretty much impossible to write a meaningful APC function
+since it couldn't reliably read from or write to any variables
+(since those variables could be unstable),
+nor could it call any functions that read from or wrote to variables.
+Given these constraints, there isn't much left for a function to do.
+</p>
+<p>
+Instead, APCs are dispatched when you perform what is known as an
+"alertable wait".
+The "Ex" versions of most wait functions
+(for example, <code>WaitForSingleObjectEx</code>,
+<code>WaitForMultipleObjectsEx</code>,
+<code>MsgWaitForMultipleObjectsEx</code>, and
+<code>SleepEx</code>) allow you to specify whether
+you want to wait alertably.
+If you do wait alertably, and one or more APCs are queued to the thread,
+then all the pending APCs are run and the wait operation returns
+with a code indicating that the wait was interrupted by an APC.
+If the APC you are waiting for has not yet run (maybe you were
+interrupted by some unrelated APC), then it is your responsibility to
+restart the wait and try again.
+</p>
+<p>
+Why doesn't the operating system automatically restart the wait?
+"Imagine what the world would be like if it did":
+Suppose you want to issue asynchronous I/O and then go off and do
+some other stuff, and then wait for the asynchronous I/O to complete
+so you can use the result.
+</p>
+<pre>
+// When an asynchronous read completes, we fire off the next
+// read request. When all done, set fCompleted.
+BOOL fCompleted = FALSE;
+BOOL fSuccess;
+void CALLBACK CompletionRoutine(DWORD, DWORD, LPOVERLAPPED)
+{
+ if (&lt;finished&gt;) {
+  fSuccess = TRUE;
+  fCompleted = TRUE;
+ } else {
+  // issue the next read in the sequence
+  if (!ReadFileEx(hFile, ..., CompletionRoutine)) {
+   fSuccess = FALSE; // problem occurred
+   fCompleted = TRUE; // we're done
+ }
+}
+...
+// start the read cycle
+if (ReadFileEx(hFile, ..., CompletionRoutine)) {
+  DoOtherStuffInTheMeantime();
+  &lt;wait for fCompleted to be set&gt;
+  DoStuffWithResult();
+}
+</pre>
+<p>
+How would you write the "wait for <code>fCompleted</code> to be set"
+if the operating system auto-restarted waits?
+If you did an alertable infinite wait, say with
+<code>SleepEx(INFINITE, TRUE)</code>,
+then the APCs would run, the operating system would auto-restart
+the waits, and the sleep would just run forever.
+You would be forced to use a non-<code>INFINITE</code> sleep
+and poll for the completion.
+But this has two serious flaws:
+One is that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2006/01/24/516808.aspx">
+polling is bad</a>.
+The second is that the rate at which you poll controls how
+quickly your program reacts to the completion of the read chain.
+Higher polling rates give you better responsiveness but consume more CPU.
+</p>
+<p>
+Fortunately, waits are not auto-restarted.
+This gives you a chance to decide for yourself whether you want
+to restart them or not:
+</p>
+<pre>
+...
+// start the read cycle
+if (ReadFileEx(hFile, ..., CompletionRoutine)) {
+  DoOtherStuffInTheMeantime();
+  while (!fCompleted) SleepEx(INFINITE, TRUE);
+  DoStuffWithResult();
+}
+</pre>
+<p>
+The <code>SleepEx</code> loop just keeps waiting alertably,
+processing APCs, until the completion routine finally decides
+that it's had enough and sets the <code>fCompleted</code> flag.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-376523">
+				<div id="div-comment-376523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376523">
+			May 3, 2006 at 11:47 am</a>		</div>
+
+		<p>I still don&#8217;t see why WaitForSingleObjectEx needs to be aborted by an APC. &nbsp;If I wait on an event, why would I care that another APC was delivered? &nbsp; I can signal the event from my APC<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kjkhyperion odd alt thread-odd thread-alt depth-1" id="comment-376533">
+				<div id="div-comment-376533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376533">
+			May 3, 2006 at 11:50 am</a>		</div>
+
+		<p>Well well well, APCs. My favorite topic! Why Raymond, of course APCs could be made to interrupt a thread whenever&#8230; if you provide a way to block them temporarily. Like KeEnterCriticalRegion/KeLeaveCriticalRegion in kernel mode Windows, or like POSIX signals. But right now is way too late to introduce asynchronous signals. You&#8217;d run with asynchronous signaling disabled all the time in fear that some old or 3rd party code wouldn&#8217;t take it nicely</p>
+<p>And you may or may not know that Win32 does restart waits in certain cases (specifically, when a wait is interrupted by an alert) &#8211; all the Ex wait functions loop on while(Status == STATUS_ALERTED). Altough in those cases no user code is executed, so it&#8217;s harmless</p>
+<p>[while we are on the topic of APCs, a bit of obscure trivia for the hardcore fanboys like me: the Windows kernel has explicit support for POSIX signals. Specifically, a POSIX signal would be a &quot;special user-mode APC&quot; (&quot;special&quot; meaning it has no NormalRoutine, and &quot;user-mode&quot; meaning it will only interrupt user-mode waits), where the KernelRoutine messes with the user-mode stack to arrange for the signal dispatcher to be called. KeInitializeApc won&#8217;t let you create a &quot;special user-mode APC&quot;, but if you tweak the KAPC by hand before calling KeInsertQueueApc you can get one. A hackish, user-mode only implementation is possible with normal user-mode APCs, and I think that&#8217;s what SUA currently uses, but the special user-mode APC method yields the best performance]</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376573">
+				<div id="div-comment-376573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376573">
+			May 3, 2006 at 3:12 pm</a>		</div>
+
+		<p>I never really understood why APCs could not be made to interrupt a thread whenever&#8230; </p>
+<p>Back in my DEC VMS days, (going back quite a few years of course), I remember a similar concept, the Asynchronous System Trap (AST). &nbsp;When an AST was setup to trigger, perhaps based on a timer, it would immediately interrupt the current process. &nbsp;Of course we didn&#8217;t have multiple threads, but we counted on the ability to interrupt the main thread whenever required. &nbsp;</p>
+<p>When I started with Windows, I was quite surprised that APCs could not interrupt a thread whenever necessary. &nbsp;Since quite a few of the Windows concepts seemed to mirror VMS so closely, I assumed that an APC would function similarly to an AST.</p>
+<p> &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mgrier odd alt thread-odd thread-alt depth-1" id="comment-376583">
+				<div id="div-comment-376583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MGrier' rel='external nofollow' class='url'>MGrier</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376583">
+			May 3, 2006 at 4:33 pm</a>		</div>
+
+		<p>Re: ASTs:</p>
+<p>ASTs were such a pain because nobody could really maintain the discipline about what to do and not to do in an AST and how to synchronize the AST with the non-AST-level code. &nbsp;(Instead of annotating the waits which could be interrupted you had to temporarily diable and then reenable ASTs around critical sections of your non-AST-level code.)</p>
+<p>APCs are a pain because everyone has to remember to do alertable waits and since APC delivery doesn&#8217;t block APC delivery, you probably do NOT want to make alertable wait calls from within your APC.</p>
+<p>Unless you do in which case you&#8217;re into the same kinds of reentrancy hazards as exist in private message pumps.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376603">
+				<div id="div-comment-376603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376603">
+			May 3, 2006 at 5:37 pm</a>		</div>
+
+		<blockquote><p>
+  Imagine what the world would be like if it did</p>
+<p>Well, it would be like RSX-11M, or VAX/VMS (which are both Dave Cutler operating systems, of course).</p>
+<p>Though, seriously, when programming on those operating systems (which lacked thread support), one often adopted an event-driven model in which all work is done in AST handlers (=APC routines). Thus, in practice, you were only &#8216;alertable&#8217; at well-defined points, when you exited the AST.</p>
+<p>I suspect the real reason that user-mode APCs can only be deliverable at well-defined points is that programming is vastly more complicated than when I used RSX-11M.</p>
+<p>Consider if an APC could interrupt some window procedure &#8211; and the APC then issued some call which would need to run the window procedure. Eek.</p>
+<p>(And things like mutexes don&#8217;t help you &#8211; they&#8217;re used for inter-thread locking, not intra-thread locking. An APC can&#8217;t use a mutex to synchronize with activity in the same thread at non-APC level.)</p>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376633">
+				<div id="div-comment-376633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bluebytesoftware.com/blog/PermaLink.aspx?guid=480ea560-61d0-424e-91ca-42d1f5003ded' rel='external nofollow' class='url'>Generalities &amp; Details: Adventures in the High-tech Underbelly</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376633">
+			May 3, 2006 at 11:53 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376653">
+				<div id="div-comment-376653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376653">
+			May 4, 2006 at 1:29 am</a>		</div>
+
+		<p>True asynchronous notification (like Unix signals, DOS TSRs, or VMS ASTs) is not very useful because you can&#8217;t do much with it beyond setting a flag to be checked at set points where your program may be safely interrupted. If you are checking a flag to see if an interrupt occurred, you could just as easily check for APCs instead.</p>
+<p>Most things you would want to do, like memory allocation, floating point math, buffered IO, GUI operations, and much more just cannot be done safely because you may be interrupting the libraries while they&#8217;re running. You have to be very careful how you modify any data structures that might be read in your handlers.</p>
+<p>Of course, you can always just disable the interrupts when they would be inconvenient. You could wrap all memory allocations or deallocations in disable/enable functions for any handler that allocates memory, for example. Once you&#8217;ve done that, though, you have specified all of the points where interrupts are OK, so you could just check for APCs then.</p>
+<p>If you truly want asynchronous notification, you can just spawn off a thread that does {while (1) SleepEx(INFINITE, TRUE);}. Then your APCs can block on mutexes or critical sections so that whatever&#8217;s being interrupted can complete before letting the APC have the resource.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376673">
+				<div id="div-comment-376673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Becke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376673">
+			May 4, 2006 at 2:54 am</a>		</div>
+
+		<p>When I first discovered Win32 APCs I got rather excited by the prospects of (finally) making a clean inter thread signalling mechanism.</p>
+<p>Then I discovered that GUI thread pump functions &#8211; i.e. GetMessage &#8211; do not internally use alertable waits.</p>
+<p>Oh well. Back to posting messages to windows. erk.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376713">
+				<div id="div-comment-376713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">shread threads</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376713">
+			May 4, 2006 at 7:15 am</a>		</div>
+
+		<p>Why even try to get apis thread safe? All threaded apps are buggy anyway, just take a look at explorer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376923">
+				<div id="div-comment-376923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376923">
+			May 4, 2006 at 11:35 am</a>		</div>
+
+		<blockquote><p>
+  All threaded apps are buggy anyway</p>
+<p>That&#8217;s just an uninteresting special case of the theorem &#8216;all apps are buggy&#8217;.</p>
+<p>But nevertheless, we still write programs.</p>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376933">
+				<div id="div-comment-376933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-376933">
+			May 4, 2006 at 11:38 am</a>		</div>
+
+		<p>Chris, GetMessage can&#8217;t be alertable because your program may not be in a consistent state for your APC to run. Of course it doesn&#8217;t really matter because you can just use MsgWaitForMultipleObjectsEx with an alertable wait. If it returns telling you that there&#8217;s a message available, call GetMessage.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-377233">
+				<div id="div-comment-377233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377233">
+			May 4, 2006 at 3:06 pm</a>		</div>
+
+		<p>While Explorer indeed is buggy, and does neither understand nor use threading, and indeed frequently screws up (severely) when faced with mounted/dismounted driveletter (hell, even adding adding a file can make it screw up), it has nothing to do with neither APC&#8217;s nor threading. Explorer is implemented by VB-fags that think the world is a DOS-box. The shell-views added on top of it is just another layer som idiot added to make it even more plausible things would get out of synch.</p>
+<p>But to extrapolate from those Microsoft designers and developers incompetence to say &quot;X = shit&quot; is false. Think BeOS. Everything in the tracker ran inside threads. Responsive as nothing else. Never screwed up due to SHIT EMIT^WDs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-377293">
+				<div id="div-comment-377293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377293">
+			May 4, 2006 at 4:19 pm</a>		</div>
+
+		<p>It&#8217;s pretty easy to verify that Explorer is multithreaded. Simply open two Explorer windows in the same process. Do something that makes a window stop responding (like trying to access a nonexistent network share), and you&#8217;ll see that the other window is still perfectly responsive.</p>
+<p>You could argue that Explorer should have ALL of its IO done on a separate thread, but it was written over 12 years ago. Back then most GUIs either had a single message queue and/or no threading, so there wasn&#8217;t a lot of history to show why the current implementation is lacking. I&#8217;ve heard Explorer has been rewritten for Vista, so maybe they&#8217;ve moved all IO out of the GUI thread.</p>
+<p>Of course any bugs that may be in Explorer are almost undoubtedly not due to its being multithreaded, and I doubt it makes much use of APCs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-377443">
+				<div id="div-comment-377443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Becke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377443">
+			May 5, 2006 at 3:39 am</a>		</div>
+
+		<p>Gabe Wrote: &quot;Chris, GetMessage can&#8217;t be alertable because your program may not be in a consistent state for your APC to run.&quot;</p>
+<p>If a GUI thread is ever in a consistent state for asynchronous code to run, its when the GUI thread is stuck inside GetMessage. Hell, another thread can do a SendMessageXXX call to trigger the execution of code by GetMessage.</p>
+<p>As it stands, user APCs are all but useless for use with most application frameworks as most programmers, who might otherwise use user APCs inside some component of a project &#8211; cannot, as their ownership of a project extends only over their own component, not their projects framework.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-377593">
+				<div id="div-comment-377593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Boyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377593">
+			May 5, 2006 at 1:06 pm</a>		</div>
+
+		<p>i have no idea what you&#8217;re talking about.</p>
+<p><a rel="nofollow" target="_new" href="http://tinyurl.com/rwrnt" rel="nofollow">http://tinyurl.com/rwrnt</a></p>
+<p>And i don&#8217;t think i ever will.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-377693">
+				<div id="div-comment-377693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377693">
+			May 6, 2006 at 12:48 am</a>		</div>
+
+		<blockquote><p>
+  WaitForMultipleObjectsEx,<br />
+  <br />&gt; MsgWaitForMultipleObjectsEx,<br />
+  <br />&gt; and SleepEx</p>
+<p>Why is there no sEx version of Sleep????? &nbsp;What a boring system.</p>
+<p>Wednesday, May 03, 2006 4:33 PM by mgrier<br />
+  <br />&gt; ASTs were such a pain because nobody could<br />
+  <br />&gt; really maintain the discipline about what to<br />
+  <br />&gt; do and not to do in an AST and</p>
+<p>True, but I never did find any documentation of what kind of discipline needed to be maintained. &nbsp;By now I&#8217;ve forgotten most details, but have a vague feeling that I could only rely on examining a few items and deciding whether or not to set an event flag.</p>
+<p>Wednesday, May 03, 2006 5:37 PM by dave<br />
+  <br />&gt; one often adopted an event-driven model in<br />
+  <br />&gt; which all work is done in AST handlers</p>
+<p>And then often found that it didn&#8217;t work, right? &nbsp;It looks like you suffered from the same lack of documentation as I did.</p>
+<p>By the way that is one of approximately four ways in which I found documentation at the old DEC to be severely lacking. &nbsp;(This refers only to the reference text. &nbsp;The code examples were pretty much the opposite, i.e. it was rare to find an example that would work as written.)</p>
+<p>Thursday, May 04, 2006 11:35 AM by dave<br />
+  <br />&gt;&gt;All threaded apps are buggy anyway<br />
+  <br />&gt;<br />
+  <br />&gt; That&#8217;s just an uninteresting special case of<br />
+  <br />&gt; the theorem &#8216;all apps are buggy&#8217;. </p>
+<p>That&#8217;s just an uninteresting special case of the theorem &quot;all programs are buggy&quot;.</p>
+<p>(Though some of us do fix bugs in our kernels, drivers, interrupt handlers, memory managers, AND apps when we become aware of the bugs.)
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kjkhyperion even thread-even depth-1" id="comment-377753">
+				<div id="div-comment-377753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377753">
+			May 6, 2006 at 6:32 am</a>		</div>
+
+		<p>Explorer locks up because the New Shell predated OLE 2. New Shell needed OLE 2, but it wasn&#8217;t done yet, so it got its own &quot;mini-OLE&quot; that supported only a handful of features, and especially only supported single-threaded apartments (STAs). Raymond blogged about it, look in the archives</p>
+<p>OLE 2 had multithreaded apartments too (which aren&#8217;t as multithreaded as you may think), and later (around Windows 2000) got free-threaded and thread-neutral components as well (which are truly multithreaded)&#8230; but the shell still only supports STAs, and will in fact refuse to load free-threaded or thread-neutral components altogether</p>
+<p>What the shell people did to work around that and get at least a bit of multitasking is creating multiple threads (typically one for each shell view, i.e. one for the desktop and one for each folder window), each with its own STA. Thread pools (&quot;shell tasks&quot;) and a tiny bit of overlapped I/O support were introduced later, but the bulk of it stays anchored to the old model</p>
+<p>And besides, I have seen far far worse. At least the shell GUI is reentrant, if not multithreaded, so you can at least do the &quot;multi-single-threaded&quot; trick. Most other toolkits don&#8217;t have it that easy: Visual Basic&#8217;s GUI library is notoriously single-threaded, as is Borland&#8217;s VCL, and you can easily verify with a slow enough network share that Mozilla has a single-threaded GUI as well (attaching a slow network file will, in my experience, completely stall Thunderbird)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-377843">
+				<div id="div-comment-377843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377843">
+			May 7, 2006 at 3:16 am</a>		</div>
+
+		<p>KJK, are you sure about your history there? &nbsp;OLE2 was originally created for Office 4.0, which was 16-bit, but shipped with NT 3.1 in 1993 in 32-bit form.</p>
+<p>Are you saying that Explorer was sufficiently advanced by the time NT 3.1 RTMed that OLE2 could not be incorporated into it?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-377933">
+				<div id="div-comment-377933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-377933">
+			May 7, 2006 at 7:54 pm</a>		</div>
+
+		<p>Gabe, KJK::Hyperion: Actually, Raymond has talked about this before. It wasn&#8217;t because OLE2 wasn&#8217;t &quot;sufficiently advanced&quot; enough, it was because it needed too much memory, and Windows 95 needed to run in 4MB. So they basically didn&#8217;t load OLE32.dll until *absolutely nessecary* &#8211; which meant that the shell basically duplicated just the small bits that it needed.</p>
+<p>See: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2004/07/05/173226.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2004/07/05/173226.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-381293">
+				<div id="div-comment-381293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bryan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060503-11/?p=31323#comment-381293">
+			May 16, 2006 at 4:56 pm</a>		</div>
+
+		<p>mgrier made this very good point:</p>
+<p>&gt; you probably do NOT want to make alertable wait calls from within your APC</p>
+<p>What surprised me when working with APCs was that GetUserName() enters an alertable wait state, so another APC can be delivered, and hence my code was unexpectedly re-entrant.</p>
+<p>Given that APIs like GetUserName() don&#8217;t document whether or not they can enter an alertable wait state, the only safe approach seems to be to do as little as possible in an APC.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

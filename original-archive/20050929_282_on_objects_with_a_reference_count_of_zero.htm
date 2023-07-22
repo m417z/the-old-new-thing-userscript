@@ -1,0 +1,466 @@
+<html>
+<head>
+<title>On objects with a reference count of zero</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>On objects with a reference count of zero</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 29, 2005 / year-entry #283</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">One commenter claimed that When the object is first constructed, the reference count should be 0 and AddRef should be called at some point (probably via QueryInterface) to increment the reference count. If you construct your object with a reference count of zero, you are playing with matches. For starters, when the object is created,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2005/09/27/474384.aspx#474405">
+One commenter claimed</a> that
+</p>
+<blockquote CLASS=q><p>
+When the object is first constructed,
+the reference count should be 0 and
+AddRef should be called at some point
+(probably via QueryInterface) to increment the reference count.
+</p>
+</blockquote>
+<p>
+If you construct your object with a reference count of zero,
+you are playing with matches.
+For starters, when the object is created, there reference
+count is not zero - the person who created the object has a reference!
+Remember the COM rule for references:
+If a function produces a reference (typically an interface pointer),
+the reference count is incremented
+to account for the produced reference.
+If you consider the constructor to be a function, then it needs
+to return with an incremented reference
+count to account for the produced object.
+</p>
+<p>
+If you prefer to play with matches, you can end up burning yourself
+with code like the following:
+</p>
+<pre>
+// A static creator method
+HRESULT MyObject::Create(REFIID riid, void **ppvObj)
+{
+ *ppvObj = NULL;
+ MyObject *pobj = new MyObject();
+ HRESULT hr = pobj ? S_OK : E_OUTOFMEMORY;
+ if (SUCCEEDED(hr)) {
+  hr = pobj-&gt;Initialize(); // dangerous!
+  if (SUCCEEDED(hr)) {
+   hr = pobj-&gt;QueryInterface(riid, ppvObj);
+  }
+  if (FAILED(hr)) {
+   delete pobj;
+  }
+ }
+ return hr;
+}
+</pre>
+<p>
+Notice that you're initializing the object while its reference
+count is zero.
+This puts you in the same "limbo zone" as cleaning up an object
+while its reference count is zero,
+and therefore exposes you to the same problems:
+</p>
+<pre>
+HRESULT MyObject::Load()
+{
+ CComPtr&lt;IStream&gt; spstm;
+ HRESULT hr = GetLoadStream(&amp;spstm);
+ if (SUCCEEDED(hr)) {
+  CComQIPtr&lt;IObjectWithSite, &amp;IID_IObjectWithSite&gt; spows(spstm);
+  if (spows) spows-&gt;SetSite(this);
+  hr = LoadFromStream(spstm);
+  if (spows) spows-&gt;SetSite(NULL);
+ }
+ return hr;
+}
+
+HRESULT MyObject::Initialize()
+{
+ return Load();
+}
+</pre>
+<p>
+An object that saves itself during destruction
+is very likely to load itself during creation.
+And you run into exactly the same problem.
+The call to <code>IObjectWithSite::SetSite(this)</code>
+increments the reference count of the object from zero to one,
+and the call to
+The call to <code>IObjectWithSite::SetSite(NULL)</code>
+decrements it back to zero.
+When the reference count decrements to zero, this destroys
+the object,
+resulting in the object being inadvertently destroyed
+by the
+<code>MyObject::Load()</code> method.
+</p>
+<p>
+The <code>MyObject::Create</code> static method
+doesn't realize that this has happened and proceeds to
+call the <code>QueryInterface</code> method to return a
+pointer back to the caller,
+expecting it to increment the reference count from zero to one.
+Unfortunately, it's doing this to an object that has already
+been destroyed.
+</p>
+<p>
+That's what happens when you play with an object whose reference
+count is zero:
+It can disappear the moment you relinquish control.
+Objects should be created with a reference count of one,
+not zero.
+</p>
+<p>
+ATL prefers to play with matches, using the moral equivalent of
+the above <code>MyObject::Create</code> function in its
+object construction:
+</p>
+<pre>
+void InternalFinalConstructAddRef() {}
+void InternalFinalConstructRelease()
+{
+    ATLASSERT(m_dwRef == 0);
+}
+
+static HRESULT WINAPI CreateInstance(void* pv, REFIID riid, LPVOID* ppv)
+{
+    ATLASSERT(*ppv == NULL);
+    HRESULT hRes = E_OUTOFMEMORY;
+    T1* p = NULL;
+    ATLTRY(p = new T1(pv))
+    if (p != NULL)
+    {
+	p-&gt;SetVoid(pv);
+	p-&gt;InternalFinalConstructAddRef();
+	hRes = p-&gt;FinalConstruct();
+	p-&gt;InternalFinalConstructRelease();
+	if (hRes == S_OK)
+	    hRes = p-&gt;QueryInterface(riid, ppv);
+	if (hRes != S_OK)
+	    delete p;
+    }
+    return hRes;
+}
+</pre>
+<p>
+ATL hands you a set of matches by calling your
+<code>FinalConstruct</code> method with a reference count of zero.
+If you know that you're going to get burned, you can use the
+<code>DECLARE_PROTECT_FINAL_CONSTRUCT</code> macro to change
+the <code>InternalFinalConstructAddRef</code> and
+<code>InternalFinalConstructRelease</code> methods to versions
+that actually increment the reference count temporarily
+during the call to <code>FinalConstruct</code>,
+then drop the reference count back to zero (without destructing
+the object)
+prior to the <code>QueryInterface</code> call.
+</p>
+<p>
+It works, but in my opinion it relies too much on programmer vigilance.
+The default for ATL is to hand programmers matches
+and relying on programmers "knowing" that
+something dangerous might happen inside the
+<code>FinalConstruct</code>
+and having the presence of mind to ask for
+<code>DECLARE_PROTECT_FINAL_CONSTRUCT</code>.
+In other words, it chooses the dangerous default, and
+programmers must explicitly ask for the safe version.
+But programmers have a lot of things on their mind,
+and forcing them to consider the consequences of the transitive
+closure of every operation performed in the
+<code>FinalConstruct</code> method is an unresonable requirement.
+</p>
+<p>
+Consider our example above.
+When the code was originally written, the <code>Load</code> method
+may have been the much simpler
+</p>
+<pre>
+HRESULT MyObject::Load()
+{
+ CComPtr&lt;IStream&gt; spstm;
+ HRESULT hr = GetLoadStream(&amp;spstm);
+ if (SUCCEEDED(hr)) {
+  hr = LoadFromStream(spstm);
+ }
+ return hr;
+}
+</pre>
+<p>
+It wasn't until a month or two later that somebody added
+site support to the <code>Load</code> and <code>Save</code> methods.
+This seemingly simple and isolated change, adhering perfectly to
+the COM rules for reference counting, had ripple effects
+back through the object creation and destruction code paths.
+If you put four levels of function calls between the
+<code>FinalConstruct</code> and the <code>Load</code>,
+this fourth-level-caller effect can very easily be overlooked.
+I suspect that these nonlocal effects are
+one of the most significant sources of code defects.
+ATL was being clever and optimized out an increment and a decrement
+(something which the compiler most likely could optimize out on its own),
+but in return, you got handed a book of matches.
+</p>
+<p>
+(I don't mean to be picking on ATL here,
+so don't go linking to this article with the title
+"Raymond rails into ATL as a poorly-designed pile of dung".
+ATL is trying to be small and fast,
+but the cost is added complexity, often subtle.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-309543">
+				<div id="div-comment-309543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309543">
+			September 29, 2005 at 10:10 am</a>		</div>
+
+		<p>Heh, I love ATL and I love running with scissors.</p>
+<p>About a year ago, one of my guys showed me some of his ATL code with the DECLARE_PROTECT_FINAL_CONSTRUCT used.  I asked him what it did and he really couldn&#8217;t tell me.  I looked at the MSDN documentation and it gives a physical description of what it does without talking about WHY it is important.  (Protects your FinalConstruct by using a temporary reference count??? WTF???)</p>
+<p>Given that I am subject to bouts of stupidity, I pulled the old &quot;well back in my day, we didn&#8217;t need no fancy stuff like them there horseless carriages.&quot;</p>
+<p>Now that I understand WHY it exists, I&#8217;m going to start using that macro.  Thanks Raymond.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309553">
+				<div id="div-comment-309553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dean</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309553">
+			September 29, 2005 at 10:35 am</a>		</div>
+
+		<p>Hey, I saw lot of 42 in MS sample code, like this one,<br />
+<br />enum { DESTRUCTOR_REFCOUNT = 42 };</p>
+<p>where this magic 42 comes from? and people like to use foo, bar to name their classes,<br />
+<br />where these two babies come from?</p>
+<p>Thanks.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309573">
+				<div id="div-comment-309573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309573">
+			September 29, 2005 at 10:59 am</a>		</div>
+
+		<p>42 is the answer to life, the universe, and everything in Douglas Adams&#8217; Hitchhiker&#8217;s guide to the galaxy series. The specific question the answer is for remains unknown..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309583">
+				<div id="div-comment-309583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/frank_hileman' rel='external nofollow' class='url'>Frank Hileman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309583">
+			September 29, 2005 at 11:16 am</a>		</div>
+
+		<p>&quot;foo&quot; and &quot;bar&quot; are not used in production code. There is a long history in software documentation to use these names as generic names, the same way you might use &quot;x&quot; and &quot;y&quot; in mathematics.</p>
+<p>Etymology of foo and bar:</p>
+<p><a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Metasyntactic_variable#Foo.2C_Bar_and_Baz" rel="nofollow">http://en.wikipedia.org/wiki/Metasyntactic_variable#Foo.2C_Bar_and_Baz</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309603">
+				<div id="div-comment-309603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">waleri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309603">
+			September 29, 2005 at 12:38 pm</a>		</div>
+
+		<p>What&#8217;s wrong with simple call to AddRef() after the object is created with new and call Release() instead of delete?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309613">
+				<div id="div-comment-309613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rburhum</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309613">
+			September 29, 2005 at 12:57 pm</a>		</div>
+
+		<p>I thought that the &quot;static HRESULT WINAPI CreateInstance&quot; didn&#8217;t use delete, but Heapfree instead. The reason being that it would allow you to make the destructor private to enforce reference counting behavior as explained by Larry Osterman in <a rel="nofollow" target="_new" href="http://blogs.msdn.com/larryosterman/archive/2005/07/01/434684.aspx" rel="nofollow">http://blogs.msdn.com/larryosterman/archive/2005/07/01/434684.aspx</a><br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even thread-even depth-1" id="comment-309623">
+				<div id="div-comment-309623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309623">
+			September 29, 2005 at 1:15 pm</a>		</div>
+
+		<p>I hope you were joking about using HeapFree to destroy a C++ object&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309723">
+				<div id="div-comment-309723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jbn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309723">
+			September 30, 2005 at 5:45 am</a>		</div>
+
+		<p>it is never a good idea to expose a partially initialized object. If you need an Initialize method, then you should probably use a factory method to make sure no one gets a reference to a partially constructed object.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309703">
+				<div id="div-comment-309703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.winwonk.com' rel='external nofollow' class='url'>Kim Gr&#228;sman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-309703">
+			September 30, 2005 at 2:32 am</a>		</div>
+
+		<p>I think ATL does this for a reason. As far as I can see, there&#8217;s no immediate performance benefit to initializing the m_cRef member to zero over initializing it to one&#8230;</p>
+<p>As far as I can see, the problem is that by the time you&#8217;ve called new or CreateInstance, your object has no *interface* references to it, and that&#8217;s what IUnknown&#8217;s implementation tracks.</p>
+<p>The fact that there&#8217;s a C++ pointer pointing to it is, I guess, an implementation detail.</p>
+<p>The ATL equivalent of your first example, when you add an explicit Initialize method (ATL has no support for parametrized constructors, so this is the only way to init an object with a specific state) looks like this, and has the same problem:</p>
+<pre class="brush: plain; title: ; notranslate" title="">&lt;br&gt;CComObject&amp;lt;MyObject&amp;gt;* pobj = 0;&lt;br&gt;hr = CComObject&amp;lt;MyObject&amp;gt;::CreateInstance(&amp;amp;pobj); // refcount == 0&lt;br&gt;if (FAILED(hr)) return hr;&lt;br&gt;&lt;br&gt;hr = pobj-&amp;gt;Initialize(); // still dangerous!&lt;br&gt;if (SUCCEEDED(hr)) {&lt;br&gt; hr = pobj-&amp;gt;QueryInterface(riid, ppvObj);  // refcount == 1, all is well now.&lt;br&gt;}&lt;br&gt;&lt;br&gt;return hr;&lt;br&gt;</pre>
+<p>The standard solution is bumping the refcount before calling any methods on the object, and then Release:ing before handing out the now-only reference.</p>
+<p>Ah, now I see that you&#8217;re talking about protecting FinalConstruct. That is a bit of a mess, but I like the way it&#8217;s configurable :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-310063">
+				<div id="div-comment-310063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.winwonk.com' rel='external nofollow' class='url'>Kim Gr&#228;sman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-310063">
+			October 1, 2005 at 7:09 am</a>		</div>
+
+		<p>jbn: This *is* the implementation of a factory method. As I said, ATL doesn&#8217;t support parameterized constructors, so an explicit Init method is the only way (that I know of) to pass it initial state.</p>
+<p>&#8211; Kim</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-310403">
+				<div id="div-comment-310403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Doug</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-310403">
+			October 3, 2005 at 12:05 pm</a>		</div>
+
+		<p>Heh.  C++ is fundamentally broken anyway, so you are always playing with matches.</p>
+<p>ATL has one BIG BIG advantage over MFC.  You end up with statically linked code that does not put C++ objects across a DLL boundary.</p>
+<p>Why is this good?  Well, MFC objects have been changed several times.  Which means that the objects on both sides of the DLL must be compiled the same way.<br />
+<br />Which is impossible to make happen in the real world of ActiveX OCXs loaded into browser pages.<br />
+<br />(You end up with random crashes of the browser at some point.)</p>
+<p>1. There can be only one OCX on a box, loaded through the registry.   So path is (mostly) irrelevant.<br />
+<br />2. MFC OCXs must be linked to MFC as a dll, not as a static library.  (Why?  I&#8217;m sure there is some good reason.)<br />
+<br />3. Different versions of IE are compiled against the different versions of MFC.<br />
+<br />4. You cannot control the field deployment of versions of IE and versions of your software.<br />
+<br />5. You cannot control the deployment other OCXs that might be loaded and their version of MFC.</p>
+<p>(I&#8217;m missing some of the obvious facts, like that there can only be one version of the MFC dll loaded into a process space.   And that there is no way to query a C++ object to detect object compilation inconsistencies.)</p>
+<p>So, you end up with a no win situation.  Upgrade to the latest version of the compiler, you won&#8217;t work with legacy apps that the customer has.</p>
+<p>The only real answer is to rewrite your OCXs away from MFC into ATL, or something else.</p>
+<p>And all because someone had to change MFC objects that cross a DLL boundary.  At least ATL doesn&#8217;t do that.  Reference count bugs, I can fix those.  DLL hell deployment issues?  Rewrite.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-311783">
+				<div id="div-comment-311783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f schwiet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050929-10/?p=34003#comment-311783">
+			October 7, 2005 at 9:46 pm</a>		</div>
+
+		<p>Are you still using raw pointers?  Try smart pointers.  Suppose class Foo below properly initializes itself with a 0 reference, as all good classes should:</p>
+<p>SmartPointer&lt;Foo*&gt; pNewFoo = new Foo();</p>
+<p>Guess what happens as soon as I point pNewFoo at the new Foo()?  The reference count is bumped, and you can be sure it won&#8217;t be leaked.  It works dandy.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

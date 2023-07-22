@@ -1,0 +1,497 @@
+<html>
+<head>
+<title>Creating a shared memory block that can grow in size</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Creating a shared memory block that can grow in size</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 30, 2015 / year-entry #22</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A little-known feature of shared memory blocks in Win32 is that it is possible to resize them, sort of. When you create a shared memory block, you can pass the SEC_RESERVE flag to Create≠File≠Mapping, then the size you pass to the function is treated as a maximum rather than an exact size. (Don't forget that...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A little-known feature of shared memory blocks in Win32
+is that it is possible to resize them,
+sort of.
+</p>
+<p>
+When you create a shared memory block,
+you can pass
+the <code>SEC_RESERVE</code> flag to
+<code>Create&shy;File&shy;Mapping</code>,
+then the size you pass to the function is treated
+as a maximum rather than an exact size.
+(Don't forget that
+<code>Create&shy;File&shy;Mapping</code> is used
+for creating both memory-mapped files and
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/03/01/10398358.aspx">
+for creating plain old shared memory</a>.
+The name of the function is misleading
+unless you're wearing
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/05/12/10163578.aspx">
+kernel-colored glasses</a>.)
+</p>
+<p>
+When you map this shared memory block,
+you are reserving address space,
+but no memory is committed yet.
+You call
+<code>Virtual&shy;Alloc</code>
+to commit memory into the shared memory block.
+</p>
+<p>
+This means that you can create a growable shared memory block
+by creating an initially empty block,
+and then committing a small amount of memory into it.
+When you want to grow the block,
+you commit more.
+However, you cannot shrink the shared memory block.
+Once the memory is committed, it cannot be decommitted.
+</p>
+<p>
+Here's a demonstration.
+Note that most error checking has been elided
+for expository purposes.
+Note also that since the memory isn't actually being shared
+with anybody,
+this program working too hard;
+it could have just used plain old
+<code>Virtual&shy;Alloc</code>.
+So pretend that the memory is being shared with somebody else.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+
+#define ONE_GIGABYTE (1024 * 1024 * 1024)
+#define VIEW_SIZE (ONE_GIGABYTE / 2) // We will map half of it
+
+void ReportMemoryPresence(void *p)
+{
+ MEMORY_BASIC_INFORMATION mbi;
+ VirtualQuery(p, &amp;mbi, sizeof(mbi));
+ printf("Memory at %p is %s\n", p,
+        (mbi.State &amp; MEM_COMMIT) ? "committed" : "not committed");
+}
+
+void WaitForEnter()
+{
+ char dummy[64];
+ fgets(dummy, 64, stdin);
+}
+
+int __cdecl wmain(int, wchar_t **)
+{
+ BYTE *pView;
+ HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
+                              PAGE_READWRITE,
+                              0, VIEW_SIZE,
+                              NULL);
+ printf("Created the file mapping\n");
+ WaitForEnter();
+
+ pView = (BYTE*)MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, VIEW_SIZE);
+ printf("Mapped half of it at %p\n", pView);
+
+ ReportMemoryPresence(pView);
+ ReportMemoryPresence(pView + VIEW_SIZE - 1);
+ WaitForEnter();
+
+ return 0;
+}
+</pre>
+<p>
+In this version, we create a
+one-<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2009/06/11/9725386.aspx">gigabyte</a>
+shared memory block with no special flags,
+which means that all the memory gets committed up front.
+When you run this program, it reports that the memory at the start
+and end of the mapping is present.
+That's because the normal mode for shared memory is to commit it all
+at creation.
+</p>
+<p>
+You can watch the effect of commit by running Task Manager,
+going to the Performance tab,
+and looking at the value under <i>Committed</i>.
+It should jump by a gigabyte when
+"Created the file mapping" is printed.
+(For some reason, the <i>Commit size</i> in the Details pane
+counts the view as commitment, even though the view consists
+almost entirely of reserved rather than committed pages.)
+</p>
+<p>
+Now let's add the <code>SEC_RESERVE</code> flag:
+</p>
+<pre>
+ HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
+                              PAGE_READWRITE <font COLOR=blue>| SEC_RESERVE</font>,
+                              0, VIEW_SIZE,
+                              NULL);
+</pre>
+<p>
+Now when you run the program,
+Task Manager's Committed memory does not increase.
+That's because we created an empty shared memory block
+with the <i>potential</i> to grow up to one gigabyte,
+but right now it is size zero.
+This is confirmed by the memory presence check,
+which reports that the memory at the start and end of the
+mapped view is not committed.
+</p>
+<p>
+Okay, well, a zero-length shared memory block isn't very
+useful, so let's make it, say, 100 megabytes in size.
+</p>
+<pre>
+#define BLOCK_SIZE (100 * 1024 * 1024)
+
+int __cdecl wmain(int, wchar_t **)
+{
+ BYTE *pView;
+ HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
+                              PAGE_READWRITE | SEC_RESERVE,
+                              0, VIEW_SIZE,
+                              NULL);
+ printf("Created the file mapping\n");
+ WaitForEnter();
+
+ pView = (BYTE*)MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, VIEW_SIZE);
+ printf("Mapped half of it at %p\n", pView);
+
+ ReportMemoryPresence(pView);
+ ReportMemoryPresence(pView + VIEW_SIZE - 1);
+ WaitForEnter();
+
+ <font COLOR=blue>VirtualAlloc(pView, BLOCK_SIZE, MEM_COMMIT, PAGE_READWRITE);
+ printf("Committed some of it at %p\n", pView);
+
+ ReportMemoryPresence(pView);
+ ReportMemoryPresence(pView + BLOCK_SIZE - 1);
+ ReportMemoryPresence(pView + BLOCK_SIZE);
+ ReportMemoryPresence(pView + VIEW_SIZE - 1);
+ WaitForEnter();</font>
+
+ return 0;
+}
+</pre>
+<p>
+Watch the Committed memory in Task Manager go up by 0.1 gigabytes
+when we commit some of it.
+Also observe that the memory presence checks show that we have
+exactly 100 megabytes of memory available;
+the byte at 100 megabytes + 1 is not present.
+</p>
+<p>
+Okay, so we were able to grow the shared memory block from zero to
+100 megabytes.
+Let's grow it again up to 200 megabytes.
+</p>
+<pre>
+int __cdecl wmain(int, wchar_t **)
+{
+ ...
+
+ <font COLOR=blue>VirtualAlloc(pView + BLOCK_SIZE, BLOCK_SIZE, MEM_COMMIT, PAGE_READWRITE);
+ printf("Committed some of it at %p\n", pView + BLOCK_SIZE);
+
+ ReportMemoryPresence(pView);
+ ReportMemoryPresence(pView + 2 * BLOCK_SIZE - 1);
+ ReportMemoryPresence(pView + 2 * BLOCK_SIZE);
+ ReportMemoryPresence(pView + VIEW_SIZE - 1);
+ WaitForEnter();</font>
+
+ return 0;
+}
+</pre>
+<p>
+Okay, well there you go, a growable shared memory block.
+If you wanted to conserve address space, you could use
+<code>Map&shy;View&shy;Of&shy;File</code> to map only
+the number of bytes you intend to commit,
+and each time you want to grow the memory block,
+you create a new larger view.
+I didn't bother with that because I'm lazy.
+</p>
+<p>
+<b>Bonus chatter</b>:
+Another way to get the effect of growable and shrinkable shared memory blocks
+is to cheat and create multiple shared memory blocks,
+but map them right next to each other.
+</p>
+<p>
+<b>Bonus chatter 2</b>:
+You can get sort of the effect of decommitting memory from the block
+by resetting it (<code>MEM_<wbr>RESET</code>).
+The memory is still committed,
+but you told the memory manager that if the memory needs to be paged
+out,
+just discard it rather than writing it to disk.
+</p>
+<p>
+<b>Bonus chatter 3</b>:
+Be aware that creating very large <code>SEC_<wbr>RESERVE</code> sections
+<a HREF="http://blogs.technet.com/b/markrussinovich/archive/2008/11/17/3155406.aspx#commentItem99301">
+can incur high commit charges for the page tables themselves</a>.
+This is significantly improved in Windows 8.1,
+which defers committing the page tables until you actually use them.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1173693">
+				<div id="div-comment-1173693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pierre B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173693">
+			January 30, 2015 at 7:16 am</a>		</div>
+
+		<p>Unless there is something I&#39;m completely missing, the code actually only create a half-gigabyte file mapping. I think your call to CreateFileMapping() should pass ONE_GIGABYTE instead of VIEW_SIZE to match the explanatory text.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1173743">
+				<div id="div-comment-1173743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173743">
+			January 30, 2015 at 8:14 am</a>		</div>
+
+		<p>&quot;Note that most error checking has been elided for expository purposes.&quot;</p>
+<p>Everyone always says that. &nbsp;Have you ever considered putting in all the error checking, to demonstrate _that_?</p>
+<div class="post">[<em>That was my old policy and <a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/07/20/188696.aspx">it resulted in code that people pointed to and laughed at because it was so wordy and heavily indented</a>. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1173763">
+				<div id="div-comment-1173763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173763">
+			January 30, 2015 at 8:57 am</a>		</div>
+
+		<p>Mostly that would demonstrate what a pain error codes are and why I personally prefer exceptions. &nbsp;(Been trawling through a bunch of COM examples lately, and I am completely sick of code that looks like this</p>
+<p>hr = DoSomeCOMThing()</p>
+<p>if (!SUCCEEDED(hr))</p>
+<p> &nbsp; &nbsp;goto CleanupBlock7;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1173783">
+				<div id="div-comment-1173783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173783">
+			January 30, 2015 at 9:33 am</a>		</div>
+
+		<p>But what happens, if you have a reserved section mapped in two processes, and one process commits some memory to it. Does that memory become accessible in the second process without it having to commit?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jan-ringos even thread-even depth-1" id="comment-1173793">
+				<div id="div-comment-1173793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Jan+Ringo%C5%A1' rel='external nofollow' class='url'>Jan Ringo≈°</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173793">
+			January 30, 2015 at 9:55 am</a>		</div>
+
+		<p>I am particularly curious about the overhead of File Mapping Objects when only a few pages are reserved/committed. That&#39;s because I am using this technique (67 kB big mapping object) to share some data (3 kB) and to pass filenames around in the remaining 1 kB which can grow up to 64 kB in case someone decides to be clever with their directory depth and naming.</p>
+<p>But maybe I care about memory usage too much.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1173803">
+				<div id="div-comment-1173803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Torkell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173803">
+			January 30, 2015 at 10:13 am</a>		</div>
+
+		<p>&lt;I&gt;For some reason, the Commit size in the Details pane counts the view as commitment, even though the view consists almost entirely of reserved rather than committed pages&lt;/I&gt;</p>
+<p>My guess is that it counts as commitment in that the kernel has guaranteed that there is enough memory available for the entire 1GB. It may not have actually allocated any physical pages or pagefile space yet, but it&#39;s promised that it will always be able to do so. I think copy-on-write mappings do something similar in that it makes sure there&#39;s enough space available for the copied pages, even if they&#39;re never needed.</p>
+<p>Compare with Linux where depending on configuration it&#39;s possible for allocations to succeed even if there isn&#39;t enough memory available (part of the reason for this is to allow the fork/exec model to work even if there isn&#39;t enough actual memory to fork the parent process &#8211; forking uses copy-on-write semantics). This works as long as you don&#39;t try to, say, fork a large process (over half your total memory) and then have the child change all its copied pages &#8211; if you do, then the out-of-memory killer starts up and picks a process to blat. It doesn&#39;t always choose wisely (one I saw was when it killed cron &#8211; we only found out about it several months later when the log partition filled as log files weren&#39;t being rotated anymore!).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1173813">
+				<div id="div-comment-1173813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rs</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173813">
+			January 30, 2015 at 10:21 am</a>		</div>
+
+		<p>Talking about little-known features of shared memory blocks, is there any way to replace a shared memory blocked mapped at an address with another shared memory block mapped at the same address? (What I mean is a combination of UnmapViewOfFile and MapViewOfFileEx without the risk of some other part of the process taking away the address between the calls.)</p>
+<p>This could be very useful for moving large portions of memory or restoring earlier versions of memory without transferring any data.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1173863">
+				<div id="div-comment-1173863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173863">
+			January 30, 2015 at 12:53 pm</a>		</div>
+
+		<p>@Raymond, SimonRev: Yeah I feel your pain. Makes me love blocks that can&#39;t fail.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1173933">
+				<div id="div-comment-1173933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173933">
+			February 1, 2015 at 2:02 pm</a>		</div>
+
+		<p>@rs: How scary of a solution you want? I&#39;ve got one that would probably make Raymond recoil in horror.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1173973">
+				<div id="div-comment-1173973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nitpicker (Corner?)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1173973">
+			February 1, 2015 at 11:05 pm</a>		</div>
+
+		<p>Yes Joshua, more horror please! :)</p>
+<p>(blahblahblah, avoid spam filter)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174013">
+				<div id="div-comment-1174013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1174013">
+			February 2, 2015 at 8:27 am</a>		</div>
+
+		<p>Disclaimer: This should work. I haven&#39;t tried it. It&#39;s only really interesting as a use case of SuspendThread and ResumeThread in &quot;normal&quot; development as opposed to manipulating somebody else&#39;s process.</p>
+<p>Need two DLLs (henseforth known as A and B). B has no other purpose than being a helper for A and so nobody links against it. B is linked against A. Raymond calls this the Hired Lacky. We are going to be using the hired lacky to run code with the loader lock held.</p>
+<p>Exported API in A ReplaceMappedViewOfFile does the following:</p>
+<p>1. Take lock.</p>
+<p>2. Place call parameters in global variables.</p>
+<p>3. Load DLL B with LoadLibrary.</p>
+<p>In B&#39;s DllMain:</p>
+<p>4. Stop all threads but this one. This requires CreateToolhelp32Snapshot, Thread32First, Thread32Next, and NtQuerySystemInformation (to tell if a thread is suspended already), and SuspendThread. New threads can&#39;t start because we have the loader lock.</p>
+<p>5. UnmapViewOfFile (reading global variables stashed in #2)</p>
+<p>6. MapViewOfFile</p>
+<p>7. Call ResumeThread on all threads suspended in step 4.</p>
+<p>8. Return for DllMain</p>
+<p>9. FreeLibrary for DLL B.</p>
+<p>10. Release lock.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174093">
+				<div id="div-comment-1174093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nitpicker (Corner?)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1174093">
+			February 2, 2015 at 12:24 pm</a>		</div>
+
+		<p>Wow, that IS horrible. I&#39;ll wake up in a cold sweat at 1am tomorrow morning. :)</p>
+<p>I was envisaging the sledgehammer approach of reserving as much high address space as possible, and then mapping the view with MEM_TOPDOWN &#8211; assuming you can even call MapViewOfFile with that flag&#8230; </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174123">
+				<div id="div-comment-1174123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150130-00/?p=44793#comment-1174123">
+			February 2, 2015 at 6:31 pm</a>		</div>
+
+		<p>I wish that MapViewOfFileEx had as many options as the real underlying API, NtMapViewOfSection. &nbsp;Mapping into other processes, MEM_TOP_DOWN, inheritance control and forcing addresses below 2 GB are four features that NtMapViewOfSection has that MapViewOfFileEx does not. &nbsp;NtMapViewOfSection is semi-documented; see its &quot;Zw&quot; variant ZwMapViewOfSection in the &quot;Windows Dev Center &#8211; Hardware&quot; area of MSDN.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

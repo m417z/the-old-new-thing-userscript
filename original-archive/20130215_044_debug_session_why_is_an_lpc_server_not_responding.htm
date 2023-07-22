@@ -1,0 +1,480 @@
+<html>
+<head>
+<title>Debug session: Why is an LPC server not responding?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Debug session: Why is an LPC server not responding?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 15, 2013 / year-entry #45</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A particular scenario was hanging, and the team responsible for the scenario debugged it to the point where they saw that their X component was waiting for their Y component, which was waiting for Explorer, so they asked for help chasing the hang into Explorer. The team was kind enough to have shared what they've learned so...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A particular scenario was hanging,
+and the team responsible for the scenario debugged it to the
+point where they saw that their X&nbsp;component was
+waiting for their Y&nbsp;component, which was waiting for Explorer,
+so they asked for help chasing the hang into Explorer.
+</p>
+<p>
+The team was kind enough to have shared what they've learned
+so far:
+</p>
+<pre>
+kd&gt; <a HREF="http://blogs.msdn.com/b/ntdebugging/archive/2010/09/30/debug-sleuth-at-work-hung-server-mystery-of-the-unprocessed-smb-work-item.aspx">!alpc</a> /m 9c14d020
+
+Message 9c14d020
+  MessageID             : 0x0274 (628)
+  CallbackID            : 0xCCA5 (52389)
+  SequenceNumber        : 0x00000016 (22)
+  Type                  : LPC_REQUEST
+  DataLength            : 0x0094 (148)
+  TotalLength           : 0x00AC (172)
+  Canceled              : No
+  Release               : No
+  ReplyWaitReply        : No
+  Continuation          : Yes
+  OwnerPort             : 82bb9db8 [ALPC_CLIENT_COMMUNICATION_PORT]
+  WaitingThread         : 834553c0
+  QueueType             : ALPC_MSGQUEUE_MAIN
+  QueuePort             : 84646730 [ALPC_CONNECTION_PORT]
+  QueuePortOwnerProcess : 846209c0 (explorer.exe)
+  ServerThread          : 00000000 &lt;-----------------------
+  QuotaCharged          : No
+  CancelQueuePort       : 00000000
+  CancelSequencePort    : 00000000
+  CancelSequenceNumber  : 0x00000000 (0)
+  ClientContext         : 02a56b80
+  ServerContext         : 00000000
+  PortContext           : 0701ea20
+  CancelPortContext     : 00000000
+  SecurityData          : 962f89b8
+  View                  : 00000000
+kd&gt; !process 846209c0 0
+PROCESS 846209c0  SessionId: 1  Cid: 0804    Peb: 7fbac000  ParentCid: 0724
+    DirBase: 3e546380  ObjectTable: 97195300  HandleCount: 1041.
+    Image: explorer.exe
+</pre>
+<p>
+Yikes, there is no thread signed up to service the request.
+</p>
+<p>
+I don't know much about ALPC,
+but I can fumble around.
+Fortunately, this is debugging and not rocket surgery,
+so you still get full points if you stumble across the answer
+by guessing.
+</p>
+<p>
+I decided to start guessing by looking at what the
+<code>!alpc</code> command can tell me.
+</p>
+<pre>
+kd&gt; !alpc -?
+
+  !alpc /m MessageAddress
+    Dumps the message at the specified address.
+
+  !alpc /p PortAddress
+    Dumps the port at the specified address.
+</pre>
+<p>
+Well, I already saw what the result was for dumping the message,
+so I may as well dump the port.
+</p>
+<pre>
+kd&gt; !alpc /p 84646730
+
+...
+  8 thread(s) are registered with port IO completion object:
+    THREAD 84658d40  Cid 0804.0888  Teb: 7fa7e000 Win32Thread: 8214a748 WAIT
+    THREAD 8466a040  Cid 0804.08c4  Teb: 7fa74000 Win32Thread: 8214c800 WAIT
+    THREAD 84659a00  Cid 0804.08ec  Teb: 7fa72000 Win32Thread: 82158d08 WAIT
+    THREAD 8466c8c0  Cid 0804.08f0  Teb: 7fa6e000 Win32Thread: 82160420 WAIT
+    THREAD 84671040  Cid 0804.0910  Teb: 7fa68000 Win32Thread: 8217c4e8 WAIT
+    THREAD 8460d180  Cid 0804.099c  Teb: 7fa5e000 Win32Thread: 820bad08 WAIT
+    THREAD 834278c0  Cid 0804.0c80  Teb: 7fa6b000 Win32Thread: 820b9620 WAIT
+    THREAD 8345ad40  Cid 0804.0da0  Teb: 7fba9000 Win32Thread: 821c6d08 WAIT
+...
+</pre>
+<p>
+So it looks like there are eight threads signed up to process
+events on this port.
+(Is that what this means?
+I don't know, but I'm going to assume that it does,
+because this is debugging.
+Debugging is an exercise in optimism.)
+Let's see what they're doing.
+</p>
+<pre>
+kd&gt; .thread 84658d40;k
+Implicit thread is now 84658d40
+  *** Stack trace for last set context - .thread/.cxr resets it
+ChildEBP RetAddr
+940ef394 80f1505f nt!KiSwapContext+0x19
+940ef3d0 80f184e0 nt!KiSwapThread+0x34b
+940ef3fc 80f163fc nt!KiCommitThreadWait+0x26f
+940ef46c 80f4d2df nt!KeWaitForSingleObject+0x459
+940ef4b4 80e20838 nt!KiSchedulerApc+0x298
+940ef4c8 00000000 hal!KfLowerIrql+0x2c
+
+[the others look the same]
+</pre>
+<p>
+Well, I don't know what they're doing, but it looks like they're
+waiting for something.
+But one of the threads looks different:
+</p>
+<pre>
+kd&gt; .thread 84671040;k
+Implicit thread is now 84671040
+  *** Stack trace for last set context - .thread/.cxr resets it
+ChildEBP RetAddr
+9415f864 80f1505f nt!KiSwapContext+0x19
+9415f8a0 80f184e0 nt!KiSwapThread+0x34b
+9415f8cc 80eb3d6e nt!KiCommitThreadWait+0x26f
+9415f934 810c0527 nt!KeWaitForMultipleObjects+0x4e3
+9415fbe4 810c0703 nt!ObWaitForMultipleObjects+0x2fd
+9415fd38 80ef113c nt!NtWaitForMultipleObjects+0xca
+9415fd38 77945e04 nt!KiFastCallEntry+0x12c
+07e2f1c4 779437f6 ntdll!KiFastSystemCallRet
+07e2f1c8 7515c136 ntdll!NtWaitForMultipleObjects+0xa
+07e2f34c 77752658 KERNELBASE!WaitForMultipleObjectsEx+0xee
+07e2f368 777fbe60 KERNEL32!WaitForMultipleObjects+0x19
+07e2f3d4 777fc5de KERNEL32!WerpReportFaultInternal+0x1a3
+07e2f3e8 777df654 KERNEL32!WerpReportFault+0x6d
+07e2f3f4 751e517c KERNEL32!BasepReportFault+0x19
+07e2f490 77a0f95a KERNELBASE!UnhandledExceptionFilter+0x1e0
+07e2f4a0 77a0fd4d ntdll!TppExceptionFilter+0x1b
+07e2f4b4 77a1c66b ntdll!TppWorkerpInnerExceptionFilter+0x13
+07e2fb34 77753278 ntdll!TppWorkerThread+0xa6092
+07e2fb40 779761a6 KERNEL32!BaseThreadInitThunk+0xe
+07e2fb80 77976152 ntdll!__RtlUserThreadStart+0x4a
+07e2fb90 00000000 ntdll!_RtlUserThreadStart+0x1c
+</pre>
+<p>
+Ah, well that explains why Explorer isn't responding:
+It crashed on an unhandled exception!
+Windows Error Reporting is busy trying to generate a report.
+</p>
+<p>
+Now to see what the crash was.
+I don't know for sure, but I'm pretty confident that one
+of the parameters to
+<code>Basep&shy;Report&shy;Fault</code> is
+an <code>EXCEPTION_<wbr>POINTERS</code>.
+Why am I confident of that?
+Because it would be hard to report the fault without it!
+</p>
+<pre>
+kd&gt; dd 07e2f3f4 l4
+07e2f3f4  07e2f490 77a0f95a 07e2f4e8 00000001
+          ChildEBP RetAddr  Param1
+
+kd&gt; dd 07e2f4e8 l2
+07e2f4e8  07e2f620 07e2f63c 
+                 ^ ^
+   ExceptionRecord ContextRecord
+kd&gt; .cxr 0x07e2f63c
+eax=00000000 ebx=0451e2f8 ecx=e2af034f edx=77945e00 esi=00000000 edi=0451e2e0
+eip=1df7fc6a esp=07e2f920 ebp=07e2f938 iopl=0         nv up ei pl zr na pe nc
+cs=001b  ss=0023  ds=0023  es=0023  fs=003b  gs=0000             efl=00010246
+contoso!ContosoPower::Disconnect+0xdd:
+001b:1df7fc6a 8b08  mov ecx,dword ptr [eax] ds:0023:00000000=????????
+</pre>
+<p>
+Aha, Explorer crashed due to a null pointer crash in the
+<code>Contoso&shy;Power::<wbr>Disconnect</code>
+function.
+</p>
+<p>
+Passing the buck onward to Contoso,
+the report back was that this was a known issue,
+and a hotfix was available.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1039773">
+				<div id="div-comment-1039773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039773">
+			February 15, 2013 at 7:05 am</a>		</div>
+
+		<p>More often than not it seems the fault lies with Contoso; those guys suck!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1039783">
+				<div id="div-comment-1039783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039783">
+			February 15, 2013 at 7:45 am</a>		</div>
+
+		<p>So, was the original team related to Contoso?</p>
+<div class="post">[<em>Nope. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1039793">
+				<div id="div-comment-1039793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039793">
+			February 15, 2013 at 8:40 am</a>		</div>
+
+		<p>Nice. Ah yes the downside in allowing garbage into your memory space is you get the support requests for somebody else&#39;s garbage. Unfortunately the classical model of processes is the only model understood by managers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1039813">
+				<div id="div-comment-1039813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Douglas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039813">
+			February 15, 2013 at 9:32 am</a>		</div>
+
+		<p>&quot;Fortunately, this is debugging and not rocket surgery&quot;</p>
+<p>Does one require less knowledge and skill than the other?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1039823">
+				<div id="div-comment-1039823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039823">
+			February 15, 2013 at 9:37 am</a>		</div>
+
+		<p>So if they just waited a bit they&#39;d see the exception report with clear traces of Contoso?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1039833">
+				<div id="div-comment-1039833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdbsd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039833">
+			February 15, 2013 at 9:42 am</a>		</div>
+
+		<p>@John: Just look at their wiki page. Contoso Bank, Contoso Pharmaceuticals, Contoso University, Contoso News Agency, Software Developement. It&#39;s like they&#39;re some evil corporation taking over the world, but this can&#39;t be because they&#39;re just a fictional entity thought up by Microsoft, right? Ha-ha. Ha-ha, ha&#8230; Gotta lock my door.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1039843">
+				<div id="div-comment-1039843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kog999</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039843">
+			February 15, 2013 at 9:59 am</a>		</div>
+
+		<p>&quot;Fortunately, this is debugging and not rocket surgery&quot;</p>
+<p>&quot;Does one require less knowledge and skill than the other?&quot;</p>
+<p>not really about skill but if you mess up the rocket surgery the rocket could exploade costing millions of dollars and lives. If you messe up debugging you have to emm, try again.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1039853">
+				<div id="div-comment-1039853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039853">
+			February 15, 2013 at 4:22 pm</a>		</div>
+
+		<p>The big problem with rocket surgery is the malpractice insurance.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1039873">
+				<div id="div-comment-1039873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039873">
+			February 15, 2013 at 9:19 pm</a>		</div>
+
+		<p>It seems to me like this hang should be temporary. Shouldn&#39;t WEP generate the report and then &quot;unhang&quot;, somehow releasing the request made by the Y component, while simultaneously producing a report of the cause of the crash?</p>
+<p>Maybe the next question is &quot;Why did WEP hang?&quot;</p>
+<div class="post">[<em>The only way to &quot;unhang&quot; the process is to terminate it, at which point it&#39;s too late to generate the crash report. WER can&#39;t generate the report until the user gives permission, because generating the report includes transmitting information to Microsoft to ask, &quot;Hey, I hit this failure, do you want me to capture any data beyond the default crash dump?&quot; -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1039883">
+				<div id="div-comment-1039883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039883">
+			February 15, 2013 at 10:12 pm</a>		</div>
+
+		<p>@kog: &quot;if you mess up the rocket surgery the rocket could exploade costing millions of dollars and lives. If you messe up debugging you have to emm, try again.&quot;</p>
+<p>Unless you&#39;re debugging a rocket.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1039893">
+				<div id="div-comment-1039893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andreas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039893">
+			February 16, 2013 at 4:44 am</a>		</div>
+
+		<p>Debugging a rocket: <a rel="nofollow" target="_new" href="http://ti.arc.nasa.gov/m/pub-archive/176h/0176%20(Havelund).pdf" rel="nofollow">ti.arc.nasa.gov/&#8230;/0176%20(Havelund).pdf</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1039933">
+				<div id="div-comment-1039933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039933">
+			February 17, 2013 at 7:53 pm</a>		</div>
+
+		<p>[The only way to &quot;unhang&quot; the process is to terminate it, at which point it&#39;s too late to generate the crash report. WER can&#39;t generate the report until the user gives permission, because generating the report includes transmitting information to Microsoft to ask, &quot;Hey, I hit this failure, do you want me to capture any data beyond the default crash dump?&quot; -Raymond]</p>
+<p>Close all open handles. Anybody waiting for it gets WAIT_ABANDONED_*. Since they&#39;re external to the calling process, WAIT_ABANDONED_* should already be handled. I can&#39;t believe I had to write that.</p>
+<div class="post">[<em>Um, WAIT_ABANDONED is not a valid status code when waiting for a process handle. And you didn&#39;t clean up other externally-visible state, like window handles, or remove the process from the Process List (because some apps do FindProcessByName). And then you have the impossible situation of a process that still exists but is not present in the process list. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1039943">
+				<div id="div-comment-1039943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1039943">
+			February 18, 2013 at 6:03 am</a>		</div>
+
+		<p>@Joshua: Yanking a program&#39;s infrastructure out from under it is simply delaying when the program is going to crash and burn. See <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2005/09/12/463977.aspx" rel="nofollow">blogs.msdn.com/&#8230;/463977.aspx</a> for possible things that can happen when a program is presented with WAIT_ABANDONED; the answer to &quot;What can I do with invalid handles?&quot; is &quot;Not much.&quot;</p>
+<p>Terminating a hung process is probably better all around because you don&#39;t leave programs in unstable states where they think that everything&#39;s OK but in reality nothing is!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1040033">
+				<div id="div-comment-1040033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1040033">
+			February 18, 2013 at 9:06 am</a>		</div>
+
+		<p>Wow. Raymond got it ErikF didn&#39;t. My general idea is whatever handles that are being used for the LPC would be closed anyway when WER terminates the process so it could potentially close them now. I overlooked LPC by Windows messaging as opposed to kernel32 handles.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1040183">
+				<div id="div-comment-1040183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1040183">
+			February 18, 2013 at 8:41 pm</a>		</div>
+
+		<p>Microsoft is just an umbrella corporation for Contoso.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1040193">
+				<div id="div-comment-1040193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130215-00/?p=5233#comment-1040193">
+			February 18, 2013 at 9:21 pm</a>		</div>
+
+		<p>I had assumed that WER was going to silently create a small crash dump and then at some later point send it to MS, whereupon MS might say &quot;next time you hit this crash, capture additional information X&quot;.</p>
+<p>Regardless, it sounds like you&#39;re saying WER put up UI to ask if the user wants to give permission. Did the user who reported the issue not notice the UI, or did they ignore it because they didn&#39;t realize it had to do with their issue?</p>
+<div class="post">[<em>(It could have been done the way you suggested, but that means everybody has to hit the crash <span style="text-decoration:underline;">twice</span> before the information can be collected. And if the problem is sporadic, it may never get collected since it would require lightning to strike twice.) This happened in a lab, so there is nobody to look at the screen. The testing system reported &quot;test X is unresponsive&quot; and the developers connected to the machine and found this. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

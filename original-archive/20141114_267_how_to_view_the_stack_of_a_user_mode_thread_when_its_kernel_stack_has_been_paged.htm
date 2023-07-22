@@ -1,0 +1,670 @@
+<html>
+<head>
+<title>How to view the stack of a user-mode thread when its kernel stack has been paged out</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to view the stack of a user-mode thread when its kernel stack has been paged out</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 14, 2014 / year-entry #268</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141114-00/?p=43613</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Suppose you have a machine that has crashed, and your investigation shows that the reason is that there is a critical section that everybody is waiting for. While waiting for that critical section, work piles up, and eventually the machine keels over. Suppose further that this crash is given to you in the form of...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Suppose you have a machine that has crashed,
+and your investigation shows that the reason is that there
+is a critical section that everybody is waiting for.
+While waiting for that critical section, work piles up,
+and eventually the machine keels over.
+Suppose further that this crash is given to you in the form
+of a kernel debugger.
+</p>
+<p>
+In case it wasn't obvious, by "you"
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/02/11/10127845.aspx">
+I mean "me"</a>.
+</p>
+<p>
+Okay, so the critical section that is the cause of the logjam
+is this one:
+</p>
+<pre>
+1: kd&gt; !cs CONTOSO!g_csDataLock
+-----------------------------------------
+Critical section   = 0x00007ff7f0ed2f68 (CONTOSO!g_csDataLock+0x0)
+DebugInfo          = 0x0000000022f2efd0
+LOCKED
+LockCount          = 0x5D
+WaiterWoken        = No
+OwningThread       = 0x0000000000004228
+RecursionCount     = 0x1
+LockSemaphore      = 0x17A0
+SpinCount          = 0x00000000020007cb
+</pre>
+<p>
+"Great," you say.
+"I just need to look at thread 0x4228 to see why it is stuck.
+</p>
+<pre>
+1: kd&gt; !process -1 4
+PROCESS ffffe000047ae900
+    SessionId: 1  Cid: 0604    Peb: 7ff74ecfa000  ParentCid: 05cc
+    DirBase: 0eb07000  ObjectTable: ffffc000014c5680  HandleCount: 7003.
+    Image: contoso.exe
+
+        ...
+        THREAD ffffe0000c136080  Cid 0604.4228  Teb: 00007ff74e94c000 Win32Thread: fffff90144edea60 WAIT
+        ...
+</pre>
+<p>
+Woo-hoo, there's the thread.
+Now I just need to switch to its context to see what it is stuck on.
+</p>
+<pre>
+1: kd&gt; .thread ffffe0000c136080
+<a HREF="https://www.youtube.com/watch?v=1ytCEuuW2_A">Can't retrieve thread context</a>, Win32 error 0n30
+</pre>
+<p>
+Okay, that didn't work out too well.
+Now what?
+</p>
+<p>
+Even though the kernel stack is paged out,
+the user-mode stack may still be available.
+</p>
+<pre>
+1: kd&gt; !thread ffffe0000c136080
+THREAD ffffe0000c136080  Cid 0604.4228  Teb: <u>00007ff74e94c000</u>
+       Win32Thread: fffff90144edea60 WAIT: (UserRequest) UserMode Non-Alertable
+    ffffe000077a7830  NotificationEvent
+Not impersonating
+DeviceMap                 ffffc00000e89c80
+Owning Process            ffffe000047ae900       Image:         contoso.exe
+Attached Process          N/A            Image:         N/A
+Wait Start TickCount      12735890       Ticks: 328715 (0:01:25:36.171)
+Context Switch Count      75             IdealProcessor: 2
+UserTime                  00:00:00.000
+KernelTime                00:00:00.031
+Kernel stack not resident.
+</pre>
+<p>
+The limits of the user-mode stack are kept in the Teb.
+</p>
+<pre>
+2: kd&gt; !teb 00007ff74e94c000
+TEB at 00007ff74e94c000
+    ExceptionList:        0000000000000000
+    <u>StackBase:            00000001027d0000</u>
+    <u>StackLimit:           00000001027c2000</u>
+    SubSystemTib:         0000000000000000
+    FiberData:            0000000000001e00
+    ArbitraryUserPointer: 0000000000000000
+    Self:                 00007ff74e94c000
+    EnvironmentPointer:   0000000000000000
+    ClientId:             0000000000000604 . 0000000000004228
+    RpcHandle:            0000000000000000
+    Tls Storage:          000000010132dfc0
+    PEB Address:          00007ff74ecfa000
+    LastErrorValue:       1008
+    LastStatusValue:      c0000034
+    Count Owned Locks:    2
+    HardErrorMode:        0
+</pre>
+<p>
+We now use the trick we learned some time ago
+where we
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/05/17/10306078.aspx">
+grovel the stack of a thread without knowing where its stack pointer is</a>.
+</p>
+<p>
+In this case,
+the groveling is made easier because we already know that
+everybody is waiting on the data lock.
+The data lock is taken in only two functions,
+so it's a matter ot looking for
+any occurrences of one of those two functions.
+And here it is:
+<code>Data&shy;Wrapper::<wbr>Verify&shy;Data</code>.
+</p>
+<pre>
+00000001`027cef88  00007ffe`f1bbac9a NTDLL!NtWaitForSingleObject+0xa
+00000001`027cef90  00000000`00006ac8
+00000001`027cef98  00007ffe`ef1bd085 KERNELBASE!WaitForSingleObjectEx+0xa5
+00000001`027cefa0  00000000`00006ac8
+00000001`027cefa8  00000000`00000000
+00000001`027cefb0  00000000`026d0000
+00000001`027cefb8  00000000`00000000
+00000001`027cefc0  00000001`01739ee0
+00000001`027cefc8  00000000`00000001
+00000001`027cefd0  00000000`00000048
+00000001`027cefd8  00000001`00000001
+00000001`027cefe0  00000000`00000000
+00000001`027cefe8  00000000`00000000
+00000001`027ceff0  00000000`00000000
+00000001`027ceff8  00000000`00000000
+00000001`027cf000  00000000`00000000
+00000001`027cf008  00000000`00000000
+00000001`027cf010  00000000`00000000
+00000001`027cf018  00007ff7`eefe6540 FABRIKAM!Lock::IsInitialized+0xfc
+00000001`027cf020  00000000`00000000
+00000001`027cf028  00000000`3b803fa0
+00000001`027cf030  00000000`00006ac8
+00000001`027cf038  00007ff7`eeff3c43 FABRIKAM!AccessRequest::WaitTimeout+0x87
+00000001`027cf040  00000000`ffffffff
+00000001`027cf048  10f513ec`6a161fb8
+00000001`027cf050  00000000`00000000
+00000001`027cf058  00000000`00006ac8
+00000001`027cf060  00000000`3b803fb8
+00000001`027cf068  00007ff7`eeff3cc0 FABRIKAM!AccessRequest::Wait+0x18
+00000001`027cf070  00000000`8007000e
+00000001`027cf078  00000000`fd416ff0
+00000001`027cf080  4fe80c4a`51236583
+00000001`027cf088  00000000`3b803fb8
+00000001`027cf090  00000000`ffffffff
+00000001`027cf098  00000000`00000000
+00000001`027cf0a0  00000000`3b803fa0
+00000001`027cf0a8  00007ff7`da8375b7 FABRIKAM!DataAccess::RequestAccess+0x93
+00000001`027cf0b0  00000000`3b803fa0
+00000001`027cf0b8  00000000`3b803fb8
+00000001`027cf0c0  4fe80c4a`51236583
+00000001`027cf0c8  10f513ec`6a161fb8
+00000001`027cf0d0  00000000`00000076
+00000001`027cf0d8  00007ff7`f07a8619 CONTOSO!Widget::SetColor+0x9
+00000001`027cf0e0  000095dc`90897985
+00000001`027cf0e8  00000000`00000110
+00000001`027cf0f0  00000000`00000000
+00000001`027cf0f8  00000000`00000000
+00000001`027cf100  00007ff7`4dd8000c
+00000001`027cf108  00007ff7`f07a85e5 CONTOSO!Widget::UpdateColor+0x39
+00000001`027cf110  00000000`ffc03f90
+00000001`027cf118  00000001`027cf1e8
+00000001`027cf120  00000000`ffc03fc8
+00000001`027cf128  00000000`00000000
+00000001`027cf130  00000000`00000000
+00000001`027cf138  00007ff7`4dd8000c
+00000001`027cf140  00007ff7`da5bc420 FABRIKAM!DataAccess::`vftable'+0x18
+00000001`027cf148  00000000`ffc03f90
+00000001`027cf150  00000001`027cf260
+00000001`027cf158  00007ff7`f0b3459c CONTOSO!DataWrapper::VerifyData+0x428
+00000001`027cf160  00000000`3b803fa0
+00000001`027cf168  00007ff7`f0ed1d30 CONTOSO!g_DataManager
+00000001`027cf170  00000000`fe196f10
+00000001`027cf188  00000000`00000001
+00000001`027cf190  00000000`00000000
+00000001`027cf198  00000001`027cf270
+00000001`027cf1a0  00000001`027cf480
+00000001`027cf1a8  00007ff7`00000001
+00000001`027cf1b0  00000001`027cf220 
+00000001`027cf1b8  00000000`00000000 
+00000001`027cf1c0  00000000`00000000 
+</pre>
+<p>
+I left the red herrings in place just to make things a little
+more interesting.
+</p>
+<p>
+The <code>Data&shy;Wrapper::<wbr>Verify&shy;Data</code> method
+enters the critical section and then calls
+<code>Data&shy;Access::<wbr>Request&shy;Access</code>
+via a virtual method call:
+</p>
+<pre>
+00007ff7`f0b3458f mov     dword ptr [rsp+28h],eax
+00007ff7`f0b34593 mov     eax,dword ptr [rsi+10h]
+00007ff7`f0b34596 mov     dword ptr [rsp+20h],eax
+00007ff7`f0b3459a call    qword ptr [rdi] &larr;
+</pre>
+<p>
+Let's disassemble the start of
+<code>Data&shy;Access::<wbr>Request&shy;Access</code>
+to see how it sets up its stack.
+This will help us interpret the other values in the stack dump.
+</p>
+<pre>
+0: kd> u 00007ff7`da8375b7-93
+FABRIKAM!DataAccess::RequestAccess
+;; function prologue
+00007ff7`da837524 mov     rax,rsp
+00007ff7`da837527 mov     qword ptr [rax+8],rbx
+00007ff7`da83752b mov     qword ptr [rax+20h],r9
+00007ff7`da83752f mov     qword ptr [rax+18h],r8
+00007ff7`da837533 mov     qword ptr [rax+10h],rdx
+00007ff7`da837537 push    rbp
+00007ff7`da837538 push    rsi
+00007ff7`da837539 push    rdi
+00007ff7`da83753a push    r12
+00007ff7`da83753c push    r13
+00007ff7`da83753e push    r14
+00007ff7`da837540 push    r15
+00007ff7`da837542 sub     rsp,70h
+;; function body
+00007ff7`da837546 lea     rsi,[rcx+18h]
+00007ff7`da83754a mov     rdi,rcx
+00007ff7`da83754d mov     rbp,r9
+00007ff7`da837550 mov     rcx,rsi
+00007ff7`da837553 call    qword ptr [FABRIKAM!_imp_EnterCriticalSection]
+00007ff7`da837559 xor     r13b,r13b
+00007ff7`da83755c mov     ebx,8007000Eh
+...
+00007ffe`da8375b1 call    FABRIKAM!AccessRequest::Wait
+</pre>
+<p>
+We can replay the above code in our head and annotate the stack
+trace accordingly.
+On entry to the function, the stack pointer is
+<code>00000001`027cf158</code> (the return address).
+The function stashes some registers in the caller-provided spill area
+and it pushes others onto the stack,
+and then it subtracts some space for local variables
+as well as for outbound parameters of functions it intends to call.
+</p>
+<pre>
+/-00000001`027cf0b0  00000000`3b803fa0
+| 00000001`027cf0b8  00000000`3b803fb8
+| 00000001`027cf0c0  4fe80c4a`51236583
+| 00000001`027cf0c8  10f513ec`6a161fb8
+| 00000001`027cf0d0  00000000`00000076
+| 00000001`027cf0d8  00007ff7`f07a8619 CONTOSO!Widget::SetColor+0x9
+| 00000001`027cf0e0  000095dc`90897985
+| 00000001`027cf0e8  00000000`00000110
+| 00000001`027cf0f0  00000000`00000000
+| 00000001`027cf0f8  00000000`00000000
+| 00000001`027cf100  00007ff7`4dd8000c
+| 00000001`027cf108  00007ff7`f07a85e5 CONTOSO!Widget::UpdateColor+0x39
+| 00000001`027cf110  00000000`ffc03f90
+\-00000001`027cf118  00000001`027cf1e8
+  00000001`027cf120  00000000`ffc03fc8 <font COLOR=blue>// VerifyData's r15</font>
+  00000001`027cf128  00000000`00000000 <font COLOR=blue>// VerifyData's r14</font>
+  00000001`027cf130  00000000`00000000 <font COLOR=blue>// VerifyData's r13</font>
+  00000001`027cf138  00007ff7`4dd8000c <font COLOR=blue>// VerifyData's r12</font>
+  00000001`027cf140  00007ff7`da5bc420 FABRIKAM!DataAccess::`vftable'+0x18 <font COLOR=blue>// VerifyData's rdi</font>
+  00000001`027cf148  00000000`ffc03f90 <font COLOR=blue>// VerifyData's rsi</font>
+  00000001`027cf150  00000001`027cf260 <font COLOR=blue>// VerifyData's rbp</font>
+  00000001`027cf158  00007ff7`f0b3459c CONTOSO!DataWrapper::VerifyData+0x428 <font COLOR=blue>&larr; ESP is here</font>
+  00000001`027cf160  00000000`3b803fa0 <font COLOR=blue>// VerifyData's rbx</font>
+  00000001`027cf168  00007ff7`f0ed1d30 CONTOSO!g_DataManager <font COLOR=blue>// VerifyData's rdx</font>
+  00000001`027cf170  00000000`fe196f10 <font COLOR=blue>// VerifyData's r8</font>
+  00000001`027cf188  00000000`00000001 <font COLOR=blue>// VerifyData's r9</font>
+  00000001`027cf190  00000000`00000000
+  00000001`027cf198  00000001`027cf270
+  00000001`027cf1a0  00000001`027cf480
+  00000001`027cf1a8  00007ff7`00000001
+  00000001`027cf1b0  00000001`027cf220 
+  00000001`027cf1b8  00000000`00000000 
+  00000001`027cf1c0  00000000`00000000 
+</pre>
+<p>
+The region marked in brackets is the 0x70 bytes of space for local variables
+and outbound parameters.
+Notice that some red herring function pointers are in that space.
+Those are probably variables that haven't been initialized yet,
+and the memory happened previously to have been used to hold some
+return addresses.
+</p>
+<p>
+A reassuring observation is that the <code>rdx</code>
+coming from <code>Verify&shy;Data</code> is the address of
+<code>CONTOSO!<wbr>g_Data&shy;Manager</code>.
+That is the second function parameter (or first, if you aren't
+counting the hidden <code>this</code>)
+to <code>Request&shy;Access</code>.
+</p>
+<p>
+Another reassuring observation is that
+that <code>Verify&shy;Data</code>'s 
+<code>rdi</code> points into the vtable for <code>Data&shy;Access</code>,
+since that matches the code we saw at the call point:
+<code>call qword ptr [rdi]</code>.
+</p>
+<p>
+The <code>mov rdi, rcx</code> instruction in the function body
+tells us that the function
+stashed its <code>this</code> pointer in <code>rdi</code>.
+That's good info to keep track of,
+because that will let us look at the <code>Data&shy;Access</code> object
+once we figure out what is in <code>rdi</code>.
+</p>
+<p>
+The next function on the stack is
+<code>Access&shy;Request::<wbr>Wait</code>.
+</p>
+<pre>
+FABRIKAM!AccessRequest::Wait:
+00007ff7`eeff3ca8 sub     rsp,38h
+00007ffe`eeff3cb3 mov     dword ptr [rsp+20h],0FFFFFFFFh
+00007ffe`eeff3cbb call    FABRIKAM!AccessRequest::WaitTimeout
+00007ffe`eeff3cc0 add     rsp,38h
+00007ffe`eeff3cc4 ret
+</pre>
+<p>
+This function doesn't bother saving any registers;
+it just reserves space for local variables and outbound parameters.
+From inspection, you can see that this is a simple wrapper
+that passes all its parameters onward to
+<code>Wait&shy;Timeout</code>,
+with an <code>INFINITE</code> tacked onto the end,
+so this function has no local variables at all.
+Everything is just for outbound parameters.
+</p>
+<p>
+We can annotate some more entries in our stack trace.
+</p>
+<pre>
+00000001`027cf070  00000000`8007000e <font COLOR=blue>// spill space for WaitTimeout</font>
+00000001`027cf078  00000000`fd416ff0 <font COLOR=blue>// spill space for WaitTimeout</font>
+00000001`027cf080  4fe80c4a`51236583 <font COLOR=blue>// spill space for WaitTimeout</font>
+00000001`027cf088  00000000`3b803fb8 <font COLOR=blue>// spill space for WaitTimeout</font>
+00000001`027cf090  00000000`ffffffff <font COLOR=blue>// INFINITE parameter</font>
+00000001`027cf098  00000000`00000000 <font COLOR=blue>// unused</font>
+00000001`027cf0a0  00000000`3b803fa0 <font COLOR=blue>// unused</font>
+00000001`027cf0a8  00007ff7`da8375b7 FABRIKAM!DataAccess::RequestAccess+0x93
+</pre>
+<p>
+The next function on the list is
+<code>Access&shy;Request::Wait&shy;Timeout</code>.
+</p>
+<pre>
+FABRIKAM!AccessRequest::WaitTimeout:
+00007ff7`eeff3bbc mov     qword ptr [rsp+8],rbx
+00007ff7`eeff3bc1 mov     qword ptr [rsp+10h],rbp
+00007ff7`eeff3bc6 push    rsi
+00007ff7`eeff3bc7 sub     rsp,20h
+00007ff7`eeff3bcb mov     ebx,edx
+00007ff7`eeff3bcd mov     rsi,rcx
+00007ff7`eeff3bd0 mov     edx,0Bh
+00007ff7`eeff3bd5 mov     rcx,r8
+</pre>
+<p>
+This function stashes two registers in the parameter spill space,
+pushes one onto the stack,
+and reserves another 0x20 bytes for local use (outbound parameters).
+</p>
+<pre>
+00000001`027cf040  00000000`ffffffff <font COLOR=blue>// spill space for WaitForSingleObjectEx</font>
+00000001`027cf048  10f513ec`6a161fb8 <font COLOR=blue>// spill space for WaitForSingleObjectEx</font>
+00000001`027cf050  00000000`00000000 <font COLOR=blue>// spill space for WaitForSingleObjectEx</font>
+00000001`027cf058  00000000`00006ac8 <font COLOR=blue>// spill space for WaitForSingleObjectEx</font>
+00000001`027cf060  00000000`3b803fb8 <font COLOR=blue>// Wait's rsi</font>
+00000001`027cf068  00007ff7`eeff3cc0 FABRIKAM!AccessRequest::Wait+0x18
+00000001`027cf070  00000000`8007000e <font COLOR=blue>// Wait's rbx</font>
+00000001`027cf078  00000000`fd416ff0
+00000001`027cf080  4fe80c4a`51236583
+00000001`027cf088  00000000`3b803fb8
+</pre>
+<p>
+Notice that the stashed <code>rbx</code> value is <code>8007000E</code>,
+which conveniently lines up with the
+<code>mov ebx,8007000Eh</code>
+instruction in
+<code>Data&shy;Access::<wbr>Request&shy;Access</code>.
+That's a bit reassuring, since it's another sign that we're
+on the right track.
+</p>
+<p>
+Next up is
+<code>Wait&shy;For&shy;Single&shy;Object&shy;Ex</code>.
+</p>
+<pre>
+0: kd&gt; u 00007ffe`ef1bd085 -a5
+KERNELBASE!WaitForSingleObjectEx
+00007ffe`ef1bcfe0 mov     r11,rsp
+00007ffe`ef1bcfe3 mov     qword ptr [r11+8],rbx
+00007ffe`ef1bcfe7 mov     dword ptr [r11+18h],r8d
+00007ffe`ef1bcfeb push    rsi
+00007ffe`ef1bcfec push    rdi
+00007ffe`ef1bcfed push    r14
+00007ffe`ef1bcfef sub     rsp,80h
+00007ffe`ef1bcff6 mov     ebx,r8d
+</pre>
+<p>
+Incorporating this prologue into our stack annotation yields
+</p>
+<pre>
+/-00000001`027cefa0  00000000`00006ac8 <font COLOR=blue>// spill space for NtWaitForSingleObject</font>
+| 00000001`027cefa8  00000000`00000000 <font COLOR=blue>// spill space for NtWaitForSingleObject</font>
+| 00000001`027cefb0  00000000`026d0000 <font COLOR=blue>// spill space for NtWaitForSingleObject</font>
+| 00000001`027cefb8  00000000`00000000 <font COLOR=blue>// spill space for NtWaitForSingleObject</font>
+| 00000001`027cefc0  00000001`01739ee0
+| 00000001`027cefc8  00000000`00000001
+| 00000001`027cefd0  00000000`00000048
+| 00000001`027cefd8  00000001`00000001
+| 00000001`027cefe0  00000000`00000000
+| 00000001`027cefe8  00000000`00000000
+| 00000001`027ceff0  00000000`00000000
+| 00000001`027ceff8  00000000`00000000
+| 00000001`027cf000  00000000`00000000
+| 00000001`027cf008  00000000`00000000
+| 00000001`027cf010  00000000`00000000
+\-00000001`027cf018  00007ff7`eefe6540 FABRIKAM!Lock::IsInitialized+0xfc
+  00000001`027cf020  00000000`00000000 <font COLOR=blue>// WaitTimeout's r14</font>
+  00000001`027cf028  00000000`3b803fa0 <font COLOR=blue>// WaitTimeout's rdi</font>
+  00000001`027cf030  00000000`00006ac8 <font COLOR=blue>// WaitTimeout's rsi</font>
+  00000001`027cf038  00007ff7`eeff3c43 FABRIKAM!AccessRequest::WaitTimeout+0x87
+  00000001`027cf040  00000000`ffffffff <font COLOR=blue>// WaitTimeout's rbx</font>
+  00000001`027cf048  10f513ec`6a161fb8
+  00000001`027cf050  00000000`00000000 <font COLOR=blue>// WaitTimeout's r8</font>
+  00000001`027cf058  00000000`00006ac8
+</pre>
+<p>
+Ooh, another red herring function pointer got caught in the local
+variables.
+</p>
+<p>
+Putting everything together results in the following annotated stack,
+with red herrings removed.
+</p>
+<pre>
+00000001`027cef88  00007ffe`f1bbac9a NTDLL!NtWaitForSingleObject+0xa
+00000001`027cef90  00000000`00006ac8
+00000001`027cef98  00007ffe`ef1bd085 KERNELBASE!WaitForSingleObjectEx+0xa5
+00000001`027cefa0  00000000`00006ac8
+00000001`027cefa8  00000000`00000000
+00000001`027cefb0  00000000`026d0000
+00000001`027cefb8  00000000`00000000
+00000001`027cefc0  00000001`01739ee0
+00000001`027cefc8  00000000`00000001
+00000001`027cefd0  00000000`00000048
+00000001`027cefd8  00000001`00000001
+00000001`027cefe0  00000000`00000000
+00000001`027cefe8  00000000`00000000
+00000001`027ceff0  00000000`00000000
+00000001`027ceff8  00000000`00000000
+00000001`027cf000  00000000`00000000
+00000001`027cf008  00000000`00000000
+00000001`027cf010  00000000`00000000
+00000001`027cf018  00007ff7`eefe6540
+00000001`027cf020  00000000`00000000 <font COLOR=blue>// WaitTimeout's r14</font>
+00000001`027cf028  00000000`3b803fa0 <font COLOR=blue>// WaitTimeout's rdi</font>
+00000001`027cf030  00000000`00006ac8 <font COLOR=blue>// WaitTimeout's rsi</font>
+00000001`027cf038  00007ff7`eeff3c43 FABRIKAM!AccessRequest::WaitTimeout+0x87
+00000001`027cf040  00000000`ffffffff <font COLOR=blue>// WaitTimeout's rbx</font>
+00000001`027cf048  10f513ec`6a161fb8
+00000001`027cf050  00000000`00000000 <font COLOR=blue>// WaitTimeout's r8</font>
+00000001`027cf058  00000000`00006ac8
+00000001`027cf060  00000000`3b803fb8 <font COLOR=blue>// Wait's rsi</font>
+00000001`027cf068  00007ff7`eeff3cc0 FABRIKAM!AccessRequest::Wait+0x18
+00000001`027cf070  00000000`8007000e <font COLOR=blue>// Wait's rbx</font>
+00000001`027cf078  00000000`fd416ff0
+00000001`027cf080  4fe80c4a`51236583
+00000001`027cf088  00000000`3b803fb8
+00000001`027cf090  00000000`ffffffff <font COLOR=blue>// INFINITE parameter</font>
+00000001`027cf098  00000000`00000000
+00000001`027cf0a0  00000000`3b803fa0
+00000001`027cf0a8  00007ff7`da8375b7 FABRIKAM!DataAccess::RequestAccess+0x93
+00000001`027cf0b0  00000000`3b803fa0
+00000001`027cf0b8  00000000`3b803fb8
+00000001`027cf0c0  4fe80c4a`51236583
+00000001`027cf0c8  10f513ec`6a161fb8
+00000001`027cf0d0  00000000`00000076
+00000001`027cf0d8  00007ff7`f07a8619
+00000001`027cf0e0  000095dc`90897985
+00000001`027cf0e8  00000000`00000110
+00000001`027cf0f0  00000000`00000000
+00000001`027cf0f8  00000000`00000000
+00000001`027cf100  00007ff7`4dd8000c
+00000001`027cf108  00007ff7`f07a85e5
+00000001`027cf110  00000000`ffc03f90
+00000001`027cf118  00000001`027cf1e8
+00000001`027cf120  00000000`ffc03fc8 <font COLOR=blue>// VerifyData's r15</font>
+00000001`027cf128  00000000`00000000 <font COLOR=blue>// VerifyData's r14</font>
+00000001`027cf130  00000000`00000000 <font COLOR=blue>// VerifyData's r13</font>
+00000001`027cf138  00007ff7`4dd8000c <font COLOR=blue>// VerifyData's r12</font>
+00000001`027cf140  00007ff7`da5bc420 FABRIKAM!DataAccess::`vftable'+0x18 <font COLOR=blue>// VerifyData's rdi</font>
+00000001`027cf148  00000000`ffc03f90 <font COLOR=blue>// VerifyData's rsi</font>
+00000001`027cf150  00000001`027cf260 <font COLOR=blue>// VerifyData's rbp</font>
+00000001`027cf158  00007ff7`f0b3459c CONTOSO!DataWrapper::VerifyData+0x428
+00000001`027cf160  00000000`3b803fa0 <font COLOR=blue>// VerifyData's rbx</font>
+00000001`027cf168  00007ff7`f0ed1d30 CONTOSO!g_DataManager <font COLOR=blue>// VerifyData's rdx</font>
+00000001`027cf170  00000000`fe196f10 <font COLOR=blue>// VerifyData's r8</font>
+00000001`027cf188  00000000`00000001 <font COLOR=blue>// VerifyData's r9</font>
+00000001`027cf190  00000000`00000000
+00000001`027cf198  00000001`027cf270
+00000001`027cf1a0  00000001`027cf480
+00000001`027cf1a8  00007ff7`00000001
+00000001`027cf1b0  00000001`027cf220 
+00000001`027cf1b8  00000000`00000000 
+00000001`027cf1c0  00000000`00000000 
+</pre>
+<p>
+From this, we can also suck out the
+<code>this</code> pointer passed to
+<code>Data&shy;Access::<wbr>Request&shy;Access</code>.
+We saw that it was stashed in <code>rdi</code>.
+The <code>Wait</code> function doesn't use <code>rdi</code>
+(because if it did, it would have saved the old value),
+so its <code>rdi</code> is the same as
+<code>Request&shy;Access</code>'s <code>rdi</code>.
+Similarly, the
+<code>Wait&shy;Timeout</code> function does not use <code>rdi</code>.
+Therefore, when
+<code>Wait&shy;For&shy;Single&shy;Object</code> saves the
+<code>rdi</code> register,
+it is saving the value from
+<code>Data&shy;Access::<wbr>Request&shy;Access</code>.
+</p>
+<pre>
+00000001`027cf028  00000000`3b803fa0 <font COLOR=blue>// <strike>WaitTimeout</strike> DataAccess's rdi</font>
+</pre>
+<p>
+And that is the <code>this</code> pointer that lets us
+study the
+<code>Data&shy;Access</code> object to figure out why
+its access request is not completing.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-jader3rd even thread-even depth-1" id="comment-1162083">
+				<div id="div-comment-1162083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/jader3rd' rel='external nofollow' class='url'>jader3rd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141114-00/?p=43613#comment-1162083">
+			November 14, 2014 at 7:38 am</a>		</div>
+
+		<p>I was able to follow most of that, except for the second step of getting the thread id from &quot;!process -1 4&quot;. I could have stared at the output of that all day long and never have gotten the thread id out of it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1162103">
+				<div id="div-comment-1162103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141114-00/?p=43613#comment-1162103">
+			November 14, 2014 at 9:39 am</a>		</div>
+
+		<p>I&#39;m impressed by the effort it surely took to put this article together. &nbsp;Thanks, Raymond.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1162173">
+				<div id="div-comment-1162173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Azarien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141114-00/?p=43613#comment-1162173">
+			November 15, 2014 at 2:22 am</a>		</div>
+
+		<p>x64 calling convention seems to waste a lot of stack space. Whose idea was that? ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163043">
+				<div id="div-comment-1163043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141114-00/?p=43613#comment-1163043">
+			November 20, 2014 at 11:09 am</a>		</div>
+
+		<p>Nice tutorial. &nbsp;It&#39;s rare to get this kind of information except by slogging through the experience yourself.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

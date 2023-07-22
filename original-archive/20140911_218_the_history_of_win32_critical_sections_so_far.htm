@@ -1,0 +1,558 @@
+<html>
+<head>
+<title>The history of Win32 critical sections so far</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The history of Win32 critical sections so far</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 11, 2014 / year-entry #219</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The CRITICAL_SECTION structure has gone through a lot of changes since its introduction back oh so many decades ago. The amazing thing is that as long as you stick to the documented API, your code is completely unaffected. Initially, the critical section object had an owner field to keep track of which thread entered the...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The <code>CRITICAL_<wbr>SECTION</code> structure has gone through
+a lot of changes since its introduction back oh so many decades ago.
+The amazing thing is that as long as you stick to the documented API,
+your code is completely unaffected.
+</p>
+<p>
+Initially, the critical section object had an owner field
+to keep track of which thread entered the critical section, if any.
+It also had
+a lock count to keep track of how many times the owner thread
+entered the critical section, so that the critical section would
+be released when the matching number of
+<code>Leave&shy;Critical&shy;Section</code> calls was made.
+And there was an auto-reset event used to manage contention.
+We'll look more at that event later.
+(It's actually more complicated than this, but the details
+aren't important.)
+</p>
+<p>
+If you've ever looked at the innards of a critical section
+(for entertainment purposes only),
+you may have noticed that the lock count was off by one:
+The lock count was the number of active calls to
+<code>Enter&shy;Critical&shy;Section</code> <i>minus one</i>.
+The bias was needed because the original version of the
+interlocked increment and decrement operations
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/05/06/127141.aspx">
+returned only the sign of the result, not the revised value</a>.
+Biasing the result by 1 means that all three states could be detected:
+Unlocked (negative), locked exactly once (zero), reentrant lock (positive).
+(It's actually more complicated than this, but the details
+aren't important.)
+</p>
+<p>
+If a thread tries to enter a critical section but can't
+because the critical section is owned by another thread,
+then it sits and waits on the contention event.
+When the owning thread releases all its claims on the critical section,
+it signals the event to say,
+"Okay, the door is unlocked.
+The next guy can come in."
+</p>
+<p>
+The contention event is allocated only when contention occurs.
+(This is what older versions of MSDN meant when they said that
+the event is "allocated on demand.")
+Which leads to a nasty problem:
+What if contention occurs,
+but the attempt to create the contention event fails?
+Originally,
+the answer was "The kernel raises an out-of-memory exception."
+</p>
+<p>
+Now you'd think that a clever program could catch this exception
+and try to recover from it, say, by unwinding everything that led
+up to the exception.
+Unfortunately, the weakest link in the chain is the critical section
+object itself:
+In the original version of the code,
+the out-of-memory exception was raised while the critical section was
+in an unstable state.
+Even if you managed to catch the exception and unwind everything you could,
+the critical section was itself irretrievably corrupted.
+</p>
+<p>
+Another problem with the original design became apparent on multiprocessor
+systems: If a critical section was typically held for a very brief time,
+then by the time you called into kernel to wait on the contention event,
+the critical section was already freed!
+</p>
+<pre>
+void SetGuid(REFGUID guid)
+{
+ EnterCriticalSection(&amp;g_csGuidUpdate);
+ g_theGuid = guid;
+ LeaveCriticalSection(&amp;g_csGuidUpdate);
+}
+
+void GetGuid(GUID *pguid)
+{
+ EnterCriticalSection(&amp;g_csGuidUpdate);
+ *pguid = g_theGuid;
+ LeaveCriticalSection(&amp;g_csGuidUpdate);
+}
+</pre>
+<p>
+This imaginary code uses a critical section to protect accesses
+to a GUID.
+The actual protected region is just nine instructions long.
+Setting up to wait on a kernel object is way,
+way more than nine instructions.
+If the second thread immediately waited on the critical section
+contention event,
+it would find that by the time the kernel got around to entering
+the wait state, the event would say,
+"Dude, what took you so long? I was signaleded, like, a bazillion
+cycles ago!"
+</p>
+<p>
+Windows&nbsp;2000 added the
+<code>Initialize&shy;Critical&shy;Section&shy;And&shy;Spin&shy;Count</code>
+function,
+which lets you avoid the problem where waiting for a critical section
+costs more than the code the critical section was protecting.
+If you initialize with a spin count, then when a thread tries to
+enter the critical section and can't,
+it goes into a loop trying to enter it over and over again,
+in the hopes that it will be released.
+</p>
+<p>
+"Are we there yet?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?
+How about now?"
+</p>
+<p>
+If the critical section is not released after the requested number
+of iterations,
+then the old slow wait code is executed.
+</p>
+<p>
+Note that spinning on a critical section is helpful only on
+multiprocessor systems,
+and only in the case where you know that all the protected code
+segments are very short in duration.
+If the critical section is held for a long time,
+then spinning is wasteful since the odds that the critical section
+will become free during the
+<a HREF="https://www.youtube.com/watch?v=czTw2dS5dtE">
+spin cycle</a>
+are very low,
+and you wasted a bunch of CPU.
+</p>
+<p>
+Another feature added in Windows&nbsp;2000 is the ability to
+preallocate the contention event.
+This avoids the dreaded
+"out of memory" exception in
+<code>Enter&shy;Critical&shy;Section</code>,
+but at a cost of a kernel event for every critical section,
+whether actual contention occurs or not.
+</p>
+<p>
+Windows&nbsp;XP solved the problem of the dreaded "out of memory"
+exception by using a fallback algorithm that could be used
+if the contention event could not be allocated.
+The fallback algorithm is not as efficient, but at least
+it avoids the "out of memory" situation.
+(Which is a good thing, because nobody really expects
+<code>Enter&shy;Critical&shy;Section</code> to fail.)
+This also means that requests for the contention event to be preallocated
+are now ignored, since the reason for preallocating
+(avoiding the "out of memory" exception) no longer exists.
+</p>
+<p>
+(And while they were there, the kernel folks also fixed
+<code>Initialize&shy;Critical&shy;Section</code> so that
+a failed initialization left the critical section object in
+a stable state so you could safely try again later.)
+</p>
+<p>
+In Windows Vista, the internals of the critical section object
+were rejiggered once again,
+this time to add convoy resistance.
+<a HREF="http://msdn.microsoft.com/en-us/library/windows/hardware/ff541979(v=vs.85).aspx">
+The internal bookkeeping completely changed</a>;
+the lock count is no longer a 1-biased count of the number of
+<code>Enter&shy;Critical&shy;Section</code> calls which are pending.
+As a special concession to backward compatibility with people
+who violated the API contract and
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/07/12/10433554.aspx#10435411">
+looked directly at the internal data structures</a>,
+the new algorithm goes to some extra effort to ensure that
+if a program breaks the rules and
+looks at a specific offset inside the critical section
+object,
+the value stored there is &minus;1 if and only if the critical section
+is unlocked.
+</p>
+<p>
+Often, people will remark that "your compatibility problems would go
+away if you just open-sourced the operating system."
+I think there is some confusion over what "go away" means.
+If you release the source code to the operating system,
+it makes it even <i>easier</i> for people to take undocumented
+dependencies on it,
+because they no longer have the barrier of "Well, I can't find any
+documentation, so maybe it's not documented."
+They can just read the source code and say,
+"Oh, I see that if the critical section is unlocked,
+the <code>Lock&shy;Count</code> variable has the value &minus;1."
+Boom, instant undocumented dependency.
+Compatibility is screwed.
+(Unless what people are saying "your compatibility problems would
+go away if you just open-sourced <i>all applications</i>,
+so that these problems can be identified and fixed as soon as they
+are discovered.")
+</p>
+<p>
+<b>Exercise</b>:
+Why isn't it important that the fallback algorithm be highly efficient?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1150103">
+				<div id="div-comment-1150103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Bonner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150103">
+			September 11, 2014 at 7:49 am</a>		</div>
+
+		<p>Because, to a first approximation, it is never called.</p>
+<p>Also, if you can&#39;t allocate an auto-reset event, your system is very, very, overloaded &#8211; you just need to survive until the overload goes away.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1150133">
+				<div id="div-comment-1150133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">VinDuv</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150133">
+			September 11, 2014 at 7:55 am</a>		</div>
+
+		<p>“Exercise: Why isn&#39;t it important that the fallback algorithm be highly efficient? ”</p>
+<p>An Out-of-memory situation is not supposed to occur frequently, so it makes no sense to optimize for it. Anyway, the program will probably not continue running for long if it’s getting out-of-memory errors.</p>
+<p>I was wondering how the contention event is created. What if two threads try to enter a locked critical section with no contention event?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1150153">
+				<div id="div-comment-1150153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150153">
+			September 11, 2014 at 8:06 am</a>		</div>
+
+		<p>&gt;What if two threads try to enter a locked critical section with no contention event?</p>
+<p>I expect both will create an event, then use InterlockedCompareExchangePointer to set it, and one of the events will be freed.</p>
+<p>But the whole lazy allocation sceme so reeks of NT 3.1 era. If the kernel is so out of nonpaged memory that it cannot allocate about 128 bytes, them it will not even be able to run any I/O (including paging), because typical IRP, MDL and SRB will require allocations of similar size. The kernel is pretty much constipated at that point and the application will simply fail one by one, even if they don&#39;t use CRITICAL_SECTION.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1150203">
+				<div id="div-comment-1150203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150203">
+			September 11, 2014 at 8:55 am</a>		</div>
+
+		<p>Very interesting stuff! Thanks Raymond.</p>
+<p>I like reading about kernel changes in Windows. Channel9 had some good videos about this topic years ago, as well as TechNet magazine, some MSFT blogs and the Windows Internals book. These days I can&#39;t seem to find descriptions of kernel improvements anymore. Can anyone recommend some resources covering Windows 8/8.1?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1150233">
+				<div id="div-comment-1150233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael Grier [MSFT]</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150233">
+			September 11, 2014 at 9:19 am</a>		</div>
+
+		<p>Things were somewhat even worse before N. fixed this. &nbsp;I thought he fixed it in XP but yeah it could be Vista.</p>
+<p>Prior to moving to keyed events (so that no kernel object had to be allocated at all), the contention object could be allocated by the thread releasing the critical section. &nbsp;Which meant that LeaveCriticalSection could throw the exception and when it did, the CS was corrupt. &nbsp;There was even verbiage in MSDN at the time advocating putting __try/__except around critical section entry and exit to catch the exceptions but the problem was that there was really nothing reasonable that you could do in light of the exception in the first place. &nbsp;There&#39;s obviously contention (so you can&#39;t just hope the problem is theoretical rather than real) and the CS is not usable any further.</p>
+<p>These were dark times. &nbsp;The world is a much better place now.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1150253">
+				<div id="div-comment-1150253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dmitry Z</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150253">
+			September 11, 2014 at 10:13 am</a>		</div>
+
+		<p>Joe Duffy has a good explanation on the CS and keyed events</p>
+<p><a rel="nofollow" target="_new" href="http://joeduffyblog.com/2006/11/28/windows-keyed-events-critical-sections-and-new-vista-synchronization-features/">joeduffyblog.com/&#8230;/windows-keyed-events-critical-sections-and-new-vista-synchronization-features</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1" id="comment-1150263">
+				<div id="div-comment-1150263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150263">
+			September 11, 2014 at 10:20 am</a>		</div>
+
+		<p>&quot;Windows 2000 added the Initialize­Critical­Section­And­Spin­Count function&quot;</p>
+<p>NT4 SP3 did:</p>
+<p><a rel="nofollow" target="_new" href="ftp://ftp.microsoft.com/bussys/winnt/winnt-public/fixes/usa/nt40/ussp3/readme.htm">http://ftp.microsoft.com/&#8230;/readme.htm</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-1150273">
+				<div id="div-comment-1150273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150273">
+			September 11, 2014 at 10:20 am</a>		</div>
+
+		<p>&quot;Windows 2000 added the Initialize­Critical­Section­And­Spin­Count function&quot;</p>
+<p>NT4 SP3 did:</p>
+<p><a rel="nofollow" target="_new" href="ftp://ftp.microsoft.com/bussys/winnt/winnt-public/fixes/usa/nt40/ussp3/readme.htm">http://ftp.microsoft.com/&#8230;/readme.htm</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1150283">
+				<div id="div-comment-1150283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150283">
+			September 11, 2014 at 10:25 am</a>		</div>
+
+		<p>&gt;the contention object could be allocated by the thread releasing the critical section</p>
+<p>I&#39;m not sure how that would work at all. If there is a contention, a thread already needs an event handle to wait on.</p>
+<div class="post">[<em>This is in the case where the owner of the critical section exits the critical section before the waiting thread can allocate the event handle to wait on. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1150313">
+				<div id="div-comment-1150313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150313">
+			September 11, 2014 at 11:15 am</a>		</div>
+
+		<p>[This is in the case where the owner of the critical section exits the critical section before the waiting thread can allocate the event handle to wait on. -Raymond]</p>
+<p>I believe this case can be handled by having the contending thread (which successfully allocated and set the event) decrement the contention counter and go back and try to acquire the CS again.</p>
+<div class="post">[<em>Nope, there is still a race. Owner thread: Check for contention. Yes, there is contention. Is the event created? No: Don&#39;t set it. &lang;Pre-empted&rang; Contending thread: Create the event, decrement contention count, loop back. Try to enter critical section, cannot. Increment contention count. Wait on event. &lang;thread switch&lang; Owner thread: Decrement contention count, return. Result: Contending thread stuck waiting on event that is not signaled. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1150333">
+				<div id="div-comment-1150333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150333">
+			September 11, 2014 at 12:03 pm</a>		</div>
+
+		<p>Didn&#39;t you know that open source is the solution to every problem? </p>
+<p>Anyway the open source solution to the problem is &#39;change the implementation, screw the users of software that relied on internal details&#39;. </p>
+<p>There is no hope for anyone that cannot recognize that this strategy is not tenable for Microsoft.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-harry-johnston odd alt thread-odd thread-alt depth-1" id="comment-1150403">
+				<div id="div-comment-1150403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Harry+Johnston' rel='external nofollow' class='url'>Harry Johnston</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150403">
+			September 11, 2014 at 6:56 pm</a>		</div>
+
+		<p>The details are not important. &nbsp;</p>
+<p><a rel="nofollow" target="_new" href="http://basicinstructions.net/basic-instructions/2009/1/8/how-to-repel-the-inevitable-invasion-of-the-moon-men.html">basicinstructions.net/&#8230;/how-to-repel-the-inevitable-invasion-of-the-moon-men.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-harry-johnston even thread-even depth-1" id="comment-1150413">
+				<div id="div-comment-1150413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Harry+Johnston' rel='external nofollow' class='url'>Harry Johnston</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150413">
+			September 11, 2014 at 7:02 pm</a>		</div>
+
+		<p>@Yukkuri: that&#39;s if you&#39;re lucky. &nbsp;If you&#39;re not, the sentence ends at &quot;users&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1150493">
+				<div id="div-comment-1150493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150493">
+			September 12, 2014 at 3:29 am</a>		</div>
+
+		<p>Before reading the rest of the comments, my idea for solving the event contention problem would have been to wrap the creation of the event in its own critical section (a global one with a preallocated event; we don&#39;t want to contend over creating that critical section&#39;s event!) just in case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1150543">
+				<div id="div-comment-1150543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150543">
+			September 12, 2014 at 6:42 am</a>		</div>
+
+		<p>@Harry Johnston &#8212; You&#39;re not wrong, sadly :p</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-1150703">
+				<div id="div-comment-1150703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150703">
+			September 12, 2014 at 11:28 am</a>		</div>
+
+		<p>&quot;In Windows Vista, the internals of the critical section object were rejiggered once again, this time to add convoy resistance&quot;</p>
+<p>I think it was Server 2003 SP1 that did that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1150793">
+				<div id="div-comment-1150793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150793">
+			September 12, 2014 at 4:47 pm</a>		</div>
+
+		<p>[Nope, there is still a race.-Raymond]</p>
+<p>The idea is to try enter the CS. Check if the CS is currently owned and an event is not allocated. In this case, allocate and set the event, and only then really proceed with incrementing the contention count and waiting on the event if necessary. This also has a nice side effect that raising an exception on CreateEvent failure still leaves the CS in the original consistent state.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1150893">
+				<div id="div-comment-1150893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1150893">
+			September 14, 2014 at 3:09 am</a>		</div>
+
+		<p>@Yukkuri: &quot;willingness to make internal changes that break programs that do dumb stuff&quot; is orthogonal to &quot;amount of people the source code is visible to&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1151333">
+				<div id="div-comment-1151333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">win32s ftw</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140911-00/?p=44103#comment-1151333">
+			September 16, 2014 at 3:28 pm</a>		</div>
+
+		<p>@Yukkuri:</p>
+<p>Sell the source code to NSA is at least always an option for the greedy. Dunno if it counts a open though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,746 @@
+<html>
+<head>
+<title>Lock-free algorithms: The one-time initialization</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock-free algorithms: The one-time initialization</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 7, 2011 / year-entry #85</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A special case of the singleton constructor is simply lazy-initializing a bunch of variables. In a single-threaded application you can do something like this: // suppose that any valid values for a and b stipulate that // a &ge; 0 and b &ge; a. Therefore, -1 is never a valid value, // and we use...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A special case of
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx">
+the singleton constructor</a>
+is simply lazy-initializing a bunch of variables.
+In a single-threaded application you can do something like this:
+</p>
+<pre>
+// suppose that any valid values for a and b stipulate that
+// a &ge; 0 and b &ge; a. Therefore, -1 is never a valid value,
+// and we use it to mean "not yet initialized".
+int a = -1, b = -1;
+
+void LazyInitialize()
+{
+ if (a != -1) return; // initialized already
+
+ a = calculate_nominal_a();
+ b = calculate_nominal_b();
+
+ // Adjust the values to conform to our constraint.
+ a = max(0, a);
+ b = max(a, b);
+}
+</pre>
+<p>
+This works fine in a single-threaded program, but if the
+program is multi-threaded, then two threads might end up
+trying to lazy-initialize the variables, and there are
+race conditions which can result in one thread using
+values before they have been initialized:
+</p>
+<table>
+<tbody>
+<tr>
+<th>Thread 1</th>
+<th>Thread 2</th>
+</tr>
+<tr>
+<td><code>if (a != -1)</code> [not taken]</td>
+<td></td>
+</tr>
+<tr>
+<td><code>a = calculate_nominal_a();</code> // returns 2</td>
+</tr>
+<tr>
+<td></td>
+<td><code>if (a != -1) return;</code> // premature return!</td>
+</tr>
+</tbody>
+</table>
+<p>
+Observe that if the first thread is pre-empted after
+the value for <code>a</code> is initially set,
+the second thread will think that everything is initialized
+and may end up using an uninitialized&nbsp;<code>b</code>.
+</p>
+<p>
+"Aha," you say, "that's easy to fix.
+Instead of <code>a</code>,
+I'll just use <code>b</code> to tell if initialization is complete."
+</p>
+<pre>
+void LazyInitialize()
+{
+ if (<font COLOR=red>b</font> != -1) return; // initialized already (test b, not a)
+
+ a = calculate_nominal_a();
+ b = calculate_nominal_b();
+
+ // Adjust the values to conform to our constraint.
+ a = max(0, a);
+ b = max(a, b);
+}
+</pre>
+<p>
+This still suffers from a race condition:
+</p>
+<table>
+<tbody>
+<tr>
+<th>Thread 1</th>
+<th>Thread 2</th>
+</tr>
+<tr>
+<td><code>if (b != -1)</code> [not taken]</td>
+<td></td>
+</tr>
+<tr>
+<td><code>a = calculate_nominal_a();</code> // returns 2</td>
+</tr>
+<tr>
+<td><code>b = calculate_nominal_b();</code> // returns 1</td>
+</tr>
+<tr>
+<td></td>
+<td><code>if (b != -1) return;</code> // premature return!</td>
+</tr>
+</tbody>
+</table>
+<p>
+"I can fix that too.
+I'll just compute the values of <code>a</code> and <code>b</code>
+in local variables, and update the globals only after the final
+values have been computed.
+That way, the second thread won't see partially-calculated values."
+</p>
+<pre>
+void LazyInitialize()
+{
+ if (b != -1) return; // initialized already
+
+ <font COLOR=red>// perform all calculations in temporary variables first</font>
+ <font COLOR=red>int temp_a</font> = calculate_nominal_a();
+ <font COLOR=red>int temp_b</font> = calculate_nominal_b();
+
+ // Adjust the values to conform to our constraint.
+ <font COLOR=red>temp_a</font> = max(0, <font COLOR=red>temp_a</font>);
+ <font COLOR=red>temp_b</font> = max(<font COLOR=red>temp_a</font>, <font COLOR=red>temp_b</font>);
+
+ <font COLOR=red>// make the temporary values permanent
+ a = temp_a;
+ b = temp_b;</font>
+}
+</pre>
+<p>
+Nearly there,
+but there is <i>still</i> a race condition:
+</p>
+<table>
+<tbody>
+<tr>
+<th>Thread 1</th>
+<th>Thread 2</th>
+</tr>
+<tr>
+<td><code>if (b != -1)</code> [not taken]</td>
+<td></td>
+</tr>
+<tr>
+<td><code>temp_a = calculate_nominal_a();</code> // returns 2</td>
+</tr>
+<tr>
+<td><code>temp_b = calculate_nominal_b();</code> // returns 1</td>
+</tr>
+<tr>
+<td><code>temp_a = max(0, temp_a);</code> // temp_a = 2</td>
+</tr>
+<tr>
+<td><code>temp_b = max(temp_a, temp_b);</code> // temp_b = 2</td>
+</tr>
+<tr>
+<td><code>a = temp_a;</code> // store issued to memory</td>
+</tr>
+<tr>
+<td><code>b = temp_b;</code> // store issued to memory</td>
+</tr>
+<tr>
+<td>store of <code>b</code> completes to memory</td>
+</tr>
+<tr>
+<td></td>
+<td><code>if (b != -1) return;</code> // premature return!</td>
+</tr>
+<tr>
+<td>store of <code>a</code> completes to memory</td>
+</tr>
+</tbody>
+</table>
+<p>
+There is no guarantee that the assignment <code>b = 2</code> will
+become visible to other processors after the assignment
+<code>a = 2</code>.
+Even though the store operations are issued in that order,
+the memory management circuitry might
+<a HREF="http://en.wikipedia.org/wiki/Memory_barrier#An_illustrative_example">
+complete the memory operations in the opposite order</a>,
+resulting in Thread&nbsp;2 seeing <code>a = -1</code> and <code>b = 2</code>.
+</p>
+<p>
+To prevent this from happening, the store to <code>b</code> must
+be performed with
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/10/03/8969397.aspx">
+Release semantics</a>,
+indicating that all prior memory stores must complete before
+the store to <code>b</code> can be made visible to other processors.
+</p>
+<pre>
+void LazyInitialize()
+{
+ if (b != -1) return; // initialized already
+
+ // perform all calculations in temporary variables first
+ int temp_a = calculate_nominal_a();
+ int temp_b = calculate_nominal_b();
+
+ // Adjust the values to conform to our constraint.
+ temp_a = max(0, temp_a);
+ temp_b = max(temp_a, temp_b);
+
+ // make the temporary values permanent
+ a = temp_a;
+ <font COLOR=red>// since we use "b" as our indication that
+ // initialization is complete, we must store it last,
+ // and we must use release semantics.
+ InterlockedCompareExchangeRelease(
+    reinterpret_cast&lt;LONG*&gt;&amp;b, temp_b, -1);</font>
+}
+</pre>
+<p>
+If you look at the final result,
+you see that this is pretty much a re-derivation of the
+singleton initialization pattern:
+Do a bunch of calculations off to the side, then
+publish the result with a single
+<code>Interlocked&shy;Compare&shy;Exchange&shy;Release</code>
+operation.
+</p>
+<p>
+The general pattern is therefore
+</p>
+<pre>
+void LazyInitializePattern()
+{
+ if (global_signal_variable != sentinel_value) return;
+
+ ... calculate values into local variables ...
+
+ globalvariable1 = temp_variable1;
+ globalvariable2 = temp_variable2;
+ ...
+ globalvariableN = temp_variableN;
+
+ // publish the signal variable last, and with release
+ // semantics to ensure earlier values are visible as well
+ InterlockedCompareExchangeRelease(
+    reinterpret_cast&lt;LONG*&gt;&amp;global_signal_variable,
+    temp_signal_variable, sentinel_value);
+}
+</pre>
+<p>
+If this all is too much for you
+(and given some of the subtlety of double-check-locking
+that I messed up the first time through,
+it's clearly too much for me),
+you can let the Windows kernel team do the thinking
+and use the
+<a HREF="http://msdn.microsoft.com/en-us/library/aa363808.aspx">
+one-time initialization functions</a>,
+which encapsulate all of this logic.
+(My pal
+<a HREF="http://blogs.msdn.com/doronh/">
+Doron</a>
+called out the one-time initialization functions
+<a HREF="http://blogs.msdn.com/doronh/archive/2006/11/29/support-for-double-checked-locking.aspx">
+a while back</a>.)
+Version 4 of the .NET Framework has corresponding functionality
+in the
+<a HREF="http://msdn.microsoft.com/en-us/library/dd997286.aspx">
+<code>Lazy&lt;T&gt;</code> class</a>.</p>
+<p>
+<b>Exercise</b>:
+What hidden assumptions are being made about the functions
+<code>calculate_<wbr>nominal_a</wbr></code> and
+<code>calculate_<wbr>nominal_b</wbr></code>?
+</p>
+<p>
+<b>Exercise</b>:
+What are the consequences if we use
+<code>Interlocked&shy;Exchange</code>
+instead of <code>Interlocked&shy;Compare&shy;Exchange&shy;Release</code>?
+</p>
+<p>
+<b>Exercise</b>:
+In the final version of <code>Lazy&shy;Initialize</code>, are the variables
+<code>temp_a</code> and <code>temp_b</code> really necessary,
+or are they just leftovers from previous attempts at fixing
+the race condition?
+</p>
+<p>
+<b>Exercise</b>:
+What changes (if any) are necessary to the above pattern
+if the global variables are pointers? Floating point variables?
+</p>
+<p>
+<b>Update</b>: See discussion below
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/07/10150728.aspx#10151639">
+between Niall and Anon</a>
+regarding the need for acquire semantics on the initial read.
+</p></p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-906213">
+				<div id="div-comment-906213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mordachai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906213">
+			April 7, 2011 at 7:30 am</a>		</div>
+
+		<p>Seems like you still have a logic error: If two threads both see b == -1, begin initializing their temp copies of a &amp; b, one of them must get to the Interlocked&#8230; first, update b, but the other thread may still overwrite a (having already begun the process of computing a &amp; b). &nbsp;There&#39;s no guarantee that a &amp; b will both be set by the same thread&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906223">
+				<div id="div-comment-906223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mordachai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906223">
+			April 7, 2011 at 7:33 am</a>		</div>
+
+		<p>Unless you&#39;re making the assumption (in which case it should be well documented) that calculate_nominal_?() always produce the exact same values, so it doesn&#39;t matter that a and b are actually assigned by different threads.</p>
+<div class="post">[<i>Congratulations, you solved Exercise&nbsp;1. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906233">
+				<div id="div-comment-906233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Eric Wilson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906233">
+			April 7, 2011 at 7:41 am</a>		</div>
+
+		<p>Exercise #1: We are also assuming that all callers to these functions get the same values (i.e., they don&#39;t depend on any global state that could change between calls to LazyInitialize)</p>
+<p>Exercise #2: Reduced performance? &nbsp;InterlockedExchange uses both acquire and release semantics, which we don&#39;t really need here.</p>
+<p>Exercise #3: temp_b is obviously needed since we are using b as the sentinal value. &nbsp;temp_a can be removed PROVIDED that calculate_nominal_a() always returns the same value.</p>
+<p>Exercise #4: For pointers, we need InterlockCompareExchangeReleasePtr. &nbsp;For floating point values, you may need a full lock because on some architectures a double is larger than the pointer size and cannot be updated atomically.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906253">
+				<div id="div-comment-906253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906253">
+			April 7, 2011 at 7:48 am</a>		</div>
+
+		<p>I can answer a few of your exercises.</p>
+<p>1) What hidden assumptions are being made about the functions calculate_nominal_a and calculate_nominal_b?</p>
+<p>There are no side-effects, e.g. manipulation of the a and b variables.</p>
+<p>2) What changes (if any) are necessary to the above pattern if the global variables are pointers? Floating point variables?</p>
+<p>If they are pointers, you&#39;ll need to use InterlockedCompareExchangePointerRelease() since pointers can be 32- or 64-bits, depending on the platform. &nbsp;While the Interlocked functions work on DWORD and QWORD values (with suitable alignment) they typically don&#39;t work on floats, at least using strict type checking. &nbsp;You can interpret a float as a DWORD and a double as a QWORD (at least on x86 hardware) and use the appropriate Interlocked function as long as you&#39;re only concerned with comparing them in bit-wise fashion. &nbsp;Note that doing so will do the exchange without using the FPU registers, so you could possibly jam NaNs into the target float/double. &nbsp;I don&#39;t think there is a 128-bit Interlocked function, so long doubles (80-bits on x86 hardware) are right out.</p>
+<p>3) In the final version of Lazy­Initialize, are the variables temp_a and temp_b really necessary, or are they just leftovers from previous attempts at fixing the race condition?</p>
+<p>I think temp_a could be removed (even by compiler optimization), but temp_b cannot because of the need for the Interlocked function call.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906273">
+				<div id="div-comment-906273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906273">
+			April 7, 2011 at 8:31 am</a>		</div>
+
+		<p>Is it safe to assume that you&#39;d need to use InterlockedCompare64Exchange128 for extended-precision floats?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906283">
+				<div id="div-comment-906283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906283">
+			April 7, 2011 at 9:12 am</a>		</div>
+
+		<p>I hope you get back to posting about non-headache inducing subjects soon!</p>
+<div class="post">[<i>You might want to go read a book. It&#39;s going to get a lot worse before it gets better. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906293">
+				<div id="div-comment-906293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mashmagar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906293">
+			April 7, 2011 at 9:20 am</a>		</div>
+
+		<p>Keep up the headache inducing subjects. Once I figure out what&#39;s going on, I learn so much more.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-906303">
+				<div id="div-comment-906303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906303">
+			April 7, 2011 at 9:29 am</a>		</div>
+
+		<p>+1 on keeping up the geek stuff; this is what I come here for.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906333">
+				<div id="div-comment-906333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906333">
+			April 7, 2011 at 9:46 am</a>		</div>
+
+		<blockquote><p>
+  &gt; What are the consequences if we use Interlocked­Exchange instead of Interlocked­Compare­Exchange­Release?
+</p></blockquote>
+<p>On x86 / x64 nothing at all because #define InterlockedCompareExchangeRelease InterlockedCompareExchange</p>
+<p>On other platforms maybe a few more cycles, but since this is a one-time initialization (maybe a few times if there is a race) this would not be measurable.</p>
+<blockquote><p>
+  &gt; What changes (if any) are necessary to the above pattern if the global variables are pointers? Floating point variables?
+</p></blockquote>
+<p>If you use a dedicated signal variable then nothing changes. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906343">
+				<div id="div-comment-906343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Derek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906343">
+			April 7, 2011 at 10:28 am</a>		</div>
+
+		<blockquote><p>
+  Exercise: What hidden assumptions are being made about the functions calculate_nominal_a and calculate_nominal_b?
+</p></blockquote>
+<p>As pointed out, these must be idempotent. &nbsp;a and b themselves must also not be changed outside LazyInitialize().</p>
+<blockquote><p>
+  Exercise: What are the consequences if we use Interlocked­Exchange instead of Interlocked­Compare­Exchange­Release?
+</p></blockquote>
+<p>Since we&#39;re assuming that calculate_nominal_a() and calculate_nominal_b() are idempotent, there are no concerns with respect to correctness. &nbsp;It doesn&#39;t really matter whether we get the first thread&#39;s or the last thread&#39;s values. &nbsp;The performance difference for this lazy-instantiation case is probably not measurable, either.</p>
+<blockquote><p>
+  Exercise: What changes (if any) are necessary to the above pattern if the global variables are pointers? Floating point variables?
+</p></blockquote>
+<p>If the globals are pointers or floating-point variables, we&#39;ll need to use the appropriate Compare/Exchange function. &nbsp;Atomicity of setting &#39;a&#39; should probably not be a concern, since we&#39;re setting the same value, so even if it&#39;s not atomic, there shouldn&#39;t be an inconsistent view. &nbsp;If we&#39;re using pointers, we also need to make sure that calculate_nominal_a() and calculate_nominal_b() aren&#39;t allocating memory (if they are, they aren&#39;t really idempotent anyway).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906353">
+				<div id="div-comment-906353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pinwing</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906353">
+			April 7, 2011 at 12:04 pm</a>		</div>
+
+		<p>When using floating points with InterlockedCompareExchangeRelease, be sure to use the correct bit-pattern to compare against (and not -1.0f converted to a LONG, if that is chosen as the sentinel value).</p>
+<p>Also, care should be taken when choosing a value for the global_signal_variable and the sentinel value: +0.0 compares equal to -0.0, but bit-patterns differ, and NaN != NaN.</p>
+<p>Also, I believe you have the Exchange (2nd parameter) and Comparand (3rd) mixed up in both uses of InterlockedCompareExchangeRelease.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906373">
+				<div id="div-comment-906373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">more boosts</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906373">
+			April 7, 2011 at 2:48 pm</a>		</div>
+
+		<p>&gt; you can let the Windows kernel team do the thinking and use the one-time</p>
+<p>&gt; initialization functions</p>
+<p>Unless you have to support such archaic operating systems as XP or Server 2003:</p>
+<p>Windows Server 2003 and Windows XP/2000: &nbsp;Applications must provide their own synchronization for one-time initialization by using the interlocked functions or other synchronization mechanism. The one-time initialization functions are available starting with Windows Vista and Windows Server 2008. </p>
+<p>Personally, I have been using boost::call_once for this.</p>
+<p><a target="_new" href="http://www.boost.org/doc/libs/1_46_1/doc/html/thread/synchronization.html#thread.synchronization.once.call_once" rel="nofollow">http://www.boost.org/&#8230;/synchronization.html</a></p>
+<p>Works on many more platforms than just versions of Windows starting with Vista and Server 2008&#8230;</p>
+<div class="post">[<i>On the other hand, call_once is not lock-free. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906263">
+				<div id="div-comment-906263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephen Oberholtzer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906263">
+			April 7, 2011 at 8:25 am</a>		</div>
+
+		<p>&gt; What hidden assumptions are being made about the functions calculate_nominal_a and calculate_nominal_b?</p>
+<p>calculate_nominal_a and calculate_nominal_b should be idempotent with regard to side effects (calling them multiple times is the same as calling them once) and reentrant (since multiple threads may be calling them at the same time).</p>
+<p>Depending on the meaning of &#39;a&#39;, interesting things may happen if calculate_nominal_a() can return a different value each time it is called, but I don&#39;t believe that will necessarily cause incorrect behavior.</p>
+<p>There&#39;s also an implicit assumption that calculate_nominal_b() does not depend on a; if it does, the original code would have worked most of the time. The new code, however, always executes calculate_nominal_b() with a=-1.</p>
+<p>&gt; What are the consequences if we use Interlocked­Exchange instead of Interlocked­Compare­Exchange­Release?</p>
+<p>MSDN says that InterlockedExchange does a full memory barrier, which take to mean &quot;both acquire and release semantics&quot;.</p>
+<p>Which as far as I understand it, means that memory-accessing operations found in the stream *after* IE will not be reordered before the IE (acquire), and memory-accessing operations found in the stream *before* IE will not be reordered after the IE (release).</p>
+<p>This could causes a slight drop in performance, which doesn&#39;t really matter too much because this code path won&#39;t be executed again after the first successful initialization ;)</p>
+<p>Possibly more significant is that this changes the semantics of our function from &quot;first to succeed wins&quot; to &quot;last to succeed wins&quot;. Depending upon what calculate_nominal_[ab]() do, this might be acceptable (if they return the same a/b each time) or even preferable (if they return some sort of statistical information, where newer information is better, but the calculation requires the same values be used throughout the execution of the program).</p>
+<p>&gt; In the final version of Lazy­Initialize, are the variables temp_a and temp_b really necessary, or are they just leftovers from previous attempts at fixing the race condition?</p>
+<p>They&#39;re necessary. Otherwise, thread A could be about to execute</p>
+<p>temp_b = max(temp_a, temp_b)</p>
+<p>when thread B executes</p>
+<p>temp_a = calculate_nominal_a() </p>
+<p>If temp_a and temp_b are both negative, and temp_b is less than temp_a, this race could cause the real &#39;b&#39; to be equal to the</p>
+<p>result of calculate_nominal_a(), instead of 0 as it should be.</p>
+<p>&gt; What changes (if any) are necessary to the above pattern if the global variables are pointers? Floating point variables? </p>
+<p>Pointers: On a 32-bit system, no worries. On a 64-bit system, you need a cmpxchg8 (I expect that&#39;s what InterlockedCompareExchangePointer is for).</p>
+<p>Floats: Floats are 32-bits, so you can use the same code as for 32-bit longs. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906323">
+				<div id="div-comment-906323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906323">
+			April 7, 2011 at 9:40 am</a>		</div>
+
+		<p>I also like keeping up. I haven&#39;t had to develop for Itanium where Release sematics matters, up to now my target was still x86 and the XP, but I&#39;m still interested in the topics.</p>
+<p>Now that I mentioned, anybody knows some other platform, except for Itanium, where Release semantics matters? In the example of today, where given Interlocked* happens only at most once per thread, I&#39;d believe there&#39;s no need to prefer them compared to the plain ones, except to be more explicit. I&#39;d also not like writing something I can&#39;t test? If I&#39;m never going to see Itanium, should I use *Release variants at all in my own code?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906403">
+				<div id="div-comment-906403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ryouj</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906403">
+			April 7, 2011 at 11:26 pm</a>		</div>
+
+		<p>#define InterlockedCompareExchangeRelease InterlockedCompareExchange</p>
+<p>lol</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906383">
+				<div id="div-comment-906383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nksingh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906383">
+			April 7, 2011 at 6:26 pm</a>		</div>
+
+		<p>@acq:</p>
+<p>You should probably *not* use the Acquire/Release variants of the operations unless it&#39;s performance-critical code actually running on an architecture where it matters (Itanium and potential future architectures). If you can&#39;t test it, chances are it will be wrong. &nbsp;Even if you can test it, there&#39;s a good chance it will be wrong in rare circumstances that only hit on customer machines under load.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906423">
+				<div id="div-comment-906423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Medinoc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906423">
+			April 8, 2011 at 3:32 am</a>		</div>
+
+		<p>@ryouj: On x86.</p>
+<p>Wow, I didn&#39;t know such functions existed. I used to do it with InterlockedCompareExchange and two LONG variables with boolean semantics, one for &quot;started initializing&quot;, the other for &quot;initialization done&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906433">
+				<div id="div-comment-906433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906433">
+			April 8, 2011 at 6:35 am</a>		</div>
+
+		<p>isn&#39;t inverted the temp_signal_variable and the sentinel_value?</p>
+<p>InterlockedCompareExchangeRelease(</p>
+<p>&nbsp; &nbsp;reinterpret_cast&lt;LONG*&gt;&amp;global_signal_variable,</p>
+<p>&nbsp; &nbsp;sentinel_value, temp_signal_variable);</p>
+<p>}</p>
+<p>it should be:</p>
+<p>InterlockedCompareExchangeRelease(</p>
+<p>&nbsp; &nbsp;reinterpret_cast&lt;LONG*&gt;&amp;global_signal_variable,</p>
+<p>&nbsp; &nbsp;temp_signal_variable, sentinel_value);</p>
+<p>}</p>
+<p>?</p>
+<div class="post">[<i>Indeed it should. Fixed, thanks. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906513">
+				<div id="div-comment-906513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Niall</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906513">
+			April 8, 2011 at 11:05 pm</a>		</div>
+
+		<p>I believe there is still one potential bug in the final version of LazyInitializePattern, at least in theory. The initial read of global_signal_variable should have acquire semantics. Consider someone using globalvariable1:</p>
+<p>LazyInitializePattern();</p>
+<p>DoSomethingWith(globalvariable1);</p>
+<p>If LazyInitializePattern is then inlined, the resulting code is equivalent to:</p>
+<p>if (global_signal_variable != sentinel_value)</p>
+<p>{</p>
+<p>&nbsp; DoSomethingWith(globalvariable1);</p>
+<p>}</p>
+<p>else</p>
+<p>{</p>
+<p>&nbsp; globalvariable1 = temp_variable1;</p>
+<p>&nbsp; InterlockedCompareRelease(&amp;global_signal_variable, sentinel_value);</p>
+<p>&nbsp; DoSomethingWith(globalvariable1);</p>
+<p>}</p>
+<p>There is then nothing preventing the compiler from reordering the read of global_signal_variable and globalvariable1, to the following:</p>
+<p>register reg1 = globalvariable1;</p>
+<p>if (global_signal_variable != sentinel_value)</p>
+<p>{</p>
+<p>&nbsp; DoSomethingWith(reg1);</p>
+<p>}</p>
+<p>else</p>
+<p>{</p>
+<p>&nbsp; globalvariable1 = temp_variable1;</p>
+<p>&nbsp; InterlockedCompareRelease(&amp;global_signal_variable, sentinel_value);</p>
+<p>&nbsp; DoSomethingWith(globalvariable1);</p>
+<p>}</p>
+<p>To fix it a compiler barrier, _ReadBarrier(), would have to be inserted after the read of global_signal_variable. Only a compiler barrier is needed, not a full memory barrier, as the memory barrier included in InterlockedCompareRelease is sufficient to prevent memory reordering issues.</p>
+<div class="post">[<i>Agreed. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906533">
+				<div id="div-comment-906533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906533">
+			April 9, 2011 at 1:44 pm</a>		</div>
+
+		<p>Niall wrote:</p>
+<p>&quot;Only a compiler barrier is needed, not a full memory barrier, as the memory barrier included in InterlockedCompareRelease is sufficient to prevent memory reordering issues.&quot;</p>
+<p>Doesn&#39;t that assume that the CPU can only reorder writes?</p>
+<p>I see nothing stopping a CPU that allows visible out-of-order reads (Itanium, Alpha) from speculatively reading/caching globalvariable1 before global_signal_variable.</p>
+<p>Based on the information at <a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/ms686355%28v=vs.85%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/ms686355%28v=vs.85%29.aspx</a> , it appears that the code should either use InterlockedCompareExchange when reading global_signal_variable, or global_signal_variable should be marked &quot;volatile&quot; (if building on VC2005+). Both of these enforce acquire barriers, and also prevent reordering by the compiler.</p>
+<p>Another option might be to insert a MemoryBarrier() before the &quot;return&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906563">
+				<div id="div-comment-906563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Niall</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110407-00/?p=11003#comment-906563">
+			April 10, 2011 at 4:05 am</a>		</div>
+
+		<p>@Anon: Yes you&#39;re quite right, it does need a real acquire barrier when reading global_signal_variable, I had x86/x64 in the back of my mind when I wrote that. Using InterlockedCompareExchange or MemoryBarrier is overkill though, the full fence they use would be a bit expensive to have on what should be the fast code path (already initialized). So volatile is probably the best, most portable choice available.</p>
+<p>This is all just a great reason to use the one-time initialization functions instead really.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

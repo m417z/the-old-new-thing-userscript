@@ -1,0 +1,516 @@
+<html>
+<head>
+<title>Mismatching scalar and vector new and delete</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Mismatching scalar and vector new and delete</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 3, 2004 / year-entry #47</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">In a previous entry I alluded to the problems that can occur if you mismatch scalar "new" with vector "delete[]" or vice versa. There is a nice description of C++ memory management in C++ Gotchas: Avoiding Common Problems in Coding and Design on www.informit.com, and I encourage you to read at least the section titled...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p><a HREF=http://weblogs.asp.net/oldnewthing/archive/2004/01/30/65013.aspx>
+In a previous entry</a> I alluded to the problems that
+can occur if you mismatch scalar "new" with vector <nobr>"delete[]"</nobr>
+or vice versa.</p>
+<p>
+There is a nice description of C++ memory management
+in
+<a HREF="http://www.informit.com/isapi/product_id~{4F6C1FE6-59E8-48BF-BB67-979C052EA7B8}/content/index.asp">
+C++ Gotchas: Avoiding Common Problems in Coding and Design</a>
+on
+<a HREF=http://www.informit.com>www.informit.com</a>,
+and I encourage you to read
+at least the section titled
+<a HREF="http://www.informit.com/isapi/product_id~{63BFBFF1-1E0E-466F-8E1A-D4AD830C2455}/content/index.asp">
+Failure to Distinguish Scalar and Array Allocation</a>
+before continuing with this entry,
+because I'm going to use that information as
+a starting point.
+</p>
+<p>
+Here's how the Microsoft C++ compiler manages vector allocation.
+Note that this is internal implementation detail, so it's subject
+to change at any time, but knowing this may give a better insight
+into why mixing scalar and vector new/delete is a bad thing.
+</p>
+<p>
+The important thing to note is that when you do a scalar
+"delete p", you are telling the compiler, "p points to a single
+object."  The compiler will call the destructor once, namely
+for the object you are destructing.
+</p>
+<p>
+When you do <nobr>"delete[] p"</nobr>, you are saying,
+"p points to a bunch of objects, but I'm not telling you how many."
+In this case, the compiler needs to generate extra code to keep
+track of how many it needs to destruct. This extra information
+is kept in a "secret place" when the vector is allocated with
+<nobr>"new[]"</nobr>.
+</p>
+<p>
+Let's watch this in action:</p>
+<pre>
+
+class MyClass {
+public:
+  MyClass(); // constructor
+  ~MyClass(); // destructor
+  int i;
+};
+
+MyClass *allocate_stuff(int howmany)
+{
+    return new MyClass[howmany];
+}
+</pre>
+<p>
+The generated code for the "allocate_stuff" function
+looks like this:
+</p>
+<pre>
+    push    esi
+    mov     esi, [esp+8] ; howmany
+   ;  eax = howmany * sizeof(MyClass) + sizeof(size_t)
+    lea     eax, [esi*4+4]
+    push    eax
+    call    operator new
+    test    eax, eax
+    pop     ecx
+    je      fail
+    push    edi
+    push    OFFSET MyClass::MyClass
+    push    esi
+    lea     edi, [eax+4] ; edi = eax + sizeof(size_t)
+    push    4 ; sizeof(MyClass)
+    push    edi
+    mov     [eax], esi ; howmany
+    call    `vector constructor iterator'
+    mov     eax, edi
+    pop     edi
+    jmp     done
+fail:
+    xor     eax, eax
+done:
+    pop     esi
+    retd    4
+</pre>
+<p>
+Translated back into pseudo-C++, the code looks like this:
+</p>
+<pre>
+MyClass* allocate_stuff(int howmany)
+{
+  void *p = operator new(
+     howmany * sizeof(MyClass) + sizeof(size_t));
+  if (p) {
+    size_t* a = reinterpret_cast&lt;size_t*&gt;(p);
+    *a++ = howmany;
+    vector constructor iterator(a,
+      sizeof(MyClass), &MyClass::MyClass);
+    return reinterpret_cast&lt;MyClass*&gt;(a);
+  }
+  return NULL;
+}
+</pre>
+<p>
+In other words, the memory layout of the vector of
+MyClass objects looks like this:
+</p>
+<table BORDER=0>
+<col ALIGN=center>
+<tr>
+<tr>
+<td STYLE="border: solid 1px buttonshadow">howmany</td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px buttonshadow; height: 4em">MyClass[0]</td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px buttonshadow; height: 4em">MyClass[1]</td>
+</tr>
+<tr>
+<td>...</td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px buttonshadow; height: 4em">MyClass[howmany-1]</td>
+</tr>
+</table>
+<p>
+The pointer returned by the <nobr>new[]</nobr> operator
+is <b>not</b> the start of the
+allocated memory but rather points to MyClass[0]. The count of
+elements is hidden in front of the vector.
+</p>
+<p>
+The deletion of a vector performs this operation in reverse:</p>
+<pre>
+void free_stuff(MyClass* p)
+{
+    delete[] p;
+}
+</pre>
+<p>generates</p>
+<pre>
+    mov     ecx, [esp+4] ; p
+    test    ecx, ecx
+    je      skip
+    push    3
+    call    MyClass::`vector deleting destructor`
+skip
+    ret     4
+</pre>
+<p>Translated back into pseudo-C++, the code looks like this:</p>
+<pre>
+void free_stuff(MyClass* p)
+{
+  if (p) p->vector deleting destructor(3);
+}
+</pre>
+<p>The vector deleting destructor goes like this (pseudo-code):</p>
+<pre>
+void MyClass::vector deleting destructor(int flags)
+{
+  if (flags & 2) { // if vector destruct
+    size_t* a = reinterpret_cast&lt;size_t*&gt;(this) - 1;
+    size_t howmany = *a;
+    vector destructor iterator(p, sizeof(MyClass),
+      howmany, MyClass::~MyClass);
+    if (flags & 1) { // if delete too
+      operator delete(a);
+    }
+  } else { // else scalar destruct
+    this->~MyClass(); // destruct one
+    if (flags & 1) { // if delete too
+      operator delete(this);
+    }
+  }
+}
+</pre>
+<p>
+The vector deleting destructor takes some flags. If 2 is set,
+then a vector is being destructed; otherwise a single object is
+being destructed. If 1 is set, then the memory is also freed.
+</p>
+<p>
+In our case, the flags parameter is 3, so we will perform
+a vector destruct followed by a delete. Observe that this
+code sucks the original "howmany" value out of its secret
+hiding place and asks the vector destructor iterator to
+run the destructor that many times before freeing the memory.
+</p>
+<p>
+So now, armed with this information, you should be able to
+describe what happens if you allocate memory with scalar "new"
+and free it with vector <nobr>"delete[]"</nobr> or vice versa.
+</p>
+<p>
+Bonus exercise: What optimizations can be performed if the
+destructor MyClass::~MyClass() is removed from the class
+definition?
+</p>
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/02/04/67384.aspx">
+Answers to come tomorrow</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-140843">
+				<div id="div-comment-140843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Johan Ericsson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140843">
+			February 3, 2004 at 7:58 am</a>		</div>
+
+		<p>That must be the first psuedo-code that I&#8217;ve seen that uses reinterpret_cast&lt;&gt;. Cool!</p>
+<p>Of course, if you use new[] and then delete only a single destructor gets called. That is the destructor for the first element. However, I&#8217;m not sure what the outcome of deleting the first element is as compared to deleting the hidden count. Perhaps the count gets leaked as well. I don&#8217;t remember this use case causing any of the CRT leaking routines to report any memory leaking? So, I&#8217;m not sure about this part.</p>
+<p>If you use new and then delete[], then you are really in trouble. You will first call a destructor an unspecified number of times, depending on the random value of the hidden count. Then you will try to delete the hidden count, which isn&#8217;t memory that you&#8217;ve allocated. Seems like you will crash.</p>
+<p>These are some more reasons to use a vector&lt;&gt; to wrap the array pointer, instead of doing your own memory management.</p>
+<p>I seem to recall that Andrei Alexandrescu wrote some interesting articles for CUJ (C++ User&#8217;s Journal) where he was trying to create a super vector&lt;&gt;. He complained that it was obvious that the compiler was keeping track of the count, yet the vector also has to keep track of the count. This seems inefficient&#8230; Its too bad that C++ doesn&#8217;t provide a Standard way of getting a hold of that count.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140853">
+				<div id="div-comment-140853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.rotd.org/' rel='external nofollow' class='url'>Andreas Magnusson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140853">
+			February 3, 2004 at 10:22 am</a>		</div>
+
+		<p>Wouldn&#8217;t it be possible to let scalar-new be identical to &quot;new T[1]&quot;? That way calling vector-delete on a scalar-new would work fine.<br />
+<br />It would of course be a little bit more inefficient to delete single elements as well as use more memory. So maybe it&#8217;s a bad idea to make illegal programs work on the cost of legal ones&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140893">
+				<div id="div-comment-140893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">runtime</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140893">
+			February 3, 2004 at 10:37 am</a>		</div>
+
+		<p>All of these problems could be solved if new (silently) returned a 1-element array. Then calling delete or delete[] would do the same thing: check the p[-1] size count and then calling the destructors. The debug version of delete could assert(p[-1] == 1), alerting the programmer if he called delete on an array when he should have called delete[].</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140913">
+				<div id="div-comment-140913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140913">
+			February 3, 2004 at 11:17 am</a>		</div>
+
+		<p>The assert wouldn&#8217;t be accurate, as it is possible to new Foo[1] (and even new Foo[0] is legal!).</p>
+<p>What will actually happen if you use scalar delete for array new is that it will destroy a single object, then pass the pointer to free() which will back up to get ITS own count but will instead get the object count.  It will then free too little, and most likely corrupt the heap.  Unless your malloc uses a hashtable of addresses to store size data, then you will probably corrupt the heap.  </p>
+<p>This behavior is dictated by the standard.  As a developer, you should do the right thing always and not rely on the compiler to fix things for you.  Always run your code under Valgrind or BoundsChecker or Purify to find these kinds of problems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140933">
+				<div id="div-comment-140933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140933">
+			February 3, 2004 at 11:22 am</a>		</div>
+
+		<p>Johan, <a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/02/04/67384.aspx" rel="nofollow">tomorrow&#39;s entry</a> will discuss some of your points. In particular, the Bonus Exercise will explain why there is no &quot;Give me the number of elements in this dynamically-allocated array&quot; operator.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140943">
+				<div id="div-comment-140943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140943">
+			February 3, 2004 at 11:22 am</a>		</div>
+
+		<p>I should also point out that none of the suggestions will save you from:</p>
+<p>Foo *p = new Foo[10];<br />
+<br />delete p+1;</p>
+<p>If the concept of array and scalar new and delete frighten you, use malloc and placement new.</p>
+<p>Foo *p = (Foo *)malloc(sizeof(Foo));<br />
+<br />new (p) Foo;<br />
+<br />p-&gt;blah();<br />
+<br />p-&gt;~Foo();<br />
+<br />free(p);</p>
+<p>Amaze your friends!  Alienate your co-workers!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140953">
+				<div id="div-comment-140953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Wilhelm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140953">
+			February 3, 2004 at 12:03 pm</a>		</div>
+
+		<p>One of my favorite recurring &quot;programmers who know just a little too much for their own good&quot; stories:</p>
+<p>&quot;Oh, it&#8217;s easy to get the number of items in a C-style array! You just do ((int*)array)[-1]! It works every time! Why are you brandishing that axe?&quot;</p>
+<p>Quick, how many different ways can you find that would cause that to break? :P</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140983">
+				<div id="div-comment-140983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Doug</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-140983">
+			February 3, 2004 at 12:46 pm</a>		</div>
+
+		<p>Yet another reason why C++ is a broken language.</p>
+<p>Raymond, if you are looking for another topic, how about discussing the problems with MFC and different versions of the compiler.  Like what happens when you build an OCX with MFC, then try to have it work in both IE5 and IE6, without corrupting memory.  Just another version of DLL hell.  Which is compounded by OCXs loading from the registry and not the path.</p>
+<p>Or you can just rewrite the silly thing in ATL and be done with the problem.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-141003">
+				<div id="div-comment-141003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Shane King</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141003">
+			February 3, 2004 at 4:04 pm</a>		</div>
+
+		<p>If you don&#8217;t have any destructor, then the compiler doesn&#8217;t need to do any cleanup on delete, and can just free the memory. Therefore it can not bother allocating extra space for the size of the array.</p>
+<p>In this case, the &quot;give me the number of elements in the array&quot; would have nothing to look at.</p>
+<p>Additionally, if the compiler performs this optimisation, then a mismatched new[]/delete will work; right up until someone changes the code to have a destructor, then you&#8217;ll be wondering why your program crashes all the time from such a &quot;trivial&quot; change.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-141023">
+				<div id="div-comment-141023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Centaur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141023">
+			February 4, 2004 at 2:07 am</a>		</div>
+
+		<p>&gt; If you don&#8217;t have any destructor, then the<br />
+<br />&gt; compiler doesn&#8217;t need to do any cleanup on<br />
+<br />&gt; delete, and can just free the memory.</p>
+<p>That is, if you don’t have any /user-declared/ destructor, and the /implicitly-declared/ destructor is /trivial/ [12.4.3].</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-141053">
+				<div id="div-comment-141053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.honestillusion.com' rel='external nofollow' class='url'>James Curran</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141053">
+			February 4, 2004 at 8:24 am</a>		</div>
+
+		<p>Shane,<br />
+<br /> How is it &quot;bothering&quot; to allocate extra space?  Allocating 104 bytes is exactly the same work as allocating 100. You just have to add four to the number you pass to malloc(). </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-141083">
+				<div id="div-comment-141083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141083">
+			February 4, 2004 at 10:32 am</a>		</div>
+
+		<p>A question for Raymond: where&#8217;s the exception handling code for allocate_stuff? Given that this is x86 code, some of that must be generated inline. Did the compiler somehow know that MyClass&#8217;s constructor can&#8217;t throw?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-141123">
+				<div id="div-comment-141123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Shane King</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141123">
+			February 4, 2004 at 4:27 pm</a>		</div>
+
+		<p>I meant in the sense that if you don&#8217;t allocate the extra space, your program uses less memory, which is a good thing. Also, if you don&#8217;t do the work to store the size there, you also run marginally quicker.</p>
+<p>It&#8217;s a pretty small optimisation really, but some compilers do it.</p>
+<p>And yes, I realise that destructors don&#8217;t have to be declared to exist. I was speaking informally, rather than in C++ language specese.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-141193">
+				<div id="div-comment-141193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141193">
+			February 4, 2004 at 7:04 pm</a>		</div>
+
+		<p>Doug: I don&#8217;t use MFC myself and have never learned it, so I can&#8217;t talk about it with any degree of confidence.</p>
+<p>Ben: I compiled with non-throwing allocation, which is why you don&#8217;t see any throw-handling.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-141543">
+				<div id="div-comment-141543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/0001/01/01/67384.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-141543">
+			February 8, 2004 at 12:08 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-206173">
+				<div id="div-comment-206173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/2004/08/26/220933.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040203-00/?p=40763#comment-206173">
+			August 26, 2004 at 12:04 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

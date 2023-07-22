@@ -1,0 +1,264 @@
+<html>
+<head>
+<title>The Alpha AXP, part 10: Atomic updates to byte and word memory units</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Alpha AXP, part 10: Atomic updates to byte and word memory units</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 18, 2017 / year-entry #187</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170818-00/?p=96845</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Putting together some things we've learned.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today we're going to do a little exercise based on what we've
+learned so far.
+We learned how to perform byte and word
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170815-00/?p=96816">
+loads</a>
+and
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170816-00/?p=96825">
+stores</a>
+to memory.
+And we also learned how to perform
+atomic memory operations on longs and quads.
+But how about atomic memory operations on bytes and words?
+</p>
+<p>
+We will have to put together what we've learned:
+Combine the byte and word access patterns with the
+atomic memory update pattern.
+</p>
+<p>
+To recap: The sequence for reading an aligned word
+in memory goes like this:
+</p>
+<pre>
+    LDQ_U  t1, (t0)
+    EXTWL  t1, t0, t1
+</pre>
+<p>
+The sequence for writing an aligned word
+in memory goes like this:
+</p>
+<pre>
+    LDQ_U   t5, (t0)                  ; t5 = yyBA xxxx
+    INSWL   t1, t0, t3                ; t3 = 00ba 0000
+    MSKWL   t5, t0, t5                ; t5 = yy00 xxxx
+    BIS     t5, t3, t5                ; t5 = yyba xxxx
+    STQ_U   t5, (t0)
+
+    ; Byte sequence is the same, except you use INSBL and MSKBL
+</pre>
+<p>
+And the sequence for an atomic quad update goes like this:
+</p>
+<pre>
+retry:
+    LDQ_L   t1, (t0)        ; load locked
+    ... calculate new value of t1 based on old value ...
+    STQ_C   t1, (t0)        ; store conditional
+                            ; t1 = 1 if store was successful
+    BEQ     t1, failed      ; jump if store failed
+    ... continue execution ...
+
+failed:
+    BR      zero, retry     ; try again
+</pre>
+</p>
+<p>
+What we need to do is insert the byte or word extraction,
+calculation, and insertion code
+where it says "calculate new value of <var>t1</var> based on old value".
+The trick is that there is no <code>LDQ_LU</code> instruction.
+You can read for unaligned or you can read locked, but you can't read
+for unaligned locked.
+</p>
+<p>
+Fortunately, this is easy to work around: We emulate the behavior
+of <code>LDQ_U</code> in software.
+Recall that <code>LDQ_U</code> is the same as <code>LDQ</code>
+except that it ignores the bottom 3 bits of the address.
+So let's mask out the bottom 3 bits of the address.
+</p>
+<pre>
+    ; atomically increment the word at the aligned address t0
+    BIC     t3, #3, t0      ; force-align t0 to t3
+retry:
+    LDQ_L   t1, (t3)        ; load locked
+    ... calculate new value of t1 based on old value ...
+    STQ_C   t1, (t3)        ; store conditional
+                            ; t1 = 1 if store was successful
+    BEQ     t1, failed      ; jump if store failed
+    ... continue execution ...
+
+failed:
+    BR      zero, retry     ; try again
+</pre>
+<p>
+Okay, we've successfully emulated the <code>LDQ_LU</code> and
+<code>STQ_LU</code> instructions.
+Now to do the extraction, calculation, and insertion:
+</p>
+<pre>
+    ; atomically increment the word at the aligned address t0
+    BIC     t3, #3, t0      ; force-align t0 to t3
+retry:
+    LDQ_L   t1, (t3)        ; load locked
+                            ; t1 = yyBA xxxx
+
+    ; Extract
+    EXTWL   t1, t3, t2      ; t2 = 0000 00BA (the word value)
+
+    ; Calculate
+    ADDL    t2, #1, t2      ; increment t2
+
+    ; Insert
+    INSWL   t2, t0, t2      ; t2 = 00ba 0000
+    MSKWL   t1, t0, t1      ; t1 = yy00 xxxx
+    BIS     t1, t2, t1      ; t1 = yyba xxxx
+
+    STQ_C   t1, (t3)        ; store conditional
+                            ; t1 = 1 if store was successful
+    BEQ     t1, failed      ; jump if store failed
+    ... continue execution ...
+
+failed:
+    BR      zero, retry     ; try again
+</pre>
+<p>
+Fortunately, our extraction, calculation, and insertion
+could be performed in under 20 instructions
+with no additional memory access,
+and no use of potentially-emulated instructions,
+so it all fits between the
+<code>LDQ_L</code> and <code>STQ_C</code>.
+</p>
+<p>
+<b>Exercise</b>:
+What could we do if our calculation required additional memory
+access or required more than 20 instructions?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1306795">
+				<div id="div-comment-1306795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Torsten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170818-00/?p=96845#comment-1306795">
+			August 18, 2017 at 7:09 am</a>		</div>
+
+		<p>For the exercise: Write a tiny loop with LDQ_L and STQ_C that only does a compare-and-swap for aligned quads.  Then build an outer loop that loads the old value, does whatever calculations it needs, and does the compare-and-swap as its final step.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1306805">
+				<div id="div-comment-1306805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170818-00/?p=96845#comment-1306805">
+			August 18, 2017 at 7:35 am</a>		</div>
+
+		<p>I&#8217;m pretty sure the tiny loop isn&#8217;t a loop but this seems to be the general idea.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1306845">
+				<div id="div-comment-1306845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170818-00/?p=96845#comment-1306845">
+			August 18, 2017 at 2:47 pm</a>		</div>
+
+		<p>It&#8217;s more efficient if it is.  If the store conditional failed spuriously and the comparison is still satisfied, there&#8217;s no need to repeat the (expensive) calculation step.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1306886">
+				<div id="div-comment-1306886" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Bonner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170818-00/?p=96845#comment-1306886">
+			August 20, 2017 at 10:24 pm</a>		</div>
+
+		<p>It&#8217;s only more efficient if spurious failures are relatively common.  I don&#8217;t know if that&#8217;s true or not.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

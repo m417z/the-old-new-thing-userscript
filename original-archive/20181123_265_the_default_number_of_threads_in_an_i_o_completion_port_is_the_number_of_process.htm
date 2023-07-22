@@ -1,0 +1,234 @@
+<html>
+<head>
+<title>The default number of threads in an I/O completion port is the number of processors, but is that logical or physical processors?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The default number of threads in an I/O completion port is the number of processors, but is that logical or physical processors?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 23, 2018 / year-entry #265</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20181123-00/?p=100305</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">How much stuff can happen at once?</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The
+<a HREF="https://docs.microsoft.com/en-us/windows/desktop/FileIO/createiocompletionport">
+<code>Create&shy;Io&shy;Completion&shy;Port</code></a>
+function lets you specify how many concurrent threads can be
+processing work from the completion port.
+But if you pass a value of 0 for
+<code>Number&shy;Of&shy;Concurrent&shy;Threads</code>,
+"the system allows as many concurrently running threads
+as there are processors in the system."
+</p>
+<p>
+Are these physical processors or logical processors?
+</p>
+<p>
+They are logical processors.
+</p>
+<p>
+One way to figure this out is that
+the goal of the I/O completion port is to keep CPU usage at
+exactly 100%.
+If the I/O completion port consumed only as many threads as
+physical processors,
+then you wouldn't quite get to 100% CPU utilization, because there
+would be extra capacity on the unused logical processors.
+</p>
+<p>
+Another way to figure this out is to use your understanding
+of history.
+I/O completion ports were created long before hyperthreading
+was invented,
+so this code
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20040913-00/?p=37883">
+treated all logical processors as full-fledged processors</a>.
+</p>
+<p>
+And a third way to figure it out is to test it.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;strsafe.h&gt;
+
+#define THREADS 10
+
+LONG ActiveThreads = 0;
+
+DWORD CALLBACK IoThread(void* Port)
+{
+ DWORD Bytes;
+ ULONG_PTR Key;
+ OVERLAPPED* Overlapped;
+ while (GetQueuedCompletionStatus(Port, &amp;Bytes,
+              &amp;Key, &amp;Overlapped, 1000)) {
+  TCHAR msg[64];
+  auto count = InterlockedIncrement(&amp;ActiveThreads);
+  StringCchPrintf(msg, ARRAYSIZE(msg), TEXT(">%d\r\n"), count);
+  OutputDebugString(msg);
+
+  DWORD Tick = GetTickCount();
+  while (GetTickCount() - Tick < 1000) { }
+
+  count = InterlockedDecrement(&amp;ActiveThreads);
+  StringCchPrintf(msg, ARRAYSIZE(msg), TEXT("<%d\r\n"), count);
+  OutputDebugString(msg);
+ }
+ return 0;
+}
+
+int __cdecl main(int, char**)
+{
+ HANDLE Port = CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                nullptr, 0, 0);
+
+ HANDLE ThreadHandles[THREADS];
+ int i;
+ for (i = 0; i &lt; THREADS; i++) {
+  DWORD Id;
+  ThreadHandles[i] = CreateThread(0, 0, IoThread, Port, 0, &amp;Id);
+ }
+
+ for (i = 0; i &lt; THREADS * 2; i++) {
+  PostQueuedCompletionStatus(Port, 0, 0, nullptr);
+ }
+
+ for (i = 0; i &lt; THREADS; i++) {
+  WaitForSingleObject(ThreadHandles[i], INFINITE);
+ }
+
+ return 0;
+}
+</pre>
+<p>
+Pick a value for <code>THREADS</code> that is greater than the
+number of logical processors.
+</p>
+<p>
+We start by creating an I/O completion port and a bunch of threads
+whose job it is to complete work posted to the port.
+we then post a lot of work to the port and wait for the threads
+to drain the work.
+</p>
+<p>
+Each thread grabs a work item,
+then increments a counter that lets us know how many threads
+are actively processing work.
+The thread then goes into a tight spin loop for one second.
+It has to do this rather than <code>Sleep</code> because the
+thread needs to be actively doing work for it to be counted
+against the I/O completion port's concurrency limit.
+</p>
+<p>
+After wasting some time, the thread decrements the count of
+active threads,
+and then goes back to looking for more work.
+</p>
+<p>
+Along the way, we print the number of active threads.
+</p>
+<p>
+Run this program, and you'll see that it retires work in chunks,
+and the number of threads in each chunk is the number of
+logical processors.
+</p>
+<p>
+So there, confirmed by experimentation.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-colajunkie13 even thread-even depth-1 parent" id="comment-1371525">
+				<div id="div-comment-1371525" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/M.+Peters' rel='external nofollow' class='url'>M. Peters</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181123-00/?p=100305#comment-1371525">
+			November 26, 2018 at 7:28 am</a>		</div>
+
+		<p>&#8220;then you wouldn&#8217;t quite get to 100% CPU utilization&#8221; that statement is only true if the workloads used are non-optimized.</p>
+<p>Example: Gaming on a 4-Core i7 CPU with or without HyperThreading<br />
+There are benchmarks for highly optimized workloads that show a lower (overall) performance when using 8 Threads instead of 4, because the 4 threads achieve 100% physical core utilization and HT adds switching overhead, slowing everything down.<br />
+For reference: <a href="https://www.techpowerup.com/forums/threads/gaming-benchmarks-core-i7-6700k-hyperthreading-test.219417/" rel="nofollow">https://www.techpowerup.com/forums/threads/gaming-benchmarks-core-i7-6700k-hyperthreading-test.219417/</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-ajith_sub odd alt depth-2" id="comment-1371615">
+				<div id="div-comment-1371615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ajith+Subramanian' rel='external nofollow' class='url'>Ajith Subramanian</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181123-00/?p=100305#comment-1371615">
+			November 26, 2018 at 3:57 pm</a>		</div>
+
+		<p>I think what Raymond meant is that even on workloads that use close to 100% physical CPU utilization, it&#8217;d still show up as something like 50% in your Task Manager with HT enabled.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

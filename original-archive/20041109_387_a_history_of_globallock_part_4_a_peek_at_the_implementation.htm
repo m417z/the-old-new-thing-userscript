@@ -1,0 +1,367 @@
+<html>
+<head>
+<title>A history of GlobalLock, part 4: A peek at the implementation</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A history of GlobalLock, part 4: A peek at the implementation</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 9, 2004 / year-entry #388</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>11</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">On one of our internal discussion mailing lists, someone posted the following question: We have some code that was using DragQueryFile to extract file paths. The prototype for DragQueryFile appears as follows: UINT DragQueryFile( HDROP hDrop, UINT iFile, LPTSTR lpszFile, UINT cch ); In the code we have, instead of passing an HDROP as the...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+On one of our internal discussion mailing lists, someone posted
+the following question:
+</p>
+<blockquote CLASS=q>
+<p>
+We have some code that was using DragQueryFile to extract file paths.
+The prototype for DragQueryFile appears as follows:</p>
+<pre>
+UINT DragQueryFile(
+    <font COLOR=red>HDROP hDrop</font>,
+    UINT iFile,
+    LPTSTR lpszFile,
+    UINT cch
+);
+</pre>
+<p>
+In the code we have, instead of passing an HDROP as the first parameter,
+we were passing in a pointer to a DROPFILES structure. This code was
+working fine for the last few months until some protocol changes
+we made in packet layouts over the weekend.
+</p>
+<p>
+I know that the bug is that we should be passing an HDROP handle
+instead of a pointer, but I am just curious as to why this worked
+so flawlessly until now. In other words, what determines the
+validity of a handle and how come a pointer can sometimes
+be used instead of a handle?
+</p>
+</blockquote>
+<p>
+GlobalLock accepts HGLOBALs that refer to either GMEM_MOVEABLE or GMEM_FIXED
+memory. The rule for Win32 is that for fixed memory,
+the HGLOBAL is itself a pointer to the memory,
+whereas for moveable memory, the HGLOBAL is a handle that
+needs to be converted to a pointer.
+</p>
+<p>
+GlobalAlloc works closely with GlobalLock so that GlobalLock can be fast.
+If the memory happens to be aligned just right and pass some other
+tests, GlobalLock says "Woo-hoo, this is a handle to a GMEM_FIXED
+block of memory, so I should just return the pointer back."
+</p>
+<p>
+The packet layout changes probably altered the alignment,
+which in turn caused GlobalLock no longer to recognize (mistakenly) the
+invalid parameter as a GMEM_FIXED handle.  It then went down
+other parts of the validation path and realized that the handle
+wasn't valid at all.
+</p>
+<p>
+This is not, of course, granting permission to pass
+bogus pointers to GlobalLock; I'm just explaining why
+the problem kicked up all of a sudden even though
+it has always been there.
+</p>
+<p>
+With that lead-in, what's the real story behind GMEM_MOVEABLE
+in Win32?
+</p>
+<p>
+GMEM_MOVEABLE memory allocates a "handle".  This handle can be
+converted to memory via GlobalLock.  You can call GlobalReAlloc()
+on an unlocked GMEM_MOVEABLE block (or a locked GMEM_MOVEABLE
+block when you pass the GMEM_MOVEABLE flag to GlobalReAlloc
+which means "move it even if it's locked") and the memory
+<strong>will move</strong>,
+but the handle will continue to refer to it. You
+have to re-lock the handle to get the new address it got moved to.
+</p>
+<p>
+GMEM_MOVEABLE is largely unnecessary; it provides additional
+functionality that most people have no use for.  Most people
+don't mind when Realloc hands back a different value from the
+original.  GMEM_MOVEABLE is primarily for the case where you
+hand out a memory handle, and then you decide to realloc it
+behind the handle's back.  If you use GMEM_MOVEABLE, the
+handle remains valid even though the memory it refers to has moved.
+</p>
+<p>
+This may sound like a neat feature, but in practice it's much
+more trouble than it's worth.  If you decide to use moveable memory,
+you have to lock it before accessing it, then unlock it when done.
+All this lock/unlock overhead becomes a real pain, since you can't
+use pointers any more.  You have to use handles and convert them
+to pointers right before you use them.
+(This also means no pointers into the middle of a moveable object.)
+</p>
+<p>
+Consequently, moveable memory is useless in practice.
+</p>
+<p>
+Note, however, that GMEM_MOVEABLE still lingers on in various
+places for compatibility reasons.  For example, clipboard data
+must be allocated as moveable.
+If you break this rule, some programs will crash
+because they made undocumented assumptions about how the
+heap manager internally manages handles to moveable memory blocks
+instead of calling GlobalLock to convert the handle to a pointer.
+</p>
+<p>
+A very common error is forgetting to lock global handles before
+using them.
+If you forget and instead just cast a moveable memory handle to
+a pointer, you will get strange results (and will likely corrupt the heap).
+Specifically, global handles passed via
+the <code>hGlobal</code> member of
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/ost_a2z_9dt9.asp">
+the <code>STGMEDIUM</code> structure</a>,
+returned via
+<a HREF="http://msdn.microsoft.com/library/en-us/winui/winui/windowsuserinterface/dataexchange/clipboard/clipboardreference/clipboardfunctions/getclipboarddata.asp">
+the <code>GetClipboardData</code> function</a>,
+as well as lesser-known places like
+the <code>hDevMode</code> and <code>hDevNames</code> members of
+<a HREF="http://msdn.microsoft.com/library/en-us/winui/WinUI/WindowsUserInterface/UserInput/CommonDialogBoxLibrary/CommonDialogBoxReference/CommonDialogBoxStructures/PRINTDLG.asp">
+the <code>PRINTDLG</code> structure</a> are all potentially moveable.
+What's scary is that if you make this mistake, you might actually get away
+with it for a long time (if the memory you're looking at happened to
+be allocated as GMEM_FIXED), and then suddenly one day it crashes because
+all of a sudden somebody gave you memory that was allocated as
+GMEM_MOVEABLE.
+</p>
+<p>
+Okay, that's enough about the legacy of the 16-bit memory manager for now.
+My head is starting to hurt...</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (11)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-223793">
+				<div id="div-comment-223793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223793">
+			November 9, 2004 at 7:56 am</a>		</div>
+
+		<p>Am I the only one who thinks it a big mistake to allow a coding error like this (using a pointer vs. handle) to work most of the time? That&#8217;s just asking for the bug to show up. Instead of just saying &quot;don&#8217;t do this&quot; in the docs, why not actually enforce it? (i.e., don&#8217;t ever just return the pointer back from GlobalAlloc).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-223813">
+				<div id="div-comment-223813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223813">
+			November 9, 2004 at 8:16 am</a>		</div>
+
+		<p>Two questions, 1. Would the app verifier be able to spot that bug 2. is GMEM_MOVABLE&#8217;s semantics the same as GMEM_FIXED (and the GlobalFlags function removed from, etc.) in the Win64 api?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-223823">
+				<div id="div-comment-223823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223823">
+			November 9, 2004 at 8:24 am</a>		</div>
+
+		<ol>
+<li>The problem is that the caller didn&#8217;t call any APIs; they just cast a handle to a pointer. AppVerifier has no hook into a compiler cast.
+<p>2. Win64 is intended to be source-compatible with Win32. Changing function semantics would break source compatibility.</li>
+</ol>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-223853">
+				<div id="div-comment-223853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223853">
+			November 9, 2004 at 9:00 am</a>		</div>
+
+		<p>Then again, the correct code raises an error too if you omit the cast:</p>
+<p>HGLOBAL hglob = GlobalAlloc(GMEM_MOVEABLE, &#8230;);<br />
+<br />DROPFILES* pdrop = GlobalLock(hglob);<br />
+<br />pdrop-&gt;pFiles = &#8230;;<br />
+<br />GlobalUnlock(hglob);<br />
+<br />DragQueryFile(hglob, &#8230;);<br />
+<br />error C2664: &#8216;DragQueryFileA&#8217; : cannot convert parameter 1 from &#8216;HGLOBAL&#8217; to &#8216;HDROP&#8217;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-223883">
+				<div id="div-comment-223883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223883">
+			November 9, 2004 at 12:40 pm</a>		</div>
+
+		<p>Ben has the basic idea of the current implementation. But of course since it&#8217;s an implementation detail, it can change at any time so don&#8217;t go grovelling into undocumented data structures&#8230; Just call the GlobalLock function and be a good citizen.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-223903">
+				<div id="div-comment-223903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://flurf.net/' rel='external nofollow' class='url'>Eric TF Bat</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223903">
+			November 9, 2004 at 2:46 pm</a>		</div>
+
+		<p>&quot;C is a language that combines all the elegance and power of assembly language with all the readability and maintainability of assembly language.&quot;</p>
+<p>Or, for even more rude quotes about this poor old language and its cousins, see <a target="_new" href="http://www.sysprog.net/quotec.html" rel="nofollow">http://www.sysprog.net/quotec.html</a>.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-223803">
+				<div id="div-comment-223803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223803">
+			November 9, 2004 at 8:15 am</a>		</div>
+
+		<p>If you pass GMEM_FIXED then you get a pointer back; if you pass GMEM_MOVEABLE then you get a handle. GlobalAlloc *must* return a pointer if the caller asked for a pointer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-223833">
+				<div id="div-comment-223833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.1060.org/blogxter/publish/5' rel='external nofollow' class='url'>Steve Loughran</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223833">
+			November 9, 2004 at 8:20 am</a>		</div>
+
+		<p>I used to know all this nightmare. I used to know off by heart which operations yielded the thread (old: SendMessage, MessageBox(); new: COM ), because in the win16 days, any yield would move memory around. I even remember before STRICT was enabled, and everything mapped to the same UINT, so there was no guarantee that anything would work, especially as the GUI didnt do any param validation.</p>
+<p>But I have erased all that stuff from my brain and filled it up with a different set of obscure coding facts. Long term, these will be equally irrelevant, but it is so good not to have to worry about pointers *at all*. </p>
+<p>The miracle is that some pretty good stuff shipped in those days -remember the early Excel? It worked, it even had a macro language built into the cells that wasnt viewed as a virus transmission mechanism. I am not sure that we developers have given the users as much as they deserve, given how much easier our life has become, now that the cache of a CPU is greater than all the memory that Win16+himem could address.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-223843">
+				<div id="div-comment-223843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223843">
+			November 9, 2004 at 8:48 am</a>		</div>
+
+		<p>If they&#8217;d have compiled with STRICT, they&#248;&#8217;d have got this error: </p>
+<p>error C2664: &#8216;DragQueryFileA&#8217; : cannot convert parameter 1 from &#8216;struct _DROPFILES *&#8217; to &#8216;struct HDROP__ *&#8217; </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-223873">
+				<div id="div-comment-223873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223873">
+			November 9, 2004 at 12:43 pm</a>		</div>
+
+		<p>Ooh, I think I get it. A &quot;handle&quot; to a fixed block is a 16-byte-aligned pointer, but a real handle to a moveable block points to a pointer that&#8217;s offset 4 bytes into an 8-byte-aligned entry. So it&#8217;s just an alignment test:</p>
+<p>LPVOID GlobalLock(HGLOBAL hMem)<br />
+<br />{<br />
+<br />    if (((DWORD)hMem &amp; 0xF) == 0)<br />
+<br />        return (LPVOID)hMem;<br />
+<br />    /* This may not be right for Win64. Also the real implementation may detect and handle overflow somehow. */<br />
+<br />    InterlockedIncrement((DWORD *)hMem &#8211; 1);<br />
+<br />    return *(LPVOID *)hMem;<br />
+<br />}<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-223913">
+				<div id="div-comment-223913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Your Mom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041109-00/?p=37353#comment-223913">
+			November 9, 2004 at 10:40 pm</a>		</div>
+
+		<p>Umm, Honey&#8230; I dont even know what your talking about&#8230; but just remember&#8230; thinking hard makes you mess yourself, remember that time you, nevermind&#8230;Love, Your Mom.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

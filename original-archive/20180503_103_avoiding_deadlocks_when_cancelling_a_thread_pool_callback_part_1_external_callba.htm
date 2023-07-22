@@ -1,0 +1,606 @@
+<html>
+<head>
+<title>Avoiding deadlocks when cancelling a thread pool callback, part 1: External callback data</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Avoiding deadlocks when cancelling a thread pool callback, part 1: External callback data</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 3, 2018 / year-entry #103</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Breaking the deadlock by disassociating from the thread pool.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+We saw last time how to use the thread pool cleanup functions
+to manage the lifetime of the context data.
+But if the callback function tries to call into
+the thread that is calling
+<code>Wait&shy;For&shy;Threadpool&shy;Timer&shy;Callbacks</code>,
+then you have a deadlock.
+The callback cannot proceed until
+<code>Wait&shy;For&shy;Threadpool&shy;Timer&shy;Callbacks</code>
+returns,
+but
+<code>Wait&shy;For&shy;Threadpool&shy;Timer&shy;Callbacks</code>
+won't return until the callback completes.
+</p>
+<p>
+You can find yourself in this situation without realizing it.
+The callback function might send
+a message to a window that is owned by the waiting thread.
+Or it could
+invokes a method on an apartment-threaded
+object that belongs to the waiting thread.
+Or it could attempt to enter a critical section that is held
+by the waiting thread.&sup1;
+In many cases,
+the waiting thread is cleaning up an object in its destructor,
+so you don't even control the locks that may be held at that point.
+</p>
+<p>
+This is where
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms682581(v=vs.85).aspx">
+<code>Disassociate&shy;Current&shy;Thread&shy;From&shy;Callback</code></a>
+enters the picture.
+The
+<code>Disassociate&shy;Current&shy;Thread&shy;From&shy;Callback</code>
+function tells the thread pool,
+"For the purpose of waiting until all callbacks are complete,
+consider this callback to be complete even though it's still running."
+You can think of this as the
+<code>Reply&shy;Message</code> of the thread pool.
+This means that
+functions like
+<code>Wait&shy;For&shy;Threadpool&shy;Xxx&shy;Callbacks</code>
+will return,
+but other functions like
+<code>Xxx&shy;When&shy;Callback&shy;Returns</code> won't
+be fooled.
+They will wait for the callback to return for real before
+setting the event or leaving the critical section or whatever.
+</p>
+<p>
+Let's figure out how to take advantage of this.</p>
+<p>
+We make the context data for the callback function a thread-safe
+reference-counted object.
+Typical examples are
+a COM pointer to an agile object,
+and a reference to a <code>std::shared_ptr</code>.&sup2;
+The first thing the callback function does is to increment the
+reference count on the object and save it in an RAII object.
+For a COM pointer, it would be creating a COM smart pointer
+around it (say, converting it to a <code>WRL::ComPtr</code>).
+For a <code>std::shared_ptr</code> it would be copying the
+<code>std::shared_ptr</code> to a local variable.
+</p>
+<p>
+Once the context data has been safely referenced,
+you call
+<code>Disassociate&shy;Current&shy;Thread&shy;From&shy;Callback</code>
+to release the waiting thread,
+if any.
+</p>
+<p>
+At this point, you can do your work with the captured strong reference
+(the <code>WRL::ComPtr</code> or the local copy of the
+<code>std::shared_ptr</code>)
+and stop using the inbound context parameter,
+because it is no longer valid;
+the waiting thread may have destroyed it.
+</p>
+<p>
+When your callback function completes, the RAII type will release
+the reference to the context data,
+and if that was the last reference, it will destroy the context data.
+</p>
+<p>
+We start with this helper class.</p>
+<pre>
+struct TpTimerDeleter
+{
+ void operator()(PTP_TIMER timer)
+ {
+  SetThreadpoolTimer(timer, nullptr, 0, 0);
+  WaitForThreadpoolTimerCallbacks(timer, true);
+  CloseThreadpoolTimer(timer);
+ }
+};
+</pre>
+<p>
+This deleter class performs the standard synchronous
+shutdown of a thread pool timer,
+as noted in
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms682040(v=vs.85).aspx">
+the documentation</a>.
+</p>
+<p>
+Here's how we use it to build a thread pool callback that doesn't
+deadlock at cancellation.
+We'll start with one based on
+<code>WRL::ComPtr</code>:
+</p>
+<pre>
+class ObjectWithTimer
+{
+public:
+ StartTimer();
+ StopTimer();
+
+private:
+ static void CALLBACK TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer);
+
+ <font COLOR="blue">WRL::ComPtr&lt;AgileContextData&gt; contextData;</font> // ComPtr-specific code
+ std::unique_ptr&lt;TP_TIMER, TpTimerDeleter&gt; timer;
+};
+</pre>
+<p>
+Having a <code>std::unique_ptr</code> automatically
+makes the class non-copyable.
+We'll see soon why it's okay to let the object be movable.
+</p>
+<p>
+<b>Exercise</b>:
+Why did I declare the <code>timer</code> member
+after the <code>contextData</code> member?
+(Normally, I don't answer the exercises in the main body of the article,
+but this is an important detail, so I'll answer it at the end.)
+</p>
+<pre>
+void ObjectWithTimer::StartTimer()
+{
+ // Error checking elided for expository purposes.
+ timer = CreateThreadpoolTimer(
+    TimerCallback,
+    <font COLOR="blue">contextData.Get(),</font> // ComPtr-specific code
+    nullptr);
+
+ SetThreadpoolTimer(timer, ...);
+}
+</pre>
+<p>
+The <code>StartTimer</code> method assumes that the
+<code>contextData</code> method has been initialized
+(presumably by methods not shown) and that the timer has not
+already been started.
+It creates the timer with the raw COM pointer as the reference data.
+This is a non-refcounted pointer,
+so we have to make sure it remains valid for as long as the callback
+is potentially-callable.
+Once we create the timer, we start it by calling
+<code>Set&shy;Threadpool&shy;Timer</code> and passing the timer
+parameters (not shown here).
+</p>
+<p>
+The context parameter passed to the callback is the thing we have
+to worry about if the <code>Object&shy;With&shy;Timer</code> gets moved.
+In this case, it's okay to move the
+<code>Object&shy;With&shy;Timer</code> because the context parameter
+doesn't point to the <code>Object&shy;With&shy;Timer</code>;
+it is a raw COM pointer to an object that won't move.
+Therefore, the
+<code>Object&shy;With&shy;Timer</code> is movable.
+</p>
+<pre>
+void ObjectWithTimer::TimerCallback(PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer)
+{
+ // ComPtr-specific code
+ <font COLOR="blue">WRL::ComPtr&lt;AgileContextData&gt; contextData{
+    reinterpret_cast&lt;AgileContextData*&gt;(context) };</font>
+
+ context = nullptr;
+
+ DisassociateCurrentThreadFromCallback(instance);
+
+ ... do stuff with contextData ...
+}
+</pre>
+<p>
+The callback function starts by taking our weak pointer and
+converting it to a strong pointer.
+We designed our code so that the raw COM pointer is valid
+for as long as the callback is potentially-callable,
+so we know that it is valid here.
+We put it inside a <code>WRL::ComPtr</code> to make it a strong
+reference.
+</p>
+<p>
+And then here's the interesting part: We call
+<code>Disassociate&shy;Current&shy;Thread&shy;From&shy;Callback</code></a>
+to tell the thread pool to release anybody who is waiting for the
+callback to complete.
+The callback <i>is still running</i>, but anybody who is waiting for
+it to complete is free to proceed anyway.
+We can do this because we have captured the information from the
+<code>context</code> parameter, and the main object can free it.
+(To ensure we don't access the <code>context</code> parameter
+by mistake, we also set
+<code>context</code> to <code>nullptr</code>.)
+</p>
+<p>
+We then perform our callback operation with the strong reference
+in <code>contextData</code>.
+This can call back into the main thread
+because the main thread is no longer stuck in
+<code>Wait&shy;For&shy;Threadpool&shy;Timer&shy;Callbacks</code>,
+It will eventually return to its event dispatch loop, or release
+its locks, or whatever it is that needs to happen for the thread pool
+thread to be able to communicate with the main thread.
+</p>
+<p>
+The other half of the dance comes when we want to stop the timer.
+</p>
+<pre>
+void ObjectWithTimer::StopTimer()
+{
+ timer.reset();
+ <font COLOR="blue">contextData.Reset();</font> // ComPtr-specific code
+}
+</pre>
+<p>
+To stop the timer, we let the
+<code>TpTimerDeleter</code> do the heavy lifting of
+checking if we have a timer and if so, shutting it down cleanly.
+</p>
+<p>
+Once that's done,
+we can safely release our reference to the context data.
+If the callback is running, it will have its own reference.
+</p>
+<p>
+For simplicity, this code doesn't try to save the
+thread pool timer object
+for future use.
+One of the features of the thread pool functions is that object
+creation preallocates all resources.
+Once you've created the thread pool timer successfully,
+all other operations will always succeed (assuming they are
+used correctly, of course).
+Therefore, what we could've done is allocate the
+<code>PTP_TIMER</code> at construction (throwing if not possible),
+and the have the <code>Start&shy;Timer</code> and
+<code>Stop&shy;Timer</code> methods merely reconfigure the timer
+and (in the case of <code>Stop&shy;Timer</code>)
+wait for the callbacks to drain.
+</p>
+<p>
+Note that in order to avoid the deadlock, we have to accept
+that the callback may run
+<i>after the timer has been stopped</i>.
+When you have a deadlock, something has to give,
+and we choose to break the deadlock by letting
+the callback complete asynchronously.
+If you need to know when the callback is definitely finished,
+you could add an event that gets signaled when the
+COM object is destructed, so that the caller knows when
+everything is finally finished.
+</p>
+<p>
+Adapting the above code to
+<code>std::shared_ptr</code> is not too difficult.
+The tricky part is that we cannot pass a raw pointer to the
+context data as our reference data,
+because raw C++ objects are not reference-counted.
+Instead, we pass a pointer to the <code>std::shared_ptr</code>,
+which is the thing with the reference count.
+</p>
+<pre>
+class ObjectWithTimer
+{
+public:
+ <font COLOR="blue">// Make object non-movable
+ ObjectWithTimer(ObjectWithTimer&amp;&amp;) = delete;
+ ObjectWithTimer operator=(ObjectWithTimer&amp;&amp;) = delete;</font>
+
+ StartTimer();
+ StopTimer();
+
+private:
+ static void CALLBACK TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer);
+
+ <font COLOR="blue">std::shared_ptr&lt;AgileContextData&gt; contextData;</font> // shared_ptr-specific code
+ std::unique_ptr&lt;TP_TIMER, TpTimerDeleter&gt; timer;
+};
+
+void ObjectWithTimer::StartTimer()
+{
+  // Error checking elided for expository purposes.
+  timer = CreateThreadpoolTimer(
+    TimerCallback,
+    <font COLOR="blue">std::addressof(contextData),</font> // shared_ptr-specific code
+    nullptr);
+
+  // Start the timer
+  SetThreadpoolTimer(timer, ...);
+}
+
+void ObjectWithTimer::TimerCallback(PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer)
+{
+ // Capture the context with a strong reference
+ <font COLOR="blue">// shared_ptr-specific code
+ std::shared_ptr&lt;AgileContextData&gt; contextData{
+    *reinterpret_cast&lt;
+      std::shared_ptr&lt;AgileContextData&gt;*&gt;(context) };</font>
+
+ context = nullptr;
+
+ DisassociateCurrentThreadFromCallback(instance);
+
+ ... do stuff with contextData ...
+}
+
+void ObjectWithTimer::StopTimer()
+{
+  timer.reset();
+  <font COLOR="blue">contextData.reset();</font> // shared_ptr-specific code
+}
+</pre>
+<p>
+The principle is the same here as before,
+but the implementation is made more complicated by the fact
+that the <code>std::shared_ptr</code> is not necessarily
+(and in fact usually isn't)
+the size of a pointer, so it doesn't fit in the context pointer.
+We have to pass a pointer to the <code>std::shared_ptr</code>.
+</p>
+<p><b>Exercise</b>:
+We could have written <code>&amp;contextData</code>
+instead of
+<code>std::addressof(contextData)</code>.
+Why did I use
+<code>std::addressof(contextData)</code>?
+</p>
+<p>
+The fact that a <code>std::shared_ptr</code> doesn't fit in a pointer
+means that the <code>std::shared_ptr</code> cannot move,
+because it is still being referenced by the
+context pointer passed to the thread pool callback.
+We can
+make the
+<code>Object&shy;With&shy;Timer</code> object movable
+by putting the <code>std::shared_ptr</code> inside
+a <code>std::unique_ptr</code>,
+and passing the raw pointer to the <code>std::shared_ptr</code>.
+The <code>std::unique_ptr</code> will transfer the pointer to
+the moved-to object, and the <code>std::shared_ptr</code> itself
+doesn't move.
+</p>
+<pre>
+class ObjectWithTimer
+{
+public:
+ <font COLOR="blue">// Make object movable again
+ // <strike>ObjectWithTimer(ObjectWithTimer&amp;&amp;) = delete;</strike>
+ // <strike>ObjectWithTimer operator=(ObjectWithTimer&amp;&amp;) = delete;</strike></font>
+
+ StartTimer();
+ StopTimer();
+
+private:
+ static void CALLBACK TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer);
+
+ <font COLOR="blue">std::unique_ptr&lt;
+   shared_ptr&lt;AgileContextData&gt;&gt; contextData;</font> // unique_ptr-specific code
+ std::unique_ptr&lt;TP_TIMER, TpTimerDeleter&gt; timer;
+};
+
+void ObjectWithTimer::StartTimer()
+{
+  // Error checking elided for expository purposes.
+  timer = CreateThreadpoolTimer(
+    TimerCallback,
+    <font COLOR="blue">contextData.get(),</font> // unique_ptr-specific code
+    nullptr);
+
+  // Start the timer
+  SetThreadpoolTimer(timer, ...);
+}
+
+void ObjectWithTimer::TimerCallback(PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer)
+{
+ // Capture the context with a strong reference
+ <font COLOR="blue">// no change here
+ std::shared_ptr&lt;AgileContextData&gt; contextData{
+    *reinterpret_cast&lt;
+      std::shared_ptr&lt;AgileContextData&gt;*&gt;(context) };</font>
+
+ context = nullptr;
+
+ DisassociateCurrentThreadFromCallback(instance);
+
+ ... do stuff with contextData ...
+}
+
+void ObjectWithTimer::StopTimer()
+{
+  timer.reset();
+  <font COLOR="blue">contextData.reset();</font> // no change here
+}
+</pre>
+<p>
+The idea in all the cases is that we keep a reference-counted
+object in the <code>contextData</code> and provide the callback
+a way to convert its context parameter to a strong reference.
+Since we are careful always to keep the context parameter valid
+as long as the callback is potentially-callable,
+this conversion is straightforward: Just create your own
+strong reference from the raw pointer.
+</p>
+<p>
+Often, the context for the callback is the containing object itself,
+rather than some external data.
+We'll explore that scenario next time, because this article is
+too long as it is.
+</p>
+<p>
+&sup1;
+The critical section case is easy to imagine:
+You might have a critical section that protects access to object
+state.
+The waiting thread owns the critical section because it's
+trying to clean up the object's thread pool timer.
+The callback is trying to acquire the critical section because
+it wants to access the object's state as part of the callback operation.
+</p>
+<p>
+&sup2;
+<a HREF="https://www.youtube.com/watch?v=lkgszkPnV8g#t=20m10s">
+Be careful with the <code>std::shared_ptr</code></a>.
+Copying a <code>std::shared_ptr</code> is thread-safe,
+but mutating it is not,
+so you should initialize your <code>std::shared_ptr</code> with
+the context structure and not modify the <code>std::shared_ptr</code>
+until you are sure that no other threads are accessing it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20180503-00/?p=98665#respond" style="display:none;">Cancel reply</a></small></h3>			<form action="https://blogs.msdn.microsoft.com/oldnewthing/wp-comments-post.php" method="post" id="commentform" class="comment-form">
+				<p class="comment-form-comment"><textarea id="comment" name="comment" cols="45" rows="4" aria-required="true"></textarea></p><p class="comment-form-author"><label for="author">Name <span class="required">*</span></label> <input id="author" name="author" type="text" value="" size="30" maxlength="245" aria-required='true' required='required' /></p>
+<p class="comment-form-email"><label for="email">Email <span class="required">*</span></label> <input id="email" name="email" type="text" value="" size="30" maxlength="100" aria-describedby="email-notes" aria-required='true' required='required' /></p>
+<p class="comment-form-url"><label for="url">Website</label> <input id="url" name="url" type="text" value="" size="30" maxlength="200" /></p>
+<p class="form-submit"><input name="submit" type="submit" id="submit" class="submit btn btn-default" value="Post Comment" /> <input type='hidden' name='comment_post_ID' value='98665' id='comment_post_ID' />
+<input type='hidden' name='comment_parent' id='comment_parent' value='0' />
+</p><p style="display: none;"><input type="hidden" id="akismet_comment_nonce" name="akismet_comment_nonce" value="ade1c9f875" /></p><p style="display: none;"><input type="hidden" id="ak_js" name="ak_js" value="100"/></p>			</form>
+			</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1335725">
+				<div id="div-comment-1335725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665#comment-1335725">
+			May 3, 2018 at 8:13 pm</a>		</div>
+
+		<p>One ugly but straightforward alternative if, in some hypothetical edge case, dissociating the callback thread from the callback is a problem: have a dedicated (non-pooled) thread to do the wait and cleanup for you.  That way, the main thread can continue to run, preventing the deadlock. </p>
+<p>It would be possible to detect whether a callback is active or not using an interlocked state, and if a callback does happen to be active when you&#8217;re finished with the timer, it MIGHT be possible to have the callback itself do the wait-and-cleanup.  The wait wouldn&#8217;t take long to be satisfied (because even if another callback starts executing, it would exit immediately) so that should be OK &#8211; except that I&#8217;m not sure whether calling WaitForThreadpoolTimerCallbacks from a worker thread is legal or not.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665&#038;replytocom=1335725#respond' onclick='return addComment.moveForm( "div-comment-1335725", "1335725", "respond", "98665" )' aria-label='Reply to Harry Johnston'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1335735">
+				<div id="div-comment-1335735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://deleted' rel='external nofollow' class='url'>Pierre B.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665#comment-1335735">
+			May 4, 2018 at 8:41 am</a>		</div>
+
+		<p>Assuming the existence of an atomic function to copy a ref-counted pointer, a simpler, more understandable solution would be:</p>
+<p>1. Keep your context data in a ref-counter pointer.</p>
+<p>2. In the timer call-back, copy the pointer and *then* check if it is non-null. If it is null, do nothing (i.e. simulate being canceled). If it is non-null, you can use it.</p>
+<p>3. In the main thread, simply set the context data to null. It will be freed if either no callback is running or when teh call-back ends.</p>
+<p>Maybe I&#8217;m missing a fault somewhere in my reasoning?</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665&#038;replytocom=1335735#respond' onclick='return addComment.moveForm( "div-comment-1335735", "1335735", "respond", "98665" )' aria-label='Reply to Pierre B.'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1335755">
+				<div id="div-comment-1335755" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665#comment-1335755">
+			May 4, 2018 at 10:14 am</a>		</div>
+
+		<p>And what is the context parameter you pass to the callback? A pointer to the ref-counted pointer? Who maintains the reference count on the ref-counted pointer? Does the callback have a strong count? In that case, who releases that strong count if the callback is canceled?</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665&#038;replytocom=1335755#respond' onclick='return addComment.moveForm( "div-comment-1335755", "1335755", "respond", "98665" )' aria-label='Reply to Raymond Chen - MSFT'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1335795">
+				<div id="div-comment-1335795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665#comment-1335795">
+			May 4, 2018 at 4:43 pm</a>		</div>
+
+		<p>I think you&#8217;re suggesting that the context value be a pointer to a smart pointer, which points to the context data.  In that scenario, freeing the context data isn&#8217;t the problem &#8211; but how do you free the smart pointer itself?</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665&#038;replytocom=1335795#respond' onclick='return addComment.moveForm( "div-comment-1335795", "1335795", "respond", "98665" )' aria-label='Reply to Harry Johnston'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1336145">
+				<div id="div-comment-1336145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kenn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665#comment-1336145">
+			May 8, 2018 at 9:15 am</a>		</div>
+
+		<p>I can&#8217;t see the answer to Exercise 1: &#8220;Why did I declare the timer member after the contextData member?&#8221;</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180503-00/?p=98665&#038;replytocom=1336145#respond' onclick='return addComment.moveForm( "div-comment-1336145", "1336145", "respond", "98665" )' aria-label='Reply to Kenn'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

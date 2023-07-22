@@ -1,0 +1,707 @@
+<html>
+<head>
+<title>Lock-free algorithms: The try/commit/(hand off) model</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock-free algorithms: The try/commit/(hand off) model</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 15, 2011 / year-entry #93</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The last lock-free pattern for this week isn't actually lock-free, but it does run without blocking. The pattern for what I'll call try/commit/(hand off) is more complicated than the other patterns, so I'll start off by describing it in words rather than in code, because the code tends to make things more complicated. First, you...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The last lock-free pattern for this week isn't actually lock-free,
+but it does run without blocking.
+</p>
+<p>
+The pattern for what I'll call try/commit/(hand off) is more complicated
+than the other patterns, so I'll start off by
+describing it in words rather than in code,
+because the code tends to make things more complicated.
+</p>
+<p>
+First, you take the state variable and chop it up into pieces.
+You need some bits
+to be used as a lock and as a <i>work has been handed off</i> flag.
+And if the work that has been handed off is complicated,
+you may need some more bits to remember the details of the handoff.
+A common way of doing this is to use a pointer-sized state variable,
+require that the objects being pointed to are suitably aligned,
+and reusing the bottom bits as flags.
+For example, if you require that the objects be <code>DWORD</code>-aligned,
+then the two bottom bits will always be zero
+and you can reuse them as flags.
+</p>
+<p>
+To perform an operation, you first try to lock the state variable.
+If you can't because the state variable is already locked,
+then you record the details of the operation in the state variable
+and update it atomically.
+</p>
+<p>
+If you succeed in locking the state variable, then you perform
+the desired operation, but before you unlock the state variable,
+you look to see if any work has been handed off.
+(This hand-off work is the result of attempts to perform the operation
+while you held the lock.)
+If there is hand-off work, then you perform that work as well.
+Of course, while you're doing that, more
+hand-off work may arrive.
+You can't unlock the state variable until you've
+drained off all the pent-up hand-off work.
+</p>
+<p>
+The code for this pattern tends to be a tangle of loops since there
+is a lot off backing off and retrying.
+Every atomic operation is its own loop, draining the hand-off work
+is another loop,
+and
+any time an <code>Interlocked&shy;Compare&shy;Exchange</code> fails,
+you have to undo the work you did and retry&mdash;another loop.
+</p>
+<p>
+I trust only about five people in the world to write code
+that is this advanced, and I'm not one of them.
+But just to illustrate the principle (although I will certainly
+get the details wrong), here's an implementation of a synchronization-like
+object which I will call a <code>Group&shy;Wait</code> for lack of any other
+name.
+It has the following operations:
+</p>
+<ul>
+<li><code>Add&shy;Wait</code>:
+    Register an event handle with the group wait.
+</li>
+<li>
+    <code>Signal&shy;All</code>:
+    Signals all events that are registered with the group wait.
+    Once an event is signalled, it is automatically unregistered
+    from the group wait.
+    If you want the event to be signalled at the next call to
+    <code>Signal&shy;All</code> you have to re-add it.
+</li>
+</ul>
+<p>
+The group wait object is just a linked list of
+<code>NODE</code>s containing the handles being waited on.
+</p>
+<p>
+Actually, this type of object doesn't need to use the try/commit/hand off
+model.
+It can be implemented in a much more straightforward manner by
+having <code>Add&shy;Wait</code> atomically prepend the node to a list
+and having <code>Signal&shy;All</code> atomically steal the list.
+There are even
+<a HREF="http://msdn.microsoft.com/en-us/library/ms684121.aspx">
+prewritten functions to perform these atomic
+linked list operations for you</a>.
+But I'm going to implemented it the complicated way
+for demonstration purposes.
+In real life, the code would be much simpler.
+</p>
+<p>
+Since the bottom two bits of the pointer must be zero due to alignment,
+we repurpose them as a lock bit and a signal bit.
+The lock bit is set when the list is locked,
+and the signal bit is set when a signal was requested but had to be
+handed off because the list was locked.
+</p>
+<pre>
+// WARNING! IF YOU USE THIS CODE YOU ARE AN IDIOT - READ THE TEXT ABOVE
+
+struct NODE;
+NODE *Node(LONG_PTR key) { return reinterpret_cast&lt;NODE*&gt;(key); }
+
+enum {
+ Locked = 1,
+ Signalled = 2,
+};
+
+struct NODE {
+ NODE *pnNext;
+ HANDLE hEvent;
+
+ LONG_PTR Key() { return reinterpret_cast&lt;LONG_PTR&gt;(this); }
+ NODE *Ptr() { return Node(Key() &amp; ~(Locked | Signalled)); }
+};
+
+#define NODE_INVALID Node(-1)
+
+class GroupWait {
+public:
+ GroupWait() : m_pnRoot(NULL) { }
+ ~GroupWait();
+ BOOL AddWait(HANDLE hEvent);
+ void SignalAll();
+private:
+ NODE *m_pnRoot;
+};
+</pre>
+<p>
+Since I will be viewing the <code>NODE*</code> as both a pointer
+and as a bunch of bits (which I call a <i>key</i>),
+I created some helper methods to save typing.
+<code>Node</code> and <code>Key</code> convert back and forth
+between node pointers and keys,
+and <code>Ptr</code> strips off the tag bits and returns a usable
+pointer.
+</p>
+<p>
+For notational purposes, a <code>NODE*</code> will be written as
+the combination <code>p|S|L</code> where <code>p</code> is a
+pointer to the next node, <code>S</code> is the signalled bit,
+and <code>L</code> is the lock bit.
+The signalled bit is set to indicate that
+we need to signal all the nodes in the list
+starting with the <i>next</i> node.
+(Think of the <code>S</code> bit
+as being attached to the outgoing arrow.)
+For example, this linked list:
+</p>
+<pre>
+   m_pnRoot
+  +--------+-+-+
+  |   *    |0|1|
+  +---|----+-+-+
+      |
+      v
+  +--------+-+-+---------+
+A |   *    |1|?| hEvent1 |
+  +---|----+-+-+---------+
+      |
+      v
+  +--------+-+-+---------+
+B |   *    |?|?| hEvent2 |
+  +---|----+-+-+---------+
+      |
+      v
+  +--------+-+-+---------+
+C |  NULL  |?|?| hEvent3 |
+  +--------+-+-+---------+
+</pre>
+<p>
+represents a group wait with three registered event handles.
+The <code>S</code> bit is clear on the root pointer,
+which means that
+nobody has yet requested that <code>hEvent1</code> be signalled.
+On the other hand,
+the <code>S</code> bit is set on node&nbsp;A, which means that
+all the events after node&nbsp;A need to be signaled,
+specifically,
+<code>hEvent2</code> and <code>hEvent3</code>.
+Note that this means that it doesn't matter whether the <code>S</code>
+bit is set on nodes B&nbsp;or&nbsp;C; those events are
+getting set regardless because the <code>S</code> bit on node&nbsp;A
+already requested it.
+(In particular, the <code>S</code> bit on the last node is meaningless
+since there are no nodes which come after it.)
+</p>
+<p>
+The <code>L</code> bit is meaningless on all pointers
+other than <code>m_pnRoot</code>.
+</p>
+<p>
+Okay, let's start be adding a handle to the wait list:
+</p>
+<pre>
+BOOL GroupWait::AddWait(HANDLE hEvent)
+{
+ NODE *pnInsert = new(nothrow) NODE;
+ if (pnInsert == NULL) return FALSE;
+ pnInsert-&gt;hEvent = hEvent;
+
+ NODE *pn;
+ NODE *pnNew;
+ do {
+  pn = <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/12/10152296.aspx">InterlockedReadAcquire</a>(&amp;m_pnRoot, NODE_INVALID);
+  pnInsert-&gt;pnNext = pn;
+  pnNew = Node(pnInsert-&gt;Key() | (pn-&gt;Key() &amp; Locked));
+ } while (InterlockedCompareExchangeRelease(&amp;m_pnRoot, pnNew, pn) != pn);
+ return TRUE;
+}
+</pre>
+<p>
+To add a handle to the wait list, we just prepend it to the linked list,
+being careful to propagate the <code>L</code> bit into the new pointer
+so we don't accidentally release a lock that somebody else took.
+We add the node with the <code>S</code> bit clear on the
+inbound pointer since nobody has
+yet asked for this handle to be signalled.
+After setting up the node, we attempt to insert it into the head of the
+list, and if we can't (because somebody else beat us to it),
+then we restart and try again.
+This is a standard try/commit/try again pattern.
+</p>
+<p>
+<b>Exercise</b>: Is there an ABA race condition here?
+</p>
+<p>
+The <code>Add&shy;Wait</code> method illustrates one extreme case of the
+try/commit/hand off model, where there is really nothing to hand off;
+we did it all ourselves.
+Of course, this does make other parts of the code trickier since they
+have to go back and
+deal with nodes that were added while the list was locked.
+</p>
+<p>
+The nasty part of the code is in <code>Signal&shy;All</code>.
+I'll present it in pieces.
+</p>
+<pre>
+void GroupWait::SignalAll()
+{
+ NODE *pnCapture;
+ NODE *pnNew;
+ do {
+  pnCapture = InterlockedReadAcquire(&amp;m_pnRoot, NODE_INVALID);
+
+  if (pnCapture-&gt;Key() &amp; Locked) {
+   pnNew = Node(pnCapture-&gt;Key() | Signaled);
+  } else {
+   pnNew = Node(Locked);
+  }
+ } while (InterlockedCompareExchangeAcquire(&amp;m_pnRoot,
+                              pnNew, pnCapture) != pnCapture);
+
+ if (pnCapture-&gt;Key() &amp; Locked) return;
+
+ ...
+</pre>
+<p>
+If the list is locked, then all we do is try to set the <code>S</code> bit
+on the root.
+If the list is not locked, then we try to lock it and simultaneously
+detach all the nodes by replacing the root pointer with <code>NULL|0|1</code>.
+Either way, we perform the operation with the try/commit/try again pattern
+until we finally get through.
+</p>
+<p>
+If the list was locked,
+then all we had to do was set the <code>S</code> bit on the root pointer.
+Setting the <code>S</code> bit on the root pointer
+means that all the nodes reachable from this pointer
+(<i>i.e.</i>, all nodes after the root, which is all nodes) 
+should be signalled,
+which is exactly what we want.
+Since the list is locked, we leave the actual signalling to the code
+that unlocks the list.
+(This is the <i>hand off</i> part of <i>try/commit/hand off</i>.)
+</p>
+<p>
+<b>Exercise</b>:
+What if the <code>S</code> bit is already set?
+Did we lose a signal?
+</p>
+<p>
+Otherwise, we are the ones to lock the list.
+We also detach the node list, for if another thread calls
+<code>Signal&shy;All</code>,
+we don't want that signal to affect the nodes that we're signalling.
+(Otherwise we might end up double-signalling the event.)
+</p>
+<pre>
+ ...
+ NODE *pnNext;
+ NODE *pn;
+ for (pn = pnCapture-&gt;Ptr(); pn; pn = pnNext) {
+  SetEvent(pn-&gt;hEvent);
+  pnNext = pn-&gt;pnNext-&gt;Ptr();
+  delete pn;
+ }
+ ...
+</pre>
+<p>
+That little fragment above is basically what you would do in a
+na&iuml;ve implementation that didn't worry about multithreading:
+It walks the list of nodes, signals each event,
+and then frees the node.
+The only trick is sending each node pointer through <code>-&gt;Ptr()</code>
+to strip off the tag bits.
+</p>
+<p>
+Next comes the unlock code.
+First, a preparatory step:</p>
+<pre>
+ ...
+ pnCapture = pnNew;
+ ...
+</pre>
+<p>
+We exchanged <code>pnNew</code> into <code>m_pnRoot</code> up above,
+and if that's still the value of <code>m_pnRoot</code>, then it
+means that nobody tried to perform any operations while the list
+was locked, and we got off easy.
+</p>
+<pre>
+ ...
+ for (;;) {
+  pnNew = Node(pnCapture-&gt;Key() &amp; ~Locked);
+  if (InterlockedCompareExchangeRelease(&amp;m_pnRoot,
+                      pnNew, pnCapture) == pnCapture) {
+   return;
+  }
+ ...
+</pre>
+<p>
+We start a new loop whose job is to
+drain off all the
+handed-off work items that built up while the list was locked.
+First, we see whether anything has changed since the last time
+we looked; if not, then we unlock and we're done.
+Otherwise, we proceed to pick up all the handed-off work:
+</p>
+<pre>
+ ...
+  pnCapture = InterlockedReadAcquire(&amp;m_pnRoot, NODE_INVALID);
+
+  NODE *pnNew = Node(pnCapture-&gt;Key() &amp; ~(Locked | Signaled));
+  NODE **ppn = &amp;pnNew;
+  NODE *pn;
+  NODE *pnNext;
+
+  BOOL fSignalSeen = FALSE;
+  for (pn = pnNew; pn-&gt;Ptr(); pn = pnNext) {
+   pnNext = pn-&gt;Ptr()-&gt;pnNext;
+   if (fSignalSeen) {
+    SetEvent(pn-&gt;Ptr()-&gt;hEvent);
+    delete pn-&gt;Ptr();
+   } else if (pn-&gt;Key() &amp; Signaled) {
+    fSignalSeen = TRUE;
+    (*ppn) = Node(Locked); // detach but retain lock
+    SetEvent(pn-&gt;Ptr()-&gt;hEvent);
+    delete pn-&gt;Ptr();
+   } else {
+    ppn = &amp;pn-&gt;Ptr()-&gt;pnNext;
+   }
+  }
+ } // retry unlock
+} // end of function
+</pre>
+<p>
+To drain the handed-off work, we walk the list of nodes,
+keeping track of whether we've seen an <code>S</code> bit.
+If so, then we signal the event and free the node.
+And the first time we see an <code>S</code> bit, we null out
+the inbound pointer to detach the list from the chain so we
+do not double-signal the event in the future.
+</p>
+<p>
+Once that's done, we go back and try to unlock again.
+Eventually, there will be no more hand-off work, and we
+can finally return.
+</p>
+<p>
+And that's it, a demonstration of the try/commit/hand off model.
+The basic idea is simple, but getting all the details right
+is what makes your head hurt.
+</p>
+</p>
+<p>I leave this sort of thing to the kernel folks, who have the
+time and patience and brainpower to work it all through.
+An example of this pattern can be found, for example,
+in this talk that describes the
+<a HREF="https://channel9.msdn.com/shows/Going+Deep/Arun-Kishan-Farewell-to-the-Windows-Kernel-Dispatcher-Lock/">
+dismantling of the dispatcher spinlock</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-907653">
+				<div id="div-comment-907653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907653">
+			April 15, 2011 at 7:52 am</a>		</div>
+
+		<p>Ex 1: There&#39;s no ABA because even if the previous head of the list is replaced with a different head at the same address, the pointer in the new head is still correct.</p>
+<p>Ex 2: A second call to SignalAll should only signal events added after the first call to SignalAll. &nbsp;If the S bit is already set then no extra events have been added, so there&#39;s nothing extra to signal, so no signals are lost.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907663">
+				<div id="div-comment-907663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907663">
+			April 15, 2011 at 7:56 am</a>		</div>
+
+		<p>Maybe I can&#39;t count, and it&#39;s probably not crucial to the discussion&#8230; but aren&#39;t the bottom three bits (not two bits) zero for DWORD-aligned addresses?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907673">
+				<div id="div-comment-907673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907673">
+			April 15, 2011 at 8:22 am</a>		</div>
+
+		<p>Yeah, whatever. &nbsp;I&#39;m too dumb for all of this so I think I&#39;ll just stick with critical sections and the occasional mutex.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907693">
+				<div id="div-comment-907693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John D'Oriocourt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907693">
+			April 15, 2011 at 8:46 am</a>		</div>
+
+		<p>I still find these articles fascinating, even if they are over my head. They at least give me some insight into how different things work. The points discussed in the articles or comments may pop up in my head if I work on something similar in the future, preventing errors in the program I&#39;m working on.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907703">
+				<div id="div-comment-907703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">tobi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907703">
+			April 15, 2011 at 8:54 am</a>		</div>
+
+		<p>This makes me wonder if there is a way to specify the requirements for a concurrent algorithm in some efficient format and have the computer synthesize an efficient implementation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907713">
+				<div id="div-comment-907713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jeff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907713">
+			April 15, 2011 at 8:58 am</a>		</div>
+
+		<p>Thanks for this series, Raymond. Complicated topics like these are what make your blog compelling.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907723">
+				<div id="div-comment-907723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907723">
+			April 15, 2011 at 8:58 am</a>		</div>
+
+		<p>@tobi: I believe that is subject to the Turing incompleteness theorem.</p>
+<p>I suppose if I were encountering this particular case I&#39;d see if I couldn&#39;t use a lock-free queue instead.</p>
+<p>Lock free queue&#39;s exist. The implementation is left as an exercise to the reader.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907733">
+				<div id="div-comment-907733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">tobi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907733">
+			April 15, 2011 at 9:12 am</a>		</div>
+
+		<p>@Joshu: I have seen in microsoft research a project that was able to synthesize sequential programs when given constraints and a control flow template. Not usable in practical way but impressive. Also, you cannot argue that static analysis tools cannot exist because of Turings theorem. They do exist, just not complete.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907743">
+				<div id="div-comment-907743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pplu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907743">
+			April 15, 2011 at 9:29 am</a>		</div>
+
+		<p>I just can&#39;t wait to see a DailyWTF article that involves a file that starts with this comment:</p>
+<p>// WARNING! IF YOU USE THIS CODE YOU ARE AN IDIOT &#8211; READ THE TEXT ABOVE</p>
+<p>And of course: no text above ;) Well&#8230; at least they would know they are idiots XD</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907753">
+				<div id="div-comment-907753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sukru</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907753">
+			April 15, 2011 at 10:33 am</a>		</div>
+
+		<p>I&#39;m trying to go over the code (yes today&#39;s is much more intensive, btw thanks for this great series).</p>
+<p>I could not find the documentation for InterlockedReadAcquire on MSDN. Did I miss something?</p>
+<p>Also the following comment from SList documentation makes a programmer much more humble:</p>
+<p>&nbsp;&quot;SLists are straightforward to implement and use in 32-bit code. However, it is challenging to implement them in 64-bit code because the amount of data exchangeable by the native interlocked exchange primitives is not double the address size, as it is in 32-bit code. Therefore, SLists enable porting high-end scalable algorithms to Windows.&quot;</p>
+<div class="post">[<i>The articles in the series build on each other. If you jump into the middle you&#39;re going to be confused. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907763">
+				<div id="div-comment-907763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sukru</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907763">
+			April 15, 2011 at 10:53 am</a>		</div>
+
+		<p>&quot;The articles in the series build on each other. If you jump into the middle you&#39;re going to be confused.&quot;</p>
+<p>A bit of searching helped. I had actually read that article when it was published, but probably have forgotten about it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907773">
+				<div id="div-comment-907773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">J</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907773">
+			April 15, 2011 at 1:49 pm</a>		</div>
+
+		<p>If there&#39;s a call to AddWait while the list is locked &#8211; won&#39;t this cause a dangling pointer? &nbsp; Am I missing something other than the all-caps comment at the beginning?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907783">
+				<div id="div-comment-907783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrew</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907783">
+			April 15, 2011 at 3:44 pm</a>		</div>
+
+		<p>That&#39;s some seriously cool code. This whole series has been fascinating, thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907793">
+				<div id="div-comment-907793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marcel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907793">
+			April 16, 2011 at 2:21 am</a>		</div>
+
+		<p>@David Walker &#8211; try counting again ;-) 2 bits have a range of 0-3 and a DWORD has 4 bytes&#8230;</p>
+<p>Apart from that, very interesting series. Though I, too, will simply stick to critical sections and the like as I prefer &quot;is slower&quot; over &quot;occasionally doesn&#39;t work&quot;. But then I usually don&#39;t do high performance servers software or OS kernels anyway, where I can see the appeal for it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907833">
+				<div id="div-comment-907833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pete</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907833">
+			April 16, 2011 at 1:42 pm</a>		</div>
+
+		<p>We implemented ProcRun similarly in OS/2 1.1. &nbsp;We used a two-byte variable. &nbsp;The low byte was the &quot;busy&quot; byte and the high byte was the &quot;hand-off&quot; byte. &nbsp;The &quot;hand-off&quot; thread would perform the following sequence:</p>
+<p>&nbsp; &nbsp;pushf</p>
+<p>&nbsp; &nbsp;cli</p>
+<p>&nbsp; &nbsp;mov &nbsp; &nbsp; al, 0FFh</p>
+<p>&nbsp; &nbsp;xchg &nbsp; &nbsp;lockword.lobyte, al</p>
+<p>&nbsp; &nbsp;or &nbsp; &nbsp; &nbsp;al, al</p>
+<p>&nbsp; &nbsp;jz &nbsp; &nbsp; &nbsp;IAmTheWorkerNow</p>
+<p>&nbsp; &nbsp;mov &nbsp; &nbsp; lockword.hibyte, al</p>
+<p>&nbsp; &nbsp;popf</p>
+<p>&nbsp; &nbsp;ret</p>
+<p>IAmTheWorkerNow:</p>
+<p>&nbsp; &nbsp;sti</p>
+<p>Meanwhile, when the &quot;worker&quot; thread was done, it would do the following:</p>
+<p>&nbsp; &nbsp;shr &nbsp; &nbsp; lockword, 8</p>
+<p>&nbsp; &nbsp;jnz &nbsp; &nbsp; IHaveMoreWorkToDo</p>
+<p>&nbsp; &nbsp;ret</p>
+<p>The key was to let the bulk of ProcRun run with interrupts enabled. &nbsp;We ran on uniprocessor systems, and kernel code could be interrupted, but not preempted. &nbsp;Reenabling interrupts was a very expensive operation on some buggy chip steppings.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907853">
+				<div id="div-comment-907853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110415-00/?p=10923#comment-907853">
+			April 17, 2011 at 11:37 pm</a>		</div>
+
+		<p>Wow, Raymond. Could you have picked a more contentious issue to blog about?</p>
+<p>;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

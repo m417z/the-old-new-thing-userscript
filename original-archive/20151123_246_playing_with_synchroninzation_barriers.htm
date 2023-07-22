@@ -1,0 +1,680 @@
+<html>
+<head>
+<title>Playing with synchroninzation barriers</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Playing with synchroninzation barriers</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 23, 2015 / year-entry #247</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>24</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A synchronization barrier is a synchronization object that works like this: A synchronization barrier knows how many threads it is managing. Each thread that calls Enter�Synchronization�Barrier blocks. When the last thread enters the synchronization barrier, all threads are released. Once a thread exits the synchronization barrier, it can re-enter it, at which point it blocks...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A <i>synchronization barrier</i> is a synchronization object that
+works like this:
+</p>
+<ul>
+<li>A synchronization barrier knows how many threads it is managing.
+<li>Each thread that calls
+    <code>Enter&shy;Synchronization&shy;Barrier</code>
+    blocks.</p>
+<li>When the last thread enters the synchronization barrier,
+    all threads are released.</p>
+<li>Once a thread exits the synchronization
+    barrier, it can re-enter it,
+    at which point it blocks again, and the cycle repeats.
+</ul>
+<p>
+The idea here is that you have a multi-step process,
+and each thread must complete a step before any thread
+can go on to the next step.
+For example, you might have a sequence of steps like this:
+</p>
+<ul>
+<li>Everybody enters the room and sits down.
+<li>Wait for everybody to be seated.
+<li>Start the movie.
+<li>Everybody watches the movie.
+<li>After the movie ends, everybody leaves the room
+and stands outside.</p>
+<li>Wait for everybody to leave the room.
+<li>One person locks the door.
+<li>Everybody says good-bye and goes home.
+</ul>
+<p>
+The synchronization barrier takes care of the
+<i>wait for everybody to...</i> part.
+</p>
+<p>
+It is not uncommon that an action needs to be taken after
+all threads have cleared the barrier,
+and the action needs to be performed exactly once.
+In the example above,
+one such action is "Start the movie."
+To support this pattern,
+the
+<code>Enter&shy;Synchronization&shy;Barrier</code>
+returns <code>TRUE</code> to exactly one thread;
+all the other threads get <code>FALSE</code>.
+</p>
+<p>
+Here's a Little Program that demonstrates the synchronization
+barrier pattern.
+Each thread is person who wants to watch the movie.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+#define WATCHERS 4
+
+SYNCHRONIZATION_BARRIER barrier;
+HANDLE movieFinished;
+
+// Watchers gonna watch.
+DWORD CALLBACK MovieWatcherThread(void* p)
+{
+  int id = PtrToInt(p);
+
+  // Build a string that we use to prefix our messages.
+  char tag[WATCHERS + 1];
+  for (int i = 0; i &lt; WATCHERS; i++) {
+    tag[i] = (i == id) ? (char)('1' + i) : ' ';
+  }
+  tag[WATCHERS] = 0;
+
+  printf("%s Sitting down\n", tag);
+
+  if (EnterSynchronizationBarrier(&amp;barrier, 0)) {
+    // We are the one who should start the movie.
+    printf("%s Starting the movie\n", tag);
+
+    // For demonstration purposes, the movie is only one second long.
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -1000000LL;
+    SetWaitableTimer(movieFinished, &amp;dueTime, 0,
+                     nullptr, nullptr, FALSE);
+  }
+
+  // Watch the movie until it ends.
+  printf("%s Enjoying the movie\n", tag);
+  WaitForSingleObject(movieFinished, INFINITE);
+
+  // Now leave the room.
+  printf("%s Leaving the room\n", tag);
+
+  if (EnterSynchronizationBarrier(&amp;barrier, 0)) {
+    // We are the one who should lock the door.
+    printf("%s Locking the door\n", tag);
+  }
+
+  printf("%s Saying good-bye and going home\n", tag);
+  return 0;
+}
+
+int __cdecl main(int, char**)
+{
+  movieFinished = CreateWaitableTimer(nullptr, TRUE, nullptr);
+  InitializeSynchronizationBarrier(&amp;barrier, WATCHERS, -1);
+
+  HANDLE threads[WATCHERS];
+  for (int i = 0; i &lt; WATCHERS; i++) {
+    DWORD threadId;
+    threads[i] = CreateThread(nullptr, 0, MovieWatcherThread,
+                              IntToPtr(i), 0, &amp;threadId);
+  }
+
+  // Wait for the demonstration to complete.
+  WaitForMultipleObjects(WATCHERS, threads, TRUE, INFINITE);
+
+  CloseHandle(movieFinished);
+  DeleteSynchronizationBarrier(&amp;barrier);
+  return 0;
+}
+</pre>
+<p>
+Each thread represents a person who wants to watch the movie.
+We sit down, and then wait for everybody else to sit down
+by entering the synchronization barrier.
+The call to
+<code>Enter&shy;Synchronization&shy;Barrier</code>
+returns when everybody has sat down.
+</p>
+<p>
+The watcher whose call to
+<code>Enter&shy;Synchronization&shy;Barrier</code>
+returned
+<code>TRUE</code> takes responsibility for starting the movie.
+</p>
+<p>
+And then everybody watches the movie, waiting until the movie ends.
+</p>
+<p>
+Once that's done, each person leaves the room, and then enters
+another synchronization barrier to wait until everybody is outside.
+</p>
+<p>
+The synchronization barrier will nominate one person to lock the door.
+</p>
+<p>
+Everybody says good-bye and goes home.
+</p>
+<p>
+There is one tricky thing about synchronization barriers:
+Knowing when it is safe to reenter a synchronization barrier
+after exiting it.
+If the synchronization barrier is always used by the
+same pool of threads (like we did here),
+then there's no problem.
+The thread clearly has exited the synchronization barrier
+if it manages to run code and try to enter it again.
+</p>
+<p>
+The tricky part is if the collection of threads participating
+in the barrier changes over time.
+The rule is that when a thread exits the barrier,
+then it releases a "unit of synchronization"
+that another thread can consume
+by entering the barrier.
+Usually, the unit is consumed by the same thread that exits
+the barrier,
+but that thread could instead hand the unit to another thread and let
+that other thread take over the job.
+It is important that there be a causal link between the exiting
+thread and the future entering thread,
+so that the future entering thread knows that the previous exiting
+thread has fully exited.
+</p>
+<p>
+Suppose there are three steps:
+Step 1 is handled by threads A and B,
+and Steps 2 and 3 are handled by threads B and C.
+You don't want to do this:
+</p>
+<table BORDER=1 BORDERCOLOR=black
+    STYLE="border-collapse: collapse; text-align: center">
+<tr>
+<th>Thread A</th>
+<th>Thread B</th>
+<th>Thread C</th>
+</tr>
+<tr>
+<td>Work on step 1</td>
+<td>Work on step 1</td>
+<td ROWSPAN=3>Idle</td>
+</tr>
+<tr>
+<td ROWSPAN=5 VALIGN=top>Enter&shy;Synchronization&shy;Barrier</td>
+<td>Enter&shy;Synchronization&shy;Barrier</td>
+</tr>
+<tr>
+<td>Signal thread C to start</td>
+</tr>
+<tr>
+<td>Work on step 2</td>
+<td>Work on step 2</td>
+</tr>
+<tr>
+<td>Enter&shy;Synchronization&shy;Barrier</td>
+<td>Enter&shy;Synchronization&shy;Barrier</td>
+</tr>
+<tr>
+<td>Work on step 3</td>
+<td>Work on step 3</td>
+</tr>
+</table>
+<p>
+The problem here is that thread C may call
+<code>Enter&shy;Synchronization&shy;Barrier</code>
+before thread A has exited it.
+There is no causal link between thread A exiting the barrier
+and thread C entering it,
+which creates the race condition.
+</p>
+<p>
+In this case, you can solve the problem by having thread A
+be the one to signal thread C to start working on step 2.
+That way the "unit of synchronization" is positively handed
+from thread A to thread C.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (24)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1215221">
+				<div id="div-comment-1215221" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Medinoc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215221">
+			November 23, 2015 at 7:34 am</a>		</div>
+
+		<p>&gt;&quot;In this case, you can solve the problem by having thread A be the one to signal thread C to start working on step 2. That way the &quot;unit of synchronization&quot; is positively handed from thread A to thread C.&quot;</p>
+<p>I have trouble seeing how this doesn&#39;t cause a race condition between threads B and C&#8230; Isn&#39;t there a risk that C may enter the barrier before B is done leaving it (after entering it the first time)?</p>
+<div class="post">[<em>This happens even in the movie-watching scenario: The first person to leave the room may try to enter the synchronization barrier before the last person has left it, and that&#39;s fine and expected. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman odd alt thread-odd thread-alt depth-1" id="comment-1215211">
+				<div id="div-comment-1215211" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215211">
+			November 23, 2015 at 7:41 am</a>		</div>
+
+		<p>According to MSDN, these functions are new for Windows 8, i.e. won&#39;t work on Win7. I would make the suggestion that articles point out when the topic of interest is only available on some of the current MS supported OS versions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-winkingwan even thread-even depth-1" id="comment-1215201">
+				<div id="div-comment-1215201" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/pinwing' rel='external nofollow' class='url'>pinwing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215201">
+			November 23, 2015 at 8:08 am</a>		</div>
+
+		<p>There is a typo in title: synchroninzation -&gt; synchronization</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215171">
+				<div id="div-comment-1215171" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215171">
+			November 23, 2015 at 8:39 am</a>		</div>
+
+		<p>Let&#39;s see if I understand the &quot;summary&quot;, all threads are released, but that doesn&#39;t means every thread have &quot;exited&quot; the barrier? Otherwise, if thread B exits then thread A would also have to exit.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215161">
+				<div id="div-comment-1215161" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215161">
+			November 23, 2015 at 9:10 am</a>		</div>
+
+		<p>I&#39;m not sure I follow how the race condition works. &nbsp;Is the problem that, if we get unlucky with the OS thread scheduler, that thread A could still have yet to exit Enter&shy;Synchronization&shy;Barrier by the time that thread C enters Enter&shy;Synchronization&shy;Barrier, in which case the barrier will have the requisite 2 threads waiting on it and let thread C continue before A has reached it? &nbsp;That seems broken to me &mdash; I would have thought that even if the OS hasn&#39;t yet scheduled thread A, it wouldn&#39;t be counted against the target of 2 threads waiting for the barrier. And if that is the case, why wouldn&#39;t the same race happen in the case when the same threads are reused with the barrier?</p>
+<p>(Aside: a synchronization barrier is also known as a rendezvous in some systems)</p>
+<div class="post">[<em>The synchronization barrier is a user-mode concept, like a critical section. The kernel scheduler doesn&#39;t know anything about synchronization barriers. It&#39;s the same race condition you have between somebody leaving a critical section and another thread deleting it. You can&#39;t delete the critical section until the code that is exiting the critical section has fully exited. (There is no race when the same thread re-enters the barrier because it has definitely exited the barrier before re-entering.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215151">
+				<div id="div-comment-1215151" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PeteC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215151">
+			November 23, 2015 at 9:23 am</a>		</div>
+
+		<p>@Adam, I agree, compared to pthread barriers this seems like a poor design and easy to get wrong. Once the barrier has reached the required thread count, the threads should all be released simultaneously! Regardless of how long it takes any thread to be scheduled again, the barrier should be available for immediate re-use with thread count 0. Having a state which is &quot;released but not exited&quot; is asking for trouble.</p>
+<div class="post">[<em>Synchronization barriers are user-mode concepts. The scheduler releases the thread, but user-mode code needs to run in order to do the necessary bookkeeping. The scheduler can&#39;t do the bookkeeping because the scheduler doesn&#39;t have any concept of a synchronization barrier. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215131">
+				<div id="div-comment-1215131" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215131">
+			November 23, 2015 at 12:19 pm</a>		</div>
+
+		<p>I still don&#39;t follow. &nbsp;Consider these two execution traces:</p>
+<p>Trace 1 (where thread B signals thread C):</p>
+<p>1) Threads A &amp; B call EnterSynchronizationBarrier</p>
+<p>2) Thread B wakes up and signals thread C</p>
+<p>3) Thread C wakes up and calls EnterSynchronizationBarrier. &nbsp;There are now 2 threads inside the barrier (A &amp; C).</p>
+<p>4) Thread C exits EnterSynchronizationBarrier and proceeds past the barrier, but thread B has not yet reached it. &nbsp;Thread A is still waking up before the exit of EnterSynchronizationBarrier and has not yet been scheduled by the OS. [*]</p>
+<p>Trace 2 (where threads A &amp; B synchronize twice, as in the movie analogy):</p>
+<p>1) Threads A &amp; B call EnterSynchronizationBarrier</p>
+<p>2) Thread B wakes up, performs work, and calls EnterSynchronizationBarrier again. &nbsp;There are now 2 threads inside the barrier again.</p>
+<p>3) Thread B wakes up again and proceeds past the barrier, but thread A has not yet reached it. &nbsp;It is still waking up before the exist of the first call to EnterSynchronizationBarrier and has not yet been scheduled by the OS. [*]</p>
+<p>In both of the cases marked [*], a thread exits EnterSynchronizationBarrier (B) and a thread subsequently enters EnterSynchronizationBarrier (C in trace 1, B in trace 2) before the first thread (A) has exited the first call to EnterSynchronizationBarrier. &nbsp;If this causes EnterSynchronizationBarrier to say &quot;oh hey, I&#39;ve got all of the waiting threads I need, time to let you guys all go!&quot;, then there&#39;s the same race condition in both cases. &nbsp;And if those traces *don&#39;t* cause EnterSynchronizationBarrier to say that (say, because it&#39;s smart enough not to count thread A in its list of waiting threads), then I don&#39;t understand what the race is.</p>
+<p>What am I misunderstanding?</p>
+<div class="post">[<em>In trace 2&#39;s step 2, there are two threads inside the barrier, but one is entering and one is exiting. Only entering threads count toward deciding whether the barrier has enough threads waiting. (Because the exiting threads aren&#39;t waiting.) I think I&#39;ll write a follow-up article on this, since it seems to be confusing. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215111">
+				<div id="div-comment-1215111" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215111">
+			November 23, 2015 at 4:55 pm</a>		</div>
+
+		<p>@Adam Rosenfield:</p>
+<p>I think the problem is that what happens when the synchronization barrier releases all of the threads is implied and assumed to be the most logical thing to do here.</p>
+<p>When I first read this, I didn&#39;t see why it would do anything but just clean up after the operation and exit, and it would only wait on a handle once for each call to EnterSynchronizationBarrier. After getting to the end, I also saw immediately that the race condition talked about was on the structure itself, because if things turn out that way, we could end up in a situation where you are trying to add a third thread to a barrier that only handles two threads. In the case given, C was meant to replace A in the barrier, but because B signalled C to start working again, then there was no connection to whether A had actually exited the barrier.</p>
+<p>The question that I asked myself then is, do I have some kind of weird affinity with the MSDN documentation, or are other programmers jaded enough to expect weird things.</p>
+<p>Well, either way, maybe a bit more information in the Synchronization Barrier section of the MSDN, or even a bit more in the remarks section of EnterSynchronizationBarrier would help alleviate this in future.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-p_christidis even thread-even depth-1" id="comment-1215101">
+				<div id="div-comment-1215101" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/__klg' rel='external nofollow' class='url'>__klg</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215101">
+			November 23, 2015 at 10:02 pm</a>		</div>
+
+		<p>Raymond you have misspelled &#39;synchronization&#39; in your title.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215091">
+				<div id="div-comment-1215091" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215091">
+			November 24, 2015 at 12:58 am</a>		</div>
+
+		<p>@Darran Rowe &quot;I also saw immediately that the race condition talked about was on the structure itself&quot;:</p>
+<p>Why? Somehow, the implementation manages to return TRUE only to exactly one of the threads. To do this, I expect that one of the threads (the last one calling EnterSynchronizationBarrier) will continue to run, will therefore be able to reset the structure without interfering with the other threads, will then wakeup all the other threads by PulseEvent or similar, and will return TRUE in the end.</p>
+<p>The expectation depends on the mental model of the implementation of this feature.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215081">
+				<div id="div-comment-1215081" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PeteC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215081">
+			November 24, 2015 at 2:56 am</a>		</div>
+
+		<p>&gt; The problem here is that thread C may call Enter­Synchronization­Barrier before thread A has exited it.</p>
+<p>Well now I don&#39;t see the problem at all. In your reply above (Raymond) you say &quot;Only entering threads count toward deciding whether the barrier has enough threads waiting&quot;. So thread A is exiting and doesn&#39;t count, so where is the race? What is the problem with C calling Enter­Synchronization­Barrier before A has exited, if A is not counting towards the total?</p>
+<p>Another post on this topic would be useful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1215071">
+				<div id="div-comment-1215071" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215071">
+			November 24, 2015 at 6:02 am</a>		</div>
+
+		<p>If all threads are released at the same time then there is a race to be the first to printf and some threads might be enjoying the movie before the last thread has started playing the movie?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215031">
+				<div id="div-comment-1215031" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215031">
+			November 24, 2015 at 8:12 am</a>		</div>
+
+		<p>PeteC, my thoughts exactly. &nbsp;I don&#39;t see where the race is now. &nbsp;Agreed that another post on this topic would be very helpful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1214991">
+				<div id="div-comment-1214991" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sense</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1214991">
+			November 24, 2015 at 9:13 am</a>		</div>
+
+		<p>RealWord™ analogies were real good and very fun, but is this type of synchronization really useful in programming? I&#39;d love to hear practical applications for it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1214971">
+				<div id="div-comment-1214971" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1214971">
+			November 24, 2015 at 10:39 am</a>		</div>
+
+		<p>Great, one more new thing that I now have to use so my team lead has to figure out yet another new thing against his will.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1214951">
+				<div id="div-comment-1214951" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1214951">
+			November 24, 2015 at 12:41 pm</a>		</div>
+
+		<p>@Brian_EE: According to MSDN, these functions are new for Windows 8, i.e. won&#39;t work on Win7.</p>
+<p>How surprising. Ray is working part time in the marketing department again.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1214941">
+				<div id="div-comment-1214941" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1214941">
+			November 24, 2015 at 1:24 pm</a>		</div>
+
+		<p>When a (batch of) threads exits the barrier, the API needs to return the sequence # of the batch. This will take care of ordering. In any case, if you have more threads than the batch size, the latter batch threads may even get scheduled earlier than former. There cannot be any ordering.</p>
+<p>Since the API doesn&#39;t support sequence #, it needs to be generated by InterlockedIncrement and then modulo N.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1214901">
+				<div id="div-comment-1214901" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1214901">
+			November 24, 2015 at 4:06 pm</a>		</div>
+
+		<p>@S:</p>
+<p>Simply put, I&#39;m psychic an amazing.</p>
+<p>But being serious here, you have to remember a few things about this post. First, the problematic area is what happens if you reuse a structure before it has been fully cleaned up. This should be pure undefined behaviour regardless. While you are saying that the thread that unblocks the barrier should do the cleanup, is that really true, or what happens? This is implementation defined hence why it is undefined behaviour.</p>
+<p>The problem that people seem to be having stemmed from that last example where Raymond talked about that three thread setup. Again, the cause of that problem was that there is a race in the usage of the structure between when the barrier is cleaned up and when it is used again. That example was about how thread B could signal thread C to work, and then C could enter the barrier all before A could leave the barrier. The race here was how C was unaware that A even existed. This meant that C could happily go into the barrier before thread A, the thread that C was to replace, actually finished its work.</p>
+<p>There is of course lots to say about this, the barrier could protect itself against this kind of thing easily, but that isn&#39;t the point. The point is still that the behaviour is undefined in this situation and you really shouldn&#39;t press your luck.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1216031">
+				<div id="div-comment-1216031" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Magnus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1216031">
+			November 24, 2015 at 10:46 pm</a>		</div>
+
+		<p>To: sense &#8211; 24 Nov 2015 9:13 AM</p>
+<p>I once had to test some custom-written CAS (compare and swap) operations. &nbsp;I had ported IBM&#39;s IBM Open Classes framework from their VisualAge C++ compiler to MSVC, and had to re-implement the CAS operations because they were written in assembler and they hard-coded VisualAge&#39;s ABI and calling conventions.</p>
+<p>To test them I had to get multiple threads to race each other along an array, CASing the same elements at the same time. &nbsp;This would only work if I could get all threads started, and then all waiting at the starting line, before pulling the trigger.</p>
+<p>I had to implement my own synchronisation barrier (I didn&#39;t actually know there was a name for such a thing, thanks Raymond!) using C++11 STL&#39;s new (at the time) synchronisation primitives, which was quite fiddly. &nbsp;But I knew what I wanted to do, this type of thing was a bit more common in BeOS (RIP) using BeOS-style semaphores.</p>
+<p>So not quite real-world production code as I used it for testing, but still something I had to do for work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1216011">
+				<div id="div-comment-1216011" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1216011">
+			November 25, 2015 at 1:10 am</a>		</div>
+
+		<p>&quot;the problematic area is what happens if you reuse a structure before it has been fully cleaned up &#8230; &nbsp;there is a race in the usage of the structure between when the barrier is cleaned up and when it is used again&quot;</p>
+<p>For example, the mechanism could roughly work like this:</p>
+<p>For N threads, InitializeSynchronizationBarrier() creates N auto-reset events and stores the handles inside the structure. Also, a counter is set to N.</p>
+<p>For each thread, EnterSynchronizationBarrier() enters a critical section to (a) decrement this counter (=&gt; result value is C) and (b) if C &gt; 0, an unused event handle from this structure is find and marked as in-use. Then the critical section is leaved.</p>
+<p>If C is non-null, the thread calls WaitForSingleObject() on the event handle. After wakeup, it again acquires the critical section to mark the event handle in the structure as unused, then returns FALSE.</p>
+<p>If C is null, the thread resets the counter to N (stored in another field, also to allow range-checking the C value), then iterates through all the event handles marked as in-use to call SetEvent() on each, then returns TRUE.</p>
+<p>=&gt; There are always enough resources in the structure to allow each of the threads (even the true-returning one) to re-enter EnterSynchronizationBarrier as fast as possible, even when none of the other threads got any CPU time in-between.</p>
+<p>=&gt; It does not matter, if one thread is replaced by another thread.</p>
+<p>=&gt; When the barrier is unblocked, it starts over from scratch (as expected, at least by me).</p>
+<div class="post">[<em>What about if C is non-null, but there are no available event handles? (Because the&nbsp;thread that is using the event handle hasn&#39;t been scheduled yet.)&nbsp;-Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215841">
+				<div id="div-comment-1215841" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215841">
+			November 25, 2015 at 2:33 pm</a>		</div>
+
+		<p>@S:</p>
+<p>As Raymond said, &quot;What about if C is non-null, but there are no available event handles? (Because the thread that is using the event handle hasn&#39;t been scheduled yet.)&quot;</p>
+<p>I think the thing that you are still missing is that the issue isn&#39;t about N threads entering a synchronization barrier large enough to store N threads. But the fact that if the set of threads working on a problem changes over time, we have &gt;N threads entering a barrier large enough to store N threads.</p>
+<p>To use concrete numbers here. Lets say a task is split between two threads, threads A and B. At some point in the future, thread C is going to replace thread A.</p>
+<p>So we create a barrier with room to store two threads. Thread A gets the processor and quickly finishes its work, enters the barrier and waits. B takes a bit more time to finish its work, because of this A goes to sleep. B finishes its work, enters the barrier and then the barrier is released. B continues working, cleaning up after itself, signals C to start working, and then goes about doing the next stage of its work and finally re-enters the barrier, this time having to wait.</p>
+<p>So right now, there are already two threads in the barrier, A, which is taking a long time to wake up because it isn&#39;t good in the mornings, and B still wide awake.</p>
+<p>At this time, C is happily working away at the task that it is meant to do and then enters the barrier. Yes, this is a third thread entering a barrier only large enough to store two threads. ???!!! Blorf?</p>
+<p>This is the essence of the data race on the barrier, and it can happen. If A has had its priority adjusted so it was lower than B and C, then it could take some time for the thread to be rescheduled, especially if the system is busy. It is also a problem that Humans aren&#39;t really good at figuring out because it is time based.</p>
+<p>This is why I normally err on the side of caution and use the function calls as when it is safe to reuse things. Until all calls to EnterSynchronizationBarrier has exited after the barrier has been released, I class it as still being in use and would try not to use it again.</p>
+<div class="post">[<em>The scenario you describe is illegal. The number of threads a barrier waits for must remain fixed for the lifetime of the barrier. If you have a workflow where the number of threads varies, you need multiple barriers. In the above example, you would have a two-thread barrier for step 1 and a three-thread barrier for step 2. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215791">
+				<div id="div-comment-1215791" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215791">
+			November 26, 2015 at 1:56 am</a>		</div>
+
+		<p>@Darran Rowe: Raymond wrote &quot;The tricky part is if the collection of threads participating in the barrier changes over time.&quot; and you described it a problem with the management of the barrier structure, as if the implementation of EnterSynchronizationBarrier expects the exit of ALL threads from EnterSynchronizationBarrier before it can be reused.</p>
+<p>To counter this, I presented a way to implement EnterSynchronizationBarrier that does not have any book-keeping problem, regardless of timing/thread scheduling, AS LONG AS the application respects the contract of InitializeSynchronizationBarrier / EnterSynchronizationBarrier: At any time, the number of threads calling EnterSynchronizationBarrier must not exceed the number defined by InitializeSynchronizationBarrier. You cannot have a third thread calling EnterSynchronizationBarrier if you have called InitializeSynchronizationBarrier with 2, and 2 threads are still within EnterSynchronizationBarrier. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1215691">
+				<div id="div-comment-1215691" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215691">
+			November 26, 2015 at 5:34 pm</a>		</div>
+
+		<p>@Raymond:</p>
+<p>Of course it is illegal. But no, I didn&#39;t need a three thread barrier for step 2 because the entire point was to show a situation where a thread could hang around too long in a barrier after it was meant to leave it. I thought I made it clear enough that thread A was still in the barrier not because it called EnterSynchronizationBarrier again, but it still hadn&#39;t returned from its only call to it.</p>
+<p>It was meant to be a bit of a live example of the situation described in your own post which you started off with &quot;Suppose there are three steps: Step 1 is handled by threads A and B, and Steps 2 and 3 are handled by threads B and C. You don&#39;t want to do this:&quot; without the third step. Obviously I failed badly.</p>
+<p>@S:</p>
+<p>&quot;you described it a problem with the management of the barrier structure, as if the implementation of EnterSynchronizationBarrier expects the exit of ALL threads from EnterSynchronizationBarrier before it can be reused.&quot;</p>
+<p>Maybe so, but it seems I failed a second time. Go me, wonderful post that was.</p>
+<p>There was supposed to be a bit of a tone shift between my first reply to you, which was also working on the fact that the documentation, as of the time of posting, doesn&#39;t actually document the reuse of a structure. In these cases, the behaviour that you would then be using would be undocumented which is undefined.</p>
+<p>The second reply was then a failed attempt to give a bit of an example as to how even your design has flaws if you mess up with the whole change of thread situation.</p>
+<p>Note to self, stop trying to explain things to people, you suck at it&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1215541">
+				<div id="div-comment-1215541" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151123-00/?p=92161#comment-1215541">
+			November 27, 2015 at 1:35 pm</a>		</div>
+
+		<p>@Darren Rowe: I think your example is the same as my trace 1 (correct me if I&#39;m wrong), in which case Raymond&#39;s reply &quot;Only entering threads count toward deciding whether the barrier has enough threads waiting. (Because the exiting threads aren&#39;t waiting.)&quot; still applies. &nbsp;Your thread C would be the second thread, not the third, since thread A, who&#39;s not good in the mornings, doesn&#39;t count.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

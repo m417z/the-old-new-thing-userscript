@@ -1,0 +1,488 @@
+<html>
+<head>
+<title>Dumping a hash table with external chaining from the debugger</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Dumping a hash table with external chaining from the debugger</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 24, 2012 / year-entry #198</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">I was doing some crash dump debugging, as I am often called upon to do, and one of the data structure I had to grovel through was something that operated basically like an atom table, so that's what I'll call it. Like an atom table, it manages a collection of strings. You can add a...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+I was doing some crash dump debugging, as I am often called upon to do,
+and one of the data structure I had to grovel through was something
+that operated basically like an atom table, so that's what I'll call
+it.
+Like an atom table,
+it manages a collection of strings.
+You can add a string to the table (getting a unique value back,
+which we will call an atom),
+and later you can hand it the atom and it will give you the string back.
+It looked something like this:
+</p>
+<pre>
+struct ENTRY
+{
+  ENTRY *next;
+  UINT   atom;
+  PCWSTR value;
+};
+
+#define ATOMTABLESIZE 19
+struct ATOMTABLE
+{
+  ENTRY *buckets[ATOMTABLESIZE];
+};
+</pre>
+<p>
+(It didn't actually look like this; I've reduced it to the smallest
+example that still illustrates my point.)
+</p>
+<p>
+As part of my debugging, I had an atom and needed to look it up
+in the table.
+A program would do this by simply calling the
+"here is an atom, please give me the string" function,
+but since this was a crash dump,
+there's nothing around to execute anything.
+(Not that having a live machine would've made things much easier,
+because this was a kernel-mode crash,
+so you don't get any of this edit-and-continue froofy stuff.
+This is <i>real debugging</i>&trade;.)
+</p>
+<p>
+But even though the crashed system can't execute anything,
+the <i>debugger</i> can execute stuff,
+and the debugger engine used by <code>kd</code>
+comes with its own mini-programming language.
+Here's how I dumped the atom table:
+</p>
+<pre>
+// note: this was entered all on one line
+// broken into two lines for readability
+0: kd&gt .for (r $t0=0; @$t0 < 0n19; r $t0=@$t0+1)
+         { dl poi (fffff8a0`06b69930+@$t0*8) 99 2 }
+fffff8a0`06ad3b90  fffff8a0`037a3fc0 fffff8a0`0000000c \
+fffff8a0`037a3fc0  fffff8a0`037a4ae0 00000000`00000025 | $t0=0
+fffff8a0`037a4ae0  fffff8a0`02257580 00000000`00000036 |
+fffff8a0`02257580  00000000`00000000 00000000`00000056 /
+fffff8a0`06ad3b30  fffff8a0`06ad3ad0 a9e8a9d8`0000000d \
+fffff8a0`06ad3ad0  fffff8a0`037a4700 000007fc`0000000e |
+fffff8a0`037a4700  fffff8a0`01f96fb0 00000000`0000003f | $t0=1
+fffff8a0`01f96fb0  fffff8a0`06cfa5d0 fffff8a0`00000044 |
+fffff8a0`06cfa5d0  00000000`00000000 00181000`00000060 /
+fffff8a0`033e7a70  fffff8a0`037a4770 00000020`00000023 \
+fffff8a0`037a4770  fffff8a0`023b52f0 00000000`0000003e | $t0=2
+fffff8a0`023b52f0  fffff8a0`03b6e020 006f0063`00000059 |
+fffff8a0`03b6e020  00000000`00000000 00000000`00000075 /
+fffff8a0`037a0670  fffff8a0`02b08870 fffff8a0`00000026 \ $t0=3
+fffff8a0`03b9e390  00000000`00000000 00240000`00000071 /
+...
+</pre>
+<p>
+Let's take that weirdo command apart one piece at a time.
+</p>
+<p>
+The overall command is
+</p>
+<pre>
+.for (a; b; c) { d }
+</pre>
+<p>
+This operates the same as the C programming language.
+(<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/05/23/10167156.aspx#10167462">Sorry, Delphi programmers</a>,
+for yet another C-centric example.)
+In our case,
+we use the <code>$t0</code> pseudo-register as our loop control.
+</p>
+<ul>
+<li><code>r $t0=0</code>
+    &mdash; this sets <code>$t0</code> to zero</p>
+<li><code>@$t0 &lt; 0n19</code>
+    &mdash; this stops once <code>$t0</code> reaches 19.</p>
+<li><code>r $t0=@$t0+1</code>
+    &mdash; this increments <code>$t0</code>.
+</ul>
+<p>
+Note that here as well as in the loop body, I prefix the register
+name with the <code>@</code> character when I want to obtain its value,
+in order to force it to be interpreted as a register.
+(Otherwise, the debugger will look for a symbol called <code>$t0</code>.)
+</p>
+<p>
+The command being executed at each iteration is
+<code>{ dl poi (fffff8a0`06b69930+@$t0*8) 99 2 }</code>.
+Let's break this down, too:
+</p>
+<ul>
+<li><code>dl</code>
+    &mdash; this command dumps a singly-linked list.</p>
+<li><code>poi (fffff8a0`06b69930+@$t0*8)</code>
+    &mdash; this is the head of the linked list.
+    In this example,
+    <code>0xfffff8a0`06b69930</code>
+    is the address of the <code>buckets</code> array,
+    so we add the loop counter times the size of a pointer (8, in
+    this case) to get the address of the <code>$t0</code>'th entry,
+    and then dereference it (<code>poi</code>) to get the address
+    of the head of the linked list.</p>
+<li><code>99</code>
+    &mdash; This is the maximum length of the linked list.
+    I picked an arbitrary large-enough number.
+    I like using 9's because it carries the most value per keypress.
+    Other people like to use nice round numbers like <code>1000</code>,
+    but <code>999</code> saves you a whole keypress and is just one less.
+    (On the other hand, I don't use <code>fff</code> because that runs
+    the risk of being misinterpreted as a symbol.)</p>
+<li><code>2</code>
+    &mdash;
+    This is the number of pointer-sized objects to dump at the start
+    of each node.
+    For 32-bit code, I use 4, whereas for 64-bit code, I use 2.
+    Why those values?
+    Because those are the maximum number of pointer-sized objects that
+    the debugger will print on one line.
+</ul>
+<p>
+Okay, so now I have that linked list dump.
+The value I'm looking for is the <code>atom</code> whose value
+is <code>0x3F</code>, so I skim down the last column looking
+for <code>0000003f</code>, and hey there it is.
+</p>
+<pre>
+fffff8a0`037a4700  fffff8a0`01f96fb0 00000000`<u>0000003f</u>
+</pre>
+<p>
+Now I have my <code>ENTRY</code>, and I can dump it to see what
+the corresponding value is.
+</p>
+<pre>
+0: kd&gt; dt contoso!ENTRY fffff8a0`037a4700
+    +0x000 next: 0xfffff8a0`01f96fb0
+    +0x008 atom: 0x0000003f
+    +0x010 value: 0xffff8a0`01f97e20 -&gt; "foo"
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1007143">
+				<div id="div-comment-1007143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007143">
+			August 24, 2012 at 7:48 am</a>		</div>
+
+		<p>I was confused, because it took me a while to realize that there weren&#39;t 19 lines of response. I&#39;d thought that each line represented the entire output of the {dl&#8230;} command for each @t0 value, but that&#39;s not so, is it? Or have I misunderstood completely?</p>
+<div class="post">[<i>It&#39;s a bunch of dl output concatenated. (I truncated the output in the article but neglected to add ellipses, so I put the ellipses in. I also annotated the output blocks. Hope that helps.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matteo odd alt thread-odd thread-alt depth-1" id="comment-1007153">
+				<div id="div-comment-1007153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007153">
+			August 24, 2012 at 8:14 am</a>		</div>
+
+		<p>On an unrelated note, I find disturbing that every day some person comes here just to rate &quot;one star&quot; every post, without particular regard to its content.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007163">
+				<div id="div-comment-1007163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007163">
+			August 24, 2012 at 8:39 am</a>		</div>
+
+		<p>&quot;I like using 9&#39;s because it carries the most value per keypress.&quot;</p>
+<p>Priceless!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1007173">
+				<div id="div-comment-1007173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007173">
+			August 24, 2012 at 8:54 am</a>		</div>
+
+		<p>I also tend to use 9&#39;s for throw away code: char buf[999]; partyonbuffer(buf);</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007183">
+				<div id="div-comment-1007183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007183">
+			August 24, 2012 at 9:14 am</a>		</div>
+
+		<p>@Matteo: I&#39;ve noticed that as well. &nbsp;I feel sorry for that person.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1007223">
+				<div id="div-comment-1007223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JamesNT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007223">
+			August 24, 2012 at 2:48 pm</a>		</div>
+
+		<p>Is it me, or did Raymond just utterly slam Delphi programmers?</p>
+<p>And, can he do it again some time soon??</p>
+<p>JamesNT</p>
+<div class="post">[<i>It was an apology, not a slam. The default programming language for this blog is a subset of C++. If you prefer some other language, then you&#39;ll just have to tough it out. Sorry. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007203">
+				<div id="div-comment-1007203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007203">
+			August 24, 2012 at 10:49 am</a>		</div>
+
+		<p>Neat trick. &nbsp;For the curious, here&#39;s how you might do something similar in GDB (which AFAIK doesn&#39;t have a command for walking a linked list, so you have to implement that yourself):</p>
+<p>set $i=0</p>
+<p>while $i &lt; 19</p>
+<p> &nbsp;set $p = table-&gt;buckets[$i]</p>
+<p> &nbsp;while $p != 0</p>
+<p> &nbsp; &nbsp;x/4wx $p</p>
+<p> &nbsp; &nbsp;set $p = $p-&gt;next</p>
+<p> &nbsp;end</p>
+<p> &nbsp;set $i++</p>
+<p>end</p>
+<p>If you don&#39;t have symbols available, then use expressions like (void*)(0xfffff8a006b69930 + 8*$i) instead of table-&gt;buckets[$i] and *(void**)$p instead of $p-&gt;next.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1007243">
+				<div id="div-comment-1007243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007243">
+			August 24, 2012 at 6:50 pm</a>		</div>
+
+		<p>This post reminds me how weak I am at post-mortem (user mode) debugging.</p>
+<p>Are there any books or resources people can recommend?</p>
+<p>Currently I&#39;m at a loss as soon as Visual Studio tooltips refuse to show a value.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007263">
+				<div id="div-comment-1007263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007263">
+			August 24, 2012 at 7:28 pm</a>		</div>
+
+		<p>I&#39;m one of those Delphi programmers but instead of getting mad or anything I find this rather amusing. It&#39;s like the parallel in television. While NTSC used by US and to extent Japan because was imposed by US after WW2 the rest of the world is using PAL/SECAM which are far superior to NTSC. But NTSC was first, and hey, there is nothing better then the one you are used to it. Same as Microsoft at beginning, Delphi was not around so they used C and to extent C++. And now is like in that anecdote about monkeys getting down any new monkey thrown in the cage that tries to reach for the banana. No one knows why but they keep doing it in this way.</p>
+<p>On the other hand I also know Java/VB/C#/PHP/C/C++ like any programmer who is working in this field for more then two decades.</p>
+<p>And speaking of PHP, those $ in front of variables makes me wonder if the mini-programming language used by debugger is not PHP (or PERL / RUBY perhaps?) :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1007283">
+				<div id="div-comment-1007283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JamesNT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007283">
+			August 25, 2012 at 7:39 pm</a>		</div>
+
+		<p>Mr. Chen,</p>
+<p>No apology needed and yes, I knew you were not slamming Delphi programmers. &nbsp;In my circle of friends, my hatred for Delphi is legendary for what I, and many others, consider to be good reasons. &nbsp;I am a .Net programmer through-and-through with a touch of C/C++ and you are my programming god.</p>
+<p>You have my apologies for my lack of ability to control myself from taking advantage of the situation.</p>
+<p>JamesNT</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007313">
+				<div id="div-comment-1007313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jerome</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007313">
+			August 26, 2012 at 11:44 pm</a>		</div>
+
+		<p>I too did not take that as slamming Delphi programmers.</p>
+<p>Anyway, Delphi was a great language that I loved using for several years; until I made the move to c# for all my work around 2006. In any case, Delphi programmers generally understand C/C++ relatively well. You have to, to do anything less than trivial while referring to the MSDN. (The same as you end up using pinvoke in .Net)</p>
+<p>But I&#39;m amazed that anybody was *still proudly programming in Delphi* in 2011. I would call that &quot;proudly being a glutton for punishment&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf odd alt thread-odd thread-alt depth-1" id="comment-1007393">
+				<div id="div-comment-1007393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007393">
+			August 27, 2012 at 9:09 am</a>		</div>
+
+		<p>This &quot;dl&quot; command, can it work for linked lists whose &quot;next&quot; pointer isn&#39;t the first element?</p>
+<div class="post">[<i>In those cases, use the <code>!list</code> command, which is more flexible. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007413">
+				<div id="div-comment-1007413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007413">
+			August 27, 2012 at 10:26 am</a>		</div>
+
+		<p>Jerome: People still program in old Delphi probably for the same reasons that people still program in VB6.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1007433">
+				<div id="div-comment-1007433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007433">
+			August 27, 2012 at 3:10 pm</a>		</div>
+
+		<p>It&#39;s called XE2, which has support for Mac OS X / iOS beside Windows 32/64&#8230;and latest acquisition these days is XE3 coming in Sep 2012 and will features support for W8, Mountain Lion, Android and Linux. Practically everything. So yes, as of 2012 I am very proud to still program in Delphi..and I have a lot of work actually.</p>
+<p>So dear Jerome, from 2006 till 2012 &#8230;you kinda of took a coma?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick even thread-even depth-1" id="comment-1007523">
+				<div id="div-comment-1007523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007523">
+			August 28, 2012 at 5:03 am</a>		</div>
+
+		<p>@Jon: &quot;Debugging Applications for Microsoft.NET and Microsoft Windows&quot; by John Robbins. There was an earlier edition just called &quot;Debugging Applications&quot; that covered VB 6, if you need that, and I think its native content was slightly broader, from memory. The later &quot;Debugging Microsoft.NET 2.0 Applications&quot; doesn&#39;t appear to have much, if any, native content, so I&#39;d go with the older book.</p>
+<p>@Danny: WinDBG, or at least the debugging engine under it, dates right back to the start of the NT project, circa 1987 (it merely wraps the same debugger engine as cdb and ntsd in a barely-good-enough GUI). PHP and Ruby are much newer, Perl is about the same vintage. $ was being used for variables much further back than that. <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Sigil_(computer_programming)" rel="nofollow">en.wikipedia.org/&#8230;/Sigil_(computer_programming)</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1007543">
+				<div id="div-comment-1007543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007543">
+			August 28, 2012 at 7:01 am</a>		</div>
+
+		<p>@Danny: I can&#39;t speak much from the Delphi perspective, but I can from the C++ Builder perspective. &nbsp;The compiler itself has aged very poorly. &nbsp;No support yet for major C++11 features like lambda functions. &nbsp;Visual C++ 2005 introduced 64-bit compiling, yet here we are 7 years later and there is STILL no 64-bit C++ Builder compiler. &nbsp;The compiled code runs 2 or 3 times slower than equivalent Visual C++ code. &nbsp;Not to mention there are countless small bugs and gotchas in the product &#8211; noticeably worse than, say, the .NET Framework. &nbsp;The rumors I read online say that it&#39;s going to be replaced with a clang/LLVM-based compiler, but it&#39;s nowhere in sight.</p>
+<p>The VCL runtime for both Delphi and C++ Builder is forever tied to the Win32 API; they have no hope of &quot;fixing&quot; the VCL to be cross-platform without breaking compatibility in a major way. &nbsp;So, the cross-platform support you mention requires the new FireMonkey framework, and existing applications have to be re-written. &nbsp;It sounds nice in theory, but all I read about online is many negative complaints about how FireMonkey is buggy, incomplete, etc. &nbsp;I installed XE2 Update 4 and ran a simple FireMonkey form with a label on it. &nbsp;Immediately I noticed that the font looked horrible. &nbsp;Took a screenshot and zoomed in: turns out there is some weird greyscale anti-aliasing going on &#8211; it&#39;s not ClearType and it looks terrible on my monitor. &nbsp;This speaks volumes about the amount of time I&#39;d likely have to spend fussing with the product to get it to just work and look decent &#8211; if a simple label looks like garbage, how much more would I be dealing with? &nbsp;A major complaint is lack of documentation, so I looked into that and I&#39;d have to agree. &nbsp;There are zero (0) books about this framework; compare that to the dozens of books for WPF and Qt, let alone WinForms or even standard Delphi/VCL. &nbsp;Now suppose we split documentation into two categories: (1) overview documentation with high-level documentation, and (2) function-level reference documentation. &nbsp;The overview documentation, when fully expanded in the table of contents tree, only consumes a screen height and a half. &nbsp;I get the feeling I&#39;d be on my own with no documentation what-so-ever 90% of the time. &nbsp;No thanks. &nbsp;If I have to re-write, I&#39;d rather re-write for Qt.</p>
+<p>The Windows 8 support you mention sounds like a joke. &nbsp;Desktop apps that are made to look like Metro? &nbsp;What&#39;s the point?! &nbsp;Make it a Metro app! &nbsp;Making it a desktop app will just confuse the user.</p>
+<p>The Mac OS X support in FireMonkey sounds sad, too. &nbsp;Apparently they use the Carbon framework, which Apple already obsoleted several years ago. &nbsp;And you know how Apple likes to do (or not do) backwards-compatibility! &nbsp;WHY oh WHY would anyone write a new product that targets an obsolete API from Apple?!?! &nbsp;I don&#39;t know why they couldn&#39;t have just used the newer Cocoa framework. &nbsp;As a result, you can&#39;t compile 64-bit OS X applications (Delphi or C++), because Apple doesn&#39;t make a 64-bit version of Carbon.</p>
+<p>I could go on, but I&#39;m done here. &nbsp;Frankly I don&#39;t think the company has the money, resources, or community to remain competitive any more. &nbsp;They might have a lot of good ideas, but they don&#39;t have the resources to properly execute these ideas. &nbsp;The only reason I mess with any of those products is I get a paycheck for it for specific projects. &nbsp;Otherwise, I happily stick to other products which cost less and just work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1007683">
+				<div id="div-comment-1007683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120824-00/?p=6773#comment-1007683">
+			August 28, 2012 at 7:56 am</a>		</div>
+
+		<p>@JamesJohnston</p>
+<p>This last project involved managing products for big retailers where a customer would get the app for their mobile phone, then chose it&#39;s target super-market location and fill in the desired products they would like to purchase. Customer drives to the supermarket and the app will show a map for their list in shortest path where all his desired products shelves are. The customer gets notified when is in the area of the/a product on the list, grabs it and mark it as &quot;purchased&quot; in the list. Goes to cashier and already knows how much money he has to pay, just in case the cashier swipes a product 2 times or other human mistakes.</p>
+<p>Now, the actual implementation is a 2 different apps, one app is the retailer and the other one is the customer app. The retailer uses his app to manage the products on the shelves, gets reports, notifications etc etc, all sort of implementation a database related app is suppose to do, including GPS location for each product so the built-in GPS of the customer phone would match when he gets closer.</p>
+<p>Took me like 6 months and is done in XE2, and yes with FireMonkey..and looks good. I do not know what you did but I got no problems with labels font or any other visual you ranted above. And we can&#39;t wait for September launch of XE3 to get Android support so the customer based to be doubled. And yes, beside normal perks and money from the contract, the customer (big retailer company) was so happy that throw in a nice fat bonus too (6 digits in USD).</p>
+<p>So, you tested XE2 once and rant and I got a fat check and a fat bonus..guess I&#39;ll go use XE2 and XE3 further more.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,984 @@
+<html>
+<head>
+<title>Reference counting is hard.</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Reference counting is hard.</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 6, 2004 / year-entry #133</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>48</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">One of the big advantages of managed code is that you don't have to worry about managing object lifetimes. Here's an example of some unmanaged code that tries to manage reference counts and doesn't quite get it right. Even a seemingly-simple function has a reference-counting bug. template <class T> T *SetObject(T **ppt, T *ptNew) {...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One of the big advantages of managed code is that you don't have
+to worry about managing object lifetimes. Here's an example of
+some unmanaged code that tries to manage reference counts and
+doesn't quite get it right.
+Even a seemingly-simple function has a reference-counting bug.
+</p>
+<pre>
+template &lt;class T&gt;
+T *SetObject(T **ppt, T *ptNew)
+{
+ if (*ppt) (*ppt)-&gt;Release(); // Out with the old
+ *ppt = ptNew; // In with the new
+ if (ptNew) (ptNew)-&gt;AddRef();
+ return ptNew;
+}
+</pre>
+<p>
+The point of this function is to take a (pointer to)
+a variable that points to one object and replace it with
+a pointer to another object.  This is a function that sits
+at the bottom of many "smart pointer" classes.  Here's
+an example use:
+</p>
+<pre>
+template &lt;class T&gt;
+class SmartPointer {
+public:
+ SmartPointer(T* p = NULL)
+   : m_p(NULL) { *this = p; }
+ ~SmartPointer() { *this = NULL; }
+ T* operator=(T* p)
+   { return SetObject(&amp;m_p, p); }
+ operator T*() { return m_p; }
+ T** operator&amp;() { return &amp;m_p; }
+private:
+ T* m_p;
+};
+
+void Sample(IStream *pstm)
+{
+  SmartPointer&lt;IStream&gt; spstm(pstm);
+  SmartPointer&lt;IStream&gt; spstmT;
+  if (SUCCEEDED(GetBetterStream(&amp;spstmT))) {
+   spstm = spstmT;
+  }
+  ...
+}
+</pre>
+<p>
+Oh why am I explaining this?  You know how smart pointers work.
+</p>
+<p>
+Okay, so the question is, what's the bug here?
+</p>
+<p>
+Stop reading here and don't read ahead until you've figured it out
+or you're stumped or you're just too lazy to think about it.
+</p>
+<hr>
+<p STYLE="height: 20pc">
+<p>
+The bug is that the old object is Release()d before the new object
+is AddRef()'d.  Consider:
+</p>
+<pre>
+  SmartPointer&lt;IStream&gt; spstm;
+  CreateStream(&amp;spstm);
+  spstm = spstm;
+</pre>
+<p>
+This assignment statement looks harmless (albeit wasteful).
+But is it?
+</p>
+<p>
+The "smart pointer" is constructed with NULL,
+then the CreateStream creates a stream and assigns it to
+the "smart pointer".  The stream's reference count is now one.
+Now the assignment statement is executed, which turns into
+</p>
+<pre>
+ SetObject(&amp;spstm.m_p, spstm.m_p);
+</pre>
+<p>
+Inside the SetObject function, ppt points tp spstm.m_p, and
+pptNew equals the original value of spstm.m_p.
+</p>
+<p>
+The first thing that SetObject does is release the old pointer,
+which now drops the reference count of the stream to zero.
+<strong>This destroys the stream object</strong>.
+Then the ptNew parameter (which now points to a freed object)
+is assigned to spstm.m_p, and finally the ptNew pointer
+(which still points to a freed object) is AddRef()d.
+Oops, we're invoking a method on an object that has been freed;
+no good can come of that.
+</p>
+<p>
+If you're lucky, the AddRef() call crashes brilliantly so
+you can debug the crash and see your error.
+If you're not lucky (and you're usually not lucky),
+the AddRef() call interprets the freed memory as if it were
+still valid and increments a reference count somewhere inside
+that block of memory. Congratulations, you've now corrupted memory.
+If that's not enough to induce a crash (at some unspecified point
+in the future), when the "smart pointer"
+goes out of scope or otherwise changes its referent, the invalid
+m_p pointer will be Release()d, corrupting memory yet another time.
+</p>
+<p>
+This is why "smart pointer" assignment functions must AddRef() the
+incoming pointer before Release()ing the old pointer.</p>
+<pre>
+template &lt;class T&gt;
+T *SetObject(T **ppt, T *ptNew)
+{
+ if (ptNew) (ptNew)-&gt;AddRef();
+ if (*ppt) (*ppt)-&gt;Release();
+ *ppt = ptNew;
+ return ptNew;
+}
+</pre>
+<p>
+If you look at the source code for
+<a HREF=http://msdn.microsoft.com/library/en-us/vclib/html/vclrfAtlComPtrAssign.asp>
+the ATL function AtlComPtrAssign</a>,
+you can see that it exactly matches the above (corrected) function.
+</p>
+<p>
+[Raymond is currently on vacation; this message was pre-recorded.]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (48)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-161073">
+				<div id="div-comment-161073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161073">
+			April 6, 2004 at 7:17 am</a>		</div>
+
+		<p>There&#8217;s another question in my mind about assignment of raw pointers to smart pointers. If raw pointers are always converted immediately into smart pointers then no reference is added and AddRef should not be called. OTOH sometimes the smart pointer will be an additional reference alongside the raw pointer, and AddRef should be called. It might be better not to allow assignment from raw pointers and instead to have named functions that explicitly provide one or both of those behaviours.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161083">
+				<div id="div-comment-161083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">project</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161083">
+			April 6, 2004 at 7:31 am</a>		</div>
+
+		<p>The self-assignment is what any assignment function should be aware about. It&#8217;s so obvious :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161093">
+				<div id="div-comment-161093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Petr Kadlec</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161093">
+			April 6, 2004 at 7:53 am</a>		</div>
+
+		<p>Yes, the main topic I see here is not in the reference counting, but in the assignment function itself (see e.g. <a target="_new" href="http://www.parashift.com/c++-faq-lite/assignment-operators.html#faq-12.2" rel="nofollow">http://www.parashift.com/c++-faq-lite/assignment-operators.html#faq-12.2</a>).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161103">
+				<div id="div-comment-161103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.jelovic.com' rel='external nofollow' class='url'>Dejan Jelovic</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161103">
+			April 6, 2004 at 7:55 am</a>		</div>
+
+		<p>&quot;One of the big advantages of managed code is that you don&#8217;t have to worry about managing object lifetimes.&quot;</p>
+<p>Bullshit. If some objects in your data graph reference expensive or scarce resources, they you are back to reference counting for the whole graph.</p>
+<p>Only in managed code you don&#8217;t have smart pointers at your disposal.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161113">
+				<div id="div-comment-161113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.rotd.org/' rel='external nofollow' class='url'>Andreas Magnusson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161113">
+			April 6, 2004 at 8:13 am</a>		</div>
+
+		<p>Petr, if you fix the SetObject()-function then you fix the problem with the assignment-operator as well. Fix the assignment-operator and you still have a potential bug in the SetObject()-function.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161123">
+				<div id="div-comment-161123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Centaur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161123">
+			April 6, 2004 at 8:31 am</a>		</div>
+
+		<p>Another problem is that this smart pointer has a smart destructor (it will Release() the object) but a dumb copy constructor and a dumb copy assignment operator (they both will bitwise-copy m_p and forget to AddRef() the victim). Thus, if a scope has several SmartPointers that are initialized using each other, the victim will be AddRef()ed once (when assigned to the first SmartPointer) and Released() as many times as there are SmartPointers. Then it will meet an untimely death, and someone who knew it in life (had a pointer) will one day come up to it in hopes of asking it to do things (invoke a method) but will just be met by a lifeless corpse.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161143">
+				<div id="div-comment-161143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.JCABs-Rumblings.com' rel='external nofollow' class='url'>JCAB</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161143">
+			April 6, 2004 at 9:45 am</a>		</div>
+
+		<p>A word of warning: (from the article Petr linked to) &quot;if (this == &amp;f) return *this;   // Gracefully handle self assignment&quot;.</p>
+<p>This is not quite enough. Think, for instance, of object hierarchies, where the object the smartptr holds owns a pointer to another object. If you call SetObject (or the assignment operator) with this owned pointer, then the original assignment also breaks, even if you check for self-assignment, even though the object assigned is different than the existing one.</p>
+<p>JCAB</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161153">
+				<div id="div-comment-161153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Brown</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161153">
+			April 6, 2004 at 10:07 am</a>		</div>
+
+		<p>In Open Source code, of course, this could never be an issue: The end users are familiar with the code in the applications they use, and know enough not to do anything that would send the application down that code path. </p>
+<p>In fact, I and my colleagues at the Open Source Users&#8217; Forum are supporting the passage of H.R. 4014 in the House of Representatives, a bill which will effectively criminalize the use of computer hardware (not software; that would infringe the 1st Amendment) by &quot;citizens or legally resident aliens lacking in technical sophistication&quot;, where &quot;technical sophistication&quot; is defined as a working knowledge of ANSI C. This is a compromise, of course, as Hackers prefer K&amp;R C[1], but the idiot-friendly nature of our government dictates that compromises must be made. The penalties are inadequate as well, but we&#8217;re confident that the threat of hard time at Leavenworth will serve to deter at least some malefactors from abusing the technological gifts of their betters.</p>
+<p>[1] &quot;Further Bloviations and Glittering Generalities About Hacking&quot;, E. S. Raymond, E. S. Raymond Press, E. S. Raymond Memorial Edition (signed, blessed, and baptized by E. S. Raymond), 2003<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161163">
+				<div id="div-comment-161163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161163">
+			April 6, 2004 at 10:22 am</a>		</div>
+
+		<p>Reference counting is easy. You use boost::shared_ptr.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161173">
+				<div id="div-comment-161173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrPizza</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161173">
+			April 6, 2004 at 10:47 am</a>		</div>
+
+		<p>&quot;One of the big advantages of managed code is that you don&#8217;t have to worry about managing object lifetimes&quot;</p>
+<p>No, that&#8217;s not true.  You don&#8217;t have to worry about memory deallocation.  That&#8217;s it.  That&#8217;s what GC gives us.</p>
+<p>One still has to worry about every other resource one might care to use.  And the big problem with GC is that it&#8217;s other resources that I care about a lot more than memory.  I have oodles of memory.  2 or more gigabytes per process.  More memory than I know what to do with.  And as displeasing as it may be, I can afford to leak a few kilobytes of memory now and then.  I don&#8217;t, but if I did, it wouldn&#8217;t kill me.</p>
+<p>This makes memory entirely unlike file handles, or thread handles, or GDI objects, or database connections, or sockets, or damn near any other resource I have to deal with.  These objects all have much much lower limits than my memory limit, and they all do much much nastier things when they run out.  If I run out of DB connections my DB starts refusing connections from any application; if I run out of sockets the OS starts refusing connections from anyone trying to connect to me; if I run out of GDI objects my desktop stops drawing properly and I discover that a great many programs crash when they can&#8217;t draw to the screen any more.</p>
+<p>This is all bad stuff.</p>
+<p>It&#8217;s bad enough in languages with manual memory management.  At least a language like C++ has the RAII idiom to save us.  GC takes even that away from us.</p>
+<p>&quot;But we have finalizers&quot; you say.  Well, yes, we do.  But we don&#8217;t know when they&#8217;ll be run (if at all).  And because garbage collections are usually due to memory pressure, they probably won&#8217;t run between now and running out of handles anyway.  A handle doesn&#8217;t take up much memory at all.  I can easily consume all the GDI handles in a system without making an appreciable dent in the amount of free memory.  So the GC will remain completely ignorant of the dire situation the system is in.</p>
+<p>In C++ I don&#8217;t have to worry about managing object lifetimes the vast majority of time.  Mostly resources have a lifetime that&#8217;s tied to their scope, and mostly they don&#8217;t leak outside that scope.  With this in mind I can use RAII, and bingo, no object lifetime management worries; I know everything will be cleaned up in an orderly fashion.  And on those rare occasions where I do have to do something special (to let an object outlive its scope) I&#8217;m fully aware of this &#8212; I&#8217;m using C++ so I know I have to take care of these things from time to time, and I&#8217;ve not been poisoned by any GC-style propaganda about not having to care at all.</p>
+<p>One of the big disadvantages of managed code is that you do have to worry about managing object lifetimes.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161183">
+				<div id="div-comment-161183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Loathsome Echinoderm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161183">
+			April 6, 2004 at 12:34 pm</a>		</div>
+
+		<p>DrPizza: Regarding your concern about memory pressure not forcing de-allocation of GDI resources, there&#8217;s a workaround which ought to be obvious to any experienced programmer: When you call CreateSolidBrush(), for example, simply allocate ten or twenty MB off the heap and stash it away in a private pointer in the smart pointer object that holds the brush. Memory pressure is thus tied to the availability of other resources and the garbage collector will do its job correctly.</p>
+<p>All you need to do to support this is find out at runtime how much RAM is available, and calculate the amount you&#8217;ll need to allocate for each brush/device context/whatever. The details of this operation are trivial; I&#8217;ll leave the actual implementation as a healthful exercise for lesser minds.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161193">
+				<div id="div-comment-161193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Orbit</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161193">
+			April 6, 2004 at 12:35 pm</a>		</div>
+
+		<p>Whoops! Thanks Raymond, you insired me to look at my smart pointer class.  It exhibited the same (incorrect) behaviour.  It&#8217;s fixed now, cheers!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161223">
+				<div id="div-comment-161223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161223">
+			April 6, 2004 at 2:51 pm</a>		</div>
+
+		<p>JCAB: What do you mean by &quot;then the original assignment also breaks&quot;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161233">
+				<div id="div-comment-161233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Q</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161233">
+			April 6, 2004 at 3:16 pm</a>		</div>
+
+		<p>asdf: What JCAB meant (I believe) is this arrangement (pointer syntax ommitted):</p>
+<p>A =&gt; B =&gt; C</p>
+<p>(&quot;X =&gt; Y&quot; means &quot;X holds a smart pointer to Y&quot;.)</p>
+<p>Assume you have a smart pointer S. S points to A. Assume S is the only reference to A, A has the only reference to B and so on.</p>
+<p>You reassign S to point to C. Now in the original (buggy) implementation, first A&#8217;s refcount becomes zero, so A, B and C are destructed before you try to increase the refcount of C.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161243">
+				<div id="div-comment-161243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161243">
+			April 6, 2004 at 3:34 pm</a>		</div>
+
+		<p>I didn&#8217;t realize he was talking about smart pointers to smart pointers. Thanks for clearing that one up.</p>
+<p>On a side note. Raymond can you get the documentation for ChildWindowFromPoint (and the Ex version) cleaned up. Specifically this sentence: &quot;The search is restricted to immediate child windows, grandchildren, and deeper descendant windows are not searched.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161263">
+				<div id="div-comment-161263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161263">
+			April 6, 2004 at 4:05 pm</a>		</div>
+
+		<p>What specifically needs cleaning? Do you want the first comma changed to a semicolon?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161273">
+				<div id="div-comment-161273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161273">
+			April 6, 2004 at 4:49 pm</a>		</div>
+
+		<p>Yes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161283">
+				<div id="div-comment-161283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161283">
+			April 6, 2004 at 5:22 pm</a>		</div>
+
+		<p>4/6/2004 10:47 AM DrPizza:</p>
+<p>&gt; I have oodles of memory. [&#8230;]<br />
+<br />&gt; I can afford to leak a few kilobytes of<br />
+<br />&gt; memory now and then. I don&#8217;t, but if I did,<br />
+<br />&gt; it wouldn&#8217;t kill me.</p>
+<p>Suppose your car or airplane has 2 GB of memory, and it repeats some computation every 100 microseconds.  1 time in 20 it leaks 4 KB of memory.  How long until it&#8217;s out of memory?  It won&#8217;t kill you to turn the ignition off and on again to restart with 2 GB of free memory, right?</p>
+<p>On the other hand, please enlighten me:</p>
+<p>&gt; At least a language like C++ has the RAII<br />
+<br />&gt; idiom to save us. GC takes even that away<br />
+<br />&gt; from us. </p>
+<p>What does RAII stand for?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161303">
+				<div id="div-comment-161303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom Higgins</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161303">
+			April 6, 2004 at 5:40 pm</a>		</div>
+
+		<p>RAII means Resource Acquisition Is Initializiation: <a target="_new" href="http://www.hackcraft.net/raii/" rel="nofollow">http://www.hackcraft.net/raii/</a></p>
+<p>The big idea is to use C++ constructors and destructors to acquire and release resources &#8212; thus relying on the C++ implementation and object lifetime rules to manage resources for you.  It helps simplify error-handling code quite a bit.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161313">
+				<div id="div-comment-161313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Edward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161313">
+			April 6, 2004 at 5:40 pm</a>		</div>
+
+		<p>Looks like &quot;Resource Acquisition Is Initialisation&quot;<br />
+<br /><a target="_new" href="http://www.hackcraft.net/raii/" rel="nofollow">http://www.hackcraft.net/raii/</a></p>
+<p>Ahh, so much to learn, so little time. How do you guys pick up so much so fast?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161323">
+				<div id="div-comment-161323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Edward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161323">
+			April 6, 2004 at 5:41 pm</a>		</div>
+
+		<p>oh dear, still to slow. Same minute though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161353">
+				<div id="div-comment-161353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pavel Lebedinsky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161353">
+			April 6, 2004 at 5:59 pm</a>		</div>
+
+		<blockquote><p>
+  At least a language like C++ has the RAII<br />
+  <br />&gt; idiom to save us. GC takes even that away<br />
+  <br />&gt; from us.</p>
+<p>It also takes away the ability to corrupt memory by freeing the same pointer twice etc.</p>
+<p>All things considered, lack of deterministic finalization doesn&#8217;t outweigh the benefits of managed code. At least in my opinion.</p>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161373">
+				<div id="div-comment-161373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Maas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161373">
+			April 6, 2004 at 7:26 pm</a>		</div>
+
+		<p>I wonder if a language could seamlessly implement both deterministic destruction for stack objects and (lazy) garbage collection for heap objects?</p>
+<p>Python seems to do this pretty well.</p>
+<p>I don&#8217;t like languages with GC but no deterministic destruction. RAII is just too useful :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161393">
+				<div id="div-comment-161393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161393">
+			April 6, 2004 at 8:54 pm</a>		</div>
+
+		<p>Or you can just use <a target="_new" href="http://www.hpl.hp.com/personal/Hans_Boehm/gc/" rel="nofollow">http://www.hpl.hp.com/personal/Hans_Boehm/gc/</a> if not for the gc then for help with leak detection.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161403">
+				<div id="div-comment-161403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.JCABs-Rumblings.com' rel='external nofollow' class='url'>JCAB</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161403">
+			April 6, 2004 at 9:04 pm</a>		</div>
+
+		<p>asdf: sorry, I was in a hurry, and the explanation wasn&#8217;t as clear as it should.</p>
+<p>Q: You nailed it for me, thanx!<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161413">
+				<div id="div-comment-161413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161413">
+			April 6, 2004 at 10:38 pm</a>		</div>
+
+		<p>In order to get deterministic destruction of stack objects you need to be able to detect when a reference has leaked out, which means refcounted GC rather than tracing GC, and then you still have the cyclic reference problem.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161443">
+				<div id="div-comment-161443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Florian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161443">
+			April 7, 2004 at 1:41 am</a>		</div>
+
+		<blockquote><p>
+  &gt;&quot;Resource Acquisition Is Initialisation&quot;&lt;&lt;<br />
+  <br />Nice little article, but I miss a discussion of how to handle errors during resource allocation or release. He doesn&#8217;t touch that and seems to imply that you would have your constructors and destructors throw exceptions when a resource cannot be allocated or released. But what if you can&#8217;t use exceptions? Application of RAII seems rather limited to special envirounments to me. (Yes, I know this blog is about programming for Windows PCs, but that Hackcraft article wasn&#8217;t, was it?)
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161463">
+				<div id="div-comment-161463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrPizza</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161463">
+			April 7, 2004 at 2:26 am</a>		</div>
+
+		<p>&quot;DrPizza: Regarding your concern about memory pressure not forcing de-allocation of GDI resources, there&#8217;s a workaround which ought to be obvious to any experienced programmer: When you call CreateSolidBrush(), for example, simply allocate ten or twenty MB off the heap and stash it away in a private pointer in the smart pointer object that holds the brush. Memory pressure is thus tied to the availability of other resources and the garbage collector will do its job correctly. &quot;<br />
+<br />You have got to be kidding me.  That is a horrible workaround.  It still doesn&#8217;t force timely deallocation.  Nor does it scale at all well.  If I have lots of objects that need timely deallocation (such as GDI handles, where an application may have several hundred) then the memory attached to each object will itself be insignificant.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161473">
+				<div id="div-comment-161473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrPizza</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161473">
+			April 7, 2004 at 2:27 am</a>		</div>
+
+		<p>&quot;Suppose your car or airplane has 2 GB of memory, and it repeats some computation every 100 microseconds. 1 time in 20 it leaks 4 KB of memory. How long until it&#8217;s out of memory? It won&#8217;t kill you to turn the ignition off and on again to restart with 2 GB of free memory, right?&quot;</p>
+<p>Suppose it leaks a file handle at the same rate.  Which problem&#8217;s gonna make it fall over quicker?</p>
+<p>Hint: it won&#8217;t be the memory leak.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161493">
+				<div id="div-comment-161493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161493">
+			April 7, 2004 at 3:54 am</a>		</div>
+
+		<p>Florian: Then you have to manually check for errors instead of depending on exceptions (and you should never throw exceptions from destructors, that terminates your program!). This type of RAII is used to avoid code like (assuming var1 and var2 are dumb objects like regular pointers):</p>
+<p>var1 = get1();<br />
+<br />if (!got1(var1))<br />
+<br />    return;</p>
+<p>var2 = get2();<br />
+<br />if (!got2(var2)) {<br />
+<br />    unget1(var1);<br />
+<br />    return;<br />
+<br />}</p>
+<p>etc. It gets really mundane and unmaintainable quickly. And I bet you&#8217;ve seen a lot of code like this (Almost every single piece of DirectX/COM code I&#8217;ve come across does crap like this in their initialization routine: create object, check for HRESULTS, if it failed release all previous objects and set them to NULL, return an error code).</p>
+<p>So making var1 and var2 be smart objects we get code like:</p>
+<p>var1 = get1();<br />
+<br />if (!got1(var1))<br />
+<br />    return;</p>
+<p>var2 = get2();<br />
+<br />if (!got2(var2))<br />
+<br />    return;</p>
+<p>where the destructor for varN looks like:</p>
+<p>varN::~varN()<br />
+<br />{<br />
+<br />    if (!gotN(this-&gt;obj))<br />
+<br />        ungetN(this-&gt;obj);<br />
+<br />}<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161513">
+				<div id="div-comment-161513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrPizza</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161513">
+			April 7, 2004 at 4:36 am</a>		</div>
+
+		<p>&quot;Destruction is trickier though, especially in the case of VisualC++ and other compilers where the uncaught_exception() function always returns false (a clear bug, it&#8217;s documented but not everywhere that uncaught_exception() is documented). For the record, programming for Windows PCs is the only environment I&#8217;ve much experience in.&quot;</p>
+<p>In spite of the documentation, uncaught_exception appears to work properly on VC++ 7 and up.  If one looks at the source, one sees that, unlike VC++ 6, it&#8217;s no longer hard-coded to return false.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161523">
+				<div id="div-comment-161523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.hackcraft.net/' rel='external nofollow' class='url'>Jon Hanna</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161523">
+			April 7, 2004 at 4:57 am</a>		</div>
+
+		<p>Woo hoo!<br />
+<br />I just tested and yes VC++7 does have correct behaviour here, which means throwing errors from destructors has been improved from &quot;impossible&quot; to &quot;difficult, be very careful&quot;.</p>
+<p>I was pretty sure that I&#8217;d already tested that though and found it hadn&#8217;t changed. Perhaps this was a change made with the 2003 version (I had the previous version but don&#8217;t recall which I&#8217;d tested with).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161553">
+				<div id="div-comment-161553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161553">
+			April 7, 2004 at 7:33 am</a>		</div>
+
+		<p>You can sort of do RAII with the using statement in C#, then your Dispose method can act like a destructor. Unfortunately you do have to remember to use &#8216;using&#8217; each time so it&#8217;s not so automatic and the code is a little more complicated.</p>
+<p>D is also a garbage collected which has RAII features. See: <a target="_new" href="http://www.digitalmars.com/d/cpptod.html" rel="nofollow">http://www.digitalmars.com/d/cpptod.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161563">
+				<div id="div-comment-161563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161563">
+			April 7, 2004 at 7:44 am</a>		</div>
+
+		<p>In case you don&#8217;t know how to use the using statement in C#, here&#8217;s some code:</p>
+<p>class RaiiExample : System.IDisposable<br />
+<br />{<br />
+<br />    RaiiExample() {<br />
+<br />        System.Console.WriteLine(&quot;Resource acquired.&quot;);<br />
+<br />    }</p>
+<p>    public void Dispose() {<br />
+<br />        System.Console.WriteLine(&quot;Resource disposed.&quot;);<br />
+<br />    }</p>
+<p>    public static void Main() {<br />
+<br />        try {<br />
+<br />            using(RaiiExample resource = new RaiiExample()) {<br />
+<br />                System.Console.WriteLine(&quot;Do stuff with resource.&quot;);<br />
+<br />                throw new System.Exception(&quot;This failure demonstrate cleanup.&quot;);<br />
+<br />            }<br />
+<br />        }<br />
+<br />        catch(System.Exception e) {<br />
+<br />            System.Console.WriteLine(e.Message);<br />
+<br />        }<br />
+<br />    }<br />
+<br />}</p>
+<p>I think this works for structs as well as classes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161503">
+				<div id="div-comment-161503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.hackcraft.net/' rel='external nofollow' class='url'>Jon Hanna</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161503">
+			April 7, 2004 at 4:19 am</a>		</div>
+
+		<p>&quot;Nice little article, but I miss a discussion of how to handle errors during resource allocation or release. He doesn&#8217;t touch that and seems to imply that you would have your constructors and destructors throw exceptions when a resource cannot be allocated or released.&quot;</p>
+<p>Yes. Throw errors during construction. The point of a constructor is to set an object into a valid state so constructors should throw errors when they fail to do so. If that wasn&#8217;t clear I need to revisit that article. Destruction is trickier though, especially in the case of VisualC++ and other compilers where the uncaught_exception() function always returns false (a clear bug, it&#8217;s documented but not everywhere that uncaught_exception() is documented). For the record, programming for Windows PCs is the only environment I&#8217;ve much experience in.</p>
+<p>&quot;I wonder if a language could seamlessly implement both deterministic destruction for stack objects and (lazy) garbage collection for heap objects?&quot;</p>
+<p>Yes, indeed this has been done as an extension to C++.</p>
+<p>My article is often referenced in threads like this on the pros and cons of different garbage collection models which is beginning to annoy me since I don&#8217;t like reference counting much!</p>
+<p>I do think that an advantage of reference counting is that you can use RAII with it, as someone who had to suffer coding VB6 applications (yuck) the ability to use RAII was one of the few things it had going for it.</p>
+<p>However reference counting has more than a few issues. For one thing even with the well-written &quot;correct answer&quot; smart-pointer above there can be difficulties where circular references between objects mean that none of the objects will have that final Release() call to destory them and little circularly-referencing nuggets of memory (and other resources) are lost forever. In VB you had a choice of:<br />
+<br />1. Forcing the user to call a tear-down function to manually break the circular references (they won&#8217;t, they&#8217;ll forget).<br />
+<br />2. Not having the circular reference, but instead if (say) a &quot;parent&quot; has a &quot;child&quot; then parent.firstChild() could be obtained by parent having a reference to child, but child.parent() could discover the object to return by some other means (generally this is extremely inefficient, when it&#8217;s possible at all).<br />
+<br />3. Using undocumented VB6 features to copy bytes into pointer variables without AddRef() or Release() being called &#8211; obvious to a C++ hacker but exactly the sort of detail that VB was meant to hide (this works very well when it works, when it doesn&#8217;t you&#8217;ve just introduced a new CorruptMemory() feature into VB!).</p>
+<p>Personally, I like RAII that comes from having a difference between automatic and free-store variables. RAII with reference-counting is a silver lining.</p>
+<p>As for garbage collection I will tolerate having none, I will generally tolerate having lazy GC but I would prefer to have a combination of automatic variables with free-store objects which are deleted by a lazy GC *if I don&#8217;t elect to delete them myself*.</p>
+<p>For those who are missing RAII when it comes to managed code I recommend you take a look at &quot;RAII Idiom and Managed C++&quot; by Nemanja Trifunovic <a target="_new" href="http://www.codeproject.com/managedcpp/managedraii.asp" rel="nofollow">http://www.codeproject.com/managedcpp/managedraii.asp</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161683">
+				<div id="div-comment-161683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.redwoodroot.org' rel='external nofollow' class='url'>Peter Evans</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161683">
+			April 7, 2004 at 10:24 pm</a>		</div>
+
+		<p>So what&#8217;s the status of adding deterministic finalization feature to the next release of Visual Studio languages.  I heard mention that some (sells, et al) were looking into trying to add it to the c# language, but ran into performance issues.</p>
+<p>I don&#8217;t think ref counting is hard its the limitations of language constructs that make it easy to mess up.  Seems like the hard problems all resolve around treating stack and heap memory equivalently in code constructs  even though semantically they function very differently.</p>
+<p>I would prefer to see both gc based memory management and stack based destruction as features available from .NET cli compliant languages.  I think it would give them a leg up on Java.</p>
+<p>Anyone have a better scenario they&#8217;d like to share/see for future memory management implementations????<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161623">
+				<div id="div-comment-161623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Eugene Gershnik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161623">
+			April 7, 2004 at 4:02 pm</a>		</div>
+
+		<p>Reference counting may be hard but using C++ correctly isn&#8217;t. If you were to use canonical form of the assignment the problem whould not arise:</p>
+<p>X &amp; operator=(const X &amp; src)<br />
+<br />{<br />
+<br />    X temp(src);<br />
+<br />    swap(temp);<br />
+<br />    return *this;<br />
+<br />}</p>
+<p>void swap(X &amp; src)<br />
+<br />{<br />
+<br />   T * pTemp = src.m_p;<br />
+<br />   src.m_p = m_p;<br />
+<br />   m_p = temp;<br />
+<br />}</p>
+<p>This is safe from any angle.<br />
+<br />In addition this is a correct form for any class assignment operator.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161673">
+				<div id="div-comment-161673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://chuacw.hn.org/chewy/archive/0001/01/01/409.aspx' rel='external nofollow' class='url'>This side of paradise</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161673">
+			April 7, 2004 at 11:44 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-161833">
+				<div id="div-comment-161833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161833">
+			April 8, 2004 at 10:46 am</a>		</div>
+
+		<p>Deterministic finalisation is a contradiction in terms. I think what you mean is deterministic destruction. (See Boehm&#8217;s paper &quot;Destructors, Finalizers, and Synchronization&quot; &lt;<a target="_new" href="http://www.hpl.hp.com/techreports/2002/HPL-2002-335.html&gt;" rel="nofollow"></a><a href="http://www.hpl.hp.com/techreports/2002/HPL-2002-335.html&#038;gt" rel="nofollow">http://www.hpl.hp.com/techreports/2002/HPL-2002-335.html&#038;gt</a>;.) Now if C# would automatically call Dispose on references to certain types as they go out of scope, without the need for &quot;using&quot;, that would be great. This is what C++/CLI does with objects that are declared as automatic but are actually allocated on the managed heap.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-161943">
+				<div id="div-comment-161943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-161943">
+			April 8, 2004 at 8:34 pm</a>		</div>
+
+		<p>4/7/2004 2:27 AM DrPizza:</p>
+<p>&gt;&gt; Suppose your car or airplane has 2 GB of<br />
+<br />&gt;&gt; memory, and it repeats some computation<br />
+<br />&gt;&gt; every 100 microseconds. 1 time in 20 it<br />
+<br />&gt;&gt; leaks 4 KB of memory.<br />
+<br />&gt;<br />
+<br />&gt; Suppose it leaks a file handle at the same<br />
+<br />&gt; rate. Which problem&#8217;s gonna make it fall<br />
+<br />&gt; over quicker?</p>
+<p>Of course a program that kills you in 2 minutes kills you faster than a program that kills you in 20 minutes.  Now, my opinion is that all programs that kill you kill you, and all kinds of leaks are dangerous.  You are the one who said the memory leak version doesn&#8217;t kill you.  I sure hope you aren&#8217;t programming for cars or airplanes.</p>
+<p>(Of course I also hope Microsoft never does.  There have been enough failures of Microsoft-powered bank machines and phones already.  And there have already been enough virus infections of airline reservation systems and electrical power generating plants.  Sometimes it&#8217;s better to be paranoid.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-162223">
+				<div id="div-comment-162223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrPizza</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-162223">
+			April 10, 2004 at 12:11 pm</a>		</div>
+
+		<p>&quot;Of course a program that kills you in 2 minutes kills you faster than a program that kills you in 20 minutes. Now, my opinion is that all programs that kill you kill you, and all kinds of leaks are dangerous.&quot;<br />
+<br />In some situations, perhaps.  In general?  No, simply not true.</p>
+<p>&quot;You are the one who said the memory leak version doesn&#8217;t kill you. I sure hope you aren&#8217;t programming for cars or airplanes. &quot;<br />
+<br />I said that memory is rarely the most scare resource, the implication being that, if you&#8217;re leaking resources, your application isn&#8217;t going to die due to a memory leak, it&#8217;ll die due to running out of some other resource first.  As such, making memory management [slightly] easier at the expense of making management of other resources much harder is a poor trade-off.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-162353">
+				<div id="div-comment-162353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-162353">
+			April 11, 2004 at 11:14 pm</a>		</div>
+
+		<p>4/10/2004 12:11 PM DrPizza:</p>
+<p>&gt; making memory management [slightly] easier<br />
+<br />&gt; at the expense of making management of other<br />
+<br />&gt; resources much harder is a poor trade-off.</p>
+<p>Oh, we&#8217;re in huge agreement on this.  If this is the point you were trying to make in your two previous postings, I&#8217;m sorry I didn&#8217;t see it then.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-162793">
+				<div id="div-comment-162793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-162793">
+			April 13, 2004 at 4:02 am</a>		</div>
+
+		<p>Eugene Gershnik wrote about copy and swap:</p>
+<p>&gt; In addition this is a correct form for any class assignment operator.</p>
+<p>Actually, it isn&#8217;t. It requires that you have a swap function which doesn&#8217;t throw. Which means that every member variable, and every base class of your class has to have a swap which doesn&#8217;t throw. Often this isn&#8217;t the case.</p>
+<p>Sometimes it&#8217;s not practicle because of your class&#8217;s relations to other classes.</p>
+<p>And finally, this method can be expensive or impractical because any resources that the class requires need to be allocated and the old ones released. An old-fashioned copy constructor might not require this. Sometimes that can be very important.</p>
+<p>Copy and swap is often a useful technique, but it isn&#8217;t always the right thing to do.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-163143">
+				<div id="div-comment-163143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.hackcraft.net/' rel='external nofollow' class='url'>Jon Hanna</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-163143">
+			April 14, 2004 at 7:56 am</a>		</div>
+
+		<p>&quot;Actually, it isn&#8217;t. It requires that you have a swap function which doesn&#8217;t throw.&quot;<br />
+<br />No, it means you have to have a swap function that is either doesn&#8217;t throw or which is exception-safe.</p>
+<p>&quot;And finally, this method can be expensive or impractical because any resources that the class requires need to be allocated and the old ones released.&quot;<br />
+<br />That&#8217;s an inherent requirement to assignment. You can&#8217;t get away from this (in general) you can only move it around.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-163393">
+				<div id="div-comment-163393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-163393">
+			April 14, 2004 at 3:39 pm</a>		</div>
+
+		<p>&quot;No, it means you have to have a swap function that is either doesn&#8217;t throw or which is exception-safe.&quot;</p>
+<p>True, but this can make things harder. The whole point of this technique is to make life easy. Now you have to fully think through what you&#8217;re doing, but this gives the impression that you don&#8217;t have to.</p>
+<p>For example, if a new class is created, which has two member classes which have swaps which can throw, your exception-safe throw isn&#8217;t so easy. It also means that your assignment is not going to be strongly exception safe, which may or may not be important. You&#8217;ve moved the difficulty from the assignment into the swap.</p>
+<p>&quot;You can&#8217;t get away from this (in general) you can only move it around.&quot;</p>
+<p>Yes you can. For example, if you implement a vector class, you can reuse the array in the object you&#8217;re assigning to, as long as it&#8217;s bigger than the size of the source. You can reuse the existing resource, instead of creating a new one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-170173">
+				<div id="div-comment-170173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bauq.com' rel='external nofollow' class='url'>Bauq</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-170173">
+			April 30, 2004 at 2:26 pm</a>		</div>
+
+		<p>Agree. The benefit of GC to remove complexity far outweighs the cost, to majority of programmers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-190493">
+				<div id="div-comment-190493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-190493">
+			July 4, 2004 at 11:16 pm</a>		</div>
+
+		<p>Commenting on this entry has been closed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-480933">
+				<div id="div-comment-480933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.antcassidy.com/code/?p=44' rel='external nofollow' class='url'>Code &raquo; Blog Archive &raquo; Adding reference counting to something.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040406-00/?p=39903#comment-480933">
+			March 11, 2007 at 3:50 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.antcassidy.com/code/?p=44" rel="nofollow">http://www.antcassidy.com/code/?p=44</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

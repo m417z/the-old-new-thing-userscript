@@ -1,0 +1,327 @@
+<html>
+<head>
+<title>The Itanium processor, part 3b: How does spilling actually work?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Itanium processor, part 3b: How does spilling actually work?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 30, 2015 / year-entry #159</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>7</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Working quietly in the background.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Answering some interesting questions that arose
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150729-00/?p=90801">
+yesterday</a>.
+I didn't know the answers either, so I went and read
+<a HREF="http://www.intel.com/content/www/us/en/processors/architectures-software-developer-manuals.html">
+the manual</a>,
+specifically Volume 2 (IA-64 System Architecture),
+chapter 6 (IA-64 Register Stack Engine).
+</p>
+<p>
+Evan asks,
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150729-00/?p=90801#comment-1234646"
+_HREF="http://blogs.msdn.com/b/oldnewthing/archive/2015/07/29/10631311.aspx#10631494"
+>Is the spilling to the stack done by the hardware,
+or does it trap into the OS</a>?"
+</p>
+<p>
+According to the manual:
+</p>
+<blockquote CLASS=q><p>
+The RSE operates concurrently and asynchronously with respect
+to instruction execution by taking advantage of unused memory
+bandwidth to dynamically perform register spill and fill operations.
+</p>
+</blockquote>
+<p>
+So yeah, it's done in hardware.
+</p>
+<p>
+Let's look at our register allocation diagram again.
+But I'm going to use colors to describe how they are treated
+by the Register Stack Engine.
+</p>
+<table BORDER=1 BORDERCOLOR=black
+       STYLE="border: solid 1px black;
+              border-collapse: collapse; text-align: center">
+<tr>
+<td VALIGN=bottom ROWSPAN=2>static</td>
+<td ROWSPAN=3 WIDTH=0 BGCOLOR=black></td>
+<td COLSPAN=2>a</td>
+<td ROWSPAN=2>open</td>
+<td>g</td>
+<td>f</td>
+<td>e</td>
+<td>d</td>
+<td>c</td>
+<td>b</td>
+</tr>
+<tr>
+<td>LR</td>
+<td>O</td>
+<td>LR</td>
+<td>LR</td>
+<td>LR</td>
+<td>LR</td>
+<td>LR</td>
+<td>LR</td>
+</tr>
+<tr>
+<td BGCOLOR=#808080>&bull;&bull;&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#FFBBBB>&bull;&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#FFBBBB>&bull;&bull;&bull;</td>
+<td>&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</td>
+<td>&bull;&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#C0FF97>&bull;&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#C0FF97>&bull;&bull;&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#FFFF99>&bull;&bull;&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#FFFF99>&bull;&bull;&bull;&bull;</td>
+<td BGCOLOR=#FFFF99>&bull;&bull;&bull;&bull;&bull;&bull;</td>
+</tr>
+</table>
+<p>
+The static registers do not participate in register stacking,
+so I've grayed them out.
+</p>
+<p>
+The registers belonging to the currently active function are
+never spilled to backing store.
+Those are marked red in the diagram above.
+</p>
+<p>
+The registers with undefined contents are in white.
+The ones marked "open" are registers that were discarded
+when a function returned,
+or registers which have never been used at all.
+There might also be registers,
+like those belonging to function <var>g</var>,
+which got flushed out to backing store,
+then got reused to satisfy some deeply-nested function call,
+and haven't yet been reloaded from backing store.
+</p>
+<p>
+The green registers are those that are clean.
+They contain valid values, and the values have been flushed out
+to backing store.
+</p>
+<p>
+The yellow registers are dirty.
+They contain valid values, and the values have not yet been
+flushed out to backing store.
+</p>
+<p>
+We saw last time that
+when a function call occurs,
+the registers in the local region
+are rotated to the end of the diagram,
+and the other registers slide left to make room.
+What also happens is that the formerly-red registers are colored yellow,
+to indicate that they are dirty and can be flushed.
+The function being called carves out some white and green registers
+and colors them red.
+These registers become the new local registers and output registers.
+</p>
+<p>
+When a function returns,
+its red registers are colored white,
+and the previous function's local region is slid into position
+(assuming the registers are yellow or green)
+and colored red.
+</p>
+<p>
+What the Register Stack Engine does is look for unused
+memory bandwidth and use it to extend the size of the green
+region.
+To turn white registers green, it loads them from backing store.
+To turn yellow registers green, it saves them to backing store.
+</p>
+<p>
+Turning white registers green means that when you return from
+a function, the caller's registers will already be on-chip
+and don't need to be loaded from memory.
+Turning yellow registers green means that when you call a function,
+the new function will have enough white and green registers available
+to satisfy its needs.
+</p>
+<p>
+If there aren't enough registers of the appropriate color to satisfy
+the needs of a function call or return, the processor will perform
+spills or loads immediately in order to make room.
+</p>
+<p>
+Bob wonders if the large number of registers
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150729-00/?p=90801#comment-1234626"
+_HREF="http://blogs.msdn.com/b/oldnewthing/archive/2015/07/29/10631311.aspx#10631532">
+makes context switching expensive</a>.
+On a context switch,
+only the red and yellow registers need to be flushed.
+Since the processor is working in the background to eliminate yellow
+registers,
+the hope is that by the time you perform the context switch,
+there aren't many red and yellow registers left.
+</p>
+<p>
+But yeah, context switching is more expensive.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (7)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234436">
+				<div id="div-comment-1234436" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1234436">
+			July 30, 2015 at 8:47 am</a>		</div>
+
+		<p>Wow, Intel got all fancy schmancy. Nifty idea.</p>
+<p>And thanks for taking the time to look it up and write all that out!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234416">
+				<div id="div-comment-1234416" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1234416">
+			July 30, 2015 at 9:36 am</a>		</div>
+
+		<p>My name&#39;s not Bob. &nbsp;But thanks for responding!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234406">
+				<div id="div-comment-1234406" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1234406">
+			July 30, 2015 at 10:35 am</a>		</div>
+
+		<p>Thanks for taking up those questions fast and in detail.</p>
+<p>Though numbering it 3b after already auto-posting (I assume that&#39;s still automated) 4 nearly made me miss the update until we get to part 5 ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234366">
+				<div id="div-comment-1234366" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1234366">
+			July 30, 2015 at 11:42 am</a>		</div>
+
+		<p>Perhaps &quot;Bob&quot; is a Microsoft term for &quot;whoever asked me the question.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234356">
+				<div id="div-comment-1234356" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1234356">
+			July 30, 2015 at 12:39 pm</a>		</div>
+
+		<p>@Joe: No, Bob is a Microsoft term for &quot;Some random guy.&quot; &nbsp;Presumably it comes from Alice and Bob (and Carol, David, Eve,&#8230;).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234346">
+				<div id="div-comment-1234346" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1234346">
+			July 30, 2015 at 2:45 pm</a>		</div>
+
+		<p>The gray static registers must surely be context switched, too?</p>
+<p>I must say this is a fascinating series. I&#39;m quite at home with most normal architectures, but this strikes me as positively insane :-) I certainly don&#39;t envy anybody who had to write a compiler for it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196651">
+				<div id="div-comment-1196651" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-01/?p=90781#comment-1196651">
+			August 5, 2015 at 12:04 pm</a>		</div>
+
+		<p>The link to the manual appears to be incorrect. That url only includes the IA-32 and Intel 64 (the AMD64 derivative).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

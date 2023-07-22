@@ -1,0 +1,1492 @@
+<html>
+<head>
+<title>IsBadXxxPtr should really be called CrashProgramRandomly</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>IsBadXxxPtr should really be called CrashProgramRandomly</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 27, 2006 / year-entry #330</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>81</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Often I'll see code that tries to "protect" against invalid pointer parameters. This is usually done by calling a function like IsBadWritePtr. But this is a bad idea. IsBadWritePtr should really be called CrashProgramRandomly. The documentation for the IsBadXxxPtr functions presents the technical reasons why, but I'm going to dig a little deeper. For one...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Often I'll see code that tries to "protect" against invalid pointer parameters. This is usually done by calling a function like <code>IsBadWritePtr</code>. But this is a bad idea. <code>IsBadWritePtr</code> should really be called <code>CrashProgramRandomly</code>.</p>
+<p> The documentation for the <code>IsBadXxxPtr</code> functions presents the technical reasons why, but I'm going to dig a little deeper. For one thing, if the "bad pointer" points into a guard page, then probing the memory will raise a guard page exception. The <code>IsBadXxxPtr</code> function will catch the exception and return "not a valid pointer". But guard page exceptions are raised only once. <strong>You just blew your one chance.</strong> When the code that is managing the guard page accesses the memory for what it thinks is the first time (but is really the second), it won't get the guard page exception but will instead get a normal access violation. </p>
+<p> Alternatively, it's possible that your function was called by some code that intentionally passed a pointer to a guard page (or a <code>PAGE_NOACCESS</code> page) and was expecting to receive that guard page exception or access violation exception so that it could dynamically generate the data that should go onto that page. (Simulation of large address spaces via pointer-swizzling is one scenario where this can happen.) Swallowing the exception in <code>IsBadXxxPtr</code> means that the caller's exception handler doesn't get a chance to run, which means that your code rejected a pointer that would actually have been okay, if only you had let the exception handler do its thing. </p>
+<p> "Yeah, but my code doesn't use guard pages or play games with <code>PAGE_NOACCESS</code> pages, so I don't care." Well, for one thing, just because your code doesn't use these features pages doesn't mean that no other code in your process uses them. One of the DLLs that you link to might use guard pages, and your use of <code>IsBadXxxPtr</code> to test a pointer into a guard page will break that other DLL. </p>
+<p> And second, your program does use guard pages; you just don't realize it. The dynamic growth of the stack is performed via guard pages: Just past the last valid page on the stack is a guard page. When the stack grows into the guard page, a guard page exception is raised, which the default exception handler handles by committing a new stack page and setting the <strong>next</strong> page to be a guard page. </p>
+<p> (I suspect this design was chosen in order to avoid having to commit the entire memory necessary for all thread stacks. Since the default thread stack size is a megabyte, this would have meant that a program with ten threads would commit ten megabytes of memory, even though each thread probably uses only 24KB of that commitment. When you have a small pagefile or are running without a pagefile entirely, you don't want to waste 97% of your commit limit on unused stack memory.) </p>
+<p> "But what should I do, then, if somebody passes me a bad pointer?" </p>
+<p> You should crash. </p>
+<p> No, really. </p>
+<p> In the Win32 programming model, exceptions are truly exceptional. As a general rule, you shouldn't try to catch them. And even if you decide you want to catch them, you need to be very careful that you catch exactly what you want and no more. </p>
+<p> Trying to intercept the invalid pointer and returning an error code creates nondeterministic behavior. Where do invalid pointers come from? Typically they are caused by programming errors. Using memory after freeing it, using uninitialized memory, that sort of thing. Consequently, an invalid pointer might actually point to valid memory, if for example the heap page that used to contain the memory has not been decomitted, or if the uninitialized memory contains a value that when reinterpreted as a pointer just happens to be a pointer to memory that is valid right now. On the other hand, it might point to truly invalid memory. If you use <code>IsBadWritePtr</code> to "validate" your pointers before writing to them, then in the case where it happens to point to memory that is valid, you end up corrupting memory (since the pointer is "valid" and you therefore decide to write to it). And in the case where it happens to point to an invalid address, you return an error code. In both cases, <strong>the program keeps on running</strong>, and then that memory corruption manifests itself as an "impossible" crash two hours later. </p>
+<p> In other words <code>IsBadWritePtr</code> is really <code>CorruptMemoryIfPossible</code>. It tries to corrupt memory, but if doing so raises an exception, it merely fails the operation. </p>
+<p> Many teams at Microsoft have rediscovered that <code>IsBadXxxPtr</code> causes bugs rather than fixes them. It's not fun getting a bucketful of crash dumps and finding that they are all of the "impossible" sort. You hunt through your code in search of this impossible bug. Maybe you find somebody who was using <code>IsBadXxxPtr</code> or equivalently an exception handler that swallows access violation exceptions and converts them to error codes. You remove the <code>IsBadXxxPtr</code> in order to let the exception escape unhandled and crash the program. Then you run the scenario again. And wow, look, the program crashes <strong>in that function</strong>, and when you debug it, you find the code that was, say, using a pointer after freeing it. That bug has been there for years, and it was manifesting itself as an "impossible" bug because the function was trying to be helpful by "validating" its pointers, when in fact what it was doing was taking a straightforward problem and turning it into an "impossible" bug. </p>
+<p> There is a subtlety to this advice that you should just crash when given invalid input, which I'll take up next time. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (81)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-424673">
+				<div id="div-comment-424673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424673">
+			September 27, 2006 at 10:23 am</a>		</div>
+
+		<p>I&#8217;ll admit it: I used IsBadWritePtr(), but it was only in used when compiled in a debug build. &nbsp;Honest! &nbsp;</p>
+<p>I&#8217;m glad you wrote this article. &nbsp;I knew that the stack grew dynamically, and I knew about guard pages, but I didn&#8217;t know the stack implementation used guard pages. &nbsp;Of course, since you&#8217;ve said it, it&#8217;s obvious. &nbsp;I simply never put two and two together.</p>
+<p>On a side note, I&#8217;m sure there are people out there who will think that this is obvious and that Raymond is wasting his time writing about this. &nbsp;I know, because I&#8217;m guilty of thinking that, too, particularly when writes about user interface caveats. &nbsp;But we should do well &nbsp;to remember that everybody has different experience levels, and that lessons must be constantly repeated so that new people can learn them, too. &nbsp;</p>
+<p>Thanks, Raymond.</p>
+<p>(Sorry if this is a duplicate, but the server errored when I originally hit submit.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424733">
+				<div id="div-comment-424733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nate</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424733">
+			September 27, 2006 at 11:09 am</a>		</div>
+
+		<p>I&#8217;ve always regarded IsBadXxxx as debugging functions, only relevant for debug builds to catch invalid arguments being passed into functions so that the program can panic earlier, not later. &nbsp;Surely that is an appropriate use?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424743">
+				<div id="div-comment-424743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.explorewindows.com' rel='external nofollow' class='url'>Vipin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424743">
+			September 27, 2006 at 11:14 am</a>		</div>
+
+		<p>I personally don&#8217;t use IsBadXXX functions.Although I have read in the msdn documentation and in microsoft presentations against using it, I haven&#8217;t read the justification anywhere. your explanation in the context of guard pages makes sense. Also I beleive IsBadXXX functions will be time consuming because they will have to validate whether memory is accessible, hence slowing down the process. That was one of the reasons I never used it. </p>
+<p>you said:- <br />&#8220;On the other hand, it might point to truly invalid memory. If you use IsBadWritePtr to &#8220;validate&#8221; your pointers before writing to them, then in the case where it happens to point to memory that is valid, you end up corrupting memory (since the pointer is &#8220;valid&#8221; and you therefore decide to write to it).&#8221; </p>
+<p>Regarding the above, anyway the program is going to crash on accessing a not to be accessed memory, then what is the issue with double checking it before using it.</p>
+<div class=post>[<i>See the third paragraph of the entry. The problem with double-checking is that your second check isn&#8217;t the same as the original one. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424753">
+				<div id="div-comment-424753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424753">
+			September 27, 2006 at 11:17 am</a>		</div>
+
+		<p>@Nate: As Raymond suggests, it can have an effect on components within the system that expect to catch exceptions or on guard pages. &nbsp;Using IsBadWritePtr() in debug mode means it now operates differently than in release mode. &nbsp;Effectively, you&#8217;re no longer debugging the same application.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424773">
+				<div id="div-comment-424773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrei</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424773">
+			September 27, 2006 at 11:33 am</a>		</div>
+
+		<p>These IsBadXXXPtr functions certainly hint that one of the syscall implementers thought that checking for validity of the pointers might be useful in userspace, too.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424783">
+				<div id="div-comment-424783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stuart Dootson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424783">
+			September 27, 2006 at 11:37 am</a>		</div>
+
+		<p>In an application I&#8217;m currently developing, I use VirtualQueryEx to determine the accessibility of a given memory area (in a different process &#8211; that&#8217;s why I use the &#8216;Ex&#8217; variant). Now&#8230;.do the various flavours of IsBadXxxPtr do anything useful that couldn&#8217;t be done by reimplementing with VirtualQueryEx or VirtualQuery? Or do VirtualQuery/Ex have the same drawbacks as IsBadXxxPtr (wouldn&#8217;t have thought so). Or is there a big performance hit (seems possible)?</p>
+<div class=post>[<i>Let&#8217;s not get into cross-process memory snooping since it&#8217;s just scary no matter how you slice it (<a href="http://blogs.msdn.com/oldnewthing/archive/2006/01/17/513779.aspx" rel="nofollow">both technically and from a security standpoint</a>). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424793">
+				<div id="div-comment-424793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Becke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424793">
+			September 27, 2006 at 11:42 am</a>		</div>
+
+		<p>Actually I dimly remember reading a third hand account of a study (i.e. possibly entirely bogus) that found that if you silently succeeded on all &quot;uncaught&quot; read and write access violation type crashes (by returning 0 in the read case, and doing nothing in the write case) the resulting zombie application was in most cases able to continue stably.</p>
+<p>Which got me wondering how true that was, but implementing a SEH crashhandler that can cause x86 code to continue regardless seems a little non trivial for my current skillset.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424803">
+				<div id="div-comment-424803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael Urman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424803">
+			September 27, 2006 at 11:42 am</a>		</div>
+
+		<p>&#8220;And even if you decide you want to catch them, you need to be very careful that you catch exactly what you want and no more.&#8221; </p>
+<p>This is something I agree with, as it has bitten us time and time again when we blindly catch everything we can. But we&#8217;re doing so just on the inside of a COM method boundary, where I&#8217;ve been lead to believe we have to squash exceptions. Is there a good way to handle the intersection of both these needs?</p>
+<div CLASS=post>[<i>If your code uses exceptions as an internal communication method, then you have to squash those. But access violations should simply crash and die since they are bugs. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424813">
+				<div id="div-comment-424813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bruteforce</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424813">
+			September 27, 2006 at 11:52 am</a>		</div>
+
+		<p>Wow, I&#8217;m impressed!<br />
+<br />I have been using this function heavily, hoping to protect my &quot;clients&quot; (callers of our library) from their programming errors. As you realize, if our library crashed on the spot when garbage is fed to our functions, then we would have tremendous support headaches. Now they get back a well documented error code and go figure it out themselves.</p>
+<p>What about modifying IsBadXxxPtr on the checked build, to popup or log an assert message when it encounters an address in a guard page? That would be a small consolation for us devs and some help to our QA departments.</p>
+<p>Dimitris Staikos</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424823">
+				<div id="div-comment-424823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424823">
+			September 27, 2006 at 12:13 pm</a>		</div>
+
+		<p>So if IsBadXxxPtr is really that bad, how about making it throw a compiler warning? <br />It only takes a few #warning&#8217;s&#8230; </p>
+<p>MSDN also makes no mention of any problems, how about putting a nice big bold warning in MSDN? </p>
+<p>Developers won&#8217;t stop using &#8220;bad&#8221; functions unless it&#8217;s made absolutely clear that they are bad.</p>
+<div CLASS=post>[<i>Pretty much all of these warnings are indeed in the MSDN documentation. Traditionally, documentation doesn&#8217;t make value judgements; they just explain what a function does, and it&#8217;s up to you to decide if you want to live with that. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424833">
+				<div id="div-comment-424833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DavidE</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424833">
+			September 27, 2006 at 12:17 pm</a>		</div>
+
+		<p>&quot;the resulting zombie application was in most cases able to continue stably&quot;</p>
+<p>I think that kind of depends on what your definition of &quot;stably&quot; is. I also think that this is a generalization which could be dangerous. For example, what if you had a program that read a file, ignored any corruption, and then allowed the user to save their data? That could lead to a disaster that a crash would have avoided.</p>
+<p>A couple of years ago, I was responsible for an API that had been originally implemented without any pointer checks. We got a new requirement that we check for NULL pointers and do something &quot;reasonable&quot; in those cases. In the debug version, NULL pointers caused assert failures, which is not a bad idea, but in the release version it quietly accepted these and returned an error. I have a hard time believing that a programmer who isn&#8217;t checking for &quot;garbage in&quot; is going to consistently check for &quot;garbage out&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-larryosterman odd alt thread-odd thread-alt depth-1" id="comment-424843">
+				<div id="div-comment-424843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Larry+Osterman+%5BMSFT%5D' rel='external nofollow' class='url'>Larry Osterman [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424843">
+			September 27, 2006 at 12:23 pm</a>		</div>
+
+		<p>I feel obliged to point to:<a rel="nofollow" target="_new" href="http://blogs.msdn.com/larryosterman/archive/2004/05/18/134471.aspx" rel="nofollow">http://blogs.msdn.com/larryosterman/archive/2004/05/18/134471.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424853">
+				<div id="div-comment-424853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">A</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424853">
+			September 27, 2006 at 12:32 pm</a>		</div>
+
+		<p>&quot;When the stack grows into the guard page, a guard page exception is raised,&quot;</p>
+<p>Technically, calling IsBad*Ptr() on the stack is safe because the guard page exceptions are handled entirely within the kernel. User-mode exception handlers cannot see or intercept them (contrary to what Larry Osterman&#8217;s article claims).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424863">
+				<div id="div-comment-424863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424863">
+			September 27, 2006 at 12:51 pm</a>		</div>
+
+		<p>The MSDN page for IsBadWritePtr is here: <br /><a href="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/memory/base/isbadwriteptr.asp" target=_new rel=nofollow rel="nofollow">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/memory/base/isbadwriteptr.asp</a>. </p>
+<p>It mentions multithreading problems, but no mention of the guard page problem. <br />It also doesn&#8217;t mention that the pointer being &#8220;valid&#8221; is no garantee that you can use it. Maybe a better definition of &#8220;valid&#8221; is needed.</p>
+<div CLASS=post>[<i>Hm, it does mention the stack growth problem, which occupies the same space in my brain as &#8216;guard page&#8217;, that&#8217;s what faked me out. Valid in that function means &#8216;can be accessed without raising an exception&#8217;. I would hope that was clear from context but maybe not. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424873">
+				<div id="div-comment-424873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">30000 Leagues under the C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424873">
+			September 27, 2006 at 12:58 pm</a>		</div>
+
+		<p>My take is that the real problem is that the API itself has side effects that it really ought not to have. This is not the fault of developers who use the API, it is it fault of the implementation (&quot;oh, you mean you wanted to USE it?&quot;).</p>
+<p>What&#8217;s the point of an API called IsBadxxxPtr if calling it causes more problems then not calling it? I also disagree with the notion of &quot;so what if it&#8217;s bad, let &#8216;er crash&quot; &#8230;.there are too many systems that are mission critical where that&#8217;s not a valid option.</p>
+<p>I do agree with the point that bugs should be caught early and often, and that the easiest way to find this is to let it crash, but once the system ships it is no longer a developer&#8217;s machine, it is a customer&#8217;s; maybe it can&#8217;t go on running, but that should be a policy decision, not a default, and a graceful shutdown is preferable to slamming into a wall.</p>
+<p></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424883">
+				<div id="div-comment-424883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424883">
+			September 27, 2006 at 12:58 pm</a>		</div>
+
+		<p>Not sure what this says about either Unix or Windows, but I&#8217;m not aware of any Unix variant ever having introduced an equivalent of IsBad*Ptr(), despite it having had longer to do so.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424893">
+				<div id="div-comment-424893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Dunn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424893">
+			September 27, 2006 at 1:15 pm</a>		</div>
+
+		<blockquote><p>
+  &gt;&#8230;if you silently succeeded on all &quot;uncaught&quot; read and write access violation type crashes (by returning 0 in the read case, and doing nothing in the write case) the resulting zombie application was in most cases able to continue stably.</p>
+<p>That&#8217;s already been tried. Back in the late 90s, there was a fad of &quot;crash recovery&quot; apps like Norton CrashGuard. If an app AV&#8217;d or did something else Bad, NCG tried to fix things up so the app would keep running and you could save your data and then close the app gracefully. The problem is, it wasn&#8217;t successful often enough to be useful.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424903">
+				<div id="div-comment-424903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">boxmonkey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424903">
+			September 27, 2006 at 1:26 pm</a>		</div>
+
+		<p>DavidE, are you sure that wasn&#8217;t because in debug builds pointers are initialized to NULL but are not initialized at all in release builds?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424913">
+				<div id="div-comment-424913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://msmvps.com/blogs/peterritchie/archive/2006/09/27/More-Windows-SDK-Functions-That-Are-Not-Safe.aspx' rel='external nofollow' class='url'>Peter Ritchie's MVP Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424913">
+			September 27, 2006 at 1:41 pm</a>		</div>
+
+		<p>Raymond Chen recently blogged that IsBadWritePtr, IsBadCodePtr, IsBadHugeReadPtr, IsBadHugeWritePtr,</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424923">
+				<div id="div-comment-424923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ac</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424923">
+			September 27, 2006 at 2:17 pm</a>		</div>
+
+		<p>Another practice that leads to the similar problems as described in the article is enclosing the part of the program in the </p>
+<p>try { </p>
+<p> } catch ( &#8230; ) { }</p>
+<p>where the three dot catch just swallows everything, including any chance to detect where the problem happened. And they even nest such things.</p>
+<p>Actually, most of the C++ programmers are clueless about the exceptions anyway, they just regularly shoot themselves in the foot.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424933">
+				<div id="div-comment-424933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424933">
+			September 27, 2006 at 2:20 pm</a>		</div>
+
+		<p>What about device drivers? <br />Is it safe to use IsBadWritePtr() there to check if user supplied output buffer is valid and avoid writing to it if it isn&#8217;t? </p>
+<p>&gt;The dynamic growth of the stack is performed <br />&gt;via guard pages </p>
+<p>I have one serious question about this for you Raymond because I haven&#8217;t found any documented way of doing this properly: </p>
+<p>I recenly had to allocate three int arrays of 2048 elements each on stack in a __declspec(naked) function written completely in assembler. I wrote prologue and epilogue code to handle alignment and allocation and the code was ok but it crashed on writing to said arrays on stack. </p>
+<p>By debugging it I realized that I have only 4KB of commited stack space. It wasn&#8217;t easy to come to this conclusion even though I knew about /STACK:reserve,commit thing because one had actually to look at the stack segment limit to figure this out. </p>
+<p>Now for the question &#8212; how to change this limit programmatically from assembler code? Is it possible at all to change it during runtime? </p>
+<div CLASS=post>[<i>Hint: _chkstk. This is off topic so I won&#8217;t say any more. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424943">
+				<div id="div-comment-424943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/ericlippert/archive/2006/09/27/774117.aspx' rel='external nofollow' class='url'>Fabulous Adventures In Coding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424943">
+			September 27, 2006 at 2:21 pm</a>		</div>
+
+		<p>Here’s a story that I said </p>
+<p>a long time ago that I was<br />
+<br />going to tell you all, and then promptly&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424953">
+				<div id="div-comment-424953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Barry Tannenbaum</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424953">
+			September 27, 2006 at 2:27 pm</a>		</div>
+
+		<p>There are times when crashing is simply not an option. &nbsp;The debugger shouldn&#8217;t cause my app to crash, no matter what I do. &nbsp;Neither should other debugging tools. </p>
+<p>This is code in Kernel32 we&#8217;re talking about, not some 3rd part DLL. &nbsp;Microsoft controls the vertical &amp; horizontal here. &nbsp;Why doesn&#8217;t IsBad*Ptr catch the STATUS_GUARD_PAGE and either note that we&#8217;re dealing with the stack and extend it, or reset the PAGE_GUARD setting? </p>
+<p>Or else implement it by calling VirtualQuery to check what access is allowed, instead of using a condition handler. &nbsp;Yeah, that&#8217;ll probably slow down the function, but the current implementation is fatally flawed.</p>
+<div CLASS=post>[<i>Perhaps it could have been implemented differently originally, but that&#8217;s water under the bridge. What&#8217;s done is done and you can&#8217;t change it after the fact. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424963">
+				<div id="div-comment-424963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424963">
+			September 27, 2006 at 2:27 pm</a>		</div>
+
+		<p>This explains why I was having a hard time finding out the problem: </p>
+<p>&#8220;Dereferencing potentially invalid pointers can disable stack expansion in other threads. A thread exhausting its stack, when stack expansion has been disabled, results in the immediate termination of the parent process, with no pop-up error window or diagnostic information.&#8221; </p>
+<p>So instead of crashing with access violation and showing me the address which triggered it the OS terminated the application I was testing &#8220;with no pop-up error window or diagnostic information.&#8221; Neat feature indeed. </p>
+<div CLASS=post>[<i>You lost your stack. There&#8217;s nothing that can be done. Displaying an error window requires a stack. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jamescurran even thread-even depth-1" id="comment-424973">
+				<div id="div-comment-424973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Garry Trinder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424973">
+			September 27, 2006 at 2:42 pm</a>		</div>
+
+		<p>Sorry if this is off-topic, but I couldn&#8217;t find an email address for you, so I&#8217;ll have to post this in a comment. </p>
+<p>May I suggest a future topic in our &#8220;Why Windows does it that way&#8221; series? &nbsp;Specifically, why is it so difficult to go back &amp; forth between domains. </p>
+<p>Here&#8217;s the scenario: &nbsp;I get a new laptop at work. &nbsp;IT delivers it already join to the ofice domain. &nbsp;I selected workdomain.local from the login dropdown and log in. </p>
+<p>That night I bring the laptop home, join the laptop to &nbsp;my network at home. (not problem &#8212; I&#8217;m the network admin at home). &nbsp;Select homedomain.local from the dropdown &amp; login. </p>
+<p>The next day, I bring it back to the office, and expect to just select workdomain.local from the dropdown and login &#8212; but it&#8217;s not in the dropdown! &nbsp;I&#8217;m now expected to REJOIN workdomain.local (an action which requires a special privalege on the domain) &#8212; even though workdomain.local is COMPLETELY UNAWARE that I ever left it. &nbsp;Why can&#8217;t I just log on it each domain (at separate times) after I&#8217;ve joined each?</p>
+<div CLASS=post>[<i>Look harder. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-424983">
+				<div id="div-comment-424983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Jones</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424983">
+			September 27, 2006 at 2:46 pm</a>		</div>
+
+		<p>Wine uses an exception: </p>
+<div class=post>[<i>Code removed because it violated Paragraph 1 of the GPL and because I did not give you permission to cause me legal grief. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-424993">
+				<div id="div-comment-424993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-424993">
+			September 27, 2006 at 3:06 pm</a>		</div>
+
+		<p>@Nate: As Raymond suggests, it can have an effect on components within the system that expect to catch exceptions or on guard pages. &nbsp;Using IsBadWritePtr() in debug mode means it now operates differently than in release mode. &nbsp;Effectively, you&#8217;re no longer debugging the same application.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425003">
+				<div id="div-comment-425003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Foolhardy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425003">
+			September 27, 2006 at 3:07 pm</a>		</div>
+
+		<p>Igor-<br />
+<br />There is one case where you are expected to eat all EXCEPTION_ACCESS_VIOLATION exceptions: in kernel mode when accessing user mode memory. An access violation raises the same exception in kernel mode as it does in user mode. An unhandled exception causes a bugcheck, so every time you touch user mode memory, it must be enclosed in an exception handler.</p>
+<p>Note that before touching a user-supplied pointer, you must first ensure that the pointer in question actually resides in user memory by calling ProbeForRead/Write. Getting an access violation in kernel mode for the kernel&#8217;s address space results in an automatic bugcheck&#8211; no option to handle an exception.</p>
+<p>The entire evilness of having a IsBadXxxPtr is that you don&#8217;t know where bad pointers (other than null) came from what they once represented, and what arbitrary things they represent now. If the bad pointer has an arbitrary value, it could just as easily point to data alloctated for something else, just waiting to be corrupted. Even if IsBadXxxPtr didn&#8217;t have bad side effects, it still can&#8217;t distinguish between unallocated pages and data belonging to something else. Pointers need to have a value of null or point to valid data. Anything else is a logic error.</p>
+<p>Accessing user buffers from kernel mode:<br />
+<br /><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/kernel_d/hh/Kernel_d/iputoput_c6e8f2ab-7282-4282-b149-63300a7d97d4.xml.asp" rel="nofollow">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/kernel_d/hh/Kernel_d/iputoput_c6e8f2ab-7282-4282-b149-63300a7d97d4.xml.asp</a></p>
+<p>Handling exceptions in kernel mode:<br />
+<br /><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/kernel_d/hh/Kernel_d/other_f7259c51-1557-42e6-8264-ac8dae0177e3.xml.asp" rel="nofollow">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/kernel_d/hh/Kernel_d/other_f7259c51-1557-42e6-8264-ac8dae0177e3.xml.asp</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425013">
+				<div id="div-comment-425013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425013">
+			September 27, 2006 at 3:37 pm</a>		</div>
+
+		<blockquote><p>
+  Hint: _chkstk. This is off topic so I won&#8217;t<br />
+  <br />&gt;say any more.</p>
+<p>It is enough, thanks. But what if you don&#8217;t have C runtime linked in? How to properly grow the stack from assembler in that case?</p>
+<p>&gt;You lost your stack. There&#8217;s nothing that can<br />
+  <br />&gt;be done. Displaying an error window requires<br />
+  <br />&gt;a stack.</p>
+<p>I must admit that I don&#8217;t quite understand the logic behind this. I tried to write to stack location which was reserved but not commited. For me, it would be more logical to allow stack growth until you hit reserve limit and then crash with a page fault and a message &quot;Stack exhausted&quot; then just silently exit the process without any hint so as to what happened.<br />
+  
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425023">
+				<div id="div-comment-425023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.explorewindows.com' rel='external nofollow' class='url'>Vipin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425023">
+			September 27, 2006 at 3:44 pm</a>		</div>
+
+		<p>Mike, Nice to see the wine source.<br />
+<br />Does someone with access to Windows source code want to show the corresponding algorithm or Is reverse engineering the way to go?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425043">
+				<div id="div-comment-425043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">WikiServerGuy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425043">
+			September 27, 2006 at 4:17 pm</a>		</div>
+
+		<p>When I first saw these, my first instinct was to put them everywhere. Glad I didn&#8217;t go with that! :)</p>
+<p>A lot of code uses this; even the directshow baseclasses use to. The code is still there, but it is ifdefed out, and all it says now is &quot;The IsBadXXXX APIs are banned.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425053">
+				<div id="div-comment-425053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antti Huovilainen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425053">
+			September 27, 2006 at 4:45 pm</a>		</div>
+
+		<p>Are there any significant cases where IsBadXxxPtr() would actually work better than simple check for NULL?</p>
+<p>Most of the time in my own code bad pointers are either NULL or point to deallocated memory.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425073">
+				<div id="div-comment-425073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425073">
+			September 27, 2006 at 4:54 pm</a>		</div>
+
+		<p>Well, &quot;deallocated&quot; is not necessarily the same as &quot;will cause an exception if you try to read or write it&quot;. &nbsp;Certainly not if you use malloc and free (although there are other issues with those on Windows, with its plethora of C runtimes). &nbsp;There may even be issues with the Heap* functions, I&#8217;m not sure.</p>
+<p>Anyway, my point is, it may be possible to pass a deallocated pointer to IsBadReadPtr and get false back, even in cases where the pointer is invalid.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ericlippert odd alt thread-odd thread-alt depth-1" id="comment-425103">
+				<div id="div-comment-425103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Eric+Lippert' rel='external nofollow' class='url'>Eric Lippert</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425103">
+			September 27, 2006 at 5:19 pm</a>		</div>
+
+		<blockquote><p>
+  You lost your stack. There&#8217;s nothing that can be done. Displaying an error window requires a stack. </p>
+<p>Sure, but Windows didn&#8217;t <em>have</em> to be designed that way; other operating systems do not necessarily have this problem. &nbsp;An ancient example: the Amiga operating system reserved a four kilobyte chunk of memory for displaying simple error messages in the event that insufficient stack/heap/whatever was available to display a real error message. &nbsp;The window was always red on black and gave the &#8220;Guru meditation&#8221; error number, and that&#8217;s pretty much it. &nbsp;(So-called because you needed to be an OS guru to understand the cryptic error codes.) </p>
+<p>It&#8217;s not clear to me why Windows didn&#8217;t pursue a similar strategy for reporting blown stacks. &nbsp;This business of &#8220;the process just disappears&#8221; is pretty irksome, wouldn&#8217;t you say?</p>
+<div CLASS=post>[<i>Windows used to have such an &#8220;emergency error dialog&#8221;. Remember the UAE? People hated it. -Raymond</i>]</div>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425113">
+				<div id="div-comment-425113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">cthrall</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425113">
+			September 27, 2006 at 5:35 pm</a>		</div>
+
+		<p>&quot;In the Win32 programming model, exceptions are truly exceptional. As a general rule, you shouldn&#8217;t try to catch them. And even if you decide you want to catch them, you need to be very careful that you catch exactly what you want and no more.&quot;</p>
+<p>YES.</p>
+<p>I was working on a large &quot;enterprise application&quot; (as they are called these days) written in VC6. Somebody, somewhere did &quot;catch (&#8230;).&quot;</p>
+<p>I learned a lesson that day. Never, ever, ever catch (&#8230;). When it crashed for me in my DLL, this exception handler caught it. My machine took many minutes to unwind the stack and I wound up in never-never land without much of a clue (I was also a newbie then).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425123">
+				<div id="div-comment-425123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andy C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425123">
+			September 27, 2006 at 5:43 pm</a>		</div>
+
+		<p>JamesCurran: Being in two domains would be a fundamental security hole. Domain Admins would be completely unable to enforce any settings at all because anyone could just join their computer to a different domain and &#8216;hey presto&#8217; they have unrestricted access to the entire box. </p>
+<p>Back to the topic, what I don&#8217;t understand here is that if the IsBadXxxPtr functions are so flawed, why not just replace then with stub functions that just return 0 (or perhaps just do minimal NULL pointer checking). Document them as such in MSDN and just move on.</p>
+<div CLASS=post>[<i>Actually, that last sentence is incorrect. It&#8217;s &#8220;Document them as such in MSDN, try to move on, but find yourself innundated with application compatibility bugs.&#8221; Just look at all the apps that are actually relying on IsBadXxxPtr doing something. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425133">
+				<div id="div-comment-425133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stuart Dootson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425133">
+			September 27, 2006 at 5:54 pm</a>		</div>
+
+		<p>Hmmm &#8211; well, I&#8217;m just using VirtualQueryEx to determine what access there is to memory in a remote process &#8211; I actually package up memory read/write requests into a file mapping and do use proper IPC to ask the remote process to access memory. Maybe I should ask the remote process to do the access check as well.</p>
+<p>I guess I shouldn&#8217;t mention that I&#8217;m using Jeffrey Richter&#8217;s DLL injection technique to get the remote end of the IPC link started&#8230;.not dodgy at all :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425153">
+				<div id="div-comment-425153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antti Huovilainen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425153">
+			September 27, 2006 at 6:46 pm</a>		</div>
+
+		<p>&quot;Well, &quot;deallocated&quot; is not necessarily the same as &quot;will cause an exception if you try to read or write it&quot;.&quot;</p>
+<p>This was my point. Majority of time (in my experience) the bad pointer is either NULL or invalid in such way that IsBad*Ptr() won&#8217;t catch it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425163">
+				<div id="div-comment-425163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ealva</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425163">
+			September 27, 2006 at 7:06 pm</a>		</div>
+
+		<p>This &quot;catch (&#8230;) { }&quot; phenomenon seems to be the rule rather than the exception. &nbsp;My three most recent projects has them all over the place&#8211;unfortunately.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425173">
+				<div id="div-comment-425173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425173">
+			September 27, 2006 at 7:30 pm</a>		</div>
+
+		<p>Why the kernel doesn&#8217;t use his own stack to display an error message when it notices that application stack is corrupted? <br />I haven&#8217;t given it much thought so if someone has any ideas why that would be a bad thing to do then please elaborate on the subject.</p>
+<div CLASS=post>[<i>Um, because it&#8217;s a kernel stack? Not sure how you expect to be able to use a kernel stack from user mode. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425183">
+				<div id="div-comment-425183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425183">
+			September 27, 2006 at 8:05 pm</a>		</div>
+
+		<p>Stack trace logic within custom unhandled exception handlers might be using these functions a lot.</p>
+<p>Matt Pietrek&#8217;s old article (<a rel="nofollow" target="_new" href="http://www.microsoft.com/msj/0497/hood/hood0497.aspx" rel="nofollow">http://www.microsoft.com/msj/0497/hood/hood0497.aspx</a>) uses IsBadReadPtr (<a rel="nofollow" target="_new" href="http://www.microsoft.com/msj/0497/hood/hoodtextfigs.htm#fig1" rel="nofollow">http://www.microsoft.com/msj/0497/hood/hoodtextfigs.htm#fig1</a>). </p>
+<p>I&#8217;ve based my custom unhandled exception handler on the above article &#8211; and now I&#8217;m investigating alternatives.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425193">
+				<div id="div-comment-425193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Ritchie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425193">
+			September 27, 2006 at 9:46 pm</a>		</div>
+
+		<p>With respect to using VirtualQuery, I&#8217;d have to look at a bit closer; but, is VirtualQuery guarenteed to return the same protection value on a guarded page after the STATUS_GUARD_PAGE_VIOLATION and the page is &quot;loaded&quot;?</p>
+<p>e.g. if VirtualQuery returns PAGE_READWRITE|PAGE_GUARD for a page, will it then be just PAGE_READWRITE after you try and read the first byte?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425203">
+				<div id="div-comment-425203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Ritchie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425203">
+			September 27, 2006 at 9:53 pm</a>		</div>
+
+		<p>@Jan: Even good programmers sometimes use functions that aren&#8217;t safe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425213">
+				<div id="div-comment-425213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Ritchie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425213">
+			September 27, 2006 at 9:58 pm</a>		</div>
+
+		<p>&#8230;of course VirtualQuery doesn&#8217;t get around the PAGE_NOACCESS (for Me/9x apps) problem if there is an exception handler waiting around for first access to that page in order to populate it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425223">
+				<div id="div-comment-425223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425223">
+			September 27, 2006 at 10:34 pm</a>		</div>
+
+		<blockquote><p>
+  Um, because it&#8217;s a kernel stack? Not sure <br />&gt;how you expect to be able to use a kernel <br />&gt;stack from user mode. </p>
+<p>Sorry, language barrier, I didn&#8217;t mean literally. </p>
+<p>If we are in kernel mode when the bad thing with stack happens to an application why doesn&#8217;t the kernel in addition to terminating the application create user mode thread and pass the error details to it via some structure? </p>
+<p>That thread would just show the message and exit when the user clicks on OK button. </p>
+<p>Or even better, have a waiting thread for that purpose and send a message. Passing messages should be possible from kernel to user mode, no? </p>
+<p>I mean drivers do that sometimes, for example they can get notification about newly created processes and pass that info to user mode application so why not use the same technique? </p>
+<div CLASS=post>[<i>And what if the thread that crashed owned a critical section that the error dialog thread needs? (E.g., the heap critical section.) Now instead of exiting, the app just hangs. Is that an improvement? -Raymond</i>]</div>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425083">
+				<div id="div-comment-425083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425083">
+			September 27, 2006 at 4:57 pm</a>		</div>
+
+		<p>We had a huge developement problem is IsBadReadPtr!</p>
+<p>We had a very large application and team, and some of the key developpers would put IsBadxxxxPtr in almost every function they write, in the debug build (ASSERT()).</p>
+<p>Here&#8217;s are the two problems! &nbsp;</p>
+<p>1) the functions are extremely slow. &nbsp;So the debug build ended up being extremely slow. &nbsp;Slower than a normal debug build is expected to be. &nbsp;</p>
+<p>The result is that programmer gave up thinking of the performance, since it&#8217;s was so different between ship and debug. &nbsp;At one point the software is so slow, you don&#8217;t realize you&#8217;ve just added a half-second delay to an operation.</p>
+<p>It&#8217;s very important IMHO that the ship and debug build&#8217;s performance are not *completely* at each end of the spectrum, so that a programmer can tell while debugging if he&#8217;s just done a big boo boo that slows down some part by a factor of two.</p>
+<p>2) The functions &nbsp;WERE USELESS. &nbsp;The devs were using this to check if structures or pointers passed in were valid &#8216;read&#8217; or &#8216;write&#8217; memory</p>
+<p>But in normal application developement, almost everything in valid except a NULL pointer! &nbsp;These functions can&#8217;t tell you a stack buffer is not large enough, and a heap region can be entierly read/writable without being the right size &#8211; or even allocated!</p>
+<p>I explained to these guys : it only checks if the pages are read/writable! A freed page on the heap will still pass that test! &nbsp;A malloc block too small will generally pass that test too! &nbsp;Plus pages are rounded to a certain increment (512 bytes is it?)</p>
+<p>So what I did was #define these functions to only a NULL pointer check. &nbsp;The difference in performance was incredible and the team couldn&#8217;t believe the difference in productivity. &nbsp;(Example: file load time was something like 4 times faster.) &nbsp;</p>
+<p>There was a huge flame war internally as the old gang lectured that we should never look at performance in debug, but they lost.</p>
+<p>In the mean time, not calling the &#8216;real&#8217; IsBadxxxPtr function in debug has never caused anyone to miss a bug or coding error. &nbsp;These functions do not have that power, it&#8217;s not what they do.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425233">
+				<div id="div-comment-425233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425233">
+			September 28, 2006 at 12:25 am</a>		</div>
+
+		<p>Wednesday, September 27, 2006 2:27 PM by Barry Tannenbaum <br />&gt; Why doesn&#8217;t IsBad*Ptr catch the <br />&gt; STATUS_GUARD_PAGE and either note that we&#8217;re <br />&gt; dealing with the stack and extend it, or <br />&gt; reset the PAGE_GUARD setting? <br />&gt; Or else implement it by calling VirtualQuery </p>
+<p>I second that. </p>
+<p>&gt; [Perhaps it could have been implemented <br />&gt; differently originally, but that&#8217;s water <br />&gt; under the bridge. What&#8217;s done is done and <br />&gt; you can&#8217;t change it after the fact. -Raymond] </p>
+<p>Um, OK, thank you for explaining why Microsoft so fiercely resists the idea of fixing bugs. &nbsp;But if this were 100% true then there wouldn&#8217;t have been any service packs at all. </p>
+<p>Mr. Chen and Mr. Osterman gave excellent descriptions of this bug, and I thank both of you. &nbsp;But I really don&#8217;t see why it can&#8217;t be fixed. &nbsp;The only break with backwards compatibility is that applications which shouldn&#8217;t have crashed will crash less often. &nbsp;(Of course they won&#8217;t stop invalid applications from corrupt themselves, such as writing to memory which was freed but still on the heap.) </p>
+<p>Wednesday, September 27, 2006 2:27 PM by Igor <br />&gt; So instead of crashing with access violation <br />&gt; and showing me the address which triggered <br />&gt; it the OS terminated the application I was <br />&gt; testing &#8220;with no pop-up error window or <br />&gt; diagnostic information.&#8221; <br />&gt; <br />&gt; [You lost your stack. There&#8217;s nothing that <br />&gt; can be done. Displaying an error window <br />&gt; requires a stack. -Raymond] </p>
+<p>So that&#8217;s why some crashes of Visual Studio 2005 don&#8217;t result in offers to send crash dumps to Microsoft. &nbsp;Maybe an emergency exception stack would be a useful thing to add after all. </p>
+<p>&gt; [Windows used to have such an &#8220;emergency <br />&gt; error dialog&#8221;. Remember the UAE? People <br />&gt; hated it. -Raymond] </p>
+<p>What does UAE stand for? &nbsp;Is there a link to explain it to people who were doing 32-bit programming before Windows was 32-bits (or before Microsoft existed)? </p>
+<p>If it&#8217;s the black and white screens of death that Windows 95 sometimes displayed, then people hated it because Windows wouldn&#8217;t even say which application was dying, and in fact all applications were dying when only one should have been dying, and people lost all of their work in progress. &nbsp;People hated those for the same reason we hate BSODs in Vista.</p>
+<div CLASS=post>[<i>So you agree that changing the behavior of IsBadXxxPtr will break programs. If the behavior is to change, it has to be to some new function IsBadXxxPtrEx &#8212; but what would be the point of creating a function that is a bad idea from the start? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425143">
+				<div id="div-comment-425143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Carlos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425143">
+			September 27, 2006 at 6:26 pm</a>		</div>
+
+		<p>&quot;A&quot; wrote: &quot;Technically, calling IsBad*Ptr() on the stack is safe because the guard page exceptions are handled entirely within the kernel.&quot;</p>
+<p>Yes and no. &nbsp;What seems to happen is:</p>
+<p>One of your threads uses IsBadWritePtr to write to a stack guard page. &nbsp;The kernel catches the STATUS_GUARD_PAGE_VIOLATION exception and checks if you are writing to the guard page *for the current thread*. &nbsp;If so, the kernel extends the stack *for the current thread*.</p>
+<p>So if you write to the guard page for a different thread&#8217;s stack, the kernel doesn&#8217;t catch the STATUS_GUARD_PAGE_VIOLATION exception and it appears in user-mode, where IsBadWritePtr discards it. &nbsp;When that other thread writes beyond its now useless guard page you get an access violation (STATUS_ACCESS_VIOLATION).<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425243">
+				<div id="div-comment-425243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425243">
+			September 28, 2006 at 1:52 am</a>		</div>
+
+		<blockquote><p>
+  And what if the thread that crashed owned a <br />&gt;critical section that the error dialog thread <br />&gt;needs? (E.g., the heap critical section.) </p>
+<p>Well if the thread crashed then it doesn&#8217;t own anything anymore &#8212; similar to people dying and others inheriting (and sometimes throwing away) their possessions. You are already purging it brutally from the system so why do you need to honor its critical sections? </p>
+<div CLASS=post>[<i>Um, because that critical section was protecting a data structure that is now inconsistent? -Raymond</i>]</div>
+<p>&gt;Now instead of exiting, the app just hangs. <br />&gt;Is that an improvement? </p>
+<p>Well it is and it isn&#8217;t depending how you look at it. If you can break into the hung application with a debugger and see the thread stuck inside critical section you could at least see approximately where the problem is. </p>
+<p>On the other hand if it resulted in a hang of the whole OS then of course it wouldn&#8217;t be an improvement at all. </p>
+<p>I believe that from a user perspective there is no difference. Non-working application is a non-working application, never mind if it crashes or hangs as long as the rest of the system is left untouched. </p>
+<p>IMO, the only people who might prefer hanging over mindless crashing if it would help debugging would be developers. 
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425253">
+				<div id="div-comment-425253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425253">
+			September 28, 2006 at 1:57 am</a>		</div>
+
+		<p>If you want to feel this from a user perspective then download:<br />
+<br /><a rel="nofollow" target="_new" href="http://www.mozilla-x86-64.com/firefox/firefox-3.0a1.en-US.win64.20060518.zip" rel="nofollow">http://www.mozilla-x86-64.com/firefox/firefox-3.0a1.en-US.win64.20060518.zip</a></p>
+<p>Unpack and run regxpcom.exe then Firefox.exe on Windows XP Professional x64 Edition patched up to date. Into search box type UAE and hit enter. Poof, the Firefox will just vanish. No clues, no way to send a debug report, no trace of it even being started. IMO that is extremely both user and developer unfriendly.</p>
+<div class="post">[<i>I never said that the current behavior is <u>good</u>. But the proposed alternatives are worse. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425273">
+				<div id="div-comment-425273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425273">
+			September 28, 2006 at 3:30 am</a>		</div>
+
+		<p>&lt;WiseRaymond Joking=&quot;;-)&quot;&gt;<br />
+<br />&quot;But what should I do, then, if somebody passes me a bad pointer?&quot;<br />
+<br />You should crash.<br />
+<br />&lt;/WiseRaymond&gt;</p>
+<p>+1 +1 +1 +1. This should be taught at school and we should have a &quot;tax&quot; as Raymond puts it that deals with crashes in production code (pdb&#8217;s for release builds, map files, whatever is needed to get close to the error after the fact in order to fix it).</p>
+<p>Trying to deal with bugs using functions such as IsBad&#8230; is a cheapo get-out.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425283">
+				<div id="div-comment-425283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425283">
+			September 28, 2006 at 4:38 am</a>		</div>
+
+		<blockquote><p>
+  [So you agree that changing the behavior of<br />
+  <br />&gt; IsBadXxxPtr will break programs.</p>
+<p>Which of my words gave you that impression?</p>
+<p>Rereading my words, it still looks like I said what I meant: &nbsp;I think that fixing IsBadXxxPtr will unbreak some unbroken programs (so they will no longer be broken by broken APIs) and will leave some broken programs unchanged.</p>
+<p>A DLL ought to be allowed to check the parameters that a caller gave it, to the best of its ability whether that catches 10% of bad parameters or 90%, when the programmer wishes to do so.</p>
+<p>Of course there would be no sense in converting a bad parameter to a return code, letting a broken caller ignore it and proceed to do more damage. &nbsp;But there&#8217;s also no sense in the DLL proceeding halfway through its normal operations and passing bad parameters down the call stack to where they&#8217;ll eventually cause an undebuggable crash. &nbsp;A DLL should be allowed to do its best to detect bad parameters so that the DLL can cause a debuggable crash right then and there.</p>
+<p>In cases where the caller wasn&#8217;t broken, the DLL doing its best to detect bad parameters shouldn&#8217;t get sabotaged by a broken API.</p>
+<p>If you want to play word games, &quot;changing&quot; bad APIs instead of &quot;fixing&quot; them, then I&#8217;ll agree that &quot;changing&quot; can be a move from the frying pan to the fire. &nbsp;But I seconded a suggestion for &quot;fixing&quot;.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425293">
+				<div id="div-comment-425293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425293">
+			September 28, 2006 at 4:44 am</a>		</div>
+
+		<p>catch (&#8230;) does weird things on my system when you open a common file dialog&#8230; instead of listing the files instantly they take seconds to appear&#8230;</p>
+<p>Oh, and the point of the catch (&#8230;) is to stop buggy explorer extensions from crashing the app. Unless anyone has any better ideas?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425313">
+				<div id="div-comment-425313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andy C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425313">
+			September 28, 2006 at 5:50 am</a>		</div>
+
+		<p>&#8220;Just look at all the apps that are actually relying on IsBadXxxPtr doing something&#8221;</p>
+<p>Yes, but by your analysis above this is already broken, the very act of calling IsBadXxxPtr means their code is already not going to do what it is expected to do. It&#8217;s going to crash randomly.</p>
+<p>Normally, I agree with you that it&#8217;s worth retaining a buggy function if code that will be dependant upon that bug is in the wild, but that&#8217;s not the case here, is it? As it stands, if you call IsBadXxxPtr, your application will crash &#8211; so wouldn&#8217;t it be better to either make the function work or at the very least make it crash more cleanly by acting as if it were never called? </p>
+<div CLASS=post>[<i>Suppose a program crashes once a day due to IsBadxxxPtr. Suppose changing IsBadXxxPtr alters the crash rate to 99%. Is that a good thing for the person who needs to use that program every day? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425333">
+				<div id="div-comment-425333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">good function for sloppy coding</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425333">
+			September 28, 2006 at 6:59 am</a>		</div>
+
+		<p>This is exacly was I expected. The OS is incapable of determining which of my process&#8217; pointers are invalid. I guess is very slow too.</p>
+<p>Is there any nonbuggy BOOL Will_My_Process_Crash_If_I_Touch_What_This_Pointer_Points_To() ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425343">
+				<div id="div-comment-425343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425343">
+			September 28, 2006 at 8:30 am</a>		</div>
+
+		<blockquote><p>
+  Is there any nonbuggy BOOL Will_My_Process_Crash_If_I_Touch_What_This_Pointer_Points_To() ?</p>
+<p>No.</p>
+<p>Say that function does exist, and say you call it. &nbsp;If it returns FALSE, you&#8217;re able to touch memory that the pointer points to without crashing, right? &nbsp;Well, wrong &#8212; another thread may have unmapped the virtual address that the pointer points to after the function returned but before you do your indirection.</p>
+<p>There is no way to check beforehand, because as soon as the &quot;check&quot; function returns, its return value is out of date, and therefore useless.</p>
+<p>The only way to check for invalid pointers is to (1) check for NULL, and then (2) try indirecting through the pointer, and crash if it&#8217;s invalid.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425353">
+				<div id="div-comment-425353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DavidE</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425353">
+			September 28, 2006 at 10:26 am</a>		</div>
+
+		<p>Just for completeness, I&#8217;ll answer this: &quot;DavidE, are you sure that wasn&#8217;t because in debug builds pointers are initialized to NULL but are not initialized at all in release builds?&quot;</p>
+<p>Yes, I&#8217;m sure that&#8217;s not the reason. The reason was that my team spent a couple of days going into every API and adding checks for NULL pointers. I still felt that this was the wrong thing to do, since the people using the API should have been checking for NULL pointers and handling them correctly. All we did was add more code to slow things down (OK, so it wasn&#8217;t that much).</p>
+<p>The funny thing was that we later started getting bug reports from the testers that their tests would crash in asserts when they sent in NULL pointers. Apparently, they preferred to use the debug version of the DLL&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425393">
+				<div id="div-comment-425393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425393">
+			September 28, 2006 at 11:45 am</a>		</div>
+
+		<blockquote><p>
+  Um, because that critical section was <br />&gt;protecting a data structure that is now <br />&gt;inconsistent? </p>
+<p>You are trying to confuse me intentionally, aren&#8217;t you Raymond? :) </p>
+<p>Which data structure? </p>
+<p>a) one that belonged to the crashing thread? </p>
+<p>or </p>
+<p>b) some system structure? </p>
+<p>In any case, so what if it is inconsistent? Are you trying to tell me that by honoring dying thread&#8217;s critical section you are making that structure consistent again even though you don&#8217;t have a clue in which state that thread left it before crashing? </p>
+<p>You have to draw the line somewhere. </p>
+<p>What I am trying to say here is: </p>
+<p>By swallowing stack related exceptions and not giving any messages you are defeating the purpose of having an exception handling in the first place. It is like an exception has never happened because you are the only person who knows about it. </p>
+<p>It would be the same thing if you came back home, found a burglar and let him go without reporting it to the police. </p>
+<div CLASS=post>[<i>I&#8217;m sorry I&#8217;m not being clear. Supposed the crashed thread owns a critical section. That critical section existed for a reason, didn&#8217;t it? Presumably it protects some data structure. If a thread crashes while owning the critical section, then the data structure might be unstable. (The thread might be updating the data structure the critical section protects.) The error thread might need that critical section in order to display its error. Now you&#8217;re stuck. The problem is that exception handling happens in context on the thread that raised the exception. But if there is no stack any more, then you can&#8217;t raise the exception since there is no stack to execute on. I believe Win32 does raise an ignorable stack overflow exception when the stack is ALMOST run out (I think you get 8KB warning), so you get one last chance to run exception handlers before everything vanishes. Most apps just ignore it. -Raymond</i>]</div>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425433">
+				<div id="div-comment-425433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425433">
+			September 28, 2006 at 12:30 pm</a>		</div>
+
+		<p>Raymond thank you very much for trying to explain things to me, here is my original problem with stack exception:</p>
+<p>push ebp<br />
+<br />mov ebp, esp<br />
+<br />and esp, 0FFFFFFC0h<br />
+<br />sub esp, 6000h ; more than the commited 4KB<br />
+<br />&#8230; ; do some other stuff<br />
+<br />mov [esp], eax ; Poof! Your code is gone.</p>
+<p>When I executed it in a debugger I got the following message:</p>
+<p>The instruction at 0x402989 referenced memory at 0x129E40. The memory could not be written (0x00402989 -&gt; 00129E40).</p>
+<p>Why the debugger can show that message and the OS can&#8217;t? That is what I still don&#8217;t understand.</p>
+<div CLASS=post>[I&lt;>Because the debugger is a separate process that hasn&#8217;t crashed. -Raymond]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425303">
+				<div id="div-comment-425303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://codeka.com/blogs' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425303">
+			September 28, 2006 at 5:36 am</a>		</div>
+
+		<p>&gt; But there&#8217;s also no sense in the DLL proceeding halfway through its<br />
+<br />&gt; normal operations and passing bad parameters down the call stack<br />
+<br />&gt; to where they&#8217;ll eventually cause an undebuggable crash.</p>
+<p>The sort of &quot;problem&quot; that IsBad*Ptr might catch are perfectly debuggable, since you&#8217;d have a nice call stack to walk back up. It&#8217;s the invalid pointers that IsBat*Prt WOULDN&#8217;T catch that cause &quot;undebuggable&quot; problems, since you can still write to it, but you&#8217;ll just be corrupting your memory.</p>
+<p>So IsBad*Ptr really has no good points, but only bad points. &quot;Fixing&quot; it would be pointless, since even if it worked, it doesn&#8217;t do anything for you.</p>
+<p>Just don&#8217;t use it, and your app will be fine.</p>
+<p>&gt; If you want to play word games, &quot;changing&quot; bad APIs instead of &quot;fixing&quot;<br />
+<br />&gt; them, then I&#8217;ll agree that &quot;changing&quot; can be a move from the frying pan<br />
+<br />&gt; to the fire. &nbsp;But I seconded a suggestion for &quot;fixing&quot;.</p>
+<p>How can you &quot;fix&quot; something without &quot;changing&quot; it?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425443">
+				<div id="div-comment-425443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425443">
+			September 28, 2006 at 1:12 pm</a>		</div>
+
+		<p>Anyway, I still learned a few things here:</p>
+<p>I was getting ACCESS_VIOLATION exception because I wasn&#8217;t probing the stack pages in right order &#8212; I touched the pages before the GUARD_PAGE so the OS wasn&#8217;t able to grow the stack on demand.</p>
+<p>What I am not sure is whether this really counts as a non-reportable exception?</p>
+<p>I haven&#8217;t really exhausted the stack, I was still within its reserved part.</p>
+<p>What is really interesting is why there is only one GUARD_PAGE at the TOS?</p>
+<p>What is the reason that we don&#8217;t have each reserved stack page set as the GUARD_PAGE so that you can commit them in any order?</p>
+<p>About warning exception, you are right, there is an _XCPT_UNABLE_TO_GROW_STACK which you can get as a warning but in this case I wasn&#8217;t getting it because I got access violation.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425503">
+				<div id="div-comment-425503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425503">
+			September 28, 2006 at 2:34 pm</a>		</div>
+
+		<p>GregM, yes, I meant caller, thanks for correcting me.</p>
+<p>I believe that it is the ZwTerminateProcess() that kills it after &quot;stack exhausted&quot; exception is caught.</p>
+<p>But what confuses me is why the process gets terminated without error message in response to &quot;access violation&quot; exception which happens on the stack which is actually not exhausted?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425413">
+				<div id="div-comment-425413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425413">
+			September 28, 2006 at 12:07 pm</a>		</div>
+
+		<p>&gt;The only way to check for invalid pointers<br />
+<br />&gt;is to (1) check for NULL, and then (2) try<br />
+<br />&gt;indirecting through the pointer, and crash<br />
+<br />&gt;if it&#8217;s invalid.</p>
+<p>Then why even bother checking for NULL? Why not just access it and crash if it is invalid?</p>
+<p>IMO, it should really be the responsibility of the _callee_ to check what they are passing to your function.</p>
+<p>If someone calling your function writes their code like this:</p>
+<p>BOOL s;<br />
+<br />char *p = malloc(1024);<br />
+<br />s = YourFunc(p);<br />
+<br />if (s) {<br />
+<br /> &nbsp; &nbsp;OtherFunc(p);<br />
+<br />}</p>
+<p>Now you have to check p in your func and to signal an error:</p>
+<p>BOOL YourFunc(char *p)<br />
+<br />{<br />
+<br /> &nbsp; &nbsp;if (p == NULL) {<br />
+<br /> &nbsp; &nbsp; &nbsp; &nbsp;return FALSE;<br />
+<br /> &nbsp; &nbsp;}<br />
+<br /> &nbsp; &nbsp;&#8230; // do stuff with p<br />
+<br /> &nbsp; &nbsp;return TRUE;<br />
+<br />}</p>
+<p>So you are fine, your code doesn&#8217;t crash and it signals an error. But if they are really lousy programmers they won&#8217;t check the return value of YourFunc() either:</p>
+<p>char *p = malloc(1024);<br />
+<br />YourFunc(p);<br />
+<br />OtherFunc(p);</p>
+<p>So instead of crashing in YourFunc() immediately after getting a NULL pointer, they will crash in OtherFunc() which would be harder to debug because it is further away from the cause.</p>
+<p>Oh the other hand if they bother to check everything you get redundant NULL and error checks first in their code:</p>
+<p>BOOL s;<br />
+<br />char *p = malloc(260);<br />
+<br />if (p != NULL) {<br />
+<br /> &nbsp; &nbsp;s = YourFunc(p);<br />
+<br /> &nbsp; &nbsp;if (s) {<br />
+<br /> &nbsp; &nbsp; &nbsp; &nbsp;OtherFunc(p);<br />
+<br /> &nbsp; &nbsp;}<br />
+<br />} else {<br />
+<br /> &nbsp; &nbsp;&#8230; // handle the error<br />
+<br />}</p>
+<p>And then in your code:</p>
+<p>BOOL YourFunc(char *p)<br />
+<br />{<br />
+<br /> &nbsp; &nbsp;if (p == NULL) {<br />
+<br /> &nbsp; &nbsp; &nbsp; &nbsp;return FALSE;<br />
+<br /> &nbsp; &nbsp;}<br />
+<br /> &nbsp; &nbsp;&#8230; // do stuff with p<br />
+<br /> &nbsp; &nbsp;return TRUE;<br />
+<br />}</p>
+<p>Here is what it should really look like:</p>
+<p>char *p = malloc(260);<br />
+<br />if (p != NULL) {<br />
+<br /> &nbsp; &nbsp;YourFunc(p);<br />
+<br /> &nbsp; &nbsp;OtherFunc(p);<br />
+<br />} else {<br />
+<br /> &nbsp; &nbsp;&#8230; // handle the error<br />
+<br />}</p>
+<p>And:</p>
+<p>void YourFunc(char *p)<br />
+<br />{<br />
+<br /> &nbsp; &nbsp;&#8230; // do stuff with p<br />
+<br />}</p>
+<p>As I said you have to draw the line somewhere.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425553">
+				<div id="div-comment-425553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425553">
+			September 28, 2006 at 9:14 pm</a>		</div>
+
+		<p>Thursday, September 28, 2006 5:36 AM by Dean Harding<br />
+<br />&gt;&gt; If you want to play word games, &quot;changing&quot;<br />
+<br />&gt;&gt; bad APIs instead of &quot;fixing&quot; them, then I&#8217;ll<br />
+<br />&gt;&gt; agree that &quot;changing&quot; can be a move from the<br />
+<br />&gt;&gt; frying pan to the fire. &nbsp;But I seconded a<br />
+<br />&gt;&gt; suggestion for &quot;fixing&quot;.<br />
+<br />&gt;<br />
+<br />&gt; How can you &quot;fix&quot; something without<br />
+<br />&gt; &quot;changing&quot; it?</p>
+<p>Oh neat, two people playing word games now. &nbsp;To repeat, I seconded a suggestion for &quot;fixing&quot;. &nbsp;When one person misquoted me as saying &quot;changing&quot;, the reason I pointed that out is that it is indeed possible to &quot;change&quot; something without &quot;fixing&quot; it, and those are the kinds of &quot;changes&quot; which I did not second.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425493">
+				<div id="div-comment-425493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GregM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425493">
+			September 28, 2006 at 2:17 pm</a>		</div>
+
+		<p>Igor, you mean *caller*, not *callee*. &nbsp;The callee is the function being called by the caller.</p>
+<p>&quot;Why the debugger can show that message and the OS can&#8217;t?&quot; &#8211; Igor&quot;</p>
+<p>&quot;Because the debugger is a separate process that hasn&#8217;t crashed. -Raymond&quot;</p>
+<p>Isn&#8217;t the OS also a separate process that hasn&#8217;t crashed, unless this is a blue screen? &nbsp;I guess what would clarify things is what exactly kills the process in this situation? &nbsp;Is it something in the dying process that kills it, or is it the OS itself that kills it?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425623">
+				<div id="div-comment-425623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425623">
+			September 29, 2006 at 1:58 am</a>		</div>
+
+		<blockquote><p>
+  But access violations should simply crash and die since they are bugs.<br />
+  <br />Kind of on topic: The win32 api SetTimer seems to hide AV&#8217;s when the callback is executed.</p>
+<p>I couldn&#8217;t find mention of this on msdn or the &#8216;net in general. &nbsp;Any comment? &nbsp;Is there any way to stop this from happening? &nbsp;(I would much prefer that the AV would cause my program to crash and die as you indicated.)</p>
+<p>Ok, I could set-up my own exception handling in any SetTimer callback to do the crash and die, but that solution is clunky, imo.<br />
+  
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425643">
+				<div id="div-comment-425643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425643">
+			September 29, 2006 at 8:48 am</a>		</div>
+
+		<p>Tom wrote:<br />
+<br />&gt; @Nate: As Raymond suggests, it can have an<br />
+<br />&gt; effect on components within the system that<br />
+<br />&gt; expect to catch exceptions or on guard pages.</p>
+<p>If it is a pre-condition for my function that it is not passed bad pointers, it&#8217;s reasonable for me to assert(!IsBadReadPtr(ptr)) at the start. IsBadReadPtr only causes problems if the pointer is bad, and in that case we already have a bug so it doesn&#8217;t matter if behaviour afterwards changes.</p>
+<p>&gt; Effectively, you&#8217;re no longer debugging the<br />
+<br />&gt; same application.</p>
+<p>By this argument, DEBUG builds should never be used.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425713">
+				<div id="div-comment-425713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425713">
+			September 29, 2006 at 10:37 am</a>		</div>
+
+		<p>BryanK wrote:<br />
+<br />&gt; Now if that other thread needs to grow its<br />
+<br />&gt; stack past the guard page, it&#8217;ll just<br />
+<br />&gt; crash. &nbsp;(As will your whole process, I<br />
+<br />&gt; think.) &nbsp;You have screwed up another<br />
+<br />&gt; (possibly completely unrelated) thread<br />
+<br />&gt; by using IsBadReadPtr. </p>
+<p>That&#8217;s not a problem, because the assert will terminate the app anyway. We are just making it crash earlier and with an indication of where the problem lies.</p>
+<p>&gt; If some other random thread is crashing at<br />
+<br />&gt; some other random time, the caller has<br />
+<br />&gt; no way to know (a) that it crashed, and<br />
+<br />&gt; (b) why. </p>
+<p>The fact that one thread is sitting in a failing assert should be a clue. Ignore assertion failures at your peril.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425943">
+				<div id="div-comment-425943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425943">
+			September 29, 2006 at 1:56 pm</a>		</div>
+
+		<p>But the caller can&#8217;t catch a failed assert like they can catch an exception. &nbsp;All they get is a dialog &quot;assertion failed: IsBadReadPtr(x)&quot;, which really doesn&#8217;t help narrow anything down. &nbsp;Yes, the process dies (and I must have gotten the return value semantics of IsBadReadPtr messed up when I originally wrote that), but there&#8217;s very little debugging information available. &nbsp;At least if you use the MS compiler&#8217;s assert.</p>
+<p>But with an exception, they can get a stack trace under a debugger (or from the drwtsn32.log file), and with symbols, they can see where in the stack control left their code. &nbsp;That&#8217;s actually useful information.</p>
+<p>Throwing up an &quot;assertion failed&quot; dialog and dying is marginally better than just dying, but it&#8217;s still not as good as giving information on where in the code the failure happened.</p>
+<p>(And even if failed-assert dialogs show line number information now &#8212; I don&#8217;t believe they do, but I&#8217;m not sure &#8212; that still doesn&#8217;t help much. &nbsp;That&#8217;s just the line number of the assert call, in the library&#8217;s code. &nbsp;What the programmer needs to know is which of the library&#8217;s APIs they called from their code, and when. &nbsp;The failed-assert dialog would have to show the entire stack trace to be of any help.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-425683">
+				<div id="div-comment-425683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425683">
+			September 29, 2006 at 10:24 am</a>		</div>
+
+		<p>Dave:</p>
+<p>&gt; IsBadReadPtr only causes problems if the pointer is bad, and in that case we already have a bug so it doesn&#8217;t matter if behaviour afterwards changes.</p>
+<p>No.</p>
+<p>The problem is, if someone passes you a bad pointer that&#8217;s pointing at another thread&#8217;s stack guard page, and you pass that to IsBadReadPtr, you&#8217;ve just made that other thread&#8217;s stack non-growable (because the PAGE_GUARD bit is removed), where before it was growable.</p>
+<p>Now if that other thread needs to grow its stack past the guard page, it&#8217;ll just crash. &nbsp;(As will your whole process, I think.) &nbsp;You have screwed up another (possibly completely unrelated) thread by using IsBadReadPtr.</p>
+<p>Whereas if you&#8217;d just used the pointer and crashed, the caller would at least have had a *chance* to catch the AV. &nbsp;If some other random thread is crashing at some other random time, the caller has no way to know (a) that it crashed, and (b) why.</p>
+<p>&gt; By this argument, DEBUG builds should never be used.</p>
+<p>I would not agree with that either. &nbsp;I would agree if you said &quot;by this argument, you should not change your code&#8217;s behavior in a DEBUG build&quot;, though. &nbsp;Make the differences as small as possible.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-425693">
+				<div id="div-comment-425693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-425693">
+			September 29, 2006 at 10:29 am</a>		</div>
+
+		<p>Antti Huovilainen wrote:<br />
+<br />&gt; Are there any significant cases where<br />
+<br />&gt; IsBadXxxPtr() would actually work better<br />
+<br />&gt; than simple check for NULL? </p>
+<p>A fairly common case is when someone passes an offset from a null pointer.<br />
+<br /> &nbsp; &nbsp;struct Data { int a, b };<br />
+<br /> &nbsp; &nbsp;Data *p = NULL;<br />
+<br /> &nbsp; &nbsp;// &#8230;<br />
+<br /> &nbsp; &nbsp;int *pi = &amp;p-&gt;b;</p>
+<p>This will probably set pi to 0x00000004, which is not NULL, is invalid, and should be caught by IsBadXxxPtr.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-426243">
+				<div id="div-comment-426243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://russelldavis.mvps.org' rel='external nofollow' class='url'>Russell Davis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-426243">
+			October 1, 2006 at 5:08 pm</a>		</div>
+
+		<p>Raymond, I&#8217;m confused by this paragraph:</p>
+<p>&#8220;Swallowing the exception in IsBadXxxPtr means that the caller&#8217;s exception handler doesn&#8217;t get a chance to run, which means that your code rejected a pointer that would actually have been okay, if only you had let the exception handler do its thing.&#8221;</p>
+<p>Think about that for a minute. Since the caller&#8217;s exception handler has to run for the pointer to be valid INSIDE the callee, that means that the caller&#8217;s exception handler must be set up to handle and stop the exception without the callee even knowing an exception was raised (which is indeed how guard page exceptions are handled). So exception swallowing is NOT the problem!</p>
+<p>As a couple other commenters have noted, the real problem is that these guard page handlers are tied to a specific thread. If you access the guard page on a different thread, the handler won&#8217;t get called, and problems will arise.</p>
+<p>So it seems that in a single threaded situation (like the scenario mentioned in that paragraph), IsBadXxxPtr will not cause guard page problems.</p>
+<p>Am I missing something?</p>
+<div CLASS=post>[<i>There are multiple problems with swallowing exceptions. I pointed out one of them (pointer swizzling); you pointed out another (stack guard pages). There is no conflict here. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-426283">
+				<div id="div-comment-426283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JimD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-426283">
+			October 1, 2006 at 8:56 pm</a>		</div>
+
+		<p>I agree with the arguments against using IsBadxxxPtr. It just always seemed like a good way to check pre-conditions.</p>
+<p>I see MFC 8 (Visual Studio 2005) changed the AfxIsValidAddress, AfxIsValidString to no longer make the IsBadReadPtr/IsBadWritePtr calls. They now simply check for a null pointer. No string length checks, etc.</p>
+<p>I haven&#8217;t checked if the VS2003 SP1 made the same changes, but I guess I would expect that it did.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-426803">
+				<div id="div-comment-426803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michiell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-426803">
+			October 3, 2006 at 7:17 am</a>		</div>
+
+		<p>I&#8217;m surprised that these functions can&#8217;t be removed from the API. Just put an #if (!Vista) before them. Any program written for XP will not only continue to run, but can still be compiled. Only programs written or updated for Vista will be impacted.</p>
+<p>That&#8217;s a good thing for Microsoft too; it improves applications build for Vista only, and thus is an upgrade reason for consumers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-426833">
+				<div id="div-comment-426833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-426833">
+			October 3, 2006 at 7:57 am</a>		</div>
+
+		<p>BryanK wrote@</p>
+<blockquote><p>
+  But the caller can&#8217;t catch a failed assert</p>
+<p>  like they can catch an exception.
+</p></blockquote>
+<p>They shouldn&#8217;t be trying to catch it. They should let the program terminate.</p>
+<blockquote><p>
+  All they get is a dialog &quot;assertion failed:</p>
+<p>  IsBadReadPtr(x)&quot;, which really doesn&#8217;t help</p>
+<p>  narrow anything down.
+</p></blockquote>
+<p>That depends on which assert you use and what your debugging tools are. Would it help if I wrote ASSERT instead of assert? With my IDE, an assertion failure gives the option to halt the program at the offending line, with the stack and variables available for inspection. I can switch to other threads and inspect them, too.</p>
+<p>Remember we are talking about DEBUG builds, which normally means it is being run by a programmer from an IDE like Visual Studio. An end-user would be using a RELEASE build and not have the IsBadReadPtr check at all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-426863">
+				<div id="div-comment-426863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-426863">
+			October 3, 2006 at 9:02 am</a>		</div>
+
+		<p>Er, wait, the above comment makes no sense. &nbsp;If you get a bad pointer in a release build, you&#8217;ll just crash, same as if you never used IsBad*Ptr.</p>
+<p>So never mind. &nbsp;(And sorry about the duplicate comment; it made sense to me at the time&#8230;)</p>
+<p>But I still don&#8217;t see the point. &nbsp;You won&#8217;t necessarily catch all bad pointers (see the race condition), and you&#8217;ll catch some pointers as bad that aren&#8217;t actually.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-426853">
+				<div id="div-comment-426853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-426853">
+			October 3, 2006 at 9:00 am</a>		</div>
+
+		<p>&gt; from an IDE</p>
+<p>So you expect you&#8217;ll *never* get an invalid pointer when your release build is running?</p>
+<p>This seems way too optimistic to me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-427253">
+				<div id="div-comment-427253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-427253">
+			October 4, 2006 at 12:02 pm</a>		</div>
+
+		<p>The assertion won&#8217;t catch all bad pointers even without race conditions. For example, some might point to memory which has been free()d (hence shouldn&#8217;t be used) but which is still part of the crt heap (hence owned by the app as far as IsBadXxxPtr is concerned). It can still be useful to catch at least some errors, eg of the 0x00000008 form I mentioned earlier, or due to uninitialised pointer variables etc.</p>
+<p>The false positives are a more serious issue. The real problem with IsBadXxxPtr for assert purposes is not that it has unwanted side effects on the (potentially random) memory page, but that it lies: it can return true for memory which can, in fact, be read or written to.</p>
+<p>However, this is unlikely. It&#8217;s unlikely to happen with stack frames, because the memory should come from the stack frame of routine which is higher up the stack, and that memory ought to be committed by the time our assert is hit. So we&#8217;re left with the people playing games with PAGE_NOACCESS. Don&#8217;t use the assert if you want to play those games.</p>
+<p>Generally it would be better to just use the memory. The only times I&#8217;d even consider adding the assert are (a) as documentation; and (b) when the routine only used the memory some of the time, and I wanted the caller to make it available all of the time. The same applies to ASSERT( p != NULL ). Assertions for things which the hardware will detect anyway are often unnecessary clutter.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-427263">
+				<div id="div-comment-427263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-427263">
+			October 4, 2006 at 12:17 pm</a>		</div>
+
+		<blockquote><p>
+  The documentation for the IsBadXxxPtr</p>
+<p>  functions presents the technical reasons why
+</p></blockquote>
+<p>Not really. It says, &quot;Dereferencing potentially invalid pointers can disable stack expansion in other threads&quot; but it doesn&#8217;t say that IsBadXxxPtr dereferences the pointer. In fact I&#8217;d read it as saying the opposite: that you should use IsBadXxxPtr in order to avoid the stack expansion problem, because IsBadXxxPtr tells you whether the dereference would succeed without actually dereferencing it, by accessing the memory manager hardware directly. That&#8217;s what I&#8217;d expect, and the documentation doesn&#8217;t disillusion me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-441813">
+				<div id="div-comment-441813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.ailight.jp/blog/sha256/archive/2006/11/11/13305.aspx' rel='external nofollow' class='url'>社本＠ワック Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-441813">
+			November 11, 2006 at 4:08 am</a>		</div>
+
+		<p>re: IsBadReadPtr, IsBadWritePtr APIが禁止に &#8211; Windows Vista</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-518563">
+				<div id="div-comment-518563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://computinglife.wordpress.com/2007/06/23/how-do-you-chose-your-apis/' rel='external nofollow' class='url'>Complexity &laquo; Computing Life</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060927-07/?p=29563#comment-518563">
+			June 23, 2007 at 8:02 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://computinglife.wordpress.com/2007/06/23/how-do-you-chose-your-apis/" rel="nofollow">http://computinglife.wordpress.com/2007/06/23/how-do-you-chose-your-apis/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

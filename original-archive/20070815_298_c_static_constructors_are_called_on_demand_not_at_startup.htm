@@ -1,0 +1,1183 @@
+<html>
+<head>
+<title>C# static constructors are called on demand, not at startup</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>C# static constructors are called on demand, not at startup</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 15, 2007 / year-entry #299</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>55</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">One of the differences between C++ and C# is when static constructors run. In C++, static constructors are the first thing run in a module, even before the DllMain function runs.� In C#, however, static constructors don't run until you use the class for the first time. If your static constructor has side effects, you...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One of the differences between C++ and C# is when static constructors run.
+In C++, static constructors are the first thing run in a module,
+even before the <code>DllMain</code> function
+runs.&sup1;
+In C#, however, static constructors
+<a HREF="http://msdn.microsoft.com/library/en-us/csspec/html/vclrfcsharpspec_10_11.asp">
+don't run until you use the class for the first time</a>.
+If your static constructor has side effects,
+you may find yourself experiencing those side effects in strange ways.
+</p>
+<p>
+Consider the following program.
+It's rather contrived and artificial,
+but it's based on an actual program that encountered the same problem.
+</p>
+<pre>
+using System;
+using System.Runtime.InteropServices;
+
+class Program {
+ [DllImport("kernel32.dll", SetLastError=true)]
+ public static extern bool SetEvent(IntPtr hEvent);
+
+ public static void Main()
+ {
+  if (!SetEvent(IntPtr.Zero)) {
+   System.Console.WriteLine("Error: {0}", Trace.GetLastErrorFriendlyName());
+  }
+ }
+}
+</pre>
+<p>
+This program tries to set an invalid event, so the call to
+<code>SetEvent</code> is expected to fail with an invalid handle error.
+We print the last error code using a function in this helper class:
+The details of this method aren't important.
+In fact, for illustrative purposes, I'm going to skip
+the call to <code>FormatMessage</code> and just return an ugly
+name.&sup2;
+</p>
+<pre>
+class Trace {
+ public static string GetLastErrorFriendlyName()
+ {
+  return Marshal.GetLastWin32Error().ToString();
+ }
+}
+</pre>
+<p>
+Run this program, and you should get this output:
+</p>
+<pre>
+Error: 6
+</pre>
+<p>
+Six is the expected error code, since that is the numeric value of
+<code>ERROR_INVALID_HANDLE</code>.
+</p>
+<p>
+You don't think much of this program until one day you run it
+and instead of getting error 6, you get something like this:
+</p>
+<pre>
+Error: 126
+</pre>
+<p>
+What happened?
+</p>
+<p>
+While you weren't paying attention, somebody decided to do
+some enhancements to the <code>Trace</code> class,
+maybe added some new methods and stuff,
+and in particular, a static constructor got added:
+</p>
+<pre>
+class Trace {
+ public static string GetLastErrorFriendlyName()
+ {
+  return Marshal.GetLastWin32Error().ToString();
+ }
+
+ <font COLOR=blue>[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+ public static extern IntPtr LoadLibrary(string dll);
+ static Trace() { LoadLibrary("enhanced_logging.dll"); }</font>
+}
+</pre>
+<p>
+It's not important what the static constructor does;
+the point is that we have a static constructor now.
+In this case, the static constructor tries to load a helper DLL
+which presumably does something fancy so we can get better trace logging,
+something like that, the details aren't important.
+</p>
+<p>
+The important thing is that the constructor has a side effect.
+Since it uses a p/invoke, the value of
+<code>Marshal.GetLastWin32Error()</code> is overwritten by the
+error code returned by the <code>LoadLibrary</code>,
+which in our case is error&nbsp;126, <code>ERROR_MOD_NOT_FOUND</code>.
+</p>
+<p>
+Now let's look at what happens in our program.
+</p>
+<p>
+First, we call <code>SetEvent</code>, which fails and sets the
+Win32 error code to&nbsp;6.
+Next, we call <code>Trace.GetLastErrorFriendlyName</code>,
+but wait!
+This is the first call to a method in the <code>Trace</code> class,
+so we have to run the static constructor first.
+</p>
+<p>
+The static constructor tries to load the <code>enhanced_logging.dll</code>
+module, and it fails, setting the last error code to&nbsp;126.
+This <i>overwrites the previous value</i>.
+</p>
+<p>
+After the static constructor returns, we return to our program already
+in progress and call <code>Trace.GetLastErrorFriendlyName</code>,
+but it's too late.
+The damage has been done.
+The last error code has been corrupted.
+</p>
+<p>
+And that's why we get 126 instead of 6.
+</p>
+<p>
+What's really scary is that problems with static constructors running
+at inopportune times are often extremely hard to identify.
+For one thing, there is no explicit indication in the source code that
+there's any static constructor funny business going on.
+Indeed, somebody could just recompile the assembly containing the
+<code>Trace</code> class without modifying your program, and the problem
+will rear its head.
+"But I didn't change anything.
+The timestamp on <code>program.exe</code> is the same as the one that
+still works!"
+</p>
+<p>
+A side effect you might not consider is synchronization.
+If the static constructor takes any locks,
+you have to keep an eye on your lock hierarchy, or one of those
+locks might trigger a deadlock.
+This is insidious, because you can stare at the code all you want;
+you won't see anything.
+You'll have a method like
+</p>
+<pre>
+class Trace {
+ ...
+ public static string GetFavoriteColor() { return "blue"; }
+}
+</pre>
+<p>
+and yet when you try to step over a call to
+<code>Trace.GetFavoriteColor</code>,
+your program hangs!
+"This makes no sense.
+How can <code>Trace.GetFavoriteColor</code> hang?
+It just returns a constant!"
+</p>
+<p>
+Another factor that makes this problem baffling is that
+the problem occurs only the first time you call
+a method in the <code>Trace</code> class.
+We saw it here only because the very first thing we did with
+<code>Trace</code> was display an error.
+If you happened to call, say,
+<code>Trace.GetFavoriteColor()</code> before calling
+<code>Trace.GetLastErrorFriendlyName()</code>,
+then you wouldn't have seen this problem.
+In fact, that's how the program that inspired today's entry stumbled
+across this problem.
+They deleted a call into the <code>Trace</code> class from some unrelated
+part of the program,
+which meant that the static constructor
+ran at a different time than it used to,
+and unfortunately, the new time was less hospitable to static construction.
+</p>
+<p>
+"I'm sorry, did I call you at a bad time?"
+</p>
+<p>
+<b>Footnotes</b>&sup3;
+</p>
+<p>
+&sup1;This is not strictly true.
+In reality, it's a bit of
+sleight-of-hand performed by the C runtime library.&#x2074;
+</p>
+<p>
+&sup2;For a less ugly name,
+you can use this class instead:</p>
+<pre>
+class Trace {
+ [DllImport("kernel32.dll", SetLastError=true)]
+ public static extern IntPtr LocalFree(IntPtr hlocal);
+
+ [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+ public static extern int FormatMessage(int flags, IntPtr unused1,
+    int error, int unused2, ref IntPtr result, int size, IntPtr unused3);
+ static int FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100;
+ static int FORMAT_MESSAGE_IGNORE_INSERTS  = 0x00000200;
+ static int FORMAT_MESSAGE_FROM_SYSTEM     = 0x00001000;
+
+ public static string GetLastErrorFriendlyName()
+ {
+  string result = null;
+  IntPtr str = IntPtr.Zero;
+  if (FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                    FORMAT_MESSAGE_IGNORE_INSERTS  |
+                    FORMAT_MESSAGE_FROM_SYSTEM, IntPtr.Zero,
+                    Marshal.GetLastWin32Error(), 0,
+                    ref str, 0, IntPtr.Zero) > 0) {
+   try {
+    result = Marshal.PtrToStringAuto(str);
+   } finally {
+    LocalFree(str);
+   }
+  }
+  return result;
+ }
+}
+</pre>
+<p>
+Note that there may be better ways of accomplishing this.
+I'm not the expert here.
+</p>
+<p>
+&sup3;Boring footnote symbols from now on.
+You guys sure know how to take the fun out of blogging.
+(I didn't realize that blogs were held to academic writing standards.
+Silly me.)
+Now you can go spend your time telling
+<a HREF="http://scobleizer.com/">Scoble</a>
+that he wrote a run-on sentence or something.
+</p>
+<p>
+&#x2074;Although this statement is written as if it were a fact,
+it is actually my interpretation of how the C runtime works
+and is
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/08/10/4315707.aspx#4327521">
+not an official position</a>
+of the Visual Studio team
+nor Microsoft Corporation,
+and that interpretation may ultimately prove incorrect.
+Similar remarks apply to other statements of fact in this article.
+</p>
+<p>
+<b>Postscript</b>:
+Before you start pointing fingers and saying,
+"Hah hah, we don't have this problem in Win32!"&mdash;it turns out that you do!
+As we noted in the introduction,
+static constructors run when the DLL is loaded.
+The granularity in Win32 is not as fine,
+being at the module level rather than the class level,
+but the problem is still there.
+If you use delay-loading,
+then the first call to a function in a delay-loaded DLL
+will load the target DLL, and its static constructors will run,
+possibly when your program wasn't expecting it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (55)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-536963">
+				<div id="div-comment-536963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.vyvojar.cz/jachymko' rel='external nofollow' class='url'>jachymko</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-536963">
+			August 15, 2007 at 10:06 am</a>		</div>
+
+		<blockquote><p>
+  &gt; Note that there may be better ways of</p>
+<p>  &gt; accomplishing this. I&#8217;m not the expert here.
+</p></blockquote>
+<p>return new System.ComponentModel.Win32Exception().Message</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-536983">
+				<div id="div-comment-536983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">oliver</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-536983">
+			August 15, 2007 at 10:33 am</a>		</div>
+
+		<p>&gt; Boring footnote symbols from now on. You guys sure know how to take the fun out of blogging.</p>
+<p>Apparently nobody noticed or complained when you used normal<br />
+footnote symbols yesterday. Why complain _today_ about your readers, or<br />
+get back to that topic anyway? (Note: that was a rhetoric question)</p>
+<div class="post">[<i>Yesterday&#8217;s article didn&#8217;t have footnotes when I originally wrote it. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-536993">
+				<div id="div-comment-536993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://cs.usu.edu.ru/home/skrobov/' rel='external nofollow' class='url'>A. Skrobov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-536993">
+			August 15, 2007 at 10:35 am</a>		</div>
+
+		<p>Numbered footnote marks are cool.</p>
+<div class="post">[<i>Numbered footnotes are boring. They suck the life out of the article. And having to go back and renumber all the footnotes when I add a new one is a pain. But I&#8217;ve learned that when I try to add character and whimsy, people complain. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537003">
+				<div id="div-comment-537003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andy Hertzfeld</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537003">
+			August 15, 2007 at 10:39 am</a>		</div>
+
+		<p>what .net needs, is more cowbell.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537033">
+				<div id="div-comment-537033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">e.thermal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537033">
+			August 15, 2007 at 10:55 am</a>		</div>
+
+		<p>plenty of cowbell in System.Music.Instruments.Awesome namespace</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537043">
+				<div id="div-comment-537043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537043">
+			August 15, 2007 at 10:56 am</a>		</div>
+
+		<p>How about a C# example without mucking it up with DllImports? &nbsp;Certainly you could display the effects of static constructors without needing to call all of those external methods.</p>
+<div class="post">[<i>As noted in the concluding remarks, the original scenario that brought this problem to my attention used DllImport, and I try to base my examples on actual events. (Yes, sometimes I use completely artificial examples, but I prefer to base them on real code.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537073">
+				<div id="div-comment-537073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537073">
+			August 15, 2007 at 11:06 am</a>		</div>
+
+		<p>Wow, just yesterday Eric Lippert blogged about the horrors of uncertainty in C++ (e.g., the result of ++i + i++ being undefined). Yet in C# there is uncertainty about the time of construction of a class&#8211;oh, and in the destruction as well, since it&#8217;s not cleaned up when you exit any scope but left to GC. Those issues seem much more horrifying and difficult to track down than sequence point problems in C++ expressions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537093">
+				<div id="div-comment-537093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.chphilli.net' rel='external nofollow' class='url'>Chris Phillips</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537093">
+			August 15, 2007 at 11:13 am</a>		</div>
+
+		<p>While I totally understand the reason you&#8217;ve needed to be complete, formal, and covering all the bases lately, I&#8217;m a bit sad that it&#8217;s come to that. It was more fun for everyone before the nitpickers and literalists made you cover everything!</p>
+<p>Your blog is great reading! Thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537103">
+				<div id="div-comment-537103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pierre B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537103">
+			August 15, 2007 at 11:18 am</a>		</div>
+
+		<p>To paraphrase a motto from an online game that shall remain nameless:</p>
+<p>&#8220;Write what you want and ignore the complaints.&#8221;</p>
+<p>Or is it a requirement from MS legal department that you address every single issue?</p>
+<div class=post>[<i>I initially ignored them, but when every single article that used a nonstandard footnote created a barrage of comments arguing about footnotes (and when I offhandedly made fun of the people who complained about footnotes, the footnote comments exploded), that&#8217;s when I decided to throw in the towel. Having my own style wasn&#8217;t worth putting up with the constant complainers. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537113">
+				<div id="div-comment-537113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Clifton</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537113">
+			August 15, 2007 at 11:21 am</a>		</div>
+
+		<blockquote><p>
+  But I&#8217;ve learned that when I try to add character and whimsy, people complain.
+</p></blockquote>
+<p>This is why we can&#8217;t have nice things.</p>
+<p>I love your recurring, albeit yearly, .NET stuff. &nbsp;Keep rocking, Raymond!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537143">
+				<div id="div-comment-537143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nick</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537143">
+			August 15, 2007 at 11:39 am</a>		</div>
+
+		<p>@Dave:</p>
+<p>There&#8217;s no uncertainty about when static constructors execute. &nbsp;They execute the first time a class is used. &nbsp;The problem is that a lot of people don&#8217;t understand this, and they assume that the constructor gets run when the assembly is loaded.</p>
+<p>I used to feel the same way you do about nondeterministic finalization (comming from a C++ background), but then I realized that it&#8217;s better that way. &nbsp;It means that the GC can optimize the finalization order. &nbsp;Additionally, there is a mechanism (the using keyword) in place that allows the programmer to explicitly control finalization when necessary.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537173">
+				<div id="div-comment-537173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Randy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537173">
+			August 15, 2007 at 11:43 am</a>		</div>
+
+		<p>I like fancy footnote symbols. &nbsp;They add to your uniqueness. &nbsp;Fight the man. &nbsp;Be passive aggressive against those who would push you into the mold of conformity. &nbsp;They are the ones that don&#8217;t realize what makes you a brilliant programmer is that your thinking is a bit &quot;skewed&quot; from normal. &nbsp;The crazy footnotes are just an indication of your true brilliance and ability to see the world from a different perspective.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537183">
+				<div id="div-comment-537183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537183">
+			August 15, 2007 at 11:50 am</a>		</div>
+
+		<p>And the finalizers are called by the GC, which means you don&#8217;t have to worry about them altering state, as in C++.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick odd alt thread-odd thread-alt depth-1" id="comment-537213">
+				<div id="div-comment-537213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537213">
+			August 15, 2007 at 12:13 pm</a>		</div>
+
+		<p>Nick, if you&#8217;re writing a robust program that you don&#8217;t want to end up stuck in the finalizer thread, you have to call Dispose (or use &#8216;using&#8217;) all over the place. Every time. With every resource that&#8217;s IDisposable.</p>
+<p>Don&#8217;t have to worry about finalizers altering state? Only if the author of the finalizer is very rigorous. The level of discipline is no different from C++.</p>
+<p>Some versions of FxCop could tell you when you hadn&#8217;t called Dispose on an object that implemented IDisposable going out of scope, but I understand they have removed/are removing the engine support for it as it was too hard to get right.</p>
+<p>Best practice now is to only use a finalizer on an object that holds a handle to an unmanaged resource, and that should be the only purpose and responsibility of that class. There&#8217;s now a SafeHandle class in .NET 2.0 that gets you a long way towards your own implementation.</p>
+<p>C++/CLI automatically calls Dispose at the end of an object&#8217;s scope, as if it were a destructor &#8211; no using blocks required. It maps ~Class() to Dispose(). If you really need a finalizer in C++/CLI, you write a !Class() method.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537223">
+				<div id="div-comment-537223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://joecobol.blogspot.com' rel='external nofollow' class='url'>E Schneider</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537223">
+			August 15, 2007 at 12:19 pm</a>		</div>
+
+		<p>Well, that was a bit of disturbing information. &nbsp;Not having checked when C# static constructors get called, I sort of naively assumed they behaved like the C++ equivalents.</p>
+<p>I wouldn&#8217;t say the C# behavior is a <em>problem</em>, not now that it&#8217;s been brought to my attention, but yeah, that was a bad bug just waiting to happen&#8230;</p>
+<p>Thanks Raymond, I think that gem of info probably saved me a week of my life sometime down the road. :&gt; &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537233">
+				<div id="div-comment-537233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537233">
+			August 15, 2007 at 12:20 pm</a>		</div>
+
+		<p>If nitpickers told you to jump off a bridge, would you do it?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537253">
+				<div id="div-comment-537253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537253">
+			August 15, 2007 at 12:39 pm</a>		</div>
+
+		<p>One of the things I learned from this post and the comments is that it is very difficult being Raymond Chen.</p>
+<p>I agree with Raymond regarding the footnotes and lament the loss of &quot;character and whimsy&quot;. &nbsp;I really enjoy it when Raymond adds a little character and whimsy to his post!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537263">
+				<div id="div-comment-537263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mr Cranky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537263">
+			August 15, 2007 at 12:42 pm</a>		</div>
+
+		<p>&#8220;You guys sure know how to take the fun out of blogging.&#8221;</p>
+<p>I am a little too tired of the constant whining you do about comments, &nbsp;When are you going to realize that it is not only ridiculous to try to please every random person who writes a comment here, but is mathematically impossible?</p>
+<p>Do you really think that more than 2 people in the universe really care what kind of footnote markers you use? &nbsp;And why should anyone else&#8217;s opinion (on a trivial style preference) be of any concern to you?</p>
+<div class=post>[<i>Commenters arguing over footnotes drowned out everything else. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537273">
+				<div id="div-comment-537273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://cs.usu.edu.ru/home/skrobov/' rel='external nofollow' class='url'>A. Skrobov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537273">
+			August 15, 2007 at 12:50 pm</a>		</div>
+
+		<p>Numbered footnotes using Roman numerals would be both cool and whimsy.</p>
+<p>When footnotes are numbered, they are so much easier to look up compared to oddly-shaped ones. Everyone likes binary search.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537283">
+				<div id="div-comment-537283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.jeffwhitledge.com/' rel='external nofollow' class='url'>Jeffrey L. Whitledge</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537283">
+			August 15, 2007 at 1:03 pm</a>		</div>
+
+		<p>I don’t know a dang thing about programming ’puters. I’m here as a footnoting style enthusiast.</p>
+<p>Keep up the good work!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537293">
+				<div id="div-comment-537293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Ritchie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537293">
+			August 15, 2007 at 1:08 pm</a>		</div>
+
+		<p>Maybe for those of who read Raymond&#8217;s technical details, a blog devoid of nitpickers, this is ridiculous: 9 of 23 comments have nothing to do with the technical details&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537333">
+				<div id="div-comment-537333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Humanoid....</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537333">
+			August 15, 2007 at 1:48 pm</a>		</div>
+
+		<p>I&#8217;m not a fan of C#, there&#8217;s something smelly about it. Having said that I only really know what I learn here!!!! (Probably ought to go somewhere where I am likely to get a &quot;Pro C#&quot; picture! :)</p>
+<p>Nevertheless, I can think of a scenario where this &quot;on demand&quot; approach has it&#8217;s advantages.</p>
+<p>If you have a number of static objects greater than one, and one needs to reference one from another, then the order of initialisation can be wrong.</p>
+<p>I&#8217;m not sure if there is a way to specify to the linker (I assume) what order any objects at global scope should be constructed, but when I have this problem I usually just frig the build. It&#8217;s not a regularly occuring problem to say the least, but it can be painful to find if you&#8217;ve not seen the code before, and is (I think) specific to the C++ approach. It would seem from this article that one at least has some mechanism of natural control over the order of initialisation.</p>
+<p>Surely these are the two ends of the same problem?</p>
+<p>Having said that, I think I prefer the C++ approach, merely because the number of instances of the problem are minimized by writing clean well structured code.</p>
+<p>On the face of it, writing clean structured C#, would appear to introduce this problem all over the place.</p>
+<p>Then again, I&#8217;m probably wrong! :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537343">
+				<div id="div-comment-537343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Aidan Thornton</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537343">
+			August 15, 2007 at 2:04 pm</a>		</div>
+
+		<p>As I recall, the equivalent feature in Java &#8211; the static block &#8211; works the same way; it gets run the first time the class is used. This isn&#8217;t surprising, since C# has more than a few similarities to Java.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537373">
+				<div id="div-comment-537373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537373">
+			August 15, 2007 at 2:35 pm</a>		</div>
+
+		<blockquote><p>
+  And having to go back and renumber all the footnotes when I add a new one is a pain
+</p></blockquote>
+<p>You could bug the MSDN blog software guys to add something like wikipedia&#8217;s &lt;ref&gt; tag so you can get (clickable!) footnote numbering automatically:</p>
+<p><a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Wikipedia:Footnotes" rel="nofollow">http://en.wikipedia.org/wiki/Wikipedia:Footnotes</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537383">
+				<div id="div-comment-537383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">poochner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537383">
+			August 15, 2007 at 2:45 pm</a>		</div>
+
+		<p>As for the footnote symbols, he&#8217;s still using little characters, they&#8217;re just not as whimsical :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537403">
+				<div id="div-comment-537403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.parkscomputing.com/' rel='external nofollow' class='url'>Paul M. Parks</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537403">
+			August 15, 2007 at 3:01 pm</a>		</div>
+
+		<p>Peter: The comments about Raymond whining about comments are drowning out everything else.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537423">
+				<div id="div-comment-537423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dopefish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537423">
+			August 15, 2007 at 3:14 pm</a>		</div>
+
+		<p>With all the disclaimers, Raymond might consider changing the byline of the blog from &quot;Not actually a .net blog&quot; to &quot;Not actually a primary source&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537433">
+				<div id="div-comment-537433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mccoyn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537433">
+			August 15, 2007 at 3:49 pm</a>		</div>
+
+		<p>I like the C# approach because its more scaleable. &nbsp;Suppose I were to create a library that contained 10 objects that each needed a static initialization. &nbsp;With the C++ approach anyone that used my library would have to pay the static initializations for all of the classes in my library, meaning I have to trade startup time for the convienence of static initializations. &nbsp;With the C# approach the static initializations for the objects that are never used are never run.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537443">
+				<div id="div-comment-537443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sohail</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537443">
+			August 15, 2007 at 4:11 pm</a>		</div>
+
+		<p>[quote]</p>
+<p>I like the C# approach because its more scaleable. &nbsp;Suppose I were to create a library that contained 10 objects that each needed a static initialization. &nbsp;With the C++ approach anyone that used my library would have to pay the static initializations for all of the classes in my library, meaning I have to trade startup time for the convienence of static initializations. &nbsp;With the C# approach the static initializations for the objects that are never used are never run.</p>
+<p>[/quote]</p>
+<p>It seems no one read my comment :-(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537063">
+				<div id="div-comment-537063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537063">
+			August 15, 2007 at 11:04 am</a>		</div>
+
+		<p>Raymond,</p>
+<p>I can&#8217;t be the only reader of your blog who&#8217;s just grateful that you provide an insight into *why* things are done the way they are, not just how things are done.</p>
+<p>Thanks for continuing to write for us; it&#8217;d still be interesting (if harder to read) if you decided to use txtspk.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537133">
+				<div id="div-comment-537133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537133">
+			August 15, 2007 at 11:37 am</a>		</div>
+
+		<p>And I thought the problem of C++ calling *destructors* at the end of a function were bad enough.</p>
+<p>For example:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/ericlippert/archive/2004/03/23/94651.aspx" rel="nofollow">http://blogs.msdn.com/ericlippert/archive/2004/03/23/94651.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537163">
+				<div id="div-comment-537163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sohail</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537163">
+			August 15, 2007 at 11:41 am</a>		</div>
+
+		<p>Actually, you should say &quot;One of the differences between *Visual* C++&#8230;&quot;</p>
+<p>The reason is that according to the standard non-POD classes *may* be initialized before main but are certainly initialized before the first use (which has implications for threading &#8211; as I painfully found out recently.) The relevant portion of the standard refers to dynamic initialization.</p>
+<p>So:</p>
+<p>class BigFatConstructor</p>
+<p>{</p>
+<p>public:</p>
+<p> &nbsp;BigFatConstructor(){ /* initialize resource a */ }</p>
+<p> &nbsp;resource &amp; getresource(){return a;}</p>
+<p>private:</p>
+<p> &nbsp;resource a;</p>
+<p>}</p>
+<p>static BigFatConstructor bfc;</p>
+<p>&#8230;</p>
+<p>void threadfn1()</p>
+<p>{</p>
+<p> &nbsp;bfc.getresource(); // uh oh&#8230;</p>
+<p>}</p>
+<p>int main()</p>
+<p>{</p>
+<p> &nbsp; new thread(threadfn1);</p>
+<p> &nbsp; new thread(threadfn1);</p>
+<p> &nbsp; new thread(threadfn1);</p>
+<p> &nbsp; new thread(threadfn1);</p>
+<p>}</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-537523">
+				<div id="div-comment-537523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537523">
+			August 15, 2007 at 8:27 pm</a>		</div>
+
+		<p>In both C++ and C#, the general rule is that you should keep your static constructors to a minimum. That would certainly rule out doing P/Invoke inside a static constructor (and almost anything that can throw an exception is generally a bad idea).</p>
+<p>If you follow that rule, the deterministic order of construction that the on-demand model provides is a pretty nice benefit.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537363">
+				<div id="div-comment-537363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wolf Logan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537363">
+			August 15, 2007 at 2:21 pm</a>		</div>
+
+		<p>(Warning: mention of a bug in a .Net implementation ahead! This is not a complaint, nor a whine for help. This is simply a report on a minor bug that relates to the topic of today&#8217;s blog entry. This disclaimer brought to you by the Nitpicker Defense Brigade.)</p>
+<p>While doing some development under .NetCF, I discovered what *appears* to be a bug in static initialisation. I mention it here in case others are debugging .NetCF code and run into static strangeness.</p>
+<p>There are two places where static members can be initialised: in the static constructor (.cctor), and in a static initialiser (static int foo = 1;). Ordinarily, the static initialisers are called just before the static constructor runs, so they obey the same &quot;on demand&quot; rules described by Raymond. However, under the Compact Framework (in the version I was using at the time, 1.0 I believe), static initialisers in referenced assemblies are not called at all. That is, if your app loads an assembly containing a class with static members (with initialisers) and a static constructor, the static constructor will be called on the first use of the class, but the initialisers won&#8217;t.</p>
+<p>I haven&#8217;t worked in .NetCF for some time, so I don&#8217;t know if the bug still exists in recent releases.</p>
+<p>The code I was working on when I discovered the problem is here: <a rel="nofollow" target="_new" href="http://www.codeproject.com/netcf/CfResortCompanion.asp" rel="nofollow">http://www.codeproject.com/netcf/CfResortCompanion.asp</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537453">
+				<div id="div-comment-537453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Ritchie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537453">
+			August 15, 2007 at 4:19 pm</a>		</div>
+
+		<p>The C# method has another benefit. &nbsp;In C++ static constructors are process-wide and could be called in any application-specific security context. &nbsp;In C# static constructors are AppDomain-wide (and you *can* get a particular static constructor called more than once in a process) and if your application-specific security context is sandboxed with an AppDomain you don&#8217;t leak from one context to another.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537563">
+				<div id="div-comment-537563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537563">
+			August 15, 2007 at 11:21 pm</a>		</div>
+
+		<p>C# and Java always seem to me to be something of a con. The original idea was that programmers don&#8217;t need to be concerned with object lifetimes since the garbage collector will take care of it. And some of the time it&#8217;s true, but there are loads of cases where you actually need to do more work to get a stable application. And constructors, destructors and exceptions make it harder to do that work.</p>
+<p>C++ is ok if you use it sensibly, but I&#8217;ve spent ages debugging non sensible C++ designs on embedded systems where you only have printf and that slows things down to the point where they work.</p>
+<p>It seems like bad programmers will write code with a bunch of subtle timing problems in any language. But in C it&#8217;s much easier to debug and patch than in C++ where so much more happens behind the scenes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537593">
+				<div id="div-comment-537593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Triangle</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537593">
+			August 16, 2007 at 12:34 am</a>		</div>
+
+		<p>Problems like this are the exact reason I prefer to use C and assembly over C++ and managed languages.</p>
+<p>They are the cause of a large class of bugs stemming from things that do alot more than you expect them to, and things that interact poorly with each other. Edge cases like this one in particular are horrible to debug.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537603">
+				<div id="div-comment-537603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ashley Ross</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537603">
+			August 16, 2007 at 1:11 am</a>		</div>
+
+		<p>Damn, beaten to it by Dopefish, although I was favouring &#8220;not actually an official Microsoft documentation blog&#8221;.</p>
+<p>All comments are moderated, right? Why not just silently delete/drop<br />
+comments that are nit-picky, off-topic or in some other way a<br />
+detraction from the overall post? </p>
+<p>In fact, please do just that, and go back to writing /your/ blog the<br />
+way /you/ want to. Stop trying to please everyone else, and focus on<br />
+making yourself happy.</p>
+<p>And if someone is unhappy or upset that their comment didn&#8217;t make<br />
+the grade, tough. They can go rant about it on their own blog if they<br />
+have to. Clicking the Submit button at the bottom of this form does not<br />
+automatically grant one the right to be heard.</p>
+<div class="post">[<i>I&#8217;ve deleted comments in the past and gotten<br />
+grief for doing so. Deleting comments I don&#8217;t like may lead people to <a href="http://blogs.msdn.com/oldnewthing/archive/2007/07/24/4019215.aspx" rel="nofollow">infer that I<br />
+approve of the comments that remain</a>, and it <a href="http://www.businessweek.com/the_thread/blogspotting/archives/2005/08/is_it_riskier_t.html" rel="nofollow">creates potential legal liability</a>. (That specific case was tossed out on a technicality, so the underlying legal issue remains unresolved.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537533">
+				<div id="div-comment-537533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Luz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537533">
+			August 15, 2007 at 8:49 pm</a>		</div>
+
+		<p>Of course GetFavoriteColor() won&#8217;t work; you gave the wrong answer! You&#8217;re lucky an exception wasn&#8217;t thrown straight into the Gorge of Eternal Peril. *ducks*</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537663">
+				<div id="div-comment-537663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://cs.usu.edu.ru/home/skrobov/' rel='external nofollow' class='url'>A. Skrobov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537663">
+			August 16, 2007 at 4:43 am</a>		</div>
+
+		<p>For even more whimsy numbered footnotes, there are two sets of<br />
+circled numbers (U+2460—U+2473 and U+2780—U+2789), two sets of inverted<br />
+circled digits (U+2776—U+277F and U+278A—U+2793), a set of<br />
+parenthesized numbers (U+2474—U+2487), a set of numbers with periods<br />
+(U+2488—U+249B), and a set of fullwidth digits (U+FF10—U+FF19), as well<br />
+as two sets of Roman numerals (U+2160—U+216F and U+2170—U+217F). Quite<br />
+enough for not being boring.</p>
+<div class="post">[<i>① Those characters do not exist in all fonts, and<br />
+&amp;x2461; It&#8217;s the numbers I object to. You<br />
+can decorate the numbers in whimsical ways, but they&#8217;re still numbers.<br />
+-Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537733">
+				<div id="div-comment-537733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537733">
+			August 16, 2007 at 8:22 am</a>		</div>
+
+		<p>A big part of the problem in the first example is the communication covertly via side-effects on globals, as implied by GetLastWin32Error(). If SetEvent() returned an error code explicitly, it couldn&#8217;t be clobbered by the unexpected static constructor.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537743">
+				<div id="div-comment-537743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537743">
+			August 16, 2007 at 8:44 am</a>		</div>
+
+		<p>@Yuhong Bao: the C++ destructor is one of the reasons why resource management is in many cases easier in C++ than in so-called managed languages. Objects can actually be wholly responsible for the resources they allocate.</p>
+<p>The example link you posted doesn&#8217;t really demonstrate a problem with destructors per se so much as it demonstrates a problem with global variables (which is what SetLastError/GetLastError essentially are, though they are thankfully local to the thread they&#8217;re called on).</p>
+<p>That&#8217;s not to say the link doesn&#8217;t describe a genuine and ugly problem, but the problem is consistent with the well-known issues with globals.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537773">
+				<div id="div-comment-537773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://jasonhaley.com/blog/archive/2007/08/16/140228.aspx' rel='external nofollow' class='url'>Jason Haley</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537773">
+			August 16, 2007 at 10:28 am</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537623">
+				<div id="div-comment-537623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537623">
+			August 16, 2007 at 3:32 am</a>		</div>
+
+		<p>P. Ritchie: &quot;In C++ static constructors are process-wide&quot;</p>
+<p>No, they are module-wide (*.exe, *.dll).</p>
+<p>E.g. if your program.exe and two *.dlls you use in it all link with library l.lib, and you have static object in l.lib, you&#8217;ll have three instances of them and three constructors called.</p>
+<p>You must have l.dll and l.lib (i.e. dynamic linking) to get &quot;process-wide&quot; effect (but then it goes under &quot;module-wide&quot;, module being l.dll).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-537643">
+				<div id="div-comment-537643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Name required</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537643">
+			August 16, 2007 at 4:13 am</a>		</div>
+
+		<p>&gt; when I try to add character and whimsy, people complain</p>
+<p>When people write comments with &quot;character and whimsy&quot; *you* complain, which merely increases antipathy towards your &quot;style&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-537993">
+				<div id="div-comment-537993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-537993">
+			August 16, 2007 at 2:14 pm</a>		</div>
+
+		<blockquote><p>
+  It&#8217;s the numbers I object to.
+</p></blockquote>
+<p>Apply whimsy to numbers: &nbsp;use them in an unordered manner. &nbsp;That would also answer your objection to having to renumber them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-538003">
+				<div id="div-comment-538003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gene</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-538003">
+			August 16, 2007 at 3:04 pm</a>		</div>
+
+		<p>And of course it sounds so obvious when Raymond explains it, but then you think of the poor guy behind the debugger who&#8217;s got no idea of the oncoming freight train.</p>
+<p>So how long did it take to figure out the original problem?</p>
+<p>(I hate all these kinda-sorta &quot;C-derived&quot; languages. Especially Java)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-538163">
+				<div id="div-comment-538163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jolyon Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-538163">
+			August 16, 2007 at 11:20 pm</a>		</div>
+
+		<p>Um, the Win32 comment&#8230;. &nbsp;perhaps I&#8217;m wrong because I would have expected others to pick up on this but they didn&#8217;t so at the risk of sounding foolish&#8230;</p>
+<p>Surely with dyna-load DLL&#8217;s, static initialisation occurs at the point at which the DLL is loaded.</p>
+<p>Since my code is &nbsp;loading the DLL, presumably having checked that it isn&#8217;t already loaded, so my code also knows that initialisation of that DLL is going to occur right here, right now.</p>
+<p>vs</p>
+<p>I&#8217;m accessing an instance of a class. &nbsp;Is this the first time I&#8217;ve ever accessed any instance of that particular class in this session? &nbsp;(gazes into tea leaves at bottom of cup)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-538173">
+				<div id="div-comment-538173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-538173">
+			August 16, 2007 at 11:58 pm</a>		</div>
+
+		<p>Jolyon: Not with delay-load DLLs: &quot;your&quot; code is not the one the who loads the DLL, it&#8217;s just loaded the first time you use it. This is different to calling LoadLibrary/GetProcAddress however.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-538843">
+				<div id="div-comment-538843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ripster</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-538843">
+			August 17, 2007 at 5:39 pm</a>		</div>
+
+		<p>There&#8217;s a wee bit more to static constructors than you think, the following goes into all the gory detail: <a rel="nofollow" target="_new" href="http://www.yoda.arachsys.com/csharp/beforefieldinit.html" rel="nofollow">http://www.yoda.arachsys.com/csharp/beforefieldinit.html</a> Note that it&#8217;s actually possible to use a class before the static constructor is called, it&#8217;s all in the implicit/explicit declaration ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-539073">
+				<div id="div-comment-539073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://opentk.sourceforge.net' rel='external nofollow' class='url'>StApostol</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-539073">
+			August 19, 2007 at 6:42 pm</a>		</div>
+
+		<p>&#8212;&#8212;&#8212;&#8212;&#8212;-Quote&#8212;&#8212;&#8212;&#8212;&#8212;&#8211;</p>
+<p>Ordinarily, the static initialisers are called just before the static constructor runs, so they obey the same &quot;on demand&quot; rules described by Raymond. However, under the Compact Framework (in the version I was using at the time, 1.0 I believe), static initialisers in referenced assemblies are not called at all.</p>
+<hr />
+<p>If I understand what you are saying, this is not a bug; rather this is an optimization, where fields are not initialized before a static method is called. Look up the BeforeFieldInit attribute, it is a very important (but subtle) point regarding static initialization.</p>
+<p>The only way to disable this behavior is to specify a static constructor (even an empty one). The static constructor guarantees that fields will be initialized first, then the constructor will run, and only then will your static method be called.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-539083">
+				<div id="div-comment-539083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jan Kučera</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-539083">
+			August 19, 2007 at 6:53 pm</a>		</div>
+
+		<p>Hello,</p>
+<p>I usually don&#8217;t read comments, simply because they are not part of the RSS feed. But this time I went to read every piece to find out, whether I am the only one who is really enjoying your footnotes symbols. There are some as well, but not as much as I expected.</p>
+<p>Regardless the way you list your footnotes, be it Tamil numbers or whatever, this is just to let you know that I liked your symbols and without them it will just&#8230;be not so fun.</p>
+<p>Have a nice day!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-539163">
+				<div id="div-comment-539163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dll != lib</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-539163">
+			August 20, 2007 at 7:22 am</a>		</div>
+
+		<p>Can anyone please explain how the c++ runtime can call static functions in dlls (before DllMain). I&#8217;m curious and have never seen any description of this &quot;work-a-round&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-539213">
+				<div id="div-comment-539213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-539213">
+			August 20, 2007 at 10:28 am</a>		</div>
+
+		<p>&quot;dll != lib&quot; &#8212; When you write a C++ DLL, you don&#8217;t actually write the DllMain export that ends up in your DLL&#8217;s export table.</p>
+<p>The DllMain address from teh export table is inside the C++ runtime; when it gets an attach notification, it calls your static constructors, then calls the DllMain-lookalike that you wrote.</p>
+<p>(At least, that&#8217;s my understanding. &nbsp;It may be wrong.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-539563">
+				<div id="div-comment-539563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070815-00/?p=25573#comment-539563">
+			August 20, 2007 at 11:59 pm</a>		</div>
+
+		<p>&quot;The example link you posted doesn&#8217;t really demonstrate a problem with destructors per se so much as it demonstrates a problem with global variables (which is what SetLastError/GetLastError essentially are, though they are thankfully local to the thread they&#8217;re called on).&quot;</p>
+<p>Indeed, a global variable would have the same problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

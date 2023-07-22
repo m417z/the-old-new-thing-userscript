@@ -1,0 +1,317 @@
+<html>
+<head>
+<title>You must flush GDI operations when switching between direct access and GDI access, and direct access includes other parts of GDI</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>You must flush GDI operations when switching between direct access and GDI access, and direct access includes other parts of GDI</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 23, 2010 / year-entry #268</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer was running into problems when accessing the pixels of a DIB section. They used the HANDLE parameter to Create­DIB­Section and created two bitmaps from the same underlying memory. Those two bitmaps were then selected into corresponding DCs, and the customer found that changes to the pixels performed by writing via one DC were...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was running into problems when accessing the pixels of
+a DIB section.
+They used the <code>HANDLE</code> parameter to
+<code>Create&shy;DIB&shy;Section</code> and created two bitmaps from the same
+underlying memory.
+Those two bitmaps were then selected into corresponding DCs,
+and the customer found that changes to the pixels performed
+by writing via one DC
+were not visible when read from the other DC.
+</p>
+<p>
+The customer pointed out this clause in MSDN:
+</p>
+<blockquote CLASS=q><p>
+You need to guarantee that the GDI subsystem has completed
+any drawing to a bitmap created by <code>Create&shy;DIB&shy;Section</code>
+before you draw to the bitmap yourself.
+Access to the bitmap must be synchronized.
+Do this by calling the <code>Gdi&shy;Flush</code> function.
+This applies to any use of the pointer to the bitmap bit values,
+including passing the pointer in calls
+to functions such as <code>Set&shy;DIBits</code>.
+</p>
+</blockquote>
+<p>
+The customer said,
+"The description says that it applies to cases
+where you modify the bits yourself through the direct memory pointer.
+But all of our access is performed through HDCs;
+I would think GDI is smart enough to handle that,
+but we've found that we still need to call <code>Gdi&shy;Flush</code>
+to get the two DCs back in sync."
+</p>
+<p>
+What you ask GDI to do you have done yourself.
+That's why the documentation say <i>any use of the pointer</i>.
+Sort of like in law, where in many causes you can be punished for
+"doing X or causing X to be done."
+If you induce somebody else to do X,
+you're in violation as much as if you had done X yourself.
+</p>
+<p>
+I doubt that every call to GDI ends
+with a big loop that checks whether the bits
+it just modified also belong to some other GDI bitmap in the system.
+</p>
+<pre>
+GDIFinishAPI(HDC hdc)
+{
+ if (IsDIBSection(GetCurrentObject(hdc, OBJ_BITMAP), &amp;ds)) {
+  EnumGdiObjects(FlushIfOverlap, &amp;ds));
+ }
+}
+
+FlushIfOverlap(HGDIOBJ h, DIBSECTION *pds)
+{
+ if (IsDIBSection(h, &amp;ds) &amp;&amp;
+     DIBSectionsReferToSameUnderlyingBits(pds, &amp;ds)) {
+  GdiFlush();
+ }
+}
+</pre>
+<p>
+That would seriously slow down all DIB section operations
+to cover a rare scenario that most people don't realize is
+even possible to create.
+Not the best engineering tradeoff.
+</p>
+<p>
+The point of the documentation is
+is that if you ask GDI to mess with the bits in the bitmap
+via the <code>HDC</code>,
+you must call <code>Gdi&shy;Flush</code>
+before anybody else tries to access those bits,
+even if that "somebody else" is another part of GDI.
+The example of <code>Set&shy;DIBits</code> is an attempt to capture the
+sense of this requirement.
+</p>
+<p>
+Translating into this specific scenario:
+You must flush the pending changes whenever you switch between
+"GDI accesses bits through the DIB section created by this handle"
+and "the bits are accessed by anybody else."
+And "anybody else" could be
+"GDI accesses bits through the DIB section created by a different handle."
+</p>
+<p>
+<b>Bonus chatter</b>:
+What's the deal with <code>Gdi&shy;Flush</code> anyway?
+</p>
+<p>
+As a performance optimization, GDI performs "batching"
+of operations.
+When you ask GDI to perform an operation, it doesn't always do it
+right away.
+Instead, it may choose to store the action in a buffer,
+and when the buffer gets full,
+it "flushes the batch" and sends the commands that it had been
+saving up into kernel mode for execution.
+(This idea of buffering up operations and submitting them as a batch
+is hardly new to GDI.
+The C stdio library does it, and
+in networking, a variation of it goes by the name
+<a HREF="http://blogs.msdn.com/b/larryosterman/archive/2004/08/05/209160.aspx">
+Nagle's Algorithm</a>.)
+</p>
+<p>
+GDI also flushes the batch when necessary in order to preserve semantics;
+for example, if you call <code>Gradient&shy;Fill</code> and follow it
+with a call to <code>Get&shy;Pixel</code>,
+GDI needs to flush out the <code>Gradient&shy;Fill</code> before
+issuing the <code>Get&shy;Pixel</code> so that the pixels that get
+read match the pixels that were written.
+(A much more common case of just-in-time flushing is
+where you <code>Bit&shy;Blt</code> the results out of the bitmap
+into another device context.)
+</p>
+<p>
+This behind-the-scenes optimization works great with one exception:
+DIB sections.
+Since the memory for DIB sections is directly visible,
+GDI doesn't get a chance to sneak a call to <code>Gdi&shy;Flush</code>
+before you issue your "mov eax, [esi]" instruction.
+Hence the clause in MSDN explaining that when you switch between
+GDI access and direct access,
+you need to call <code>Gdi&shy;Flush</code> to get all pending operations
+out of the buffer so that the bits in memory match the operations
+you performed.
+</p>
+<p>
+Many years ago,
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/09/15/54925.aspx">
+we saw another case where we had to compensate for GDI batching</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-862513">
+				<div id="div-comment-862513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christopher Walken</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862513">
+			September 23, 2010 at 7:14 am</a>		</div>
+
+		<p>Excellent post Raymond. We are always grateful when you explain in detail the mysterious shenanigans that go on in the background of GDI. Thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-862593">
+				<div id="div-comment-862593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">steven</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862593">
+			September 23, 2010 at 8:30 am</a>		</div>
+
+		<p>Very insightful post, as usual. I think this explains why I had trouble with bit of a GDI-drawn logo being missing when saving the DIB section to a custom file format. I wish I&#39;d found the GdiFlush function back then rather than the embarrassing workaround I ended up using.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-862623">
+				<div id="div-comment-862623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862623">
+			September 23, 2010 at 9:11 am</a>		</div>
+
+		<p>The docs for GdiFlush say that &quot;Calling any GDI function that does not return a Boolean value&quot; will flush GDI. Does &quot;GDI function&quot; mean &quot;a function from Gdi32.lib&quot;? Will SelectObject or GetCurrentObject cause a flush, and if so &#8211; why?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-862633">
+				<div id="div-comment-862633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bob</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862633">
+			September 23, 2010 at 9:32 am</a>		</div>
+
+		<p>You also have to call GdiFlush if you pass GDI objects between threads, even if you don&#39;t access the bitmap directly (the batching is per thread, so if thread A uses a GDI object and then passes it to thread B w/o calling GdiFlush, thread B doesn&#39;t know that there are still pending operations on it).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-862793">
+				<div id="div-comment-862793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862793">
+			September 23, 2010 at 3:21 pm</a>		</div>
+
+		<p>Then when will the graphic subsystem in windows be thread safe?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-862863">
+				<div id="div-comment-862863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Buchan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862863">
+			September 23, 2010 at 6:44 pm</a>		</div>
+
+		<p>@640k: A bit after that ever becomes a good idea for immediate mode rasterizers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-862923">
+				<div id="div-comment-862923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-862923">
+			September 24, 2010 at 3:31 am</a>		</div>
+
+		<p>The last time I had to use GdiFlush was to port Mozilla 1.7 to run on Windows NT 3.51, whose batching was more aggressive than that in later versions of Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-863403">
+				<div id="div-comment-863403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Worf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100923-00/?p=12773#comment-863403">
+			September 24, 2010 at 10:56 pm</a>		</div>
+
+		<p>@Neil &#8211; makes sense as graphicx drivers in NT 3.5 series were user mode, so GDI operations had to undergo kernel task switches. Doing this for every GDI call would just bog things to the point of unusability with all the IPC going on.</p>
+<p>NT 4 onwards moved the display driver into the kernel, so things were much faster and thus, less batching is needed as each call is faster.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

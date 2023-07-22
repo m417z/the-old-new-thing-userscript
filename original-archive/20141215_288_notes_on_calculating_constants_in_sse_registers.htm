@@ -1,0 +1,405 @@
+<html>
+<head>
+<title>Notes on calculating constants in SSE registers</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Notes on calculating constants in SSE registers</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 15, 2014 / year-entry #289</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">There are a few ways to load constants into SSE registers. Load them from memory. Load them from general purpose registers via movd. Insert selected bits from general purpose registers via pinsr[b|w|d|q]. Try to calculate them in clever ways. Loading constants from memory incurs memory access penalties. Loading or inserting them from general purpose registers...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+There are a few ways to load constants into SSE registers.
+</p>
+<ul>
+<li>Load them from memory.
+<li>Load them from general purpose registers via
+    <code>movd</code>.</p>
+<li>Insert selected bits from general purpose registers via
+    <code>pinsr[b|w|d|q]</code>.</p>
+<li>Try to calculate them in clever ways.
+</ul>
+<p>
+Loading constants from memory incurs memory access penalties.
+Loading or inserting them from general purpose registers incurs
+cross-domain penalties.
+So let's see what we can do with clever calculations.
+</p>
+<p>
+The most obvious clever calculations are the ones for setting
+a register to all zeroes or all ones.
+</p>
+<pre>
+    pxor    xmm0, xmm0 ; set all bits to zero
+    pcmpeqd xmm0, xmm0 ; set all bits to one
+</pre>
+<p>
+These two idioms are special-cased in the processor and execute
+faster than normal pxor and pcmpeqd instructions
+because the results are not dependent on the previous value
+in <code>xmm0</code>.
+</p>
+<p>
+There's not much more you can do to construct other
+values from zero,
+but a register with all bits set does create additional
+opportunities.
+</p>
+<p>If you need a value loaded into all lanes whose bit pattern
+is either a bunch of 0's followed by a bunch of 1's,
+or a bunch of 1's followed by a bunch of 0's,
+then you can shift in zeroes.
+For example, assuming you've set all bits in <code>xmm0</code> to 1,
+here's how you can load some other constants:
+</p>
+<pre>
+    pcmpeqd xmm0, xmm0 ; set all bits to one
+-then-
+    pslld  xmm0, 30    ; all 32-bit lanes contain 0xC0000000
+-or-
+    psrld  xmm0, 29    ; all 32-bit lanes contain 0x00000007
+-or-
+    psrld  xmm0, 31    ; all 32-bit lanes contain 0x00000001
+</pre>
+<p>
+Intel suggests loading 1 into all lanes with the sequence
+</p>
+<pre>
+    pxor    xmm0, xmm0 ; xmm0 = { 0, 0, 0, 0 }
+    pcmpeqd xmm1, xmm1 ; xmm1 = { -1, -1, -1, -1 }
+    psubd   xmm0, xmm1 ; xmm0 = { 1, 1, 1, 1 }
+</pre>
+<p>
+but that not only takes more instructions but also consumes two registers,
+and registers are at a premium since there are only eight of them.
+The only thing I can think of is that <code>psubd</code> might be faster
+than <code>psrld</code>.
+</p>
+<p>
+In general, to load <code>2&#x207F;&minus;1</code>
+into all lanes, you do</p>
+<p>
+<pre>
+    pcmpeqd xmm0, xmm0 ; set all bits to one
+-then-
+    psrlw  xmm0, 16-n  ; clear top 16-n bits of all 16-bit lanes
+-or-
+    psrld  xmm0, 32-n  ; clear top 32-n bits of all 32-bit lanes
+-or-
+    psrlq  xmm0, 64-n  ; clear top 64-n bits of all 64-bit lanes
+</pre>
+<p>
+Conversely, if you want to load
+<code>~(2&#x207F;&minus;1) = -2&#x207F;</code> into all lanes,
+you shift the other way.
+</p>
+<pre>
+    pcmpeqd xmm0, xmm0 ; set all bits to one
+-then-
+    psllw  xmm0, n     ; clear bottom n bits of all 16-bit lanes = 2&sup1;&#x2076; - 2&#x207F;
+-or-
+    pslld  xmm0, n     ; clear bottom n bits of all 32-bit lanes = 2&sup3;&sup2; - 2&#x207F;
+-or-
+    psllq  xmm0, n     ; clear bottom n bits of all 64-bit lanes = 2&#x2076;&#x2074; - 2&#x207F;
+</pre>
+<p>
+And if the value you want has all its set bits in the middle,
+you can combine two shifts (and stick something in between the two
+shifts to ameliorate the stall):
+</p>
+<pre>
+    pcmpeqd xmm0, xmm0 ; set all bits to one
+-then-
+    psrlw  xmm0, 13    ; all lanes = 0x0007
+    psllw  xmm0, 4     ; all lanes = 0x0070
+-or-
+    psrld  xmm0, 31    ; all lanes = 0x00000001
+    pslld  xmm0, 3     ; all lanes = 0x00000008
+</pre>
+<p>
+If you want to set high or low lanes to zero,
+you can use <code>pslldq</code> and
+<code>psrldq</code>.
+</p>
+<pre>
+    pcmpeqd xmm0, xmm0 ; set all bits to one
+-then-
+    pslldq xmm0, 2     ; clear bottom word, xmm0 = { -1, -1, -1, -1, -1, -1, -1, 0 }
+-or-
+    pslldq xmm0, 4     ; clear bottom dword, xmm0 = { -1, -1, -1, 0 }
+-or-
+    pslldq xmm0, 8     ; clear bottom qword, xmm0 = { -1, 0 }
+-or-
+    psrldq xmm0, 2     ; clear top word, xmm0 = { 0, -1, -1, -1, -1, -1, -1, -1 }
+-or-
+    psrldq xmm0, 4     ; clear top dword, xmm0 = { 0, -1, -1, -1 }
+-or-
+    psrldq xmm0, 8     ; clear top qword, xmm0 = { 0, -1 }
+</pre>
+<p>
+No actual program today.
+Just some notes from my days writing SSE assembly language.
+</p>
+<p>
+<b>Bonus chatter</b>:
+There is an intrinsic for <code>pxor xmmReg, xmmReg</code>:
+<a HREF="http://msdn.microsoft.com/en-us/library/ys7dw0kh(v=vs.90).aspx">
+<code>_mm_setzero_si128</code></a>.
+However, there is no corresponding intrinsic for
+<code>pcmpeqd xmmReg, xmmReg</code>,
+which would presumably be called
+<code>_mm_setones_si128</code>
+or
+<code>_mm_setmone_epiNN</code>.
+In order to get all-ones, you need to get a throwaway register
+and compare it against itself.
+The cheapest throwaway register is one that is set to zero,
+since that is special-cased inside the processor.
+</p>
+<pre>
+__m128i zero = _mm_setzero_si128();
+__m128i ones = _mm_cmpeq_epi32(zero, zero);
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1166573">
+				<div id="div-comment-1166573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166573">
+			December 15, 2014 at 7:51 am</a>		</div>
+
+		<p>This is starting to look like Agner Fog blog, maybe, good things at wrong places?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166593">
+				<div id="div-comment-1166593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darius</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166593">
+			December 15, 2014 at 8:37 am</a>		</div>
+
+		<p>The reason Intel goes with 3 instructions instead of shift by immediate is probably the following: CPUs have just 1 execution port for vector shift. &nbsp;That moves vector shift instruction into critical path and ties down that port. Vector sub has no such limitation and can choose from several execution ports on latest hardware.</p>
+<div class="post">[<em>That makes sense. They should have <a href="http://blogs.msdn.com/b/oldnewthing/archive/2009/11/04/9917052.aspx">included the rationale</a> in their recommendation. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166603">
+				<div id="div-comment-1166603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166603">
+			December 15, 2014 at 10:04 am</a>		</div>
+
+		<p>I&#39;m surprised that 4 or 5 instructions in setup phase is cheaper than a fetch from memory. (My trick was to place the memory constant immediately above the entry point for high probability of cache hit).</p>
+<div class="post">[<em>I ran across this problem in a situation where absolute memory access was not convenient (it&#39;s hard to write PIC for x86), so I had to survive entirely in registers. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166623">
+				<div id="div-comment-1166623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166623">
+			December 15, 2014 at 12:00 pm</a>		</div>
+
+		<p>Unfortunately, Visual C++ considers uninitialized variables to always have to come from memory, so the following does not work to do what we want:</p>
+<p>__m128i _mm_setmone_si128() { __m128i meow; return _mm_cmpeq_epi32(meow, meow); }</p>
+<p>Visual C++ will compile that as allocating 16 bytes of stack memory and reading from it without initializing it, then doing pcmpeqd. &nbsp;Initializing &quot;meow&quot; with _mm_setzero_epi128 fixes it, at the cost of an extra pxor instruction.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166633">
+				<div id="div-comment-1166633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166633">
+			December 15, 2014 at 2:33 pm</a>		</div>
+
+		<p>Ewww. I dislike inline assembly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166643">
+				<div id="div-comment-1166643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Owen Shepherd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166643">
+			December 15, 2014 at 4:25 pm</a>		</div>
+
+		<p>Joshua: That&#39;s very likely to hit in L2, but not in L1 (because L2 is generally separated between I-Cache and D-Cache).</p>
+<p>That said, it&#39;s probably as good a place as any.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166663">
+				<div id="div-comment-1166663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166663">
+			December 15, 2014 at 6:36 pm</a>		</div>
+
+		<p>Joshua, that&#39;s not a good idea outside microbenchmarks because the line will be replicated in L1D and L1I, a constant pool will likely be cached without the risk of being replicated.</p>
+<p>But mixing code and data is much more fun, pushing a string parameter is much more sexy this way:</p>
+<p>call @F</p>
+<p>db &quot;a string parameter!&quot;, 0</p>
+<p>@@:</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166683">
+				<div id="div-comment-1166683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166683">
+			December 15, 2014 at 11:42 pm</a>		</div>
+
+		<p>Regarding this:</p>
+<p>&gt; And if the value you want has all its set bits in the middle, you can combine two shifts (and stick something in between the two shifts to ameliorate the stall):</p>
+<p>Wouldn&#39;t the fact that most modern processors are out-of-order, superscalar and pipelined ameliorate the stall, obviating the need for the programmer to do that manually?</p>
+<div class="post">[<em>It definitely helps, but I prefer to give the CPU the extra scheduling help, in case it needs it. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1166693">
+				<div id="div-comment-1166693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166693">
+			December 16, 2014 at 1:20 am</a>		</div>
+
+		<p>After seeking some article, I believe PSUBD is recommended also for the following reason:</p>
+<p>Source: <a rel="nofollow" target="_new" href="https://software.intel.com/en-us/android/articles/finer-points-of-using-sse-instructions-for-android-media-apps-on-the-intel-atom-platform">software.intel.com/&#8230;/finer-points-of-using-sse-instructions-for-android-media-apps-on-the-intel-atom-platform</a></p>
+<p>Section: Partial register dependencies</p>
+<p>The execution pipeline interprets these as dependency-chain breaking idioms; so no stalls will occur on subsequent partial accesses to the register. In other words, even if the register has a read-after-write (RAW) dependency from some earlier instruction, the machine doesn’t need to check for that because all of the bits are going to be set to zero irregardless of what values resided there previously.</p>
+<p>Btw, the following article also suggest using pcmpeqd trick for setting all bits to 1:</p>
+<p><a rel="nofollow" target="_new" href="https://software.intel.com/en-us/articles/assembly-language-tips-tricks-for-the-intel-pentiumr-4-processor">software.intel.com/&#8230;/assembly-language-tips-tricks-for-the-intel-pentiumr-4-processor</a></p>
+<p>So I guess the recommendation changes with time.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166833">
+				<div id="div-comment-1166833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Josh B</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166833">
+			December 16, 2014 at 1:04 pm</a>		</div>
+
+		<p>@Nathan</p>
+<p>The deep pipelining is what makes the stall so bad, and unless the front-end of the CPU can specifically recognize this as an operation that needs to be interleaved and can find suitable code to interleave it with, out-of-orderness won&#39;t fix it. There&#39;s only so much logic you can jam into the front-end while keeping up throughput, not to mention minimizing power use.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166993">
+				<div id="div-comment-1166993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1166993">
+			December 17, 2014 at 6:45 am</a>		</div>
+
+		<p>@cheong00 Am I the only one that&#39;s a bit disturbed that Intel uses &quot;irregardless&quot; in that documentation? If nobody bothered to proofread that document one can just hope that the technical advise is more sound</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1" id="comment-1167223">
+				<div id="div-comment-1167223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141215-00/?p=43403#comment-1167223">
+			December 17, 2014 at 5:48 pm</a>		</div>
+
+		<p>@voo: To be fair, even books you paid for has spelling mistakes. I&#39;m less concern about this unless the misspelt word can have different meaning in that paragraph.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

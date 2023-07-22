@@ -1,0 +1,737 @@
+<html>
+<head>
+<title>Investigating an app compat problem: Part 3: Paydirt</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Investigating an app compat problem: Part 3: Paydirt</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 10, 2016 / year-entry #122</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Finding the answer.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Last time, we learned that the proximate cause of failure was that
+we were trying to set a bit in a bit array, except that the <code>this</code>
+pointer was null. That didn't really
+bring us any closer to the bug. What we need to do is find out why
+the calling function tried to invoke the method on a null pointer.
+</p>
+<p>
+The function that generated the null pointer is kind of long,
+but let's see what we can get out of it.
+</p>
+<pre>
+contoso!ContosoInitialize+0x5620:
+31426280 push    ebp
+31426281 mov     ebp ,esp
+31426283 push    0FFFFFFFFh
+31426285 push    offset contoso!ContosoInitialize+0xa57c3 (314c6423)
+3142628a mov     eax, dword ptr fs:[00000000h]
+31426290 push    eax
+31426291 mov     dword ptr fs:[0],esp
+31426298 sub     esp, 24h       // 24h bytes of local variables
+</pre>
+<p>
+So far, we have the standard prologue for functions that use
+exception handling
+when compiled by the Microsoft C++ compiler.
+The compiler uses <code>[ebp-4]</code> to keep track of
+what objects need to be unwound
+if an exception is raised,
+so don't be surprised to see apparent write-only operations
+to <code>[ebp-4]</code>.
+These writes are actually clues to us that a stack object
+with a nontrivial destructor
+was just constructed or destructed.
+</p>
+<pre>
+3142629b mov     dword ptr [ebp-2Ch], ecx   // this
+3142629e mov     eax, dword ptr [ebp-2Ch]
+314262a1 mov     ecx, dword ptr [eax+400h]  // this->m_tlsIndex
+314262a7 cmp     ecx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)] // some global variable
+</pre>
+<p>
+We learned from our first day that the value at offset <code>0x400</code>
+is a TLS slot index.
+We compare it against some global variable.
+What's up with that global variable?
+</p>
+<p>
+Let's search the DLL for all references to that global variable.
+</p>
+<pre>
+0:000&gt; s 31410000 3151e000 9c 69 50 31
+3142592c  9c 69 50 31 89 08 8b 55-fc c7 42 04 00 00 00 00  .iP1...U..B.....
+31425b6d  9c 69 50 31 74 0c 8b 4d-f0 e8 75 01 00 00 85 c0  .iP1t..M..u.....
+31425f9b  9c 69 d2 31 74 11 8b 55-fc 8b 84 95 f8 fe ff ff  .iP1t..U........
+31425ffe  9c 69 50 31 89 91 00 04-00 00 8b 45 fc 8b e5 5d  .iP1.......E...]
+314262a9  9c 69 50 31 75 71 8b 15-ac 69 d2 1f 52 8d 4d e8  .iP1uq...i..R.M.
+314262d0  9c 69 50 31 75 3b 6a 00-68 c0 5f c4 1f 8b 55 d4  .iP1u;j.h._...U.
+0:000&gt; u 3142592c-2 3142592c
+contoso!ContosoInitialize+0x4cca:
+3142592a mov     ecx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)]
+0:000&gt; u 31425b6d-2 31425b6d
+contoso!ContosoInitialize+0x4f0b:
+31425b6b cmp     eax, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)]
+0:000&gt; u 31425f9b-2 31425f9b
+contoso!ContosoInitialize+0x5339:
+31425f99 cmp     ecx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)]
+0:000&gt; u 31425ffe-2 31425ffe
+contoso!ContosoInitialize+0x539c:
+31425ffc mov     edx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)]
+0:000&gt; u 314262a9-2 314262a9
+contoso!ContosoInitialize+0x5647:
+314262a7 cmp     ecx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)]
+0:000&gt; u 314262d0-2 314262d0
+contoso!ContosoInitialize+0x566e:
+314262ce cmp     ecx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)]
+</pre>
+<p>
+It appears that this is a read-only variable.
+Therefore, its current value is its permanent value.
+And we saw last time that the permanent value is zero.
+</p>
+<p>
+And we already found a bug.
+This code assumes that zero is not a valid TLS index.
+Actually,
+the invalid TLS index goes by the name
+<code>TLS_OUT_OF_INDEXES</code>,
+which is the value that <code>TlsAlloc</code>  
+uses to say "Sorry, I couldn't allocate a TLS index for you."
+If this app ever calls <code>TlsAlloc</code> and get zero back,
+it will think that
+it hasn't yet assigned a TLS slot.
+</p>
+<p>
+But that's not the bug that we're chasing, because we got a TLS index of 65.
+But at least we can come up with a nice name for the variable.
+</p>
+<pre>
+DWORD invalidTlsIndex = 0;
+</pre>
+<p>
+Back to the function, already in progress.
+</p>
+<pre>
+314262ad jne     contoso!ContosoInitialize+0x56c0 (31426320) // if valid, then skip
+314262af mov     edx, dword ptr [contoso!ContosoInitialize+0xe5d4c (315069ac)] // get some other thing
+314262b5 push    edx
+314262b6 lea     ecx, [ebp-18h]
+314262b9 call    contoso!ContosoInitialize+0x5170 (31425dd0) // construct something, probably
+314262be mov     dword ptr [ebp-4], 0                                           // exception unwinding tracking
+</pre>
+<p>
+I'm guessing that we're constructing something
+because it first this pattern:
+Put into the
+<code>ecx</code> register the
+address of some memory never accessed before,
+then call a function.
+The object being constructed here
+doesn't participate in managing the TLS index:
+We assume this because it doesn't take the TLS slot as a parameter.
+Therefore, we will ignore it for now.
+(Although I do know what it is, and you might be able to guess too,
+after we disassemble a little more.)
+</p>
+<pre>
+314262c5 mov     eax, dword ptr [ebp-2Ch]           // this
+314262c8 mov     ecx, dword ptr [eax+400h]          // this->m_tlsIndex
+314262ce cmp     ecx, dword ptr [contoso!ContosoInitialize+0xe5d3c (3150699c)] // invalidTlsIndex
+314262d4 jne     contoso!ContosoInitialize+0x56b1 (31426311) // jump if not equal
+</pre>
+<p>
+This next chunk of code is executed if the TLS index is zero;
+presumbaly it allocates a TLS slot. Let's see.
+</p>
+<pre>
+314262d6 push    0                                  // mystery parameter
+314262d8 push    offset contoso!ContosoInitialize+0x5360 (31425fc0) // function callback
+314262dd mov     edx, dword ptr [ebp-2Ch]           // this
+314262e0 add     edx, 400h                          // &amp;this->m_tlsIndex
+314262e6 push    edx
+314262e7 call    contoso!ContosoInitialize+0x6680 (314272e0) // looks promising
+314262ec add     esp, 0Ch
+314262ef test    eax, eax
+314262f1 je      contoso!ContosoInitialize+0x56b1 (31426311) // jump if zero
+314262f3 mov     dword ptr [ebp-1Ch], 0             // local1c = 0
+314262fa mov     dword ptr [ebp-4], 0FFFFFFFFh
+31426301 lea     ecx, [ebp-18h]                     // destruct that thing on the stack
+31426304 call    contoso!ContosoInitialize+0x5200 (31425e60)
+31426309 mov     eax, dword ptr [ebp-1Ch]           // return local1c
+3142630c jmp     contoso!ContosoInitialize+0x5783 (314263e3)
+31426311 mov     dword ptr [ebp-4], 0FFFFFFFFh
+31426318 lea     ecx, [ebp-18h]                     // destruct that thing on the stack
+3142631b call    contoso!ContosoInitialize+0x5200 (31425e60)
+...
+314263e3 mov     ecx, dword ptr [ebp-0Ch]
+314263e6 mov     dword ptr fs:[0], ecx
+314263ed mov     esp, ebp
+314263ef pop     ebp
+314263f0 ret
+</pre>
+<p>So far, we have reverse-compiled the code to look like this:
+</p>
+<pre>
+SomeBitArrayClass1* Class2::f_31426280()
+{
+    if (this->m_tlsIndex == invalidTlsIndex)
+    {
+        Class3 object3(...);
+        if (this->m_tlsIndex == invalidTlsIndex)
+        {
+            if (f_314272e0(&amp;this->m_tlsIndex, f_31425fc0, 0) != 0)
+            {
+                return nullptr;
+            }
+        }
+    }
+    ... more code ...
+</pre>
+<p>
+The <code>Class3</code> object is probably some sort of synchronization
+object, since what we have here looks very much like a double-check-locking
+pattern.
+</p>
+<p>
+Anyway, that function at <code>314272e0</code> probably allocates the TLS slot,
+seeing as we pass the address of where we want to put the TLS index.
+</p>
+<pre>
+contoso!ContosoInitialize+0x6680:
+314272e0 push    ebp
+314272e1 mov     ebp, esp
+314272e3 push    ecx
+314272e4 call    dword ptr [contoso!ContosoInitialize+0xa85bc (314c921c)] // TlsAlloc
+314272ea mov     ecx, dword ptr [ebp+8]     // arg1
+314272ed mov     dword ptr [ecx], eax       // save it
+314272ef mov     edx, dword ptr [ebp+8]
+314272f2 cmp     dword ptr [edx], 0FFFFFFFFh // was it invalid?
+314272f5 je      contoso!ContosoInitialize+0x66b3 (31427313) // Y: bail
+314272f7 mov     eax, dword ptr [ebp+10h]
+314272fa push    eax
+314272fb mov     ecx, dword ptr [ebp+0Ch]
+314272fe push    ecx
+314272ff mov     edx, dword ptr [ebp+8]
+31427302 mov     eax, dword ptr [edx]
+31427304 push    eax
+31427305 call    contoso!ContosoInitialize+0x53b0 (31426010) // succeeded, keep going
+3142730a mov     ecx, eax
+3142730c call    contoso!ContosoInitialize+0x5490 (314260f0)
+31427311 jmp     contoso!ContosoInitialize+0x6710 (31427370)
+31427370 mov     esp, ebp
+31427372 pop     ebp
+</pre>
+<p>
+This function allocates the TLS slot, and if successful, it does something ambiguous.
+The code seqeuence at <code>314272f7</code> could be any of
+</p>
+<pre>
+    f_31426010(*tlsIndex, callbackFunction, arg3)->f_314260f0()
+    f_31426010(*tlsIndex, callbackFunction)->f_314260f0(arg3)
+    f_31426010(*tlsIndex)->f_314260f0(callbackFunction, arg3)
+    f_31426010()->f_314260f0(*tlsIndex, callbackFunction, arg3)
+</pre>
+<p>
+    If the <code>f_31426010</code> and <code>f_314260f0</code>
+    functions were <code>__cdecl</code>, then there would be
+<code>add esp, N</code> instructions after each call,
+    and that would tell us how many parameters each function consumes.
+    But there isn't, which means that these functions are
+<code>__stdcall</code>.
+</p>
+<p>
+    To find out which of the above four cases is the one we have,
+    we need to look at the function epilogue
+    for <code>f_31426010</code>. That will tell us how many bytes
+    of parameters it consumes, and that will tell us which of the
+    parameters belong to <code>f_31426010</code> and which belong
+    to <code>f_314260f0</code>.
+</p>
+<pre>
+contoso!ContosoInitialize+0x53b0:
+31426010 push    ebp
+31426011 mov     ebp,esp
+...
+314260ea mov     esp,ebp
+314260ec pop     ebp
+314260ed ret
+</pre>
+<p>
+    Okay, the function ends with a plain <code>ret</code>, which
+    combined with the lack of <code>add esp, N</code>
+    in the calling code
+    means that it consumes zero parameters from the stack.
+</p>
+<p>
+    Therefore, we are in this case:
+</p>
+<pre>
+    f_31426010()->f_314260f0(*tlsIndex, callbackFunction, arg3)
+</pre>
+<p>
+    The parameters (including the TLS slot index
+    that we are tracking very closely) all go to the
+    <code>f_314260f0</code> function.
+</p>
+<pre>
+contoso!ContosoInitialize+0x5490:
+314260f0 push    ebp
+314260f1 mov     ebp, esp
+314260f3 push    0FFFFFFFFh
+314260f5 push    offset contoso!ContosoInitialize+0xa5778 (314c63d8)
+314260fa mov     eax, dword ptr fs:[00000000h]
+31426100 push    eax
+31426101 mov     dword ptr fs:[0], esp
+31426108 sub     esp, 28h
+3142610b mov     dword ptr [ebp-34h], ecx       // save "this"
+3142610e mov     eax, dword ptr [contoso!ContosoInitialize+0xe5d4c (315069ac)]
+31426113 push    eax
+31426114 lea     ecx, [ebp-18h]
+31426117 call    contoso!ContosoInitialize+0x5170 (31425dd0) // construct Class3
+3142611c mov     dword ptr [ebp-4], 0
+31426123 mov     ecx, dword ptr [ebp+8]         // tlsIndex
+31426126 mov     dword ptr [ebp-10h], ecx       // local10 = tlsIndex
+31426129 cmp     dword ptr [ebp-10h], 40h       // tlsIndex compared with 64
+3142612d jae     contoso!ContosoInitialize+0x551f (3142617f) // Jump if tlsIndex &gt;= 64
+
+3142617f mov     dword ptr [ebp-30h], 0FFFFFFFFh // local30 = -1
+31426186 mov     dword ptr [ebp-4], 0FFFFFFFFh
+3142618d lea     ecx, [ebp-18h]
+31426190 call    contoso!ContosoInitialize+0x5200 (31425e60) // destruct Class3
+31426195 mov     eax, dword ptr [ebp-30h]       // return local30
+31426198 mov     ecx, dword ptr [ebp-0Ch]
+3142619b mov     dword ptr fs:[0], ecx
+314261a2 mov     esp, ebp
+314261a4 pop     ebp
+314261a5 ret     0Ch
+</pre>
+<p>
+Aha! We see that the code checks the numeric value of the TLS index.
+The only meaningful value to compare the index against
+is <code>TLS_OUT_OF_INDEXES</code>.
+Once you verify that you have a valid TLS index,
+the actual numeric value is opaque.
+Changing behavior based on the numeric value
+of the slot index is highly suspect.
+</p>
+<p>
+The partially-reverse-compiled function looks like this:
+</p>
+<pre>
+int f_314260f0(DWORD tlsIndex, callback, x)
+{
+    Class3 object3(...);
+    if (tlsIndex &lt; 64)
+    {
+        ...
+    }
+    else
+    {
+        return -1;
+    }
+}
+</pre>
+<p>
+Holy cow, this function simply rejects TLS slot indices that are
+greater than or equal to 64!
+Returning <code>-1</code> causes the calling function
+<code>f_31426280</code> to return <code>nullptr</code>,
+which leads to our null pointer crash.
+</p>
+<p>
+Now we understand why the program is crashing.
+It mishandles TLS slot indices that are 64 or higher.
+It tries to reject them, but notice that when function
+<code>f_314260f0</code> returns <code>-1</code>,
+the calling function does not free the TLS slot or
+reset <code>this-&gt;m_tlsIndex</code> back to
+<code>invalidTlsIndex</code>.
+Instead, it leaves the TLS slots index allocated,
+and the next time the code wants to use the object,
+it sees that the TLS slot index is valid
+and tries to use the value stored in that slot.
+</p>
+<p>
+Except we never stored anything there.
+</p>
+<p>
+What's so special about the number 64?
+We'll dig into that next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1252095">
+				<div id="div-comment-1252095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Max</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252095">
+			June 10, 2016 at 7:44 am</a>		</div>
+
+		<p>Just my two cents, it seems the &#8220;offending&#8221; code compares the index against TLS_MINIMUM_AVAILABLE, is that what it looks like ? And also, while we&#8217;re on the subject, why is the maximum amount of TLS slots, as per MSDN, 1088 ? I mean, it does not look like a &#8220;perfect&#8221; number in terms of 2-based numeric system, simply curious :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-raykoopa odd alt thread-odd thread-alt depth-1 parent" id="comment-1252115">
+				<div id="div-comment-1252115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ray+Koopa' rel='external nofollow' class='url'>Ray Koopa</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252115">
+			June 10, 2016 at 8:46 am</a>		</div>
+
+		<p>I found a quite old article about TlsGetValue when just searching for that together with the 64 constant&#8230; <a href="https://support.microsoft.com/en-us/kb/94804" rel="nofollow">https://support.microsoft.com/en-us/kb/94804</a><br />
+&#8220;Although one TLS index is usually sufficient, a process may have up to TLS_MINIMUM_AVAILABLE indexes (guaranteed to be greater than or equal to 64).&#8221;<br />
+Cool, but that doesn&#8217;t help dumb-me&#8230; x&#8217;3 I&#8217;m now really excited for the next part, damn this weekend!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-ted-2 even depth-2 parent" id="comment-1252116">
+				<div id="div-comment-1252116" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Glassware' rel='external nofollow' class='url'>Glassware</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252116">
+			June 10, 2016 at 10:22 am</a>		</div>
+
+		<p>The fact that the number 64 was mentioned as a kind of guarantee in the documentation leads me to believe that someone misread the documentation.  This kind of thing happens a lot if you know you need to write tests for return values, but at the same time you are in a rush and don&#8217;t scrutinize the results.</p>
+<p>My guess is, poor developer is tasked to make sure all Windows API calls have their return values checked.  Developer reads documentation and sees &#8220;Guaranteed to be greater than 64&#8221;, but he (or she) notices that all the values in the real world are low numbers less than 64.  So the developer just sets a limit and says &#8220;Return a failure if the number is &gt; 64&#8221;.  Because the code doesn&#8217;t break in the real world, this is harmless.</p>
+<p>Note that two things have to happen before this becomes an app crash:<br />
+&#8211; First, someone has to write a piece of code that uses this shared function with the mistaken assumption about 64 and assumes that it always succeeds, and<br />
+&#8211; Second, the behavior of Windows needs to change in some fashion so that apps in practice get numbers above 64.</p>
+<p>Basically, if the consumer of this incorrect code had tested for -1, they would get a false negative success and could throw an error saying &#8220;This app is out of TLS slots!&#8221; which would be easier to figure out.  If Windows kept on returning low numbers, this problem wouldn&#8217;t get triggered.  But since it has worked in the past, it&#8217;s easy for new circumstances to trigger the problem.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1252135">
+				<div id="div-comment-1252135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252135">
+			June 11, 2016 at 1:20 am</a>		</div>
+
+		<p>My money is on the developer was just dumb &amp; ran the allocator to find the highest value it returned on his computer and then put that in the code and never tested it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-raykoopa even depth-4 parent" id="comment-1252195">
+				<div id="div-comment-1252195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ray+Koopa' rel='external nofollow' class='url'>Ray Koopa</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252195">
+			June 13, 2016 at 12:57 am</a>		</div>
+
+		<p>But since Raymond says it&#8217;s an application compatibility problem, I understood it as if this code worked in earlier versions of Windows, but doesn&#8217;t anymore, so something in Windows changed and this weird code doesn&#8217;t work anymore?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1252675">
+				<div id="div-comment-1252675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252675">
+			June 14, 2016 at 2:22 pm</a>		</div>
+
+		<p>Yes, old versions of windows old return values up to 64. New versions return higher values. Windows is guaranteed to always return up to 64, but there is no guarantee it will return higher values. But it can if it wants.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn even depth-2" id="comment-1252215">
+				<div id="div-comment-1252215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252215">
+			June 13, 2016 at 2:38 am</a>		</div>
+
+		<p>Some while ago, the TLS slots were less abundant. See <a href="http://www.nynaeve.net/?p=181" rel="nofollow">http://www.nynaeve.net/?p=181</a> (circa 2007): </p>
+<p>&gt; The TlsSlots array in the TEB is a part of every thread, which gives each thread a guaranteed set of 64 thread local storage indexes. Later on, Microsoft decided that 64 was not enough TLS slots to go around and added the TlsExpansionSlots array, for an additional 1024 TLS slots. The TlsExpansionSlots array is demand-allocated in TlsAlloc if the initial set of 64 slots is exceeded.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1252145">
+				<div id="div-comment-1252145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tihiy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252145">
+			June 11, 2016 at 2:09 am</a>		</div>
+
+		<p>I&#8217;m old fart enough to know 64 is original Windows 95 tls index limitation. 80 (64+16) is Windows 98 limitation and 1088 (64+1024) is modern Windows limitation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1252205">
+				<div id="div-comment-1252205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252205">
+			June 13, 2016 at 1:56 am</a>		</div>
+
+		<p>What tool do you use to disassemble and annotate? IDA? Or just windbg and notepad? Or does windbg contain powerful rename and annotate functions?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1252305">
+				<div id="div-comment-1252305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252305">
+			June 13, 2016 at 9:54 am</a>		</div>
+
+		<p>ntsd and notepad.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn even thread-even depth-1 parent" id="comment-1252225">
+				<div id="div-comment-1252225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252225">
+			June 13, 2016 at 2:43 am</a>		</div>
+
+		<p>Actually, I have never understood the importance of system-backed TLS. Why is it better than a user-defined map [thread_id: dictionary], where the dictionary simply maps (thread local) variable names and values?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1252685">
+				<div id="div-comment-1252685" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252685">
+			June 14, 2016 at 2:30 pm</a>		</div>
+
+		<p>@Alex Cohn: After you have made a thread safe dictionary that is fast, all you&#8217;ve done is duplicated the thread local storage api.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-alexcohn even depth-3 parent" id="comment-1252855">
+				<div id="div-comment-1252855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252855">
+			June 16, 2016 at 1:34 am</a>		</div>
+
+		<p>No, there is no need to keep a fast thread safe dictionary. You only need mutex&#8217;ed (actually, a multi-reader, single-writer) table to store per-thread dictionaries. Each of these dictionaries is guaranteed to have single-threaded access.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mike-winterberg odd alt depth-4" id="comment-1252875">
+				<div id="div-comment-1252875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Michael+Winterberg' rel='external nofollow' class='url'>Michael Winterberg</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252875">
+			June 16, 2016 at 5:02 pm</a>		</div>
+
+		<p>TlsGetValue has basically the same execution time as GetCurrentThreadId. Using google benchmark to probably imperfectly measure, on my machine, I get 4ns per call to GetCurrentThreadId() and 5ns for TlsGetValue. Using an SRWLOCK in shared mode to protect a std::map or std::unordered_map, the time roughly triples. concurrency::combinable (as implemented today, a lock free hash map indexed by key) could be close to TlsGetValue, but the modulus in the lookup is brutal, so it&#8217;s about double.</p>
+<p>Since there were / are many libraries that depend on global state and used / use TLS to avoid that, &#8220;implement a lock-free power-of-two hash map in order to get on-par performance in 1993&#8221; (or whenever TlsAlloc was introduced) was probably deemed excessive, especially if the OS is already going to allocate a bunch of thread local state anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-davebacher even depth-2 parent" id="comment-1252706">
+				<div id="div-comment-1252706" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dave+Bacher' rel='external nofollow' class='url'>Dave Bacher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252706">
+			June 14, 2016 at 3:41 pm</a>		</div>
+
+		<p>If you are not using pointers, cleanup is nicer.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-alexcohn odd alt depth-3 parent" id="comment-1252835">
+				<div id="div-comment-1252835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252835">
+			June 16, 2016 at 1:01 am</a>		</div>
+
+		<p>Does TLS get destroyed automatically when a thread is closed?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mike-winterberg even depth-4" id="comment-1252885">
+				<div id="div-comment-1252885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Michael+Winterberg' rel='external nofollow' class='url'>Michael Winterberg</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252885">
+			June 16, 2016 at 5:17 pm</a>		</div>
+
+		<p>&#8220;If you are not using pointers&#8221;, yes (or possibly earlier, when the thread exits). When TLS in Win32 was designed, DllMain was probably viewed as the way to go for cleanup of TLS data with non-trivial cleanup. At least one non-Win32 platform offers &#8220;run this function on thread exit&#8221; to provide cleanup of dynamically allocated TLS data. Windows provides almost identical functionality for fiber local storage.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1252786">
+				<div id="div-comment-1252786" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.andreybazhan.com' rel='external nofollow' class='url'>Andrey Bazhan</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1252786">
+			June 15, 2016 at 1:22 pm</a>		</div>
+
+		<p># command can save you the hassle with s and u commands</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1253065">
+				<div id="div-comment-1253065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1253065">
+			June 17, 2016 at 11:08 am</a>		</div>
+
+		<p>Not sure how # saves any hassle. It is much slower, stops once it hits an invalid page, and gets confused by data in the code segment.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1253115">
+				<div id="div-comment-1253115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.andreybazhan.com' rel='external nofollow' class='url'>Andrey Bazhan</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1253115">
+			June 18, 2016 at 5:12 am</a>		</div>
+
+		<p>Yeah, it&#8217;s true. But when you have like 100 hits it&#8217;s really tedious to do it all manually. So, it got me thinking what could be done about it and here it is:<br />
+.foreach ( Address { s -[1]b 31410000 3151e000 9c 69 50 31 } ) { u Address &#8211; 2 L1 }</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-4" id="comment-1253145">
+				<div id="div-comment-1253145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160610-00/?p=93645#comment-1253145">
+			June 18, 2016 at 4:08 pm</a>		</div>
+
+		<p>If there were 100 hits, I would have scripted it. But there were only six hits.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,636 @@
+<html>
+<head>
+<title>The case of the SRWLock violation in a thread pool work item</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The case of the SRWLock violation in a thread pool work item</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 2, 2018 / year-entry #30</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Application verifier tells the story.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer encountered a failure detected by
+Application Verifier and wanted some assistance
+understanding what happened and how they can fix it.
+</p>
+<p>
+The verifier failure was "invalid SRWLock owner",
+and the failure details were as follows:
+</p>
+<ul>
+<li>Lock = (the address of an SRWLock)</li>
+<li>Local thread ID = (the thread trying to release the lock)</li>
+<li>Owner thread ID = (some thread pool thread)</li>
+<li>Acquire stack trace = (see below)</li>
+</ul>
+<p>
+The acquire stack trace looked like this:
+</p>
+<pre>
+verifier!AVrfpRtlAcquireSRWLockShared+0x5e
+contoso!Microsoft::WRL::Wrappers::SRWLock::LockShared+0x16
+contoso!CDoodad::NotifyListenersAsync+0xb2
+contoso!CDoodad::OnPropertyChanged+0x20a
+contoso!CChannel::ProcessNotification+0x20a
+ntdll!RtlpTpWaitCallback+0x9b
+ntdll!TppExecuteWaitCallback+0x9b
+ntdll!TppDirectExecuteCallback+0xb9
+ntdll!TppWorkerThread+0x497
+kernel32!BaseThreadInitThunk+0x14
+ntdll!RtlUserThreadStart+0x21
+</pre>
+<p>
+The thread pool processed a notification from the channel,
+and the channel handed the property-change notification to the doodad,
+and the doodad took a shared lock so it could notify the listeners.
+</p>
+<p>
+Here's the stack that is trying to release the lock:
+</p>
+<pre>
+ntdll!RtlReportException+0x9d
+verifier!VerifierCaptureContextAndReportStop+0xc0
+verifier!VerifierStopMessageEx+0x750
+verifier!AVrfpVerifySRWLockRelease+0x126
+verifier!AVrfpRtlReleaseSRWLockShared+0x42
+contoso!Microsoft::WRL::Wrappers::Details::SyncLockShared::{dtor}+0x12
+contoso!Doodad::Notifier::`scalar deleting destructor'+0x20
+contoso!Doodad::Notifier::DispatchNotification+0x11a0d
+ntdll!TppWorkpExecuteCallback+0x131
+ntdll!TppWorkerThread+0x43e
+kernel32!BaseThreadInitThunk+0x14
+ntdll!RtlUserThreadStart+0x21
+</pre>
+<p>
+The customer was kind enough to share the code for the classes
+in question.
+Here's what the code is trying to do:
+When the doodad learns from the channel that a property has changed,
+it notifies all the listeners who subscribed to that change.
+To avoid blocking the channel, the code queues a work item to
+deliver the notifications.
+</p>
+<p>
+But there's a race condition:
+What if the doodad is destroyed while the work item is still
+waiting in the thread pool?
+When the work item gets to run on the thread pool,
+it will try to access a freed doodad.
+(You also have this problem if the doodad is destroyed
+while the work item is running.)
+</p>
+<p>
+The code solves this problem like this:
+</p>
+<pre>
+<i>// Code in italics is wrong.
+class Doodad
+{
+ ...
+private:
+  ~Doodad()
+  {
+    auto ensureNoNotifications = m_notifyLock.LockExclusive();
+    ... other cleanup ...
+  }
+
+  class Notifier
+  {
+  public:
+    static void QueueNotification(CDoodad* doodad)
+    {
+      auto notifier = std::make_unique&lt;Notifier&gt;(doodad);
+      if (!QueueUserWorkItem(DispatchNotification, notifier.get(), 0)) {
+        throw some_error();
+      }
+      notifier.release(); // work item owns the Notifier now
+    }
+
+  private:
+    Notifier(CDoodad* doodad) :
+      m_doodad(doodad),
+      m_sharedLock(doodad-&gt;m_notifyLock.LockShared())
+    {
+    }
+
+    static DWORD CALLBACK DispatchNotification(void* parameter)
+    {
+      // ensure that the Notifier gets deleted
+      auto notifier = std::make_unique&lt;Notifier&gt;(
+                        reinterpret_cast&lt;Notifier*&gt;(parameter));
+
+      ... notify the listeners ...
+    }
+
+  private:
+    CDoodad* m_doodad;
+    Microsoft::WRL::Wrappers::SRWLock::SyncLockShared m_sharedLock;
+  };
+
+  void NotifyListenersAsync()
+  {
+    Notifier::QueueNotification();
+  }
+
+  Microsoft::WRL::Wrappers::SRWLock m_srwlock;
+};</i>
+</pre>
+<p>
+In words:
+When we want to notify the listeners,
+we create a <code>Notifier</code> object and queue it onto the thread pool.
+The <code>Notifier</code> object has a reference to the <code>Doodad</code>,
+as well as a shared lock.
+Since a shared lock can be acquired multiple times,
+this means that multiple notifications can be in flight.
+</p>
+<p>
+When the work item is dispatched,
+it notifies all the listeners and then destroys the
+<code>Notifier</code>,
+which in turn releases the shared lock.
+</p>
+<p>
+Finally, when the <code>Doodad</code> is destructed,
+it takes an exclusive lock.
+Since an exclusive lock cannot be acquired while there are still
+any shared locks active,
+this will wait until all of the notification work items have
+been retired.
+That way, no notification will operate on a destroyed <code>Doodad</code>.
+</p>
+<p>
+Do you see the problem?
+</p>
+<p>
+If you know what's good for you,
+you put RAII object that represents a lock on the stack,
+or inside an object whose lifetime is tied to the stack,
+because the lifetime of the lock needs to be tied to the thread.
+</p>
+<p>
+But this code doesn't do what proper deity-fearing code does.
+Instead, it saves the lock in a member variable of an object
+that is not destroyed before the function returns.
+This means that the lifetime of the shared lock is not tied to a thread.
+The shared lock is acquired by the thread that queues the work item,
+and the shared lock is released by the thread that processes the work
+item.
+If you're lucky, they are the same thread and nobody gets hurt.
+But if you're not lucky, then they are different threads,
+and you violated the lock rules and have entered the world of
+undefined behavior.
+</p>
+<p>
+The developer here thought they were being clever by abusing
+the <code>SRWLock</code>,
+but in fact they were getting themselves into trouble.
+</p>
+<p>
+To fix the problem, they switched to a custom synchronization
+object built out of <code>Wait&shy;On&shy;Address</code>.
+</p>
+<pre>
+class Doodad
+{
+ ...
+private:
+  ~Doodad()
+  {
+    <font COLOR=blue><a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180118-00/?p=97825">WaitForValueByAddress</a>(m_notificationCount,
+      [](auto&amp;&amp; value) { return value == 0; });</font>
+    ... other cleanup ...
+  }
+
+  class Notifier
+  {
+  public:
+    static void QueueNotification(CDoodad* doodad)
+    {
+      auto notifier = std::make_unique&lt;Notifier&gt;(doodad);
+      if (!QueueUserWorkItem(DispatchNotification, notifier.get(), 0)) {
+        throw some_error();
+      }
+      notifier.release(); // work item owns the Notifier now
+    }
+
+  private:
+    Notifier(CDoodad* doodad) : m_doodad(doodad)
+    {
+      <font COLOR=blue>InterlockedIncrement(&amp;doodad-&gt;m_notificationCount);</font>
+    }
+
+    <font COLOR=blue>~Notifier()
+    {
+      if (InterlockedDecrement(&amp;doodad-&gt;m_notificationCount) == 0) {
+        WakeByAddressSingle(&amp;doodad-&gt;m_notificationCount);
+      }
+    }
+
+    // Not copyable or movable
+    Notifier(const Notifier&amp;) = delete;
+    Notifier(Notifier&amp;&amp;) = delete;
+    Notifier&amp; operator=(const Notifier&amp;) = delete;
+    Notifier&amp; operator=(Notifier&amp;&amp;) = delete;</font>
+
+    static DWORD CALLBACK DispatchNotification(void* parameter)
+    {
+      // ensure that the Notifier gets deleted
+      auto notifier = std::make_unique&lt;Notifier&gt;(
+                        reinterpret_cast&lt;Notifier*&gt;(parameter));
+
+      ... notify the listeners ...
+    }
+
+  private:
+    CDoodad* m_doodad;
+  };
+
+  void NotifyListenersAsync()
+  {
+    Notifier::QueueNotification();
+  }
+
+  <font COLOR=blue>LONG m_notificationCount = 0;</font>
+};
+</pre>
+<p>
+<code>Wait&shy;On&shy;Address</code>
+requires Windows 8 or higher,
+and the customer was okay with that.
+If the customer needed something that ran on Windows Vista,
+they could have accomplished something similar with a
+condition variable.
+</p>
+<pre>
+class Doodad
+{
+ ...
+private:
+  ~Doodad()
+  {
+    <font COLOR=blue>auto lock = m_notifierLock.LockExclusive();
+    <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180119-00/?p=97845">SleepConditionVariableExclusiveSRWUntil</a>(&amp;m_notifierCV,
+        &amp;m_notifierLock,
+        [](auto&amp;&amp; value) { return value == 0; });</font>
+    ... other cleanup ...
+  }
+
+  class Notifier
+  {
+  public:
+    static void QueueNotification(CDoodad* doodad)
+    {
+      auto notifier = std::make_unique&lt;Notifier&gt;(doodad);
+      if (QueueUserWorkItem(DispatchNotification, this, 0)) {
+        notifier.release(); // work item owns the Notifier now
+      }
+      throw some_error();
+    }
+
+  private:
+    Notifier(CDoodad* doodad) : m_doodad(doodad)
+    {
+      <font COLOR=blue>auto lock = m_doodad-&gt;m_notifierLock.LockExclusive();
+      &amp;doodad-&gt;m_notificationCount++;</font>
+    }
+
+    <font COLOR=blue>~Notifier()
+    {
+      auto lock = m_doodad-&gt;m_notifierLock.LockExclusive();
+      if (--doodad-&gt;m_notificationCount == 0) {
+        WakeConditionVariable(&amp;doodad-&gt;m_notificationCV);
+      }
+    }
+
+    // Not copyable or movable
+    Notifier(const Notifier&amp;) = delete;
+    Notifier(Notifier&amp;&amp;) = delete;
+    Notifier&amp; operator=(const Notifier&amp;) = delete;
+    Notifier&amp; operator=(Notifier&amp;&amp;) = delete;</font>
+
+    static DWORD CALLBACK DispatchNotification(void* parameter)
+    {
+      // ensure that the Notifier gets deleted
+      auto notifier = std::make_unique&lt;Notifier&gt;(
+                        reinterpret_cast&lt;Notifier*&gt;(parameter));
+
+      ... notify the listeners ...
+    }
+
+  private:
+    CDoodad* m_doodad;
+  };
+
+  void NotifyListenersAsync()
+  {
+    Notifier::QueueNotification();
+  }
+
+  <font COLOR=blue>LONG m_notificationCount = 0;
+  Microsoft::WRL::Wrappers::SRWLock m_notificationLock;
+  CONDITION_VARIABLE m_notificationCV = CONDITION_VARIABLE_INIT;</font>
+};
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1323605">
+				<div id="div-comment-1323605" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323605">
+			February 2, 2018 at 7:34 am</a>		</div>
+
+		<p>Why not just allocate a single SRW lock (Microsoft::WRL::Wrappers::SRWLock *)? It seems to me like the real problem is that the lock is copied rather than shared&#8230; Or does WRL do magic to avoid this scenario?</p>
+<p>And I&#8217;ve never understood the zealousness of demanding that the same thread that acquires a lock be the one that releases the lock, especially for a slim lock where you couldn&#8217;t even store data for thread affinity. Where is the contract that enforces that rule for SRW locks? Is it specific to the WRL wrapper (you did say RAII, after all) or part of the base SRWLOCK system?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1323665">
+				<div id="div-comment-1323665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323665">
+			February 2, 2018 at 11:19 am</a>		</div>
+
+		<p>Not sure what your question is asking. There is a single SRW Lock (in the Doodad) that is never copied. The lock <i>guard</i> is moved into a member, and then the guard is released from the wrong thread. Thread affinity is one of the rules of SRWLock.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1323615">
+				<div id="div-comment-1323615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323615">
+			February 2, 2018 at 9:01 am</a>		</div>
+
+		<p>An interesting example of how C++11 (and later) optional restrictions on things like constructors and operators (ie the <b>= delete</b>) bit) can be used to enforce a low-level contract.  It&#8217;s basically RAII on steroids.</p>
+<p>I wonder how many C++ shops have actually left the 20th century and embraced this stuff?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1323806">
+				<div id="div-comment-1323806" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323806">
+			February 5, 2018 at 6:06 am</a>		</div>
+
+		<p>There&#8217;s plenty of 20th century code that works fine without C++11 additions. Moreover, since C++11 came about some time after the turn of the century, 2000 not a particularly good line of demarcation for archaic vs. &#8220;modern&#8221; C++ practices anyways. But to answer the question I think you&#8217;re asking, we adopt features as appropriate and when they&#8217;re available in the compiler that we&#8217;re using, one which has historically been slow at adopting C++ standards, though that&#8217;s changing (can you guess which one it is?), and that compiler choice is dictated / affected by availability of 3rd-party library options that we rely on. Even so, rewriting large portions of the code base to take on C++11 and higher features &#8220;just because&#8221; isn&#8217;t always a practical move either.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1323635">
+				<div id="div-comment-1323635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pm100</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323635">
+			February 2, 2018 at 10:38 am</a>		</div>
+
+		<p>// Code in italics is wrong.</p>
+<p>all the code you give from the customer is in italics. Is that a joke or is it a styling error</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1323685">
+				<div id="div-comment-1323685" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323685">
+			February 2, 2018 at 11:26 am</a>		</div>
+
+		<p>It&#8217;s not uncommon for Raymond to post large sections of code in italics, when the approach the code is taking is wrong.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1323745">
+				<div id="div-comment-1323745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323745">
+			February 2, 2018 at 2:43 pm</a>		</div>
+
+		<p>Probably there&#8217;s not much point showing us the correct bits of code? The focus of this post is &#8220;this is the wrong way to do this, here is the right way&#8221;, so the incorrect parts of the customer code are the parts we need to see.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1323775">
+				<div id="div-comment-1323775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323775">
+			February 3, 2018 at 8:03 am</a>		</div>
+
+		<p>That&#8217;s how it&#8217;s always been. The entire code fragment is marked &#8220;wrong&#8221;, and then we discuss what&#8217;s wrong with it, and then we present a correct (or at least &#8220;less wrong&#8221;) version.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1323785">
+				<div id="div-comment-1323785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323785">
+			February 3, 2018 at 9:48 am</a>		</div>
+
+		<p>Even the code itself says </p>
+<p>// Code in italics is wrong.</p>
+<p>The same with all of the &#8220;bad&#8221; code in this same blog.  It is supposed to prevent people from copying and reusing an example of bad code.  But who knows, the bad code might get copied and reused anyway.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1324546">
+				<div id="div-comment-1324546" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1324546">
+			February 11, 2018 at 7:53 pm</a>		</div>
+
+		<p>Complete with &#8220;// Code in italics is wrong&#8221; comments, no doubt.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1323645">
+				<div id="div-comment-1323645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323645">
+			February 2, 2018 at 11:06 am</a>		</div>
+
+		<p>Personally, I like locks that don&#8217;t have the &#8220;must be released on same thread&#8221; rule.</p>
+<p>From time to time you really do want to lock an object and move it&#8217;s ownership to another thread.</p>
+<p>On the other hand, for reference counting I don&#8217;t lock at all. I directly use InterlockedIncrement and InterlockedDecrement and the guy who sees InterlockedDecrement return zero is the guy who frees the object.</p>
+<p>I haven&#8217;t been able to work out what the shared lock is actually protecting. Maybe it&#8217;s in code not present in the example.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1323655">
+				<div id="div-comment-1323655" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323655">
+			February 2, 2018 at 11:16 am</a>		</div>
+
+		<p>What you&#8217;ve got there my friend is a semaphore. (Also, the shared lock is protecting destruction of the Doodad.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1323675">
+				<div id="div-comment-1323675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323675">
+			February 2, 2018 at 11:23 am</a>		</div>
+
+		<p>The same problem exists in .NET or Java too where locks also have an owner. </p>
+<p>The only use case for that is to enable recursive locking, i.e. if the thread that owns the lock tries to acquire it out succeeds and increases a lock count instead of causing a deadlock.</p>
+<p>While this sounds like a clever idea on first glance the repercussions are enormous.<br />
+&#8211; Any kind of asynchronous code can&#8217;t work with it.<br />
+&#8211; It&#8217;s  inefficient to drag that amount of extra data with you and support efficient recursive locking (look at the lengths to which HotSpot goes)<br />
+&#8211; But by far the worst: it leads to really, really bad designs. If you&#8217;re writing concurrent code where you don&#8217;t know what locks you&#8217;re holding you have a big design problem. Or as in this case you don&#8217;t have a sane lifetime for your objects and have to come up with workarounds. </p>
+<p>We&#8217;d be much better off if they weren&#8217;t the default but alas too late.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1323695">
+				<div id="div-comment-1323695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323695">
+			February 2, 2018 at 11:32 am</a>		</div>
+
+		<p>Doodads!  We need more doodads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1323825">
+				<div id="div-comment-1323825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323825">
+			February 5, 2018 at 8:40 am</a>		</div>
+
+		<p>Synchronization in a destructor is usually a bad idea.   Might work in this case, as long as there&#8217;s no classes that derive from doodad, but a better solution is to use a reference count.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1323945">
+				<div id="div-comment-1323945" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180202-00/?p=97955#comment-1323945">
+			February 5, 2018 at 10:22 am</a>		</div>
+
+		<p>True, but that would require the doodad to have an independent lifetime, which means a separate heap allocation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

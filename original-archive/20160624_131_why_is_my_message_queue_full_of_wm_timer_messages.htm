@@ -1,0 +1,502 @@
+<html>
+<head>
+<title>Why is my message queue full of WM_TIMER messages?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why is my message queue full of WM_TIMER messages?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 24, 2016 / year-entry #132</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>18</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Where do timer messages come from, anyway?</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Dmitry wondered
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/05/23/10420741.aspx#10420954">
+how it's possible for a lot of auto-generated messages to pile up in
+the message queue</a>.
+I remarked,
+"That's a good question, and I didn't provide all the information necessary
+to answer it.
+Answering it will take more than two sentences, so I will toss it onto
+the topic queue."
+</p>
+<p>
+One of my colleagues wrote to me and said,
+"Hey, could you bump up the priority of that topic?
+I happen to have a bug where COM calls are failing because
+the message queue is full.
+I wrote some diagnostic code to drain the message queue to see
+what was in it, and it was full of
+unprocessed <code>WM_<wbr>TIMER</code> messages.
+There were 53 timers running at 16ms each,
+and the UI thread stopped processing messages for 9 seconds."
+</p>
+<p>
+Back when
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/06/05/10423678.aspx">
+I explained how asynchronous input worked</a>,
+I didn't talk about where auto-generated messages came from.
+</p>
+<p>
+If a request for a message is about to say,
+"Nope, no matching messages,"
+the window manager makes one last check:
+"Is there an auto-generated message that could satisfy this request?"
+If so, then it generates the message,
+and hey look, there's a message!
+</p>
+<p>
+The catch is that auto-generated messages are grouped together.
+For example, if you ask for any kind of mouse message,
+and there is an auto-generated <code>WM_<wbr>MOUSE&shy;MOVE</code>
+available,
+then the window manager will generate a
+<code>WM_<wbr>MOUSE&shy;MOVE</code> and then check if that matches
+the filter you provided.
+The auto-generation is done this way so that message ordering is preserved
+within a group.
+You wouldn't want a mouse-up to be generated before the corresponding
+mouse-down.
+</p>
+<p>
+The message groups can be see in functions like
+<code>Get&shy;Queue&shy;Status</code>
+and
+the
+<code>PM_<wbr>QS_*</code> flags to
+<code>Peek&shy;Message</code>.
+</p>
+<p>
+Okay, now we're getting closer to seeing how
+auto-generated messages can pile up:
+If you are filtering for a message,
+and there is an auto-generated message from the same group,
+but which doesn't match your filter,
+then the window manager will auto-generate the message,
+and then go back and re-run the "Find a message" code,
+which sees the auto-generated message but says,
+"Nope, I'm not interested in that message."
+</p>
+<p>
+Another piece of the puzzle is understanding the timer group.
+There are two messages in the timer group.
+One is your friend and mine,
+<code>WM_<wbr>TIMER</code>.
+The other is an undocumented internal message known as
+<code>WM_<wbr>SYS&shy;TIMER</code>.
+This is an alternate universe of timers used by the system
+to manage system things,
+like the animated concentric circles in the
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms645601(v=vs.85).aspx#_win32_Mouse_Sonar">
+Mouse Sonar</a>
+feature,
+deciding when to time out the system tooltips
+(like the one that appears when you hover over the &times; button),
+driving autorepeat when you click on the scroll bar,
+and blinking the caret in an edit control.
+</p>
+<p>
+The final piece of the puzzle is the COM modal message loop.
+This is the message loop used by COM when you call a method on
+an STA
+that needs to be marshaled.
+COM notifies the destination thread that it needs to run some code,
+and then it enters a modal message loop waiting for the destination
+thread to reply,
+"Okay, I'm done.
+Here's the answer."
+</p>
+<p>
+The COM message loop is a complicated beast,
+most likely the result of over twenty years of evolution
+rather than having been designed that way from the beginning.
+One of the things that it does is peek <code>WM_<wbr>SYS&shy;TIMER</code>
+messages.
+Another thing that it does is dispatch timer messages,
+provided you passed the
+<code>COWAIT_<wbr>DISPATCH_<wbr>WINDOW_<wbr>MESSAGES</code> flag.
+</p>
+<p>
+Okay, here comes the wild ride.
+</p>
+<p>
+COM wants to process
+<code>WM_<wbr>SYS&shy;TIMER</code> messages,
+but not
+<code>WM_<wbr>TIMER</code> messages.
+It therefore does a
+<code>Peek&shy;Message(<wbr>&amp;msg, nullptr,
+WM_<wbr>SYS&shy;TIMER,
+WM_<wbr>SYS&shy;TIMER,
+PM_<wbr>REMOVE)</code>.
+If there is a
+<code>WM_<wbr>SYS&shy;TIMER</code> message due,
+then the window manager generates the
+<code>WM_<wbr>SYS&shy;TIMER</code> message on the fly,
+puts it in the queue,
+and the
+<code>Peek&shy;Message</code> function returns it.
+That's the good case.
+</p>
+<p>
+Another good case is that there is neither a
+<code>WM_<wbr>SYS&shy;TIMER</code> message
+nor a
+<code>WM_<wbr>TIMER</code> message due.
+In that case, the window manager generates nothing,
+and the <code>Peek&shy;Message</code> function returns
+"Sorry, I didn't find anything."
+</p>
+<p>
+The bad case is where there is no
+<code>WM_<wbr>SYS&shy;TIMER</code> message
+due,
+<i>but there is a
+<code>WM_<wbr>TIMER</code> message due</i>.
+In that case, the window manager generates the
+<code>WM_<wbr>TIMER</code> message
+on the fly and puts it in the queue.
+But the <code>Peek&shy;Message</code> function ignores
+that message
+because it's interested only in
+<code>WM_<wbr>SYS&shy;TIMER</code> messages.
+</p>
+<p>
+Result: A <code>WM_<wbr>TIMER</code> message got
+generated and dumped into the queue.
+</p>
+<p>
+Every time a <code>WM_<wbr>TIMER</code> comes due,
+another
+<code>WM_<wbr>TIMER</code> message gets generated
+and added to the queue.
+Eventually, your queue fills up with
+<code>WM_<wbr>TIMER</code> messages.
+</p>
+<p>
+My colleague replied,
+"Thanks for the explanation.
+Of course, it's COM, the Bermuda triangle of Win32!"</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (18)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1253745">
+				<div id="div-comment-1253745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pm100</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253745">
+			June 24, 2016 at 8:39 am</a>		</div>
+
+		<p>so whats the solution?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip odd alt depth-2 parent" id="comment-1253775">
+				<div id="div-comment-1253775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253775">
+			June 24, 2016 at 10:21 am</a>		</div>
+
+		<p>Be careful when doing message queue operations with filters, and make sure that your message loop is written in a way to handle this.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1253795">
+				<div id="div-comment-1253795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253795">
+			June 24, 2016 at 11:59 am</a>		</div>
+
+		<p>But if I&#8217;m reading this correctly (and I may not be), the core of COM has a message loop that *doesn&#8217;t* handle this. So you&#8217;re just stuck if you need to use COM?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip odd alt depth-4" id="comment-1253805">
+				<div id="div-comment-1253805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253805">
+			June 24, 2016 at 2:44 pm</a>		</div>
+
+		<p>Yes, but for a GUI application, you should always have a message loop that isn&#8217;t filtered for your window anyway.<br />
+The thing that you must remember is that the COM message loop only runs for marshalling, so when the COM object has finished the marshalling of data between compartments then it will exit the loop. So the reason why it isn&#8217;t seen as much of a problem is that the main window loop will start handling the messages as soon as it starts running again.<br />
+The issue only becomes a real problem if there are lots of timers triggering at once because the COM serialisation is keeping the message queue busy.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip even depth-4" id="comment-1253815">
+				<div id="div-comment-1253815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253815">
+			June 24, 2016 at 2:46 pm</a>		</div>
+
+		<p>Oh, and one solution if you are having problems because of the COM Bermuda Triangle is to use other threads if you can, but this gets quite problematic.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip odd alt depth-4 parent" id="comment-1253825">
+				<div id="div-comment-1253825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253825">
+			June 24, 2016 at 3:43 pm</a>		</div>
+
+		<p>OK, after thinking about it a bit and realising my daftness, I&#8217;ll try this again. Sometimes I wish I could delete comments.<br />
+There is only one major cause for this, and that is a filtered message loop is running to long.<br />
+But there are actually two ways for a filtered message loop running to long to actually happen. The first is you are only writing filtered message loops in your code. The obvious solution is to make sure that one, preferably the one used to handle the window messages, is completely unfiltered. So that is GetMessage(&amp;msg, nullptr, 0, 0);.<br />
+The second is to keep the unfiltered message loop from running long enough to allow the message queue to saturate. I admit, I kinda forgot about this for a while, hence the daftness. In this case, if you can, try to move the COM related code onto a separate thread. The message loop will then have to run on that other thread and so your main thread. But this can get complicated. But the important thing here is that since you have two threads with two message loops and two message queues, there shouldn&#8217;t be any risk of one interfering with the other. You can also communicate back and forth with thread/windows messages too.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip even depth-5" id="comment-1253835">
+				<div id="div-comment-1253835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253835">
+			June 24, 2016 at 3:46 pm</a>		</div>
+
+		<p>&#8220;The message loop will then have to run on that other thread and so your main thread.&#8221;<br />
+Meh, I was going well this time too. I thought about that sentence, decided to split it up, and then forgot to delete a part of it. This should be:<br />
+&#8220;The message loop will then have to run on that other thread.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1253765">
+				<div id="div-comment-1253765" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://english.rejbrand.se' rel='external nofollow' class='url'>Andreas Rejbrand</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253765">
+			June 24, 2016 at 9:06 am</a>		</div>
+
+		<p>Trevligt med ett inlägg även på midsommarafton!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1253785">
+				<div id="div-comment-1253785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253785">
+			June 24, 2016 at 10:58 am</a>		</div>
+
+		<p>Kiiiiiiiiiiiiiiiiiiiinda sounds like one should think very carefully before filtering at all&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1253845">
+				<div id="div-comment-1253845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253845">
+			June 24, 2016 at 3:53 pm</a>		</div>
+
+		<p>Question: What is the maximum number of timers I can use?<br />
+Answer: If you are asking this question, you are using too many!</p>
+<p>Using modal message loops for marshaling may or may not be a good design, but firing 53 timers at a 16 ms. (60 Hz.) frequency is crazy. My psychical powers tell me they are related to some kind of UI update (60 Hz. is often considered the optimal speed for animations), and you can easily use a single timer to trigger 53 animations instead of having to send a single message for every item you need to update.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1253855">
+				<div id="div-comment-1253855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Waleri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253855">
+			June 24, 2016 at 11:46 pm</a>		</div>
+
+		<p>I&#8217;ve always wondered, why this message filtering is needed anyway&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-hardon odd alt thread-odd thread-alt depth-1" id="comment-1253885">
+				<div id="div-comment-1253885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/gdalsnes' rel='external nofollow' class='url'>gdalsnes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253885">
+			June 26, 2016 at 9:46 am</a>		</div>
+
+		<p>Isn&#8217;t it an equally bad case where there is a WM_SYS­TIMER due and a WM_TIMER due? So it doesn&#8217;t really matter if there is a WM_SYS­TIMER due or not? But I guess this could all be solved with a new flag to disable message group generation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1253905">
+				<div id="div-comment-1253905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253905">
+			June 26, 2016 at 6:38 pm</a>		</div>
+
+		<p>Would it be better if we change those 53 timers into Waitable Timer / Timer Queue instead to evade the problem? Is there any drawback?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1253915">
+				<div id="div-comment-1253915" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253915">
+			June 27, 2016 at 12:28 am</a>		</div>
+
+		<p>Solution: Remove COM from windows.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip even depth-2" id="comment-1253916">
+				<div id="div-comment-1253916" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253916">
+			June 27, 2016 at 3:02 am</a>		</div>
+
+		<p>The problem is, a lot of APIs like DirectX would have to be re-implemented, and that would break a lot of things in Windows. Is that really worth the cost here?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1253935">
+				<div id="div-comment-1253935" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Engywuck</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253935">
+			June 27, 2016 at 6:53 am</a>		</div>
+
+		<p>if you want to remove COM you must know a way to replace it. But don&#8217;t forget such small details like network-transparency, apartments, language-agnosticism, etc..<br />
+Oh, and of course you should provide a way to be backwards-compatible with (nearly) all programs written with or relying on COM in the last 25 years.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1254015">
+				<div id="div-comment-1254015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1254015">
+			June 27, 2016 at 11:33 am</a>		</div>
+
+		<p>Better solution: restore the old restricted COM used by Win95 so that you don&#8217;t load the whole corrupt edifice for common dialog boxes and don&#8217;t use it at all elsewhere.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1253995">
+				<div id="div-comment-1253995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://programmerman.net/' rel='external nofollow' class='url'>Nick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160624-00/?p=93745#comment-1253995">
+			June 27, 2016 at 10:49 am</a>		</div>
+
+		<p>I laughed out loud</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

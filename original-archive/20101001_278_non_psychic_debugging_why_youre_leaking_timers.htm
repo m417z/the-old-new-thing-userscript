@@ -1,0 +1,518 @@
+<html>
+<head>
+<title>Non-psychic debugging: Why you're leaking timers</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Non-psychic debugging: Why you&#8217;re leaking timers</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 1, 2010 / year-entry #279</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>22</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">I was not involved in this debugging puzzle, but I was informed of its conclusions, and I think it illustrates both the process of debugging as well as uncovering a common type of defect. I've written it up in the style of a post-mortem. A user reported that if they press and hold the F2...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+I was not involved in this debugging puzzle,
+but I was informed of its conclusions,
+and I think it illustrates both the process of debugging
+as well as uncovering a common type of defect.
+I've written it up in the style of a post-mortem.
+</p>
+<blockquote CLASS=m>
+<p>
+A user reported that if they press and hold the F2 key
+for about a minute,
+our program eventually stops working.
+According to Task Manager, our User object count has reached
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/07/18/3926581.aspx">
+the 10,000 object limit</a>,
+and closer inspection revealed that we had created over 9000 timer
+objects.
+</p>
+<p>
+We ran the debugger and
+set breakpoints on <code>SetTimer</code> and <code>KillTimer</code>
+to print to the debugger each timer ID as it was created and destroyed.
+Visual inspection of the output revealed that all but one of the IDs
+being created was matched with an appropriate destruction.
+We re-ran the scenario with a conditional breakpoint on
+<code>SetTimer</code> set to fire when that bad ID was set.
+It didn't take long for that breakpoint to fire,
+and we discovered that we were setting the timer against a
+<code>NULL</code> window handle.
+</p>
+<p>
+A different developer on the team arrived at the same
+conclusion by a different route.
+Instead of watching timers being created and destroyed,
+the developer dumped each timer message before it was dispatched
+and observed that most of the
+entries were associated with <code>NULL</code> window handles.
+</p>
+<p>
+Two independent analyses came to the same conclusion:
+We were creating a bunch of thread timers and not destroying them.
+</p>
+<p>
+A closer inspection of the code revealed that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/10/16/9001218.aspx">
+thread timers were not intended in the first place</a>.
+Each time the user presses F2,
+the code calls <code>SetTimer</code> and passes a window handle
+it believes to be non-<code>NULL</code>.
+The timer is destroyed
+in the window procedure's <code>WM_TIMER</code> handler, but
+since the timer was registered against the wrong window handle,
+the <code>WM_TIMER</code> is never received by the intended
+target's window procedure,
+and the timer is never destroyed.
+</p>
+<p>
+The window handle is <code>NULL</code> due to a defect in the code
+which handles the F2 keypress:
+The handle that the code wanted to use
+for the timer had not yet been set.
+(It was set by a later step of F2 processing.)
+The timer was being set by a helper function which is called both
+before and after the code that sets the handle, but it obviously was
+written on the assumption that it would only be called after.
+</p>
+<p>
+To reduce the likelihood of this type of defect being introduced
+in the future,
+we're going to introduce a wrapper function around <code>SetTimer</code>
+which asserts that the window handle is non-<code>NULL</code> before
+calling <code>SetTimer</code>.
+(In the rare case that we actually want a thread timer,
+we'll have a second wrapper function called
+<code>SetThreadTimer</code>.)
+</p>
+</blockquote>
+<p>
+I haven't seen the wrapper function, but I suspect it goes
+something like this:
+</p>
+<pre>
+inline UINT_PTR SetWindowTimer(
+    __in HWND hWnd, // NB - not optional
+    __in UINT_PTR nIDEvent,
+    __in UINT uElapse,
+    __in_opt TIMERPROC lpTimerFunc)
+{
+    assert(hWnd != NULL);
+    return SetTimer(hWnd, nIDEvent, uElapse, lpTimerFunc);
+}
+
+inline UINT_PTR SetThreadTimer(
+    __in UINT uElapse,
+    __in_opt TIMERPROC lpTimerFunc)
+{
+    return SetTimer(NULL, 0, uElapse, lpTimerFunc);
+}
+
+__declspec(deprecated)
+WINUSERAPI
+UINT_PTR
+WINAPI
+SetTimer(
+    __in_opt HWND hWnd,
+    __in UINT_PTR nIDEvent,
+    __in UINT uElapse,
+    __in_opt TIMERPROC lpTimerFunc);
+</pre>
+<p>
+There are few interesting things here.
+</p>
+<p>
+First, observe that the annotation for the first parameter to
+<code>SetWindowTimer</code> is <code>__in</code> rather than
+<code>__in_opt</code>. This indicates that the parameter
+cannot be <code>NULL</code>.
+Code analysis tools can use this information to attempt to identify
+potential defects.
+</p>
+<p>
+Second, observe that the <code>SetThreadTimer</code> wrapper
+function omits the first two parameters.
+For thread timers, the <code>hWnd</code> passed to
+<code>SetTimer</code> is always <code>NULL</code> and the
+<code>nIDEvent</code> is ignored.
+</p>
+<p>
+Third, after the two wrapper functions, we redeclare
+the <code>SetTimer</code>, but mark it as <code>deprecated</code>
+so the compiler will complain if somebody tries to call the
+original function instead of one of the two wrappers.
+(The <code>__declspec(deprecated)</code> extended attribute
+is a nonstandard Microsoft extension.)
+</p>
+<p>
+<b>Exercise</b>:
+Why did I use <code>__declspec(deprecated)</code> instead of
+<code>#pragma deprecated(SetTimer)</code>?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (22)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-864683">
+				<div id="div-comment-864683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864683">
+			October 1, 2010 at 7:28 am</a>		</div>
+
+		<p>The API they ended with is what the API should have been since the beginning &#8211; no magic values selecting a different magic meaning, and each function doing just one thing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-864703">
+				<div id="div-comment-864703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henning Makholm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864703">
+			October 1, 2010 at 8:01 am</a>		</div>
+
+		<p>&quot;Why did I use __declspec(deprecated) instead of #pragma deprecated(SetTimer)?&quot;</p>
+<p>Not being psychic, I can only guess: It must have something to do with the fact that __declspec is much better suited for preprocessor tricks that you might need in order to push the code through different compilers, analysis tools, and the like.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-864713">
+				<div id="div-comment-864713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Saveddijon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864713">
+			October 1, 2010 at 8:06 am</a>		</div>
+
+		<p>What I&#39;d like to know: given the application in question, would it be reasonable for a user to hold down the F2 key for an entire minute? How was this even discovered? (Perhaps it is reasonable; I don&#39;t know what this application is, or what it does. If it&#39;s a racing car game where F2 maps to the gas pedal then maybe it&#39;s very reasonable to have it pressed for a full minute.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-864753">
+				<div id="div-comment-864753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Taylor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864753">
+			October 1, 2010 at 8:30 am</a>		</div>
+
+		<p>&quot;Why did I use __declspec(deprecated) instead of #pragma deprecated(SetTimer)&quot;</p>
+<p>I prefer the using __declspec(deprecated) because you have the option to provide a message to the developer informing them of the alternate API functions. But it does not seem that you are taking advantage of that in this case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-864763">
+				<div id="div-comment-864763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Taylor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864763">
+			October 1, 2010 at 8:34 am</a>		</div>
+
+		<p>Ah, it just came to me. Using the pragma would mark all overloads deprecated which might be a problem if other libraries or utility functions provide a function with the same name but different signature.</p>
+<div class="post">[<i>True, but there&#39;s another reason which is probably more likely&#8230; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-864813">
+				<div id="div-comment-864813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">A Guy Somewhere Cold</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864813">
+			October 1, 2010 at 8:54 am</a>		</div>
+
+		<p>@Saveddjion: Thorough application testing means not only testing the expected code paths, but the unexpected ones. Users can do some really bizarre things for reasons you might never have expected, and I think it would be rather arrogant to suggest that a given bug is a user&#39;s fault because they were using the application wrong.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-864853">
+				<div id="div-comment-864853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kujo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864853">
+			October 1, 2010 at 9:20 am</a>		</div>
+
+		<p>The pragma doesn&#39;t care about type or scope, so referencing Foo::SetTimer() or enum { SetTimer } will be considered deprecated.</p>
+<div class="post">[<i>That&#39;s what I was looking for. A lot of classes have a method called SetTimer. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-864883">
+				<div id="div-comment-864883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864883">
+			October 1, 2010 at 9:50 am</a>		</div>
+
+		<p>It&#39;s over 9000&#8230;!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-864893">
+				<div id="div-comment-864893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PhiSmi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864893">
+			October 1, 2010 at 10:33 am</a>		</div>
+
+		<p>The F2 for a whole minute is not very relevant. Every F2 press/repeat is going to leak a timer resource. It just took a minute to exhaust them all. Don&#39;t get distracted by how the problem was discovered; the problem is valid and ought to be resolved. If the application ran for a long time the F2 will eventually be pressed enough times.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-864903">
+				<div id="div-comment-864903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Timothy Byrd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864903">
+			October 1, 2010 at 11:10 am</a>		</div>
+
+		<p>PhiSmi&#39;s answer is better, but I was going to say that having the corner of a book or notebook accidentally hold a key down is not unheard of in my experience.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-864963">
+				<div id="div-comment-864963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864963">
+			October 1, 2010 at 2:55 pm</a>		</div>
+
+		<p>Why no IsWindow in the assert?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk odd alt thread-odd thread-alt depth-1" id="comment-864823">
+				<div id="div-comment-864823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864823">
+			October 1, 2010 at 8:56 am</a>		</div>
+
+		<p>Don&#39;t press and hold the F2 key for a whole minute! &nbsp;(Although it might be appropriate, in the context of the program.)</p>
+<p>Doctor, it hurts when I do *this*. &nbsp;&quot;Then, don&#39;t do that.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk even thread-even depth-1" id="comment-864983">
+				<div id="div-comment-864983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864983">
+			October 1, 2010 at 4:03 pm</a>		</div>
+
+		<p>Ah, yes, a book on the keyboard could certainly cause that problem. &nbsp;Or a cat, which happens at my house often enough. &nbsp;Once, our cat bought an expensive piece of art from EBay. &nbsp;My partner learned not to leave the screen up with the &quot;buy now&quot; button visible and leave the computer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-864993">
+				<div id="div-comment-864993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-864993">
+			October 2, 2010 at 3:25 am</a>		</div>
+
+		<blockquote><p>
+  Code analysis tools can use this information to attempt to identify potential defects.
+</p></blockquote>
+<p>Unfortunately PREfast&#39;s ability to detect use of NULL pointers isn&#39;t very good, and conversly it produces large numbers of false positives for these, so I wouldn&#39;t rely on this.</p>
+<blockquote><p>
+  assert(hWnd != NULL);
+</p></blockquote>
+<p>&#8230; which will only work in the non-release version of the code, thus making it anything from &quot;completely useless&quot; through to &quot;only marginally effective&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-865003">
+				<div id="div-comment-865003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-865003">
+			October 2, 2010 at 3:31 am</a>		</div>
+
+		<p>(In the rare case that we actually want a thread timer, we&#39;ll have a second wrapper function called SetThreadTimer.)</p>
+<p>SetThreadTimer will still need the nIDEvent parameter in case you need to reset an existing timer. (Or create a ResetThreadTimer wrapper&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-865033">
+				<div id="div-comment-865033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Steward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-865033">
+			October 2, 2010 at 11:56 am</a>		</div>
+
+		<p>Dave: why on earth would you turn a resource leak into a fatal error on a release product? &nbsp;If passing a null value will cause serious problems during normal usage, don&#39;t use an assert.</p>
+<p>asf: IsWindow is not thread safe, and you&#39;re more likely to pass a valid (but wrong) handle than a non-existent one. &nbsp;At best, you&#39;d catch a corrupt variable just before SetTimer does.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-865273">
+				<div id="div-comment-865273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-865273">
+			October 4, 2010 at 9:36 am</a>		</div>
+
+		<p>While it&#39;s certainly an interesting question as to how they discovered that holding down F2 for a minute makes the app stop working , you really have to ask why nobody noticed that the timer wasn&#39;t working! I&#39;m sure the test plan is much more likely to include &quot;Press F2. Verify that X happens after Y seconds.&quot; than &quot;Hold down F2 for 1 minute. Verify app still works.&quot;!</p>
+<div class="post">[<i>My guess (total guess) is that the &quot;set up the F2 timer&quot; function was called a second redundant time, at which point the handle was valid and the timer ran as expected. The only consequence was the leaked timer from the first call. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-866053">
+				<div id="div-comment-866053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tergiver</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-866053">
+			October 6, 2010 at 5:08 pm</a>		</div>
+
+		<p>The other flaw that is missed in the analysis is that the developer used the WM_KEYDOWN event to trigger an action (which is subject to repeat), rather than WM_KEYUP which is the &#39;more correct&#39; choice. Mouse/Key down is for predicate to an action (e.g. selection), up is where actions should trigger.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-866083">
+				<div id="div-comment-866083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-866083">
+			October 6, 2010 at 11:41 pm</a>		</div>
+
+		<p>Tergiver: I can&#39;t think of any key action that triggers on WM_KEYUP instead of WM_KEYDOWN. Can you name some?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-866153">
+				<div id="div-comment-866153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tergiver</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-866153">
+			October 7, 2010 at 7:36 am</a>		</div>
+
+		<p>Frankly, I think most programmers simply get it wrong. The only case that comes easily to mind where it is correct is Shift+F10 (or the context menu key). Of course this only works correctly if the programmer responds to WM_CONTEXTMENU instead of WM_RBUTTONUP (or if you&#39;re really green you think it should be WM_RBUTTONDOWN). WM_CONTEXTMENU is fired on WM_KEYUP (I believe TranslateMessage does the job of sending WM_CONTEXTMENU).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm even thread-even depth-1" id="comment-866243">
+				<div id="div-comment-866243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-866243">
+			October 7, 2010 at 10:39 am</a>		</div>
+
+		<p>Tergiver, it&#39;s only &quot;wrong&quot; if you don&#39;t want key repeat to trigger the action multiple times.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-866253">
+				<div id="div-comment-866253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tergiver</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101001-00/?p=12663#comment-866253">
+			October 7, 2010 at 10:55 am</a>		</div>
+
+		<p>Which is what I said the first time: &quot;trigger an action (which is subject to repeat)&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

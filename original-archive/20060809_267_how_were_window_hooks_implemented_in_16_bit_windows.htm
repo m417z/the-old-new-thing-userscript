@@ -1,0 +1,519 @@
+<html>
+<head>
+<title>How were window hooks implemented in 16-bit Windows?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How were window hooks implemented in 16-bit Windows?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 9, 2006 / year-entry #268</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The mechanism for keeping track of window hooks was very different in 16-bit Windows. The functions involved were SetWindowsHook, UnhookWindowsHook and DefHookProc. The first two functions still exist today, but the third one has been replaced with a macro: // 16-bit prototype DWORD WINAPI DefHookProc(int nCode, WPARAM wParam, LPARAM lParam, HHOOK FAR *phk); // 32-bit...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The mechanism for keeping track of window hooks was very
+different in 16-bit Windows.
+The functions involved were <code>SetWindowsHook</code>,
+<code>UnhookWindowsHook</code>
+and <code>DefHookProc</code>.
+The first two functions still exist today, but the third one has
+been replaced with a macro:
+</p>
+<pre>
+// 16-bit prototype
+DWORD WINAPI DefHookProc(int nCode, WPARAM wParam,
+                         LPARAM lParam, HHOOK FAR *phk);
+
+// 32-bit macro
+#define DefHookProc(nCode, wParam, lParam, phhk)\
+        CallNextHookEx(*phhk, nCode, wParam, lParam)
+</pre>
+<p>
+Disclaimer: All code below is "reconstructed from memory".
+The spirit of the code is intact, but the precise details
+may be off.
+</p>
+<p>
+To install a windows hook in 16-bit Windows, you started by
+calling <code>SetWindowsHook</code>:
+</p>
+<pre>
+HHOOK g_hhkPrev;
+
+g_hhkPrev = SetWindowsHook(WH_WHATEVER, MyHookProc);
+</pre>
+<p>
+The return value from <code>SetWindowsHook</code> must be saved
+in a global variable, which we gave the somewhat provocative
+name <code>g_hhkPrev</code>.
+The hook procedure itself went something like this:
+</p>
+<pre>
+// In Win16, hook procedures returned a DWORD, not an LRESULT.
+DWORD CALLBACK MyHookProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+  if (nCode &gt;= 0) { ... }
+  return DefHookProc(nCode, wParam, lParam, &amp;g_hhkPrev);
+}
+</pre>
+<p>
+And then when you were finished, you removed the hook by
+calling <code>UnhookWindowsHook</code>:
+</p>
+<pre>
+UnhookWindowsHook(WH_WHATEVER, MyhookProc);
+g_hhkPrev = NULL;
+</pre>
+<p>
+Internally, the chain of hook functions was managed as
+a linked list, but instead of using some internal data structure
+to keep track of the hooks, the linked list was managed
+<strong>inside the HHOOK variables themselves</strong>.
+</p>
+<p>
+The internal implementation of <code>SetWindowsHook</code>
+was simply this:
+</p>
+<pre>
+// This array is initialized with a bunch
+// of "do nothing" hook procedures.
+HOOKPROC g_rgHook[NUMHOOKS];
+
+HHOOK WINAPI SetWindowsHook(int nType, HOOKPROC pfnHookProc)
+{
+ HHOOK hhkPrev = (HHOOK)g_rgHook[nType];
+ g_rgHook[nType] = pfnHookProc;
+ return hhkPrev;
+}
+</pre>
+<p>
+Installing a hook merely set your hook procedure as the head of
+the hook chain, and it returned the previous head.
+Invoking a hook was a simple matter of calling the hook at the
+head of the chain:
+</p>
+<pre>
+DWORD CallHook(int nType, int nCode, WPARAM wParam, LPARAM lParam)
+{
+ return g_rgHook[nType](nCode, wParam, lParam);
+}
+</pre>
+<p>
+Each hook procedure did its work and then sent the call
+down the hook chain by calling <code>DefHookProc</code>,
+passing the <code>HHOOK</code> <strong>by address</strong>.
+</p>
+<pre>
+DWORD WINAPI DefHookProc(int nCode, WPARAM wParam,
+                         LPARAM lParam, HHOOK FAR *phk)
+{
+ HOOKPROC pfnNext = (HOOKPROC)*phk;
+ if (nCode &gt;=0) {
+  return pfnNext(nCode, wParam, lParam);
+ }
+ ... more to come ...
+}
+</pre>
+<p>
+As you can see, it's all blindingly simple:
+Invoking a hook calls the first hook procedure,
+which then calls <code>DefHookProc</code>, which
+knows that a <code>HHOOK</code>
+is just a <code>HOOKPROC</code>, and it forwards the call down
+the chain by merely calling the next hook procedure directly.
+</p>
+<p>
+The real magic happens when somebody wants to unhook.
+Recall that the rule for hook procedures is that a negative
+hook code should be passed straight to <code>DefHookProc</code>
+(or in modern times, <code>CallNextHookEx</code>).
+This convention allows the hook system to use negative codes
+to manage its own internal bookkeeping.
+In this case, we're using <code>-1</code> as the
+"unhook this hook procedure" code.
+</p>
+<pre>
+BOOL WINAPI UnhookWindowsHook(int nType, HOOKPROC pfnHookProc)
+{
+ return DefHookProc(-1, 0, (LPARAM)pfnHookProc,
+                    (HHOOK FAR*)&amp;g_rgHook[nType]);
+}
+</pre>
+<p>And then the real magic begins:
+</p>
+<pre>
+DWORD WINAPI DefHookProc(int nCode, WPARAM wParam,
+                         LPARAM lParam, HHOOK FAR *phk)
+{
+ HOOKPROC pfnNext = (HOOKPROC)*phk;
+ if (nCode &gt;=0) {
+  return pfnNext(nCode, wParam, lParam);
+ }
+ switch (nCode) {
+ case -1: // trying to unhook a node
+  if (pfnNext == (HOOKPROC)lParam) { // found it
+   *phk = (HHOOK)pfnNext(-2, 0, 0);
+   return TRUE;
+  }
+  // else keep looking
+  return pfnNext(nCode, wParam, lParam);
+
+ case -2: // report the next hook procedure
+   return (DWORD)*phk;
+ }
+ return 0;
+}
+</pre>
+<p>
+And there you have it, the entire window hook system in
+two dozen lines of code.
+You have to give 16-bit Windows credit for being small.
+</p>
+<p>
+Let's walk through hook installation, dispatch, and removal to see
+how this all works.
+Suppose there is one <code>WH_KEYBOARD</code> hook in the system.
+Our variables are therefore set up like this:
+</p>
+<pre>
+// In USER
+g_rgHook[WH_KEYBOARD] = Hook1;
+
+// In HOOK1.DLL
+HHOOK g_hhkPrev1 = DoNothingHookProc;
+
+DWORD CALLBACK Hook1(int nCode, WPARAM wParam, LPARAM lParam)
+{
+ if (nCode &gt;= 0) { ... work ... }
+ return DefHookProc(nCode, wParam, lParam, &amp;g_hhkPrev1);
+}
+</pre>
+<p>
+Now suppose you want to install a new hook, <code>Hook2</code>.</p>
+<pre>
+// In HOOK2.DLL
+HHOOK g_hhkPrev2;
+
+g_hhkPrev = SetWindowsHook(WH_KEYBOARD, Hook2);
+</pre>
+<p>
+The <code>SetWindowsHook</code> function just puts your function
+in as the new "head" hook function and returns the old one.
+</p>
+<pre>
+// In USER
+g_rgHook[WH_KEYBOARD] = Hook2;
+
+// In HOOK2.DLL
+HHOOK g_hhkPrev2 = Hook1;
+
+DWORD CALLBACK Hook2(int nCode, WPARAM wParam, LPARAM lParam)
+{
+ if (nCode &gt;= 0) { ... work ... }
+ return DefHookProc(nCode, wParam, lParam, &amp;g_hhkPrev2);
+}
+
+// In HOOK1.DLL
+HHOOK g_hhkPrev1 = DoNothingHookProc;
+
+DWORD CALLBACK Hook1(int nCode, WPARAM wParam, LPARAM lParam)
+{
+ if (nCode &gt;= 0) { ... work ... }
+ return DefHookProc(nCode, wParam, lParam, &amp;g_hhkPrev1);
+}
+</pre>
+<p>
+Now suppose the window manager decides it's time to fire the
+<code>WH_KEYBOARD</code> hook.
+It starts with <code>CallHook</code> which calls
+<code>g_rgHook[WH_KEYBOARD]</code> that takes us to
+<code>Hook2</code>.
+That hook function does its work, then calls
+<code>DefHookProc(..., &amp;g_hhkPrev2)</code>,
+which dispatches the hook to <code>g_hhkPrev2 == Hook1</code>.
+Similarly, the hook travels through <code>Hook1</code>,
+then
+<code>DefHookProc(..., &amp;g_hhkPrev1)</code>,
+where it finally reaches the <code>DoNothingHookProc</code>
+which does nothing and ends the hook chain.
+</p>
+<p>
+Now suppose that <code>HOOK1.DLL</code> decides to uninstall its
+hook. It therefore calls
+<code>UnhookWindowsHook(WH_KEYBOARD, Hook1)</code>.
+This starts off the hook chain with the internal hook code <code>-1</code>
+and <code>&amp;g_rgHook[WH_KEYBOARD]</code> as the first hook pointer.
+This activates the <code>case -1</code> in <code>DefHookProc</code> code
+path, which dereferences its <code>phk</code> parameter and obtains
+<code>g_rgHook[WH_KEYBOARD] == Hook2</code>.
+Since this is not equal to <code>Hook1</code>, the call forwards down
+the chain to <code>Hook2</code>.
+</p>
+<p>
+Like a good hook function, <code>Hook2</code> reacts to the negative
+hook code by handing the call directly to
+<code>DefHookProc(-1, ..., &amp;g_hhkPrev2)</code>.
+This time, <code>*phk == g_hhkPrev2 == Hook1</code>, 
+so the test succeeds and we dispatch the hook down the chain
+with a new internal code of <code>-2</code>, which means,
+"Tell me what the next hook procedure is".
+</p>
+<p>
+This dispatch calls <code>Hook1</code> which (since the notification
+code is negative) immediately passes the call to
+<code>DefHookProc(-2, ..., &amp;g_hhkPrev1)</code>.
+This now triggers the <code>case -2</code> code path, which
+just returns <code>*phk == g_hhkPrev1 == DoNothingHookProc</code>.
+This value is returned to the <code>DefHookProc(-1, ...)</code>
+which stores the result into <code>*phk == g_hhkPrev2</code>;
+the result is that you have <code>g_hhkPrev2 = DoNothingHookProc</code>.
+Finally, <code>DefHookProc</code> returns <code>TRUE</code>
+to indicate that the hook was successfully uninstalled.
+This value is then returned out from all the nested function calls
+to the original caller of <code>UnhookWindowsHook</code>.
+</p>
+<p>
+Observe that at the end of this unhook exercise, we get the desired
+result:
+</p>
+<pre>
+// In USER
+g_rgHook[WH_KEYBOARD] = Hook2; // unchanged
+
+// In HOOK2.DLL
+g_hhkPrev2 = DoNothingHookProc; // updated!
+
+DWORD CALLBACK Hook2(int nCode, WPARAM wParam, LPARAM lParam)
+{
+ if (nCode &gt;= 0) { ... work ... }
+ return DefHookProc(nCode, wParam, lParam, &amp;g_hhkPrev2);
+}
+</pre>
+<p>
+And <code>Hook1</code> is out of the hook chain, as we desired.
+</p>
+<p>
+This really isn't all that complicated.
+All we did was delete a node from a linked list.
+It's just that this particular linked list cannot be traversed
+by just dereferencing pointers.
+Instead, we have to issue a function call and ask the
+recursive function to perform the work on the "next" node for us.
+That's what the negative <code>nCode</code> values are for.
+</p>
+<p>
+Every time I work through this exercise,
+I am impressed by how compactly 16-bit Windows was written.
+In just two dozen lines of code, we managed a linked list of
+function calls, including a dispatching system as well as
+arbitrary deletion from the middle
+of the linked list, and all without any memory allocation.
+</p>
+<p>
+(And because I know people are going to try to change the topic:
+Remember, I'm talking about 16-bit Windows, not 32-bit window hooks.)
+</p>
+<p>
+Next time, we'll look at one way people abused this simple system.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-407583">
+				<div id="div-comment-407583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nawak</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407583">
+			August 9, 2006 at 11:26 am</a>		</div>
+
+		<p>This is really clever!<br />
+<br />But it also &#8216;looks&#8217; fragile as it relies on user functions doing the right thing in order for the whole mechanic to work!<br />
+<br />Since I am quite a nice guy (no, really ;) ), I am waiting for your tomorrow&#8217;s post to see what evil deeds people managed to do with that!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-407603">
+				<div id="div-comment-407603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Csaboka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407603">
+			August 9, 2006 at 11:49 am</a>		</div>
+
+		<blockquote><p>
+  But it also &#8216;looks&#8217; fragile as it relies on user functions doing the right thing in order for the whole mechanic to work!</p>
+<p>Well, if you look at it that way, the whole 16-bit Windows world was fragile since it relied on user programs playing nicely. Back in the 16-bit days, it would have been too expensive to protect against misbehaving user programs. If you wanted to bring the whole system down, all you needed to do is not yielding to the OS.</p>
+<p>This solution is ideal if you want to be memory efficient and you can assume user programs playing nicely together with you.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-407613">
+				<div id="div-comment-407613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://www.darklock.com/blog' rel='external nofollow' class='url'>Caliban Darklock</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407613">
+			August 9, 2006 at 11:50 am</a>		</div>
+
+		<p>How perceptive of you, Nawak. ;)</p>
+<p>I was rather frustrated by programming under 16-bit Windows, not because of Windows itself, but purely because other developers had chosen to implement strange custom solutions to problems that had established &quot;correct&quot; answers. It was reasonably common that someone would reverse-engineer the contents of a handle &#8211; which was deliberately undocumented and unsupported, because it could change at any time &#8211; and access it directly. </p>
+<p>In the HHOOK case, for example, someone might try to duplicate the above logic himself rather than use the standard Windows calls. If he happened to get something wrong, probably because he didn&#8217;t really understand the process, the system would behave oddly and nobody would know why. I suspect that may form the basis of Raymond&#8217;s next post.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-407623">
+				<div id="div-comment-407623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407623">
+			August 9, 2006 at 5:37 pm</a>		</div>
+
+		<p>I love opaque data structures. &nbsp;It&#8217;s a relief not knowing how a class or data structure is implemented because otherwise you are tempted to program through the interface instead of to the interface (e.g. guess the implementation by the members of the class so you can &#8216;optimize&#8217; how you call its methods). &nbsp;</p>
+<p>I would have to say that if you are using a debugger to find undocumented members of structs/classes and relying on them being there: a) you&#8217;re doing something wrong; and b) you get what you deserve.</p>
+<p>I understand that Microsoft makes lots of thunks for broken software (see <a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2006/01/09/510781.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2006/01/09/510781.aspx</a> &nbsp;for more information), and I can understand why. &nbsp;But it sure would be nice to say &quot;to heck with them&quot; when somebody pokes around internal undocumented structures and expects things to work that way forever.</p>
+<p>In regards to hook dispatching, I can&#8217;t imagine how expensive it is for more than one process to have a hook on a high-traffic message. &nbsp;How does Win32 make this work without a ton of context switches?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-407703">
+				<div id="div-comment-407703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407703">
+			August 10, 2006 at 8:40 am</a>		</div>
+
+		<p>Tom: The hook function must reside in a DLL. That DLL must/will be loaded in each target process. So, in addition to message processing, you add clutter the virtual address space and some loading time. (More so if the hook function is just one function in a heavy DLL that&#8217;s then brought into every process.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-407713">
+				<div id="div-comment-407713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">swapping</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407713">
+			August 10, 2006 at 9:00 am</a>		</div>
+
+		<p>CN: 16-bit windows didn&#8217;t have &quot;virtual address space&quot;, it had segmenting at best. Only the (4k) pages that is used is loaded into ram, usually not very much.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-407723">
+				<div id="div-comment-407723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/08/10/694362.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407723">
+			August 10, 2006 at 10:00 am</a>		</div>
+
+		<p>Unhooking by hooking again.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-407803">
+				<div id="div-comment-407803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Becke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-407803">
+			August 10, 2006 at 11:32 am</a>		</div>
+
+		<p>It seems an app that passed a copy of the HHOOK it originally got would defeat the unhooking mechanism. e.g.</p>
+<p>DWORD CALLBACK MyHookProc(int nCode, WPARAM wParam, LPARAM lParam)<br />
+<br />{<br />
+<br /> &nbsp;&#8230;<br />
+<br /> &nbsp;HHOOK hhkLocal = g_hhkPrev;<br />
+<br /> &nbsp;return DefHookProc(nCode, wParam, lParam, &amp;hhkLocal);<br />
+<br />}</p>
+<p>Why do this? Who knows: Given the lack of a user parameter I can imagine a scenario where parts of the code use their own copies of an HHOOK.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-408213">
+				<div id="div-comment-408213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ATZ Man</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060809-18/?p=30183#comment-408213">
+			August 11, 2006 at 3:49 pm</a>		</div>
+
+		<p>@swapping, @DN</p>
+<p>Win16 enhanced mode had demand-paged virtual memory. In any mode, all running Win16 applications were in one memory space (accessed by the app through segment registers, it is true). The hook DLL would not have to be mapped into each target process, because the DLL was already jumpable into through a far call from any running application.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

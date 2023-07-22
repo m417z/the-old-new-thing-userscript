@@ -1,0 +1,470 @@
+<html>
+<head>
+<title>A big little program: Monitoring Internet Explorer and Explorer windows, part 3: Tracking creation and destruction</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A big little program: Monitoring Internet Explorer and Explorer windows, part 3: Tracking creation and destruction</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 14, 2013 / year-entry #160</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Last time, we listener for window navigations. Today we'll learn about tracking window creation and destruction. The events to listen to are the DShell­Windows­Events. The Window­Registered event fires when a new window is created, and the Window­Revoked event fires when a window is destroyed. The bad news is that the parameter to those events is...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Last time, we
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/06/13/10425505.aspx">
+listener for window navigations</a>.
+Today we'll learn about tracking window creation and destruction.
+</p>
+<p>
+The events to listen to are the
+<a HREF="http://msdn.microsoft.com/library/cc836565">
+<code>DShell&shy;Windows&shy;Events</code></a>.
+The
+<code>Window&shy;Registered</code> event fires
+when a new window is created, and the
+<code>Window&shy;Revoked</code> event fires
+when a window is destroyed.
+</p>
+<p>
+The bad news is that the parameter to those events is a cookie,
+which is not useful for much,
+so we just use the events to tell us that it's time to
+kick off a new enumeration to see what changed.
+This will also catch the case where something fell out of sync
+because a window closed without unregistering (say,
+because the application crashed).
+</p>
+<p>
+Take our program from last time and make these changes:
+</p>
+<pre>
+<font COLOR=blue>LONG g_lCounter;</font>
+
+struct ItemInfo
+{
+ ItemInfo(HWND hwnd, IDispatch *pdisp)
+  : hwnd(hwnd), <font COLOR=blue>lCounter(g_lCounter)</font> { ... }
+ ...
+
+ HWND hwnd;
+ CComPtr&lt;CWebBrowserEventsSink&gt; spSink;
+ <font COLOR=blue>LONG lCounter;</font>
+};
+</pre>
+<p>
+The counter is used to detect stale windows when we re-enumerate.
+</p>
+<pre>
+HRESULT BuildWindowList()
+{
+ CComPtr&lt;IUnknown&gt; spunkEnum;
+ HRESULT hr = g_spWindows-&gt;_NewEnum(&amp;spunkEnum);
+ if (FAILED(hr)) return hr;
+
+ <font COLOR=blue>++g_lCounter;</font>
+
+ CComQIPtr&lt;IEnumVARIANT&gt; spev(spunkEnum);
+ for (CComVariant svar;
+      spev-&gt;Next(1, &amp;svar, nullptr) == S_OK;
+      svar.Clear()) {
+  if (svar.vt != VT_DISPATCH) continue;
+
+  HWND hwnd;
+  CComHeapPtr&lt;WCHAR&gt; spszLocation;
+  if (FAILED(GetBrowserInfo(svar.pdispVal,
+             &amp;hwnd, &amp;spszLocation))) continue;
+
+  ItemInfo *pii = <font COLOR=blue>GetItemByWindow(hwnd, nullptr);
+  if (pii) { pii-&gt;lCounter = g_lCounter; continue; }
+  pii =</font> new(std::nothrow) ItemInfo(hwnd, svar.pdispVal);
+  if (!pii) continue;
+
+  LVITEM item;
+  item.mask = LVIF_TEXT | LVIF_PARAM;
+  item.iItem = MAXLONG;
+  item.iSubItem = 0;
+  item.pszText = spszLocation;
+  item.lParam = reinterpret_cast&lt;LPARAM&gt;(pii);
+  int iItem = ListView_InsertItem(g_hwndChild, &amp;item);
+  if (iItem &lt; 0) delete pii;
+ }
+
+ <font COLOR=blue>int iItem = ListView_GetItemCount(g_hwndChild);
+ while (--iItem &gt;= 0) {
+  ItemInfo *pii = GetItemByIndex(iItem);
+  if (pii-&gt;lCounter != g_lCounter) {
+   ListView_DeleteItem(g_hwndChild, iItem);
+  }
+ }</font>
+
+ return S_OK;
+}</font>
+</pre>
+<p>
+Building the window list is now a two-step process,
+since what we are really doing is <i>updating</i>
+the window list.
+First, we enumerate
+the contents of the <code>IShell&shy;Windows</code>.
+For each window, we get its window handle and see if there
+is already an item for that window.
+If so, then we update the counter for that item.
+If there is not already an item for that window,
+then we create one like we did before.
+</p>
+<p>
+After we've processed all the windows that exist,
+we go look for the deletion by walking through all
+our items and deleting any whose counter was not updated
+by the previous loop.
+</p>
+<p>
+Okay, but so far we haven't actually done anything new.
+Here's the new stuff:
+</p>
+<pre>
+<font COLOR=blue>class CShellWindowsEventsSink :
+    public CDispInterfaceBase&lt;DShellWindowsEvents&gt;
+{
+public:
+ HRESULT SimpleInvoke(
+    DISPID dispid, DISPPARAMS *pdispparams, VARIANT *pvarResult)
+ {
+  switch (dispid) {
+  case DISPID_WINDOWREGISTERED:
+  case DISPID_WINDOWREVOKED:
+   BuildWindowList();
+   break;
+  }
+  return S_OK;
+ }
+};
+
+CComPtr&lt;CShellWindowsEventsSink&gt; g_spShellSink;</font>
+</pre>
+<p>
+This is the object that listens for changes to the window list.
+And whether the change is that a window arrived or a window
+departed, the response is the same: Refresh the window list.
+</p>
+<p>
+All that's left to do is hook up this event sink (and clean it up):
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ g_hwndChild = CreateWindow(WC_LISTVIEW, 0,
+    LVS_LIST | WS_CHILD | WS_VISIBLE |
+    WS_HSCROLL | WS_VSCROLL, 0, 0, 0, 0,
+    hwnd, (HMENU)1, g_hinst, 0);
+ g_spWindows.CoCreateInstance(CLSID_ShellWindows);
+ BuildWindowList();
+
+ <font COLOR=blue>g_spShellSink.Attach(new CShellWindowsEventsSink());
+ g_spShellSink-&gt;Connect(g_spWindows);</font>
+
+ return TRUE;
+}
+
+void OnDestroy(HWND hwnd)
+{
+ g_spWindows.Release();
+ <font COLOR=blue>if (g_spShellSink) {
+  g_spShellSink-&gt;Disconnect();
+  g_spShellSink.Release();
+ }</font>
+ PostQuitMessage(0);
+}
+</pre>
+<p>
+We now have a program that
+displays all the
+Internet Explorer and Explorer windows, updates
+their locations as you navigate,
+and adds and removes them as new windows are created
+or existing ones are closed.
+</p>
+<p>
+<b>Reminder</b>: This is a Little Program,
+which means that there is little to no error checking,
+and the design may be somewhat suboptimal.
+(For example, I use global variables everywhere
+because I'm lazy.)
+But it should give you enough of a head start so you can
+write a more robust version.
+</p>
+<p>
+<b>Exercise</b>:
+There is still a subtle bug in <code>Build&shy;Window&shy;List</code>.
+Identify it and discuss how you would address it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1061153">
+				<div id="div-comment-1061153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061153">
+			June 14, 2013 at 10:30 am</a>		</div>
+
+		<p>Thanks for this great series, Raymond. &nbsp;I never really write code that interacts with COM, Explorer, or Internet Explorer (beyond calling ShellExecute every now and then), so it&#39;s interesting to see how this kind of stuff works.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061183">
+				<div id="div-comment-1061183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mordachai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061183">
+			June 14, 2013 at 2:31 pm</a>		</div>
+
+		<p>I would use an unsigned instead of LONG, as signed types are not guaranteed to wrap around when you hit maximum value; whereas unsigned types will.</p>
+<p>Not sure if that is the subtle bug of which you speak.</p>
+<div class="post">[<em>That&#39;s not what I was thinking. Win32 imposes a lot of requirements beyond the C standard. For example, Win32 is required to be little-endian. Also, Win32 forbids padding bits in integers, requires twos-complement representation, and InterlockedIncrement will not raise an integer overflow exception. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061193">
+				<div id="div-comment-1061193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/ajgelado_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>ajgelado@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061193">
+			June 14, 2013 at 3:12 pm</a>		</div>
+
+		<p>This series has been really great! I&#39;m in the opposite position of Adam: I use COM every day, but from Visual Basic, a language that uses it as a scripting language. This series have helped me understand some of the limitations of VB&#39;s COM support, and why some COM libraries don&#39;t work at all with VB (I had read about laking of support for &quot;scripting interfaces&quot;, but I like to understand what&#39;s happening under my feet).</p>
+<p>COM is amazing, but complex enough so that understanding it just with the official documentation (correct but terse) is very hard. Raymond&#39;s &quot;COM for dummies&quot; articles shed a lot of light over it. Great work!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061203">
+				<div id="div-comment-1061203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061203">
+			June 14, 2013 at 6:31 pm</a>		</div>
+
+		<p>Totally unrelated, but Raymond is that really you at the bottom of some of those SNPP episode capsules? Specifically AABF12: &quot;This work is dedicated to Raymond Chen, James A. Cherry, Ricardo Lafaurie, Frederic Briere, and all of those who made episode capsules what they are today.&quot; My mind was blown to read that haha.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061213">
+				<div id="div-comment-1061213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061213">
+			June 15, 2013 at 6:51 am</a>		</div>
+
+		<p>This can be done using the journal hook. No need to use bloated COM for tracking windows creation/destruction.</p>
+<div class="post">[<em>You&#39;re using a global solution to a local problem. Journal hooks force all input to be synchronized. (See last week for a discussion of why this is bad.) Also, how does your journal hook know which windows are Explorer and Internet Explorer windows? And how does it tell you what URL each browser window is looking at? -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1061223">
+				<div id="div-comment-1061223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061223">
+			June 15, 2013 at 2:52 pm</a>		</div>
+
+		<p>IShellWindows::FindWindowSW can turn a cookie into a HWND but that still leaves the issue of crashed apps.</p>
+<p>@640k: That is overkill and both the shell hook and WinEvent (Raymond used it recently) are probably better but since all we care about here are shell windows, why not used the tool designed to give you exactly that?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061233">
+				<div id="div-comment-1061233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061233">
+			June 15, 2013 at 4:54 pm</a>		</div>
+
+		<p>The hook type which records windows creation/destruction was of course CBT, not journal. This is not more &quot;global&quot; than using a message proc instead of event functions.</p>
+<div class="post">[<em>CBT hooks are awful for system performance, too, and you still have the identification problem. (For example, a CBT-based solution would have been broken when IE added tab windows, and again when IE added the Windows Store version.) Just subscribe to the event. That&#39;s what it&#39;s for. No global hooks needed or any kind. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061263">
+				<div id="div-comment-1061263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061263">
+			June 16, 2013 at 12:36 pm</a>		</div>
+
+		<p>What&#39;s bad for performance is to load the whole ole infrastructure into every application which only need to listen to raw messages.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061283">
+				<div id="div-comment-1061283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061283">
+			June 16, 2013 at 9:23 pm</a>		</div>
+
+		<p>@640k: Processing lower-level messages to obtain higher-level information is almost always the wrong method in my experience; doing so usually turns into a screen-scraping exercise and is extremely fragile (and adds to Raymond&#39;s workload by adding yet another program that relies on implementation details&#8230;.)</p>
+<p>I can&#39;t think of any realistic program that would only need raw messages anyways, unless all that you&#39;re doing is logging or something. In any event, if your program is needs to interact with Explorer/IE windows (or any other COM server!), you&#39;ll likely need to pull in COM eventually to do anything useful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061873">
+				<div id="div-comment-1061873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061873">
+			June 19, 2013 at 10:26 am</a>		</div>
+
+		<p>Exercise: the ItemInfo of each deleted list-view item (in lParam) is not deleted (freed). This can be fixed by adding &quot;delete pii;&quot; after the ListView_DeleteItem statement.</p>
+<p>I wouldn&#39;t discuss further if you wouldn&#39;t suggest to. Since BuildWindowList is doing all the bookkeeping, it wouldn&#39;t be much more worth e.g. having an LVITEM (to use with ListView_GetItem) or LVFINDINFO (to use with ListView_FindItem) in the ItemInfo itself, in such way that delete&#39;ing an ItemInfo would remove it from the list-view control e.g. in the destructor.</p>
+<p>I mean, would it be worth? Perhaps for a bigger little program, with context menus on the items, etc.</p>
+<div class="post">[<em>It is freed <a href="http://blogs.msdn.com/b/oldnewthing/archive/2013/06/13/10425505.aspx">in the <code>LVN_DELETE&shy;ITEM</code> handler</a>. Your design would leak all the <code>Item&shy;Info</code> objects when the listview is destroyed. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061943">
+				<div id="div-comment-1061943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1061943">
+			June 19, 2013 at 11:39 am</a>		</div>
+
+		<p>@Raymond, I completely missed that one.</p>
+<p>Is it then that an existing list-view item&#39;s text (location) isn&#39;t updated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1062083">
+				<div id="div-comment-1062083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1062083">
+			June 20, 2013 at 3:28 am</a>		</div>
+
+		<p>In the hope that this is the subtle bug, I&#39;d do (excuse any formatting errors, I only have a simple text box):</p>
+<p>&nbsp;// &#8230;</p>
+<p>&nbsp;int iItem = MAXLONG; // moved up</p>
+<p>&nbsp;ItemInfo *pii = GetItemByWindow(hwnd, &amp;iItem);</p>
+<p>&nbsp;if (pii &amp;&amp; iItem != MAXLONG) { // I hope we never have these many items</p>
+<p>&nbsp; &nbsp;pii-&gt;lCounter = g_lCounter;</p>
+<p>&nbsp;}</p>
+<p>&nbsp;else {</p>
+<p>&nbsp; &nbsp;pii = new(std::nothrow) ItemInfo(hwnd, svar.pdispVal);</p>
+<p>&nbsp; &nbsp;if (!pii) continue;</p>
+<p>&nbsp;}</p>
+<p>&nbsp;// &#8230;</p>
+<p>&nbsp;item.iItem = iItem;</p>
+<p>&nbsp;// &#8230;</p>
+<p>&nbsp;if (iItem != MAXLONG) {</p>
+<p>&nbsp; &nbsp;ListView_SetItem(g_hwndChild, &amp;item);</p>
+<p>&nbsp;}</p>
+<p>&nbsp;else {</p>
+<p>&nbsp; &nbsp;iItem = ListView_InsertItem(g_hwndChild, &amp;item);</p>
+<p>&nbsp; &nbsp;if (iItem &lt; 0) delete pii;</p>
+<p>&nbsp;}</p>
+<p>&nbsp;// &#8230;</p>
+<p>In English, pass an int reference to GetItemByWindow, and then use ListView_SetItem if there&#39;s an existing item.</p>
+<div class="post">[<em>I think you&#39;re saying that the subtle bug is that an existing item may have changed its location and we don&#39;t notice it in <code>Build&shy;Window&shy;List</code>. But that&#39;s okay. We notice it in our <code>DISPID_NAVIGATE&shy;COMPLETE</code> handler. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1062483">
+				<div id="div-comment-1062483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">foo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130614-00/?p=4083#comment-1062483">
+			June 21, 2013 at 6:31 am</a>		</div>
+
+		<p>I suppose the thing [GetItemByWindow(hwnd&#8230;) etc] relies on window handles not being recycled between callbacks? This is very unlikely but.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

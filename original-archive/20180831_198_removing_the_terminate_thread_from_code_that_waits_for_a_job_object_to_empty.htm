@@ -1,0 +1,793 @@
+<html>
+<head>
+<title>Removing the Terminate�Thread from code that waits for a job object to empty</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Removing the <CODE>Terminate&shy;Thread</CODE> from code that waits for a job object to empty</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 31, 2018 / year-entry #198</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Designing it out.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Some time ago I showed
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20130405-00/?p=4743">
+how to wait until all processes in a job have exited</a>.
+Consider the following code which wants to create a job,
+put a single process in it,
+and then return a handle that will become signaled when that
+process and all its child processes have exited.
+</p>
+<p>
+This exercise is inspired by actual production code,
+so we're solving a real problem here.
+</p>
+<pre>
+template&lt;typename T&gt;
+struct scope_guard
+{
+  scope_guard(T&amp;&amp; t) : t_{std::move(t)} {}
+  ~scope_guard() { if (!cancelled_) t_(); }
+
+  // Move operators are auto-deleted when we delete copy operators.
+  scope_guard(const scope_guard&amp; other) = delete;
+  scope_guard&amp; operator=(const scope_guard&amp; other) = delete;
+
+  void cancel() { cancelled_ = true; }
+
+private:
+  bool cancelled_ = false;
+  T t_;
+};
+
+template&lt;typename T&gt;
+scope_guard&lt;T&gt; make_scope_guard(T&amp;&amp; t)
+{ return scope_guard&lt;T&gt;{std::move(t)}; }
+</pre>
+<p>
+This <code>scope_guard</code> class
+is similar to every other <code>scope_guard</code>
+class you've seen:
+It babysits a functor and calls it at destruction.
+We do add a wrinkle that the guard can be cancelled,
+which means that the functor is not called after all.
+</p>
+<pre>
+struct handle_deleter
+{
+ void operator()(HANDLE h) { CloseHandle(h); }
+};
+
+using unique_handle = std::unique_ptr&lt;void, handle_deleter&gt;;
+</pre>
+<p>
+The <code>unique_handle</code> class is
+a specialization of <code>std::unique_ptr</code>
+for Windows handles that can be closed by
+<code>Close&shy;Handle</code>.
+Note that it will attempt to close
+<code>INVALID_</code><code>HANDLE_</code><code>VALUE</code>,
+so don't use it for file handles.
+</p>
+<pre>
+struct WaitForJobToEmptyInfo
+{
+ unique_handle job;
+ unique_handle ioPort;
+};
+
+DWORD CALLBACK WaitForJobToEmpty(void* parameter)
+{
+ std::unique_ptr&lt;WaitForJobToEmptyInfo&gt; info(
+    reinterpret_cast&lt;WaitForJobToEmptyInfo*&gt;(parameter));
+
+ DWORD completionCode;
+ ULONG_PTR completionKey;
+ LPOVERLAPPED overlapped;
+
+ while (GetQueuedCompletionStatus(info-&gt;ioPort.get(), &amp;completionCode,
+          &amp;completionKey, &amp;overlapped, INFINITE) &amp;&amp;
+          !(completionKey == (ULONG_PTR)info-&gt;job.get() &amp;&amp;
+           completionCode == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO)) {
+   /* keep waiting */
+ }
+
+ return 0;
+}
+</pre>
+<p>
+The <code>Wait&shy;For&shy;Job&shy;To&shy;Empty</code>
+starts by taking ownership of the
+<code>Wait&shy;For&shy;Job&shy;To&shy;Empty&shy;Info</code>
+structure it is passed as a thread parameter
+by wrapping it inside a <code>std::unique_ptr</code>.
+Next, it monitors the I/O completion port until the job
+reports that there are no more processes in it.
+Once that happens, the thread exits,
+which sets the thread handle to the signaled state.
+</p>
+<pre>
+HANDLE CreateProcessAndReturnWaitableHandle(PWSTR commandLine)
+{
+ auto info = std::make_unique&lt;WaitForJobToEmptyInfo&gt;();
+
+ info-&gt;job.reset(CreateJobObject(nullptr, nullptr));
+ if (!info-&gt;job) {
+  return nullptr;
+ }
+
+ info-&gt;ioPort.reset(
+   CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                          nullptr, 0, 1));
+ if (!info-&gt;ioPort) {
+  return nullptr;
+ }
+
+ JOBOBJECT_ASSOCIATE_COMPLETION_PORT port;
+ port.CompletionKey = info-&gt;job.get();
+ port.CompletionPort = info-&gt;ioPort.get();
+ if (!SetInformationJobObject(info-&gt;job.get(),
+       JobObjectAssociateCompletionPortInformation,
+       &amp;port, sizeof(port))) {
+  return nullptr;
+ }
+
+ DWORD threadId;
+ unique_handle thread(CreateThread(nullptr, 0, WaitForJobToEmpty,
+                             info.get(), CREATE_SUSPENDED,
+                             &amp;threadId));
+ if (!thread) {
+  return nullptr;
+ }
+
+ <i>// Code in italics is wrong
+ auto ensureTerminateWorkerThread = make_scope_guard([&amp;]{
+  TerminateThread(thread.get());
+ });</i>
+
+ PROCESS_INFORMATION processInformation;
+ STARTUPINFO startupInfo = { sizeof(startupInfo) };
+ if (!CreateProcess(nullptr, commandLine, nullptr, nullptr,
+                    FALSE, CREATE_SUSPENDED, nullptr, nullptr,
+                    &amp;startupInfo, &amp;processInformation)) {
+  return nullptr;
+ }
+
+ auto ensureCloseHandles = make_scope_guard([&amp;]{
+  CloseHandle(processInformation.hThread);
+  CloseHandle(processInformation.hProcess);
+ });
+
+ auto ensureTerminateProcess = make_scope_guard([&amp;]{
+  TerminateProcess(processInformation.hProcess);
+ });
+
+ if (!AssignProcessToJobObject(info-&gt;job.get(),
+         processInformation.hProcess)) {
+  return nullptr;
+ }
+
+ info.release();
+ ensureTerminateProcess.cancel();
+ ensureTerminateWorkerThread.cancel();
+
+ ResumeThread(processInformation.hThread);
+ ResumeThread(thread.get());
+
+ return thread.release();
+}
+</pre>
+<p>
+Let's walk through this function.
+</p>
+<p>
+First, we create the
+<code>Wait&shy;For&shy;Job&shy;To&shy;Empty&shy;Info</code>
+object that contains the information we are passing to the
+worker thread.
+</p>
+<p>
+We initialize the job and the I/O completion port,
+and associate the job with the completion port.
+If anything goes wrong, we bail out.
+</p>
+<p>
+Next, we create the worker thread that will wait for
+the signal from the I/O completion port that the job
+is empty.
+</p>
+<p>
+Here is the sticking point:
+We aren't finished setting up everything yet,
+and if it turns out we can't create the process
+or can't put the process in the job, then that
+thread will be waiting around for a notification
+that will never happen.
+But we want to pre-create all the resources we need
+before creating the process, so that we don't
+find ourselves later with a process that has already
+been created, but not enough resources to monitor that
+process.
+</p>
+<p>
+Okay, so the idea is that we create the thread suspended
+so that it is "waiting" and hasn't actually started doing
+anything yet.
+That way, if it turns out we need to abandon the operation,
+we can terminate the thread.
+(Uh-oh, he talked about terminating threads.)
+</p>
+<p>
+Okay, now that we have all our resources reserved,
+we can create the process.
+If that fails, then we bail out,
+and the <code>ensure&shy;Terminate&shy;Worker&shy;Thread</code>
+will terminate our worker thread as part of the cleanup.
+</p>
+<p>
+If the process was created successfully, then we
+create a <code>scope_</code><code>guard</code> object
+to remember to close the handles in the
+<code>PROCESS_</code><code>INFORMATION</code>
+structure.
+And we also remember to terminate the process in case
+something goes wrong.
+</p>
+<p>
+Next, we put the process in the job.
+If this fails, we bail out,
+and our various <code>scope_</code><code>guard</code>
+objects will make sure that everything gets cleaned
+up properly.
+</p>
+<p>
+Once the process is in the job, we have succeeded,
+so resume the process and the worker thread,
+and return the worker thread to the caller so it
+can be waited on.
+</p>
+<p>
+The problem with this plan, of course, is that
+pesky call to
+<code>Terminate&shy;Thread</code>,
+which is a function so awful
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150814-00/?p=91811">
+it should never be called</a>
+because there is basically no safe way of calling it.
+</p>
+<p>
+So how do we get rid of the
+<code>Terminate&shy;Thread</code>?
+</p>
+<p>
+One solution is to tweak the algorithm so the
+thread is the last thing we create.
+That way, we never have to back out of the thread
+creation.
+</p>
+<pre>
+HANDLE CreateProcessAndReturnWaitableHandle(PWSTR commandLine)
+{
+ auto info = std::make_unique&lt;WaitForJobToEmptyInfo&gt;();
+
+ info-&gt;job.reset(CreateJobObject(nullptr, nullptr));
+ if (!info-&gt;job) {
+  return nullptr;
+ }
+
+ info-&gt;ioPort.reset(
+   CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                          nullptr, 0, 1));
+ if (!info-&gt;ioPort) {
+  return nullptr;
+ }
+
+ JOBOBJECT_ASSOCIATE_COMPLETION_PORT port;
+ port.CompletionKey = info-&gt;job.get();
+ port.CompletionPort = info-&gt;ioPort.get();
+ if (!SetInformationJobObject(info-&gt;job.get(),
+       JobObjectAssociateCompletionPortInformation,
+       &amp;port, sizeof(port))) {
+  return nullptr;
+ }
+
+ <font COLOR=red>// <strike>DWORD threadId;</strike>
+ // <strike>unique_handle thread(CreateThread(nullptr, 0, WaitForJobToEmpty,</strike>
+ //                            <strike>info.get(), CREATE_SUSPENDED,</strike>
+ //                            <strike>&amp;threadId));</strike>
+ // <strike>if (!thread) {</strike>
+ //  <strike>return nullptr;</strike>
+ // <strike>}</strike>
+ //
+ // <strike>auto ensureTerminateWorkerThread = make_scope_guard([&amp;]{</strike>
+ //  <strike>TerminateThread(thread.get());</strike>
+ // <strike>});</strike></font>
+
+ PROCESS_INFORMATION processInformation;
+ STARTUPINFO startupInfo = { sizeof(startupInfo) };
+ if (!CreateProcess(nullptr, commandLine, nullptr, nullptr,
+                    FALSE, CREATE_SUSPENDED, nullptr, nullptr,
+                    &amp;startupInfo, &amp;processInformation)) {
+  return nullptr;
+ }
+
+ auto ensureCloseHandles = make_scope_guard([&amp;]{
+  CloseHandle(processInformation.hThread);
+  CloseHandle(processInformation.hProcess);
+ });
+
+ auto ensureTerminateProcess = make_scope_guard([&amp;]{
+  TerminateProcess(processInformation.hProcess);
+ });
+
+ if (!AssignProcessToJobObject(info-&gt;job.get(),
+         processInformation.hProcess)) {
+  return nullptr;
+ }
+
+ <font COLOR=blue>// Code moved here
+ DWORD threadId;
+ unique_handle thread(CreateThread(nullptr, 0, WaitForJobToEmpty,
+                             info.get(), 0, // not suspended
+                             &amp;threadId));
+ if (!thread) {
+  return nullptr;
+ }</font>
+
+ info.release();
+ ensureTerminateProcess.cancel();
+ <font COLOR=red>// <strike>ensureTerminateWorkerThread.cancel();</strike></font>
+
+ ResumeThread(processInformation.hThread);
+ <font COLOR=red>// <strike>ResumeThread(thread.get());</strike></font>
+
+ return thread.release();
+}
+</pre>
+<p>We don't need to create the thread suspended any more;
+it can hit the ground running.
+</p>
+<p>
+Okay, so that's a solution if you can find a way to tweak
+your algorithm is that the thread is the last thing to be
+created.
+That way, you never have to try to roll back a thread creation.
+But that may not be possible.
+For example, maybe your algorithm involves creating multiple threads.
+Some thread gets to be last, but the others are now at risk
+of needing to be rolled back in case the last thread cannot
+be created.
+</p>
+<p>
+Technique number two:
+Trick the thread into doing nothing if it turns out
+we don't want it to do anything.
+</p>
+<p>
+In our case, what we can do is post a fake completion
+status to the I/O completion port to tell it,
+"Um, yeah, the job has no processes in it.
+Your job is done.
+<a HREF="https://www.youtube.com/watch?v=X0KjZzsov_8&t=40s">Go home</a>."
+</p>
+<pre>
+HANDLE CreateProcessAndReturnWaitableHandle(PWSTR commandLine)
+{
+ auto info = std::make_unique&lt;WaitForJobToEmptyInfo&gt;();
+
+ info-&gt;job.reset(CreateJobObject(nullptr, nullptr));
+ if (!info-&gt;job) {
+  return nullptr;
+ }
+
+ info-&gt;ioPort.reset(
+   CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                          nullptr, 0, 1));
+ if (!info-&gt;ioPort) {
+  return nullptr;
+ }
+
+ JOBOBJECT_ASSOCIATE_COMPLETION_PORT port;
+ port.CompletionKey = info-&gt;job.get();
+ port.CompletionPort = info-&gt;ioPort.get();
+ if (!SetInformationJobObject(info-&gt;job.get(),
+       JobObjectAssociateCompletionPortInformation,
+       &amp;port, sizeof(port))) {
+  return nullptr;
+ }
+
+ DWORD threadId;
+ unique_handle thread(CreateThread(nullptr, 0, WaitForJobToEmpty,
+                             info.get(), <font COLOR=blue>0, // not suspended</font>
+                             &amp;threadId));
+ if (!thread) {
+  return nullptr;
+ }
+
+ <font COLOR=blue>// thread owns the info now
+ auto ensureReleaseInfo = make_scope_guard([&amp;]{
+  info.release();
+ });</font>
+
+ auto ensureTerminateWorkerThread = make_scope_guard([&amp;]{
+  <font COLOR=blue>// Tell the thread that there are no processes
+  // so it will break out of its loop.
+  PostQueuedCompletionStatus(info-&gt;ioPort.get(),
+                             JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
+                             (ULONG_PTR)info-&gt;job.get(),
+                             nullptr);</font>
+ });
+
+ PROCESS_INFORMATION processInformation;
+ STARTUPINFO startupInfo = { sizeof(startupInfo) };
+ if (!CreateProcess(nullptr, commandLine, nullptr, nullptr,
+                    FALSE, CREATE_SUSPENDED, nullptr, nullptr,
+                    &amp;startupInfo, &amp;processInformation)) {
+  return nullptr;
+ }
+
+ auto ensureCloseHandles = make_scope_guard([&amp;]{
+  CloseHandle(processInformation.hThread);
+  CloseHandle(processInformation.hProcess);
+ });
+
+ auto ensureTerminateProcess = make_scope_guard([&amp;]{
+  TerminateProcess(processInformation.hProcess);
+ });
+
+ if (!AssignProcessToJobObject(info-&gt;job.get(),
+         processInformation.hProcess)) {
+  return nullptr;
+ }
+
+ <font COLOR=red>// <strike>info.release();</strike></font>
+ ensureTerminateProcess.cancel();
+ ensureTerminateWorkerThread.cancel();
+
+ ResumeThread(processInformation.hThread);
+ <font COLOR=red>// <strike>ResumeThread(thread.get());</strike></font>
+
+ return thread.release();
+}
+</pre>
+<p>
+Technique number three:
+If all else fails, then just have a special flag to tell the thread,
+"I don't want you to do anything. Just get out as quickly as you can."
+</p>
+<pre>
+struct WaitForJobToEmptyInfo
+{
+ unique_handle job;
+ unique_handle ioPort;
+ <font COLOR=blue>bool active = false;</font>
+};
+
+DWORD CALLBACK WaitForJobToEmpty(void* parameter)
+{
+ std::unique_ptr&lt;WaitForJobToEmptyInfo&gt; info(
+    reinterpret_cast&lt;WaitForJobToEmptyInfo&gt;(parameter));
+
+ <font COLOR=blue>// If we are not active, then do nothing.
+ if (!info-&gt;active) return 0;</font>
+
+ DWORD completionCode;
+ ULONG_PTR completionKey;
+ LPOVERLAPPED overlapped;
+
+ while (GetQueuedCompletionStatus(info-&gt;ioPort.get(), &amp;completionCode,
+          &amp;completionKey, &amp;overlapped, INFINITE) &amp;&amp;
+          !(completionKey == (ULONG_PTR)info-&gt;job.get() &amp;&amp;
+           completionCode == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO)) {
+   /* keep waiting */
+ }
+
+ return 0;
+}
+
+HANDLE CreateProcessAndReturnWaitableHandle(PWSTR commandLine)
+{
+ auto info = std::make_unique&lt;WaitForJobToEmptyInfo&gt;();
+
+ info-&gt;job.reset(CreateJobObject(nullptr, nullptr));
+ if (!info-&gt;job) {
+  return nullptr;
+ }
+
+ info-&gt;ioPort.reset(
+   CreateIoCompletionPort(INVALID_HANDLE_VALUE,
+                          nullptr, 0, 1));
+ if (!info-&gt;ioPort) {
+  return nullptr;
+ }
+
+ JOBOBJECT_ASSOCIATE_COMPLETION_PORT port;
+ port.CompletionKey = info-&gt;job.get();
+ port.CompletionPort = info-&gt;ioPort.get();
+ if (!SetInformationJobObject(info-&gt;job.get(),
+       JobObjectAssociateCompletionPortInformation,
+       &amp;port, sizeof(port))) {
+  return nullptr;
+ }
+
+ DWORD threadId;
+ unique_handle thread(CreateThread(nullptr, 0, WaitForJobToEmpty,
+                             info.get(), CREATE_SUSPENDED,
+                             &amp;threadId));
+ if (!thread) {
+  return nullptr;
+ }
+
+ <font COLOR=red>// <strike>auto ensureTerminateWorkerThread = make_scope_guard([&amp;]{</strike>
+ //  <strike>TerminateThread(thread.get());</strike>
+ // <strike>});</strike></font>
+
+ <font COLOR=blue>auto ensureResumeWorkerThread = make_scope_guard([&amp;]{
+  ResumeThread(thread.get());
+ });</font>
+
+ PROCESS_INFORMATION processInformation;
+ STARTUPINFO startupInfo = { sizeof(startupInfo) };
+ if (!CreateProcess(nullptr, commandLine, nullptr, nullptr,
+                    FALSE, CREATE_SUSPENDED, nullptr, nullptr,
+                    &amp;startupInfo, &amp;processInformation)) {
+  return nullptr;
+ }
+
+ auto ensureCloseHandles = make_scope_guard([&amp;]{
+  CloseHandle(processInformation.hThread);
+  CloseHandle(processInformation.hProcess);
+ });
+
+ auto ensureTerminateProcess = make_scope_guard([&amp;]{
+  TerminateProcess(processInformation.hProcess);
+ });
+
+ if (!AssignProcessToJobObject(info-&gt;job.get(),
+         processInformation.hProcess)) {
+  return nullptr;
+ }
+
+ <font COLOR=blue>info-&gt;active = true; // tell the thread that it has work to do</font>
+ info.release();
+ ensureTerminateProcess.cancel();
+ <font COLOR=red>// <strike>ensureTerminateWorkerThread.cancel();</strike></font>
+ <font COLOR=blue>ensureResumeWorkerThread.cancel();</font>
+
+ ResumeThread(processInformation.hThread);
+ ResumeThread(thread.get());
+
+ return thread.release();
+}
+</pre>
+<p>
+We could have signaled the thread that it should not do anything
+by closing the handles in the
+<code>Wait&shy;For&shy;Job&shy;To&shy;Empty&shy;Info</code>
+structure,
+but I want to demonstrate the most general possible solution.
+</p>
+<p>
+There is some subtlety in resuming the worker thread:
+We need the <code>Resume&shy;Thread</code> to happen before
+the <code>thread.release()</code> because the
+<code>thread.release()</code> causes the <code>thread</code>
+to relinquish knowledge of the kernel thread.
+I probably could have fixed this some more scoping,
+but I tried to change the existing code as little as possible.
+</p>
+<p>
+So there you go: Three ways of getting rid of the
+<code>Terminate&shy;Thread</code> from this specific algorithm.
+The general-purpose trick works if the reason you were
+terminating a thread was to prevent it from starting.
+Instead of terminating the thread,
+resume it, but make sure it does nothing.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1358905">
+				<div id="div-comment-1358905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1358905">
+			August 31, 2018 at 8:44 am</a>		</div>
+
+		<p>&gt; closing the handles in the Wait­For­Job­To­Empty­Info structure</p>
+<p>Be careful with this scheme. While it works in this specific instance, if you try to read a handle from one thread while closing it in another, and you happen to be running with a single CPU kernel, you will hang in kernel mode. It&#8217;s not a hard hang as the process can still be killed or a third thread could come by and cancel the pending IO.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1358915">
+				<div id="div-comment-1358915" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">R P (MSFT)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1358915">
+			August 31, 2018 at 8:56 am</a>		</div>
+
+		<p>Maybe I&#8217;m missing something, but that last example seems to leave the thread hanging around in a suspended state if AssignProcessToJobObject fails. I feel like maybe you need a scope guard to resume the thread.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1358925">
+				<div id="div-comment-1358925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1358925">
+			August 31, 2018 at 11:10 am</a>		</div>
+
+		<p>Oops, you&#8217;re right. Fixed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1359025">
+				<div id="div-comment-1359025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359025">
+			September 1, 2018 at 3:59 am</a>		</div>
+
+		<p>Since you can control the state of the thread, you don&#8217;t need to terminate it, because as demonstrated there are ways for the thread to exit itself naturally. But out of interest, what are the dangers of terminating thread that hasn&#8217;t even started yet?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1359045">
+				<div id="div-comment-1359045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359045">
+			September 1, 2018 at 6:57 am</a>		</div>
+
+		<p><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150814-00/?p=91811" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20150814-00/?p=91811</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1359065">
+				<div id="div-comment-1359065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JAS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359065">
+			September 1, 2018 at 11:45 am</a>		</div>
+
+		<p>I never liked needing a dedicated thread to handle job events. Even back in 2000 I thought we were past that. If IOCPs could signal when they had new items, then we could SetThreadpoolWait( ) or something.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-tcb-com-au even thread-even depth-1" id="comment-1359255">
+				<div id="div-comment-1359255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/David+Fissher' rel='external nofollow' class='url'>David Fissher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359255">
+			September 3, 2018 at 11:40 pm</a>		</div>
+
+		<p>i don&#8217;t understand but efforts liked</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf odd alt thread-odd thread-alt depth-1 parent" id="comment-1359725">
+				<div id="div-comment-1359725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359725">
+			September 7, 2018 at 7:45 am</a>		</div>
+
+		<p>&gt; Note that it will attempt to close INVALID_HANDLE_VALUE, so don&#8217;t use it for file handles.<br />
+I don&#8217;t understand this part. Does a <b>CloseHandle(INVALID_HANDLE_VALUE)</b> result in anything worse than <b>{ SetLastError(ERROR_INVALID_HANDLE); return FALSE; }</b> ?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1359745">
+				<div id="div-comment-1359745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359745">
+			September 7, 2018 at 9:14 am</a>		</div>
+
+		<p>It may also raise an &#8220;invalid handle&#8221; exception.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1359895">
+				<div id="div-comment-1359895" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180831-00/?p=99625#comment-1359895">
+			September 9, 2018 at 7:37 am</a>		</div>
+
+		<p>It does only when running under the debugger. If it didn&#8217;t cost $499 to file a bug only to have it not fixed I would have filed one. That&#8217;s just silly.</p>
+<p>The exception is normally a good idea, but for INVALID_HANDLE_VALUE not so much. Modern code stye wants to omit stuff like that, and it once worked just fine.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

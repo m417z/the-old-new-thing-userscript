@@ -1,0 +1,351 @@
+<html>
+<head>
+<title>Using accessibility to monitor windows as they come and go</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using accessibility to monitor windows as they come and go</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 25, 2013 / year-entry #82</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today's Little Program monitors windows as they come and go. When people contemplate doing this, they come up with ideas like installing a WH_CBT hook or a WH_SHELL hook, but one of the major problems with those types of hooks is that they are injected hooks. Injection is bad for a number of reasons. It...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Today's Little Program monitors windows as they come and go.
+When people contemplate doing this,
+they come up with ideas like installing a
+<code>WH_CBT</code> hook
+or a
+<code>WH_SHELL</code> hook,
+but one of the major problems with those types of hooks
+is that they are injected hooks.
+Injection is bad for a number of reasons.
+</p>
+<ul>
+<li>It forces the hook to be in a DLL so it can be injected.
+<li>Hook activities need to be marshaled back to the main program.
+<li>Your DLL will capture events only in processes of the same bitness,
+    because
+    <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2008/10/20/9006720.aspx">
+    you cannot load a 32-bit DLL into a 64-bit process or vice versa</a>.</p>
+<li>You can inject into an elevated process only if your process
+    is also elevated.
+    If your process is non-elevated, then you will not capture
+    events for windows belonging to elevated processes.
+</ul>
+<p>
+This is where accessibility comes in handy,
+because accessibility lets you specify whether you want your
+hook to be an injected or non-injected one.
+And if you're non-injected, then the programming model is much simpler
+because everything happens in your process
+(indeed, on a single thread).
+</p>
+<p>
+Take
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/07/23/54576.aspx">
+the scratch program</a>
+and make the following changes:
+</p>
+<pre>
+#include &lt;strsafe.h&gt;
+
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ <font COLOR=blue>g_hwndChild = CreateWindow(TEXT("listbox"), NULL,
+     LBS_HASSTRINGS | WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+     0, 0, 0, 0, hwnd, NULL, g_hinst, 0);
+ if (!g_hwndChild) return FALSE;</font>
+ return TRUE;
+}
+
+<font COLOR=blue>void CALLBACK WinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD dwEventThread,
+    DWORD dwmsEventTime
+)
+{
+ if (hwnd &amp;&amp;
+     idObject == OBJID_WINDOW &amp;&amp;
+     idChild == CHILDID_SELF)
+ {
+  PCTSTR pszAction = NULL;
+  TCHAR szBuf[80];
+  switch (event) {
+  case EVENT_OBJECT_CREATE:
+   pszAction = TEXT("created");
+   break;
+  case EVENT_OBJECT_DESTROY:
+   pszAction = TEXT("destroyed");
+   break;
+  }
+  if (pszAction) {
+   TCHAR szClass[80];
+   TCHAR szName[80];
+   szClass[0] = TEXT('\0');
+   szName[0] = TEXT('\0');
+   if (IsWindow(hwnd)) {
+    GetClassName(hwnd, szClass, ARRAYSIZE(szClass));
+    GetWindowText(hwnd, szName, ARRAYSIZE(szName));
+   }
+   TCHAR szBuf[80];
+   StringCchPrintf(szBuf, ARRAYSIZE(szBuf),
+                   TEXT("%p %s \"%s\" (%s)"), hwnd, pszAction,
+                   szName, szClass);
+   ListBox_AddString(g_hwndChild, szBuf);
+  }
+ }
+}</font>
+
+int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
+                   LPSTR lpCmdLine, int nShowCmd)
+{
+ ...
+  ShowWindow(hwnd, nShowCmd);
+
+ <font COLOR=blue>HWINEVENTHOOK hWinEventHook = SetWinEventHook(
+     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+     NULL, WinEventProc, 0, 0,
+     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);</font>
+
+  while (GetMessage(&msg, NULL, 0, 0)) {
+   TranslateMessage(&msg);
+   DispatchMessage(&msg);
+  }
+
+  <font COLOR=blue>if (hWinEventHook) UnhookWinEvent(hWinEventHook);</font>
+...
+}
+</pre>
+<p>
+This is a generalization of our earlier program which
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/10/26/10230020.aspx">
+waits for a specific window to be destroyed</a>,
+except that we now are watching <i>all</i> windows
+for creation and destruction.
+</p>
+<p>
+When you run this program, you see that there is a lot of
+window activity,
+but maybe you are interested only in windows when they are shown
+and hidden.
+No problem, that's a small change:
+</p>
+<pre>
+  switch (event) {
+  <font COLOR=blue>case EVENT_OBJECT_SHOW:
+   pszAction = TEXT("shown");
+   break;
+  case EVENT_OBJECT_HIDE:
+   pszAction = TEXT("hidden");
+   break;</font>
+  }
+...
+
+ HWINEVENTHOOK hWinEventHook = SetWinEventHook(
+     <font COLOR=blue>EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE</font>,
+     NULL, WinEventProc, 0, 0,
+     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+</pre>
+<p>
+Notice that these notifications are received for windows
+from both 32-bit and 64-bit processes,
+and that they are received even for windows belonging
+to elevated processes.
+You can't do that with an injected hook.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1046863">
+				<div id="div-comment-1046863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1046863">
+			March 25, 2013 at 9:27 am</a>		</div>
+
+		<p>The whole concept of injecting is just horrible.</p>
+<p>With this around you can never be sure your application works as expected, because any random bug could appear caused by 3rd party injected DLLs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1046883">
+				<div id="div-comment-1046883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1046883">
+			March 25, 2013 at 1:10 pm</a>		</div>
+
+		<p>Really? Even if I am a freaking malware non-elevated I can watch the all mighty admin windows creation? OAW!!! That&#39;s awesome, now I can take over the world (heh, or only about 85% of it since rest is non-Windows). And you mean I can be notified also about the UAC asking user window creation? Or when the Antivirus is starting to hunt me by creating it&#39;s scheduler windows? Uber-super, lemme start creating the next Stuxnet :D:D.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-chuckop even thread-even depth-1" id="comment-1046893">
+				<div id="div-comment-1046893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ChuckOp' rel='external nofollow' class='url'>ChuckOp</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1046893">
+			March 25, 2013 at 1:55 pm</a>		</div>
+
+		<p>One of the things I like about this blog, indeed Raymond in general, is that he shows developers how useful the accessibility-related technology can be outside of traditional uses. &nbsp;Raymond and the original MSAA developers were key to ensuring that WinEvents has uses beyond empowering accessibility aids.</p>
+<p>@Danny, while you can get information about window creation, you can&#39;t really do much with the information. &nbsp;You are still bound by the rules of uiAccess privilege do to anything meaningful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1046903">
+				<div id="div-comment-1046903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">@AC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1046903">
+			March 25, 2013 at 2:30 pm</a>		</div>
+
+		<p>Doesn&#39;t injection require administrative rights to occur? If your giving a 3rd party program administrative rights, you better be darn sure what that 3rd party program does or just not care.</p>
+<p>And if you&#39;re running in an environment as the administrator, or disabling UAC, you are just asking for this behavior.</p>
+<p>There are plenty of valid scenarios for injection, debugging comes to mind, fixing others broken code in a product that is no longer supported, intrusive monitoring applications, etc. Just because a concept has been abused or used poorly doesn&#39;t mean its horrible, it just means that those programmers did not take great care with a powerful tool (and should be named and shamed in my opinion).</p>
+<p>@ChuckOp I think Danny was joking, mocking those that think this ability is some type of security exploit.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1046923">
+				<div id="div-comment-1046923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1046923">
+			March 26, 2013 at 3:12 am</a>		</div>
+
+		<p>@@AC the &quot;:D:D&quot; I put at the end of my statement was precisely for that purpose but I think ChuckOp was too busy to read them :).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1046933">
+				<div id="div-comment-1046933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">not my real name</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1046933">
+			March 26, 2013 at 6:06 am</a>		</div>
+
+		<p>Danny, your jokes may have been just a little too close to the truth, too. Or at least a little too close to the truth as perceived by the pinheads who write some antimalware software.</p>
+<p>People who write accessibility software NEED these interfaces. But people in the &quot;security&quot; industry go off half-cocked and regularly flag accessibility software as malware because they make similar wrong assumptions about what these interfaces can and can&#39;t do. The problem is, they don&#39;t think they&#39;re joking.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1047113">
+				<div id="div-comment-1047113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">@not my real name</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1047113">
+			March 26, 2013 at 9:51 am</a>		</div>
+
+		<p>They actually have an &quot;Internet Law&quot; for that: Poe&#39;s Law.</p>
+<p>From TOW:</p>
+<p>[Poe&#39;s Law] is an Internet adage reflecting the idea that without a clear indication of the author&#39;s intent, it is difficult or impossible to tell the difference between sincere extremism and an exaggerated parody of extremism</p>
+<p>I agree with you, my job requires me to maintain an Automation Framework that relies heavily on these Interfaces (and some other dark-evil-magic that I prefer not to mention such as Injection) and I am a huge fan of any Raymond Chen posts which dive into anything remotely related to what I&#39;m working on.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-chuckop odd alt thread-odd thread-alt depth-1" id="comment-1047783">
+				<div id="div-comment-1047783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ChuckOp' rel='external nofollow' class='url'>ChuckOp</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1047783">
+			March 28, 2013 at 4:59 am</a>		</div>
+
+		<p>@Danny, apologies, I did not pick up on the sarcasm. &nbsp;TIL today: &nbsp;Poe&#39;s Law. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1048093">
+				<div id="div-comment-1048093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://blogs.msdn.com/anil_4000_lambdah.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>anil@lambdah.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130325-00/?p=4863#comment-1048093">
+			March 28, 2013 at 11:46 pm</a>		</div>
+
+		<p>The downside of this approach is the context switching from being out-of-process. It turns out that that extra cost can be meaningful in some regards. Also, with winevents, the payload isn&#39;t usually helpful. You have to make another roundtrip talk to the application (via AccessibleObjectFromEvent) to get anything useful (and deal with reentrancy if you&#39;re on an STA).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

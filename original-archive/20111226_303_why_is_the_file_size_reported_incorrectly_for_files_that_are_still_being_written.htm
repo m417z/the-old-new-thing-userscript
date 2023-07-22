@@ -1,0 +1,730 @@
+<html>
+<head>
+<title>Why is the file size reported incorrectly for files that are still being written to?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why is the file size reported incorrectly for files that are still being written to?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 26, 2011 / year-entry #304</td></tr>
+<tr><td><b>Tags:</b></td><td>tipssupport</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>28</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The shell team often gets questions like these from customers: Attached please find a sample program which continuously writes data to a file. If you open the folder containing the file in Explorer, you can see that the file size is reported as zero. Even manually refreshing the Explorer window does not update the file...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The shell team often gets questions like these from customers:
+</p>
+<blockquote CLASS=q><p>
+Attached please find a sample program which continuously
+writes data to a file.
+If you open the folder containing the file in Explorer, you can see
+that the file size is reported as zero.
+Even manually refreshing the Explorer window does not update the file size.
+Even the <code>dir</code> command shows the file size as zero.
+On the other hand, calling <code>Get&shy;File&shy;Size</code> reports
+the correct file size.
+If I close the file handle, then Explorer and the <code>dir</code>
+command both report the correct file size.
+We can observe this behavior on Windows Server 2008 R2,
+but on Windows Server 2003, the file sizes are updated in both Explorer
+and <code>dir</code>.
+Can anybody explain what is happening?
+</p>
+</blockquote>
+<blockquote CLASS=q><p>
+We have observed that Windows gives the wrong file size for
+files being written.
+We have a log file that our service writes to,
+and we like to monitor the size of the file by watching
+it in Explorer, but the file size always reports as zero.
+Even the <code>dir</code> command reports the file size as zero.
+Only when we stop the service does the log file size get reported
+correctly.
+How can we get the file size reported properly?
+</p>
+</blockquote>
+<blockquote CLASS=q><p>
+We have a program that generates a large number of files in the current
+directory.
+When we view the directory in Explorer, we can watch the files as they
+are generated, but the file size of the last file is always reported as zero.
+Why is that?
+</p>
+</blockquote>
+<p>
+Note that this is not even a shell issue.
+It's a file system issue,
+as evidenced by the fact that a <code>dir</code> command exhibits
+the same behavior.
+</p>
+<p>
+Back in the days of FAT, all the file metadata was stored in the
+directory entry.
+</p>
+<p>
+The designers of NTFS had to decide where to store their metadata.
+If they chose to do things the UNIX way,
+the directory entry would just be a name
+and a reference to the file metadata (known in UNIX-land as an <i>inode</i>).
+The problem with this approach is that every directory listing would require
+seeking all over the disk
+to collect the metadata to report for each file.
+This would have made NTFS slower than FAT at listing the contents
+of a directory, a rather embarrassing situation.
+</p>
+<p>
+Okay, so some nonzero amount of metadata needs to go into the
+directory entry.
+But NTFS supports hard links, which complicates matters
+since a file with multiple hard links has multiple directory entries.
+If the directory entries disagree, who's to say which one is right?
+One way out would be try very hard to keep all the directory entries
+in sync and to make the <code>chkdsk</code> program arbitrary choose
+one of the directory entries as the "correct" one in the case a conflict
+is discovered.
+But this also means that if a file has a thousand hard links, then
+changing the file size would entail updating a thousand directory entries.
+</p>
+<p>
+That's where the NTFS folks decided to draw the line.
+</p>
+<p>
+In NTFS, file system metadata is a property not of the directory
+entry but rather of the <i>file</i>,
+with some of the metadata replicated into the directory entry as a
+tweak to improve directory enumeration performance.
+Functions like
+<code>Find&shy;First&shy;File</code> report the directory entry,
+and by putting the metadata that FAT users were accustomed to getting
+"for free", they could avoid being slower
+than FAT for directory listings.
+The directory-enumeration functions report the last-updated metadata,
+which may not correspond to the actual metadata if the directory entry
+is stale.
+</p>
+<p>
+The next question is where and how often this metadata replication is done;
+in other words, how stale is this data allowed to get?
+To avoid having to update a potentially unbounded number of
+directory entries each time a file's metadata changed, the NTFS folks
+decided that the replication would be performed only from the file into
+<i>the directory entry that was used to open the file</i>.
+This means that if a file has a thousand hard links,
+a change to the file size would be reflected in the directory entry
+that was used to open the file, but the other 999 directory entries
+would contain stale data.
+</p>
+<p>
+As for how often, the answer is a little more complicated.
+Starting in Windows Vista (and its corresponding Windows Server version
+which I don't know but I'm sure you can look up,
+and by "you" I mean "Yuhong Bao"),
+the NTFS file system performs this courtesy replication when the
+last handle to a file object is closed.
+Earlier versions of NTFS replicated the data while the file
+was open whenever the cache was flushed, which meant that it happened
+every so often according to an unpredictable schedule.
+The result of this change is that the directory entry now gets updated
+less frequently, and therefore the last-updated file size is more
+out-of-date than it already was.
+</p>
+<p>
+Note that even with the old behavior, the file size was still
+out of date (albeit not as out of date as it is now),
+so any correctly-written program already had to accept the possibility
+that the actual file size differs from the size reported by
+<code>Find&shy;First&shy;File</code>.
+The change to suppress the "bonus courtesy updates" was made for
+performance reasons.
+Obviously, updating the directory entries results in additional I/O
+(and forces a disk head seek),
+so it's an expensive operation for relatively little benefit.
+</p>
+<p>
+If you really need the actual file size right now, you can do what
+the first customer did and call <code>Get&shy;File&shy;Size</code>.
+That function operates on the actual file and not on the directory entry,
+so it gets the real information and not the shadow copy.
+Mind you, if the file is being continuously written-to,
+then the value you get is already wrong the moment you receive it.
+</p>
+<p>
+Why doesn't Explorer do the
+<code>Get&shy;File&shy;Size</code> thing when it enumerates the contents
+of a directory so it always reports the accurate file size?
+Well, for one thing, it would be kind of presumptuous of Explorer to
+second-guess the file system.
+"Oh, gosh, maybe the file system is lying to me.
+Let me go and verify this information via a slower alternate mechanism."
+Now you've created this environment of distrust.
+Why stop there?
+Why not also verify file contents?
+"Okay, I read the first byte of the file and it returned 0x42, but I'm
+not so sure the file system isn't trying to trick me, so after reading
+that byte, I will open the volume in raw mode, traverse the file system
+data structures, and find the first byte of the file myself,
+and if it isn't 0x42, then somebody's gonna have some explaining to do!"
+If the file system wants to lie to us,
+then <i>let the file system lie to us</i>.
+</p>
+<p>
+All this verification takes
+an operation that could be done in
+<nobr>2 + <i>N</i>/500</nobr> I/O operations
+and slows it down to
+<nobr>2 + <i>N</i>/500 + 3<i>N</i></nobr> operations.
+And you're reintroduced all the disk seeking
+that all the work was intended to avoid!
+(And if this is being done over the network,
+you can definitely feel a 1500&times; slowdown.)
+Congratulations, you made NTFS slower than FAT.
+I hope you're satisfied now.
+</p>
+<p>
+If you were paying close attention, you'd have noticed that I wrote
+that the information is propagated into the directory when the last handle
+to the <i>file object</i> is closed.
+If you call <code>Create&shy;File</code> twice on the same file,
+that creates two file objects which refer to the same underlying file.
+You can therefore trigger the update of the directory entry from another
+program by simply opening the file and then closing it.
+</p>
+<pre>
+void UpdateFileDirectoryEntry(__in PCWSTR pszFileName)
+{
+    HANDLE h = CreateFileW(
+        pszFileName,
+        0,                  // don't require any access at all
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,               // lpSecurityAttributes
+        OPEN_EXISTING,
+        0,                  // dwFlagsAndAttributes
+        NULL);              // hTemplateFile
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+    }
+}
+</pre>
+<p>
+You can even trigger the update from the program itself.
+You might call a function like this every so often
+from the program generating the output file:
+</p>
+<pre>
+void UpdateFileDirectoryEntry(__in HANDLE hFile)
+{
+    HANDLE h = ReOpenFile(
+        hFile,
+        0,                  // don't require any access at all
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0);                 // dwFlags
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+    }
+}
+</pre>
+<p>
+If you want to update all file directory entries (rather than a specific
+one), you can build the loop yourself:
+</p>
+<pre>
+// functions ProcessOneName and EnumerateAllNames
+// <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/07/20/10188033.aspx">incorporated by reference</a>.
+
+void UpdateAllFileDirectoryEntries(__in PCWSTR pszFileName)
+{
+    EnumerateAllNames(pszFileName, UpdateFileDirectoryEntry);
+}
+</pre>
+<p>
+Armed with this information, you can now give a fuller explanation of
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/08/12/10195186.aspx#10195204">
+why <code>Read&shy;Directory&shy;ChangesW</code> does not
+report changes to a file until the handle is closed</a>.
+(And why it's not a bug in
+<code>Read&shy;Directory&shy;ChangesW</code>.)
+</p>
+<p>
+<b>Bonus chatter</b>:
+Mind you, the file system could expose a flag to
+a <code>Find&shy;First&shy;File</code>-like function that
+means "Accuracy is more important than performance;
+return data that is as up-to-date as possible."
+The NTFS folks tell me that implementing such a flag wouldn't be
+all that hard.
+The real question is whether anybody would bother to use it.
+(If not, then it's a bunch of work for no benefit.)
+</p>
+<p>
+<b>Bonus puzzle</b>:
+A customer observed that whether the
+file size in the directory entry was being updated
+while the file was being written depended on what
+directory the file was created in.
+Come up with a possible explanation for this observation.</p>
+<p>
+<b>Bonus reading</b>:
+</p>
+<ul>
+<li>
+<a HREF="http://blogs.msdn.com/b/ntdebugging/archive/2008/07/03/ntfs-misreports-free-space.aspx">
+NTFS misreports free space?</a></p>
+<li>
+<a HREF="http://blogs.technet.com/b/askcore/archive/2009/10/16/the-four-stages-of-ntfs-file-growth.aspx">
+The four stages of NTFS file growth</a>.
+</ul>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (28)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-954943">
+				<div id="div-comment-954943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-954943">
+			December 26, 2011 at 7:52 am</a>		</div>
+
+		<p>When in doubt regarding strange file locking behavior, blame the antivirus application and/or the search indexing service.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-954963">
+				<div id="div-comment-954963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-954963">
+			December 26, 2011 at 8:17 am</a>		</div>
+
+		<p>What I find interesting is: why does Unix not need this optimization? Looking at a popular Unix filesystem (the ext2 family of filesystems), I see that the only things in a directory entry are the inode number, the file name, and optionally the file type (regular file, directory, symbolic link, device, &#8230;). And yet Unix does not seem to have any slowdown because of it.</p>
+<p>I believe the real cause is a difference in the API. On Unix, the API to list the contents of a directory (opendir/readdir/closedir) returns the exact same things the filesystem has in the directory entry: inode number, file type, and file name. On the other hand, the Windows API (FindFirstFile/FindNextFile/FindClose) returns much more data (see the WIN32_FIND_DATA struct for the details). That data includes the file size.</p>
+<p>The NTFS designers had no choice. The level of detail returned by the Unix directory enumeration API would be a better match to what they wanted to do, but they had to maintain compatibility with a DOS-era API which also returned the file size. They could create a better API, but nobody would use it. Unix systems never had this problem, because the inode was always a separate thing, and software written for Unix already knew it had to stat() every file (for those who do not know Unix, stat() returns much of the inode metadata, including the file size and times), and that stat()ing every file could be expensive.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-954973">
+				<div id="div-comment-954973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-954973">
+			December 26, 2011 at 8:30 am</a>		</div>
+
+		<p>@Henke37:</p>
+<p>And this (antivirus) is what caused VB6 (?) disapppearing files debacle, years ago.</p>
+<p>And for what it&#39;s worth, the search indexing service occasionally interfers with the file deletion and write access. You may have seen once in a while that you cannot delete a file because it&#39;s opened by SYSTEM.</p>
+<p>Why CreateFile always gets the most recent file size &#8211; because all FILE_OBJECT&#39;s for an open file (no matter which hardlink was used) refer to the same metadata copy in memory, maintained by the FS driver. This also allows to maintain file sharing and locking semantics, and also APPEND access semantics.</p>
+<p>If required, FindFile could be changed to see if there is such a cached metadata record. Though I&#39;m not sure if it&#39;s much requested feature.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-954993">
+				<div id="div-comment-954993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-954993">
+			December 26, 2011 at 10:06 am</a>		</div>
+
+		<p>Cesar: calling stat on every file is also what causes *nix file managers to be so slow, and why I hate preview/metadata logic in Explorer with a passion.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955003">
+				<div id="div-comment-955003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955003">
+			December 26, 2011 at 10:20 am</a>		</div>
+
+		<p>I would have used it, but I ended up calling GetFileInformation myself on every file.</p>
+<p>@Cesar: Modern UNIX systems keep the inode physically near the directory on which the file was first created, which ends up being good enough.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955013">
+				<div id="div-comment-955013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955013">
+			December 26, 2011 at 11:03 am</a>		</div>
+
+		<p>There is another explanation; namely that just because a program is writing data to a file doesn&#39;t mean that data is being committed to a disk. Point being that even if the file size was reporting something other than zero on a regular basis, it still wouldn&#39;t be accurate for a file that is still being written!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955023">
+				<div id="div-comment-955023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955023">
+			December 26, 2011 at 11:10 am</a>		</div>
+
+		<p>@Joe: I use it as something like a progress bar for a program that doesn&#39;t normally have it.</p>
+<p>Incidentally, this still works on Vista if you use Cygwin&#39;s ls. The explanation is left to the reader.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955043">
+				<div id="div-comment-955043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955043">
+			December 26, 2011 at 1:05 pm</a>		</div>
+
+		<p>I&#39;ve always wondered about that behavior. It did bother me somewhat, being that I use a lot of progs whose only progress is in log files. I usually use an &nbsp;implementation of tail, which shows a streaming log.</p>
+<p>I&#39;d expect the API to show a coherent picture of the FS, regardless of any lazy-writing or caching effect. When processing FindFirst, I imagine NTFS could lookup whether any dir entry points to a file that&#39;s currently open and take the size from there, no disk access needed. Don&#39;t know how complex that would be though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jan-ringos even thread-even depth-1" id="comment-955063">
+				<div id="div-comment-955063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Jan+Ringo%C5%A1' rel='external nofollow' class='url'>Jan Ringoš</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955063">
+			December 26, 2011 at 2:05 pm</a>		</div>
+
+		<p>I work in environment where my simplest option to track behavior, communications and data flow, is to view many log files at once (I even wrote myself notepad-like tail, called dynamic log viewer ;-)). The change in NTFS behavior in Server 2008 was slightly inconveniencing at first, but because of it I eventually stopped looking at file sizes and started using more reliable displays. So&#8230; positive for me in the end.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955073">
+				<div id="div-comment-955073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955073">
+			December 26, 2011 at 5:02 pm</a>		</div>
+
+		<p>Why doesn&#39;t the APIs (FFF) use the fresh metadata already in memory instead of physical reading invalid data from a slow device? That should be the first optimization these guys are doing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955143">
+				<div id="div-comment-955143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955143">
+			December 26, 2011 at 7:53 pm</a>		</div>
+
+		<p>&quot;Why doesn&#39;t the APIs (FFF) use the fresh metadata already in memory instead of physical reading invalid data from a slow device? That should be the first optimization these guys are doing.&quot;</p>
+<p>Back when the system was designed, memory was at a premium. &nbsp;An ironic statement to a person whose handle is 640k.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955153">
+				<div id="div-comment-955153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Evan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955153">
+			December 26, 2011 at 9:56 pm</a>		</div>
+
+		<p>First: Raymond, thank you for an awesome blog entry. This actually may help to explain quite a bit about the FindFirstFileEx API, which I&#39;ve previously found strange. (In particular, why is there a flag you can pass to suppress returning short file names which is documented to perhaps substantially increase speed, but giving the size is fast anyway.)</p>
+<p>@Cesar: &quot;What I find interesting is: why does Unix not need this optimization? &#8230; And yet Unix does not seem to have any slowdown because of it.&quot;</p>
+<p>I think it goes beyond what you say to the UI.</p>
+<p>A typical mode of looking at the directory contents in Linux is by running &#39;ls&#39;, which doesn&#39;t show you the size. In theory, &#39;ls -l&#39; can be substantially more expensive than a plain &#39;ls&#39;. (The docs even warn about this potential problem in the context of the flags which tell &#39;ls&#39; to color the results or mark directories and executable files with / and *. The former can be done on dt_type-supporting systems with just the information from readdir(), but the latter needs a stat().) In contrast, Explorer will often (always?) need the size.</p>
+<p>I actually already want, for independent reasons, to run some statistics about how much time the extra lookup costs, so if you&#39;re interested in how much difference it makes on Unix to do just a sequence of readdir calls compared to readdir+stat, or how much difference the FindExInfoBasic flag to FindFirstFileEx makes, I&#39;ll post back here if I do that investigation and this discussion is still open or you can email me at <a href="mailto:evaned@gmail.com">evaned@gmail.com</a>.</p>
+<p>@Joshua: &quot;Modern UNIX systems keep the inode physically near the directory on which the file was first created, which ends up being good enough.&quot;</p>
+<p>It&#39;s not good enough if you&#39;re on a networked file system though. I sometimes have &#39;ls&#39;s take several seconds; I have recently started to wonder if the fact that I use the &#8211;color flag (which causes those stat()s) is the main cause of that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955163">
+				<div id="div-comment-955163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tony</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955163">
+			December 27, 2011 at 3:45 am</a>		</div>
+
+		<p>&quot;Now you&#39;ve created this environment of distrust. Why stop there? Why not also verify file contents?&quot;</p>
+<p>It&#39;s not an environment of distrust, it&#39;s acknowledgement of a technical limitation and working around it to provide 100% accurate results. What&#39;s the big deal?</p>
+<div class="post">[<i>That last 1% is pretty expensive, since it increases the cost 1500&times;. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955213">
+				<div id="div-comment-955213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">heterodox</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955213">
+			December 27, 2011 at 7:32 am</a>		</div>
+
+		<p>No one&#39;s taken a swing at the puzzle yet? Okay, I&#39;ll step up to the plate (and miss, most likely). Could that happen if a FAT32 partition were mounted in one of the NTFS folders?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955293">
+				<div id="div-comment-955293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955293">
+			December 27, 2011 at 8:10 am</a>		</div>
+
+		<p>Raymond, I think the argument is that the last 1% shouldn&#39;t cost 1500x as much. Since the incorrect sizes are only for files that are currently open, the correct information should be somewhere in the computer&#39;s memory. For every enumerated file, NTFS just has to look in its dictionary of cached files to see if there&#39;s more recent metadata. Since that information is probably in RAM, it should be substantially cheaper than 1500x more. I&#39;d expect that this lookup would cost no more than 5% additional.</p>
+<div class="post">[<i>Like I said in the article, &quot;The NTFS folks tell me that implementing such a flag wouldn&#39;t be all that hard.&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955353">
+				<div id="div-comment-955353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955353">
+			December 27, 2011 at 9:02 am</a>		</div>
+
+		<p>Raymond: If getting the latest metadata costs 150000% more, then a flag for it makes sense (assuming anybody would bother to use it). But if the latest metadata can come from cache instead of hitting the disk (adding, say, only 5%), why bother with a flag &#8212; why not just do the lookup for every enumerated file?</p>
+<p>If people really object to the slight perf hit, they could create a registry entry for disabling the lookup, like they did for creating 8.3 filenames and updating last access times.</p>
+<div class="post">[<i>The 1500x cost is if Explorer decides to ignore the file size that comes out of FindFirstFile and gets the current size directly. If it happens inside NTFS, then it would naturally be cheaper. But it would also introduce other weirdness. &quot;When I type <code>dir</code> I get the correct size of the file as it is being generated, but when the program finishes, the size reverts to the incorrect value again!&quot; (Because the file closure updates the directory entry only for the hard link that was used to open it, and you were observing it through a different hard link.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955173">
+				<div id="div-comment-955173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Weland</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955173">
+			December 27, 2011 at 4:50 am</a>		</div>
+
+		<p>@cesar: Actually, a fairly valid reason why things aren&#39;t necessarily *that* slow for most common usage scenarios is that the inode table can be cached. So actually, most of the time, you don&#39;t go for a walk around the whole filesystem looking for that annoying inode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955393">
+				<div id="div-comment-955393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Right &amp; wrong</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955393">
+			December 27, 2011 at 4:59 pm</a>		</div>
+
+		<p>Right+wrong is better than wrong+wrong.</p>
+<p>Two wrongs doesn&#39;t make it right, Raymond.</p>
+<div class="post">[<i>It may not be right, but it&#39;s what it does. I find it interesting that people who normally freak out when <a href="http://blogs.msdn.com/b/oldnewthing/archive/2005/07/15/439261.aspx" rel="nofollow">the file system has some weirdo feature to accommodate an old DOS API</a> are asking for the file system to add a weirdo feature to an old DOS API. (As noted in the article, the file system folks say it wouldn&#39;t be too hard to add the feature, but nobody has asked for it.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955443">
+				<div id="div-comment-955443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/myagna01_4000_students.poly.edu/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>myagna01@students.poly.edu</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955443">
+			December 27, 2011 at 7:08 pm</a>		</div>
+
+		<p>I have a somewhat offtopic question. &nbsp;FAT did not have anything like inodes, and mostly didn&#39;t need them, because the directory entry contains everything the inode would have had: where to find the file on disk, file size, etc. &nbsp;This means no support for hard links, which makes me wonder: how are . and .. implemented? &nbsp;In particular, how do you solve the problem you mentioned, of keeping the metadata consistent? &nbsp;A directory can have many directory entries, one for each child, plus one from itself, and one from its parent. &nbsp;I can only think of two solutions. &nbsp;One is that the relevant data is stored in the direcotry itself, instead of as file system metadata. &nbsp;That seems ugly. &nbsp;Another way might be that whenever somebody wants metadata for directory stuff, we look it up in stuff. and whenever somebody asks for stuff.., we use stuff&#8230; &nbsp;That&#39;s not so ugly, but is this what was actually done?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955453">
+				<div id="div-comment-955453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xpclient</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955453">
+			December 27, 2011 at 7:25 pm</a>		</div>
+
+		<p>The shell does have its own bugs for reporting file size like the infamous Vista status bar bug which misreports size (reports the double size and it keeps multiplying) as many times as you press Refresh. Explorer status bar also is going progressively worse in each version of Windows: <a rel="nofollow" target="_new" href="http://social.msdn.microsoft.com/Forums/en-US/windowsdeveloperpreviewgeneral/thread/69de0cc1-b91b-4fd8-96c3-8299f8ed0488" rel="nofollow">social.msdn.microsoft.com/&#8230;/69de0cc1-b91b-4fd8-96c3-8299f8ed0488</a> Hiding useful info under the pretense of some insignificant performance gains has been in-fashion starting with the Vista shell, so users take double the number of steps for simple tasks like viewing size.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-955633">
+				<div id="div-comment-955633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955633">
+			December 28, 2011 at 8:46 am</a>		</div>
+
+		<p>@Mark:</p>
+<p>&#39;.&#39; is implemented by the file path &quot;canonicalization&quot;. &#39;..&#39; is an actual entry in the FAT directory.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955733">
+				<div id="div-comment-955733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/myagna01_4000_students.poly.edu/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>myagna01@students.poly.edu</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955733">
+			December 28, 2011 at 2:22 pm</a>		</div>
+
+		<p>Ok, cool, but if you have a directory called c:stuff, and also C:stuffthings, and someone is in C: and asks for the metadata on &quot;stuff&quot;, and someone else is in C:stuffthings, and they ask for the metadata on &quot;..&quot;, how will they get the same answer?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-955743">
+				<div id="div-comment-955743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955743">
+			December 28, 2011 at 5:04 pm</a>		</div>
+
+		<p>@Mark:</p>
+<p>Win32 tracks the current directory (SetCurrentDirectory). A partial path may go through conversion to a canonical path, by appending a current directory to it. But the filesystem driver might be able to do relative open by a partial path, because OBJECT_ATTRIBUTES includes a handle to the base directory. If you ask for &quot;stuff&quot; while in C:, the base directory in C:, and the relative path is &#39;stuff&#39;. If you&#39;re in C:Stuffthings, &#39;..&#39; entry in this directory points to c:stuff.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955753">
+				<div id="div-comment-955753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955753">
+			December 28, 2011 at 6:05 pm</a>		</div>
+
+		<p>Strangely enough, I observe on XP (I&#39;ll let others try other incarnations) that first findfile after boot certainly accesses MFT. It can be very slow, proportional to the number of files in the directory. Once the MFT entries are in the RAM is findfile fast.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955763">
+				<div id="div-comment-955763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/myagna01_4000_students.poly.edu/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>myagna01@students.poly.edu</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955763">
+			December 28, 2011 at 6:41 pm</a>		</div>
+
+		<p>@alegr1</p>
+<p>So you&#39;re saying that it keeps track of the whole path, and to resolve .. it basically does simple string manipulation? &nbsp;And DOS worked this way too? &nbsp;Then why bother having .. appear as a directory entry in the first place, if you don&#39;t actually use it? &nbsp;This sounds like it would make resolving .. pretty slow, if you&#39;re in C:dir1dir2dir3dir4dir5dir6dir7dir8dir9, and you want .. then it would have to go all the way from c: to dir8. &nbsp;I suppose that this is not too slow, and perhaps it is fast enough to seem instantaneous, but it seems a bit wasteful. &nbsp;Or am I misunderstanding?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-955783">
+				<div id="div-comment-955783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955783">
+			December 28, 2011 at 11:42 pm</a>		</div>
+
+		<p>For those curious, here&#39;s Part 2 of &quot;NTFS misreports free space&quot;: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/ntdebugging/archive/2008/10.aspx" rel="nofollow">blogs.msdn.com/&#8230;/10.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-955893">
+				<div id="div-comment-955893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955893">
+			December 30, 2011 at 3:00 am</a>		</div>
+
+		<p>So, is FindFirstFile the best way to access this &quot;fast&quot; metadata, for when you don&#39;t need all metadata?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-hardon odd alt thread-odd thread-alt depth-1" id="comment-955993">
+				<div id="div-comment-955993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/gdalsnes' rel='external nofollow' class='url'>gdalsnes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111226-00/?p=8813#comment-955993">
+			December 30, 2011 at 1:23 pm</a>		</div>
+
+		<p>I like the original behavior better, imo half of the changes post XP64/Server 2003 are steps backwards. You keep saying &quot;..the file system folks say it wouldn&#39;t be too hard to add the feature, but nobody has asked for it&#8230;&quot;, but who asked for a feature of not showing the file size at all? I seriously doubt someone asked to make something that previously worked &quot;ok&quot; to not work at all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

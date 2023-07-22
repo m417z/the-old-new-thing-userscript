@@ -1,0 +1,443 @@
+<html>
+<head>
+<title>Why does tapping the Alt key cause my owner-draw static control to repaint?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does tapping the Alt key cause my owner-draw static control to repaint?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 12, 2016 / year-entry #261</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Time to draw the underlines.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had an owner-drawn static control,
+and they found that when the user pressed the <kbd>Alt</kbd> key,
+their static control redrew.
+This extra redraw was unwanted,
+presumably because the control takes a long time to draw,
+and they didn't want to waste the time redrawing something
+that hadn't changed.
+</p>
+<p>
+So why does tapping the <kbd>Alt</kbd> key
+cause the owner-draw static control to repaint?
+</p>
+<p>
+Because the state of the keyboard accelerators
+has changed.
+</p>
+<p>
+The customer noticed that on the initial draw,
+the <code>itemState</code> had the numeric value
+of 260, whereas the
+<code>itemState</code> is 4 on the unwanted redraw.
+The customer noted that 4 is documented as
+<code>ODS_<wbr>DISABLED</code>,
+but 260 is not documented.
+</p>
+<p>
+Okay, well, let's note that the value 260 is documented.
+It breaks down as <code>4 | 256</code> which is
+<code>ODS_<wbr>DISABLED | ODS_<wbr>NO&shy;ACCEL</code>.
+</p>
+<p>
+Let's walk through what's going on here.
+</p>
+<p>
+When the static control first paints, the window
+that contains it is in the "hidden accelerators" state,
+so the draw flags are
+<code>ODS_<wbr>DISABLED | ODS_<wbr>NO&shy;ACCEL</code>.
+The
+<code>ODS_<wbr>DISABLED</code> is a bug,
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20141211-00/?p=43423">
+as we saw some time ago</a>.
+The
+<code>ODS_<wbr>NO&shy;ACCEL</code> is telling you
+to do your owner-draw thing, but don't draw any
+accelerators.
+</p>
+<p>
+When the user presses the <kbd>Alt</kbd> key,
+the window changes state to "visible accelerators",
+so the static control asks you to draw
+<a HREF="http://www.imdb.com/title/tt0054141/">
+once more, with accelerators</a>,
+as
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20050503-00/?p=35723">
+I discussed some time ago</a>.
+</p>
+<p>
+Okay, now that we know what's going on, what can we do
+to stop it?
+</p>
+<p>
+Once you understand
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20130516-00/?p=4343/">
+the way the
+<code>WM_<wbr>UPDATE&shy;UI&shy;STATE</code>
+and
+<code>WM_<wbr>CHANGE&shy;UI&shy;STATE</code>
+messages interact</a>,
+you can see two ways out.
+</p>
+<p>
+One is to ignore the request to draw the control
+if it is happening in response to a
+<code>WM_<wbr>UPDATE&shy;UI&shy;STATE</code>
+message.
+</p>
+<pre>
+LRESULT CALLBACK StaticSubclassProc(
+    HWND hwnd, UINT wm, WPARAM wParam, LPARAM lParam,
+    UINT_PTR id, DWORD_PTR refData)
+{
+    LRESULT lres;
+    ParentClass *parentClass = (ParentClass*)refData;
+    switch (wm)
+    {
+    case WM_UPDATEUISTATE:
+        parentClass-&gt;ignoreOwnerDraw = true;
+        lres = DefSubclassProc(hwnd, wm, wParam, lParam);
+        parentClass-&gt;ignoreOwnerDraw = false;
+        return lres;
+    }
+    return DefSubclassProc(hwnd, wm, wParam, lParam);
+}
+
+class ParentClass
+{
+ ...
+ void OnDrawItem(const DRAWITEMSTRUCT* pdis)
+ {
+  if (pdis-&gt;CtlID == IDC_MYSTATIC <font COLOR=blue>&amp;&amp; !ignoreOwnerDraw)</font> {
+   DoSlowOwnerDraw(...);
+  }
+ }
+
+ bool ignoreOwnerDraw = false;
+}
+</pre>
+<p>
+The idea here is to set a flag if a
+<code>WM_<wbr>UPDATE&shy;UI&shy;STATE</code>
+is in progress, and if the handling of the
+<code>WM_<wbr>UPDATE&shy;UI&shy;STATE</code>
+message results in a request to redraw the control,
+then ignore it.
+</p>
+<p>
+I leave as an exercise the code to install
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20031111-00/?p=41883">
+and remove</a>
+the subclass procedure.
+I do this partly as an actual exercise,
+and partly to avoid me having to write two
+versions of the answer, depending on whether
+the parent is a regular window or
+a dialog box.
+</p>
+</p>
+<p><b>Update</b>:
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276675">
+As Adrian notes below</a>,
+this algorithm fails if the static control chooses merely
+to invalidate in response to <code>WM_<wbr>UPDATE&shy;STATE</code>
+rather than repaint.
+By the time the <code>WM_<wbr>PAINT</code> arrives,
+the flag would already be reset.
+Fortunately&hellip; read on.
+</p>
+<p>
+Another solution is to prevent the static control from
+seeing the
+<code>WM_<wbr>UPDATE&shy;UI&shy;STATE</code>
+message at all.
+</p>
+<pre>
+LRESULT CALLBACK IgnoreUIStateChangeSubclassProc(
+    HWND hwnd, UINT wm, WPARAM wParam, LPARAM lParam,
+    UINT_PTR id, DWORD_PTR /* refData */)
+{
+    switch (wm) {
+    case WM_UPDATEUISTATE:
+        return DefWindowProc(hwnd, wm, wParam, lParam);
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, IgnoreUIStateChangeSubclassProc, 0);
+        break;
+    }
+    return DefSubclassProc(hwnd, wm, wParam, lParam);
+}
+
+BOOL IgnoreUIStateChange(HWND hwnd)
+{
+ return SetWindowSubclass(hwnd, IgnoreUIStateChangeSubclassProc,
+                          1, 0);
+}
+</pre>
+<p>
+I made this subclass procedure self-unregistering
+because it has no reference to any other objects,
+so there are no lifetime issues with letting the
+subclass procedure outlive the parent class.
+This makes the function self-contained and consequently
+generally useful.
+The <code>Ignore&shy;UI&shy;State&shy;Change</code> function
+registers the subclass procedure on any control,
+at which point the control will ignore any changes
+to show or hide accelerators or focus rectangles.
+</p>
+<p>
+The subclass procedure works by intercepting the
+<code>WM_<wbr>UPDATE&shy;UI&shy;STATE</code>
+message and sending it directly to
+<code>Def&shy;Window&shy;Proc</code> for
+default processing,
+bypassing any custom processing in the control itself.
+Passing the message to
+<code>Def&shy;Window&shy;Proc</code> allows
+the normal message propagation to continue,
+but bypassing the control's window procedure
+means that the control is never told that the
+UI state has changed,
+which means that it never tries to redraw itself
+to hide or show accelerators or focus rectangles.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-fredericmagnyf even thread-even depth-1 parent" id="comment-1276635">
+				<div id="div-comment-1276635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276635">
+			December 12, 2016 at 7:34 am</a>		</div>
+
+		<p>Masking keyboard shortcuts sounds a lot like a concession to the &#8220;computers are scary!&#8221; crowd. More damningly, I think instead of making a computer easier to use, it does the exact opposite because it hampers visual discovery of what programs can do.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1276695">
+				<div id="div-comment-1276695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Viila</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276695">
+			December 12, 2016 at 2:45 pm</a>		</div>
+
+		<p>Nobody (to a first approximation) these days uses keyboard to navigate their programs. If you&#8217;re power user enough to want keyboard shortcuts, you&#8217;re power user enough to know to hit alt to see them. </p>
+<p>(Though, I am very glad that Microsoft has stuck with the principle that everything should be keyboard navigable. Last time I upgraded my computer the new motherboard had no USB2 ports, so I had to make do with just a PS/2 keyboard and no mouse to install Windows and get the Intel USB3 drivers onto it. I was almost thwarted at the last hurdle by the motherboard manufacturer&#8217;s repackaged custom installer that didn&#8217;t support keyboard navigation. Had to turn on the keyboard mouse emulation in Windows.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-3 parent" id="comment-1276735">
+				<div id="div-comment-1276735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276735">
+			December 13, 2016 at 6:02 am</a>		</div>
+
+		<p>Not only is making software accessible simply the right thing to do, accessibility is also a requirement for any software sold to the U.S. government, so there&#8217;s that too.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1277095">
+				<div id="div-comment-1277095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Erkin Alp Güney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1277095">
+			December 15, 2016 at 12:00 pm</a>		</div>
+
+		<p>Do governments conduct usability tests to check accessibility?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jeremytais even thread-odd thread-alt depth-1 parent" id="comment-1276645">
+				<div id="div-comment-1276645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276645">
+			December 12, 2016 at 7:37 am</a>		</div>
+
+		<p>I have always been in the camp of:  If the control takes a long time to paint, cache the result of the last paint and just reuse it unless something changes.  I suppose that is because I started doing custom drawing stuff back in the days when you got a bunch of WM_PAINTs due to dragging windows around the screen.  I guess that with DWM that doesn&#8217;t happen quite so much anymore.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1276655">
+				<div id="div-comment-1276655" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276655">
+			December 12, 2016 at 7:51 am</a>		</div>
+
+		<p>Kids today. Back in the day, you didn&#8217;t get WM_PAINTs while dragging windows around the screen, because they were represented by a just a frame, and they didn&#8217;t redraw until you dropped them.</p>
+<p>And we liked it!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-alegrigoriev even depth-3" id="comment-1276665">
+				<div id="div-comment-1276665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276665">
+			December 12, 2016 at 8:55 am</a>		</div>
+
+		<p>Same thing with DWM</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1277175">
+				<div id="div-comment-1277175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MarcK4096</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1277175">
+			December 16, 2016 at 7:26 am</a>		</div>
+
+		<p>Up hill! Both ways!  :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1276675">
+				<div id="div-comment-1276675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276675">
+			December 12, 2016 at 9:27 am</a>		</div>
+
+		<p>Flipping a flag while processing WM_UPDATEUISTATE doesn&#8217;t seem robust.  The result of the WM_UPDATEUISTATE could be an invalidation in which case, by the time the WM_PAINT message comes, your flag would be clear.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-iboyd odd alt thread-odd thread-alt depth-1 parent" id="comment-1276696">
+				<div id="div-comment-1276696" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/IanBoyd' rel='external nofollow' class='url'>IanBoyd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276696">
+			December 12, 2016 at 3:41 pm</a>		</div>
+
+		<p>They were likely wondering because whenever someone pressed the alt key their control flickered.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-jeremytais even depth-2 parent" id="comment-1276815">
+				<div id="div-comment-1276815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1276815">
+			December 13, 2016 at 12:13 pm</a>		</div>
+
+		<p>I don&#8217;t doubt that you may be correct.  But if that is true, the correct answer is to double buffer your painting, not try to do some weird hack to avoid painting.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1277245">
+				<div id="div-comment-1277245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161212-00/?p=94915#comment-1277245">
+			December 17, 2016 at 2:28 pm</a>		</div>
+
+		<p>It is an answer and on powerful desktops it may be an acceptable one. On low powered platforms (Windows CE/RT) then it may not be. You may not be able to afford the extra ram for all those controls.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,416 @@
+<html>
+<head>
+<title>The MIPS R4000, part 5: Memory access (aligned)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The MIPS R4000, part 5: Memory access (aligned)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 6, 2018 / year-entry #82</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Simple loads and stores.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The MIPS R4000 has one addressing mode:
+Register indirect with displacement.
+</p>
+<pre>
+    LW      rd, disp16(rs)  ; rd = *( int32_t*)(rs + disp16)
+    LH      rd, disp16(rs)  ; rd = *( int16_t*)(rs + disp16)
+    LHU     rd, disp16(rs)  ; rd = *(uint16_t*)(rs + disp16)
+    LB      rd, disp16(rs)  ; rd = *(  int8_t*)(rs + disp16)
+    LBU     rd, disp16(rs)  ; rd = *( uint8_t*)(rs + disp16)
+</pre>
+<p>
+The load instructions load an aligned word, halfword, or byte
+from the address specified by adding the 16-bit signed displacement
+to the source register (known as the "base register").&sup1;
+By convention, the displacement can be omitted, in which case it is
+taken to be zero.
+</p>
+<p>
+The plain versions of these instructions sign-extend to a 32-bit value;
+the <code>U</code> versions zero-extend.
+</p>
+<p>
+There are corresponding aligned store instructions.
+</p>
+<pre>
+    SW      rs, disp16(rd)  ; *( int32_t*)(rd + disp16) = (int32_t)rs
+    SH      rs, disp16(rd)  ; *( int16_t*)(rd + disp16) = (int16_t)rs
+    SB      rs, disp16(rd)  ; *(  int8_t*)(rd + disp16) = ( int8_t)rs
+</pre>
+<p>
+In all cases, if the effective address turns out not to be
+suitably aligned, an alignment fault occurs.
+Windows NT handles the alignment fault by loading the value
+using the unaligned memory access instructions (which we'll see next time),
+and then resuming execution.
+The overhead of the emulation swamps the cost of having done it correctly
+in the first place,
+so if you know that the address may be unaligned,
+then you are far better off using the unaligned memory access instructions
+instead of having the kernel fix it up for you.
+</p>
+<p>
+The assembler emulates absolute addressing with the help of the
+<var>at</var> assembler temporary register.
+For example, the pseudo-instruction
+</p>
+<pre>
+    LW      rd, global_variable
+</pre>
+<p>
+loads an aligned word from a global variable.
+</p>
+<p>
+Let <var>A</var> be the address of the global variable,
+and let
+</p>
+<ul>
+<li><code>YYYY = (int16_t)(A &amp; 0xFFFF)</code> and
+<li><code>XXXX = (A &minus; YYYY) &gt;&gt; 16</code></li>
+</ul>
+<p>
+Then the assembler generates the following two instructions:
+</p>
+<pre>
+    LUI     at, XXXX
+    LW      rd, YYYY(at)
+</pre>
+<p>
+Note that if the bottom 16 bits of the address
+are greater than <code>0x8000</code>,
+then that results in a negative value for <code>YYYY</code>,
+and <code>XXXX</code> will be one greater than the upper 16 bits
+of the address.
+</p>
+<p>
+Another pseudo-instruction is
+</p>
+<pre>
+    LW      rd, imm32(rs)
+</pre>
+<p>
+You may want to do this if indexing a global array.
+A straightforward implementation of the pseudo-instruction would be
+</p>
+<pre>
+    LUI     at, XXXX        ; load high part
+    ADDIU   at, at, YYYY    ; add in the low part
+    ADDU    at, at, rs      ; add in the byte offset
+    LW      rd, (at)        ; load the word
+</pre>
+<p>
+but this can be shortened by an instruction
+by merging the fixed offset <code>YYYY</code> into the displacement
+of the effective address calculation in the <code>LW</code>.
+The result is
+</p>
+<pre>
+    LUI     at, XXXX
+    ADDU    at, at, rs
+    LW      rd, YYYY(at)
+</pre>
+<p>
+While the assembler emulation is convenient,
+it may not be the most efficient.
+If you are accessing the global variable more than once,
+or if you are accessing more than one variable within the same
+64<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">KB</a>
+region,
+you can share the <code>LUI</code> instruction among them.
+</p>
+<p>
+For example, suppose <code>global1</code> and
+<code>global2</code> reside in the same
+64<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">KB</a>
+block of memory.</p>
+<pre>
+    ; lazy version of global2 = global1 + 1
+    LW      r1, global1
+    ADDIU   r1, r1, 1
+    SW      r1, global2
+</pre>
+<p>
+This expands to
+</p>
+<pre>
+    LUI     at, XXXX
+    LW      r1, YYYY(at)
+    ADDIU   r1, r1, 1
+    LUI     at, XXXX
+    SW      r1, ZZZZ(at)
+</pre>
+<p>
+You can factor out the <code>XXXX</code> into a register
+that you reuse for the entire section of code.
+</p>
+<pre>
+    ; sneakier version of global2 = global1 + 1
+    LUI     r2, XXXX
+    LW      r1, YYYY(r2)
+    ADDIU   r1, r1, 1
+    SW      r1, ZZZZ(r2)
+    ; can keep using r2 to access other variables in the block
+</pre>
+<p>
+In theory, you could even store constants in your data segment,
+but since loading a 32-bit constant takes only two instructions
+at most, you probably won't bother.
+</p>
+<p>
+Next time, we'll look at unaligned access.
+</p>
+<p>
+&sup1;
+In earlier versions of the MIPS architecture,
+there was a <i>load delay slot</i>:
+The value retrieved by a load instruction was not available
+until two instructions later.
+</p>
+<p>
+We saw last time that the MIPS architecture supports
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180405-00/?p=98445">
+forwarding of arithmetic computations</a>.
+Why can't it forward memory access?
+</p>
+<p>
+The memory stage comes after the execute stage.
+This means that the result of a memory load in the memory stage
+cannot be forwarded into the execute stage of the next instruction,
+because the memory stage of the first instructions takes place
+at the same time as the execute stage of the second instruction.
+The earliest the result of the load can be consumed is two instructions later.
+</p>
+<p>That means that in the sequence
+</p>
+<pre>
+    LW      r1, (r2)        ; load word from r2 into r1
+    ADDIU   r3, r1, 1       ; r3 = r1 + 1
+</pre>
+<p>
+the <code>ADDIU</code> instruction operated on the <i>old</i>
+value of <var>r1</var>,&sup2; not the value that was loaded from memory.
+If you want to add 1 to the value loaded from memory, you need
+to insert some other instruction in the load delay slot:
+</p>
+<pre>
+    LW      r1, (r2)        ; load word from r2 into r1
+    NOP                     ; load delay slot
+    ADDIU   r3, r1, 1       ; r3 = r1 + 1
+</pre>
+<p>
+The MIPS III architecture removed the load delay slot.
+On the R4000,
+if you try to access the value of a register immediately after
+loading it, the processor stalls until the value becomes ready.
+Sure, the stall is bad, but it's better than running ahead with
+the wrong value!
+</p>
+<p>
+&sup2;
+This is true only if no hardware interrupt occurred.
+If an interrupt occurred, then the load would complete during
+the kernel transition,
+and then
+when the kernel resumed execution, the <code>ADDIU</code> would
+operate on the loaded value after all.
+Therefore, the value of the destination register of a load instruction
+should be treated as garbage until the load delay clears.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1332295">
+				<div id="div-comment-1332295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">12BitSlab</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332295">
+			April 6, 2018 at 7:54 am</a>		</div>
+
+		<p>In some ways, it reminds me of Base/Displacement addressing on S/360.  S/360 used that scheme because any 32 bit address could be represented in 16 bits.  The first four bits represented a 32 bit register and the remaining 12 bits was the added displacement from the base.</p>
+<p>When S/360 was designed, memory was the most expensive component.</p>
+<p>Of course, we didn&#8217;t have to worry about any load delays.  I imagine that could cause more than a couple of hard to find bugs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1332305">
+				<div id="div-comment-1332305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332305">
+			April 6, 2018 at 9:25 am</a>		</div>
+
+		<p>LW t0,8(t1)</p>
+<p>Worst syntax ever!  I wonder if it was inspired by C arrays where you can write buffer[8] as 8[buffer].</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1332325">
+				<div id="div-comment-1332325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332325">
+			April 6, 2018 at 9:44 am</a>		</div>
+
+		<p>Well, you might think it&#8217;s the worst, but it&#8217;s also very popular among multiple assembly languages. (And I prefer it over syntax like <code>LW t0, t1, 8</code>.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1332335">
+				<div id="div-comment-1332335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332335">
+			April 6, 2018 at 10:56 am</a>		</div>
+
+		<p>So I did some reading.  I didn&#8217;t realise this style of address offset is actually very common being x86 AT&amp;T syntax.  I still don&#8217;t like it though!</p>
+<p>Having done 6502 before ARM I found ARM-style LW t0,[t1,#8] somewhat natural in its use of #.  And LW t0,[t1,t2] is still moderately readable because it&#8217;s obvious which bits are getting added together.  Though I think Intel got it right: use a plus sign to represent addition.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1332345">
+				<div id="div-comment-1332345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matteo Italia</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332345">
+			April 6, 2018 at 10:57 am</a>		</div>
+
+		<p>Clearly you haven&#8217;t seen AT&amp;T syntax for x86 memory operands.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1332355">
+				<div id="div-comment-1332355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dandan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332355">
+			April 6, 2018 at 12:54 pm</a>		</div>
+
+		<p>More like the C syntax was inspired by assembly. You have your history quite backwards.</p>
+<p>Of course, the correct syntax would be (lw t0 (+ t1 8)).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1332375">
+				<div id="div-comment-1332375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Falcon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332375">
+			April 6, 2018 at 5:18 pm</a>		</div>
+
+		<p>68k assembly had similar syntax:</p>
+<p>MOVE.L 8(a0), d0</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1332405">
+				<div id="div-comment-1332405" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Clarkstone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332405">
+			April 7, 2018 at 6:13 pm</a>		</div>
+
+		<p>This reminds me of reading a paper on the world&#8217;s first CAD program, <a href="https://en.wikipedia.org/wiki/Sketchpad" rel="nofollow">Sketchpad</a>. The authour spent a few pages describing what we now call structs and C&#8217;s -&gt; operator, because they were unfamiliar to programmers at the time. C&#8217;s -&gt; operator is now thought of as &#8220;get struct pointer, add field offset, fetch/store at the resulting address&#8221;, but in Sketchpad was implemented using addressing modes normally used to index arrays at static addresses with registers (the sort of arrays that Fortran etc programs would use lots of).</p>
+<p>Nowadays, if you want the equivalent of C&#8217;s -&gt; operator then &#8220;field_offset(pointer_register)&#8221; is a weird syntax, but if you want to index an array at a static address using a register then &#8220;array_start(index_register)&#8221; is normal Algol-descendant syntax, especially because you&#8217;d be using a named constant for array_start.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1332455">
+				<div id="div-comment-1332455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joker_vD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180406-00/?p=98455#comment-1332455">
+			April 9, 2018 at 1:23 am</a>		</div>
+
+		<p>Oh, those antiquated relics from the Heroic (or, as some would call it, Dark) Age of the CS! They belong in the museum, but alas, one doesn&#8217;t simply change the assembler syntax.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

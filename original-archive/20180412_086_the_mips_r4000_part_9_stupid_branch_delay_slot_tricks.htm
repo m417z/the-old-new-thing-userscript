@@ -1,0 +1,533 @@
+<html>
+<head>
+<title>The MIPS R4000, part 9: Stupid branch delay slot tricks</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The MIPS R4000, part 9: Stupid branch delay slot tricks</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 12, 2018 / year-entry #86</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Technically legal, but strange.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Last time, we learned about
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180411-00/?p=98485">
+the MIPS branch delay slot</a>.
+Today, we'll look at some tricks you can play with the branch delay slot.
+</p>
+<p>
+First trick:
+It is legal to jump into a branch delay slot.
+Of course, it's not a branch delay slot when you do that.
+This lets you write some wacky-looking code:
+</p>
+<pre>
+    B       somewhere           ; unconditional branch
+label:
+    OR      v0, zero, zero      ; v0 = 0
+...
+</pre>
+<p>
+When the unconditional branch is taken,
+the <var>v0</var> register is set to zero
+before execution continues at the branch destination.
+</p>
+<p>
+Meanwhile, if somebody jumps to <code>label</code>,
+then execution continues at <code>label</code>,
+which sets <var>v0</var> to zero,
+and then continues with other stuff.
+</p>
+<p>
+The instruction at <code>label</code> acts both as the branch
+delay slot for the unconditional branch that precedes it,
+but it's also the first instruction in the basic block
+if somebody jumps directly into it.
+</p>
+<p>
+I've seen the opportunity arise for this sort of
+"squeeze out a single instruction" optimization,
+but the Microsoft compiler doesn't take advantage of it.
+Which is probably a good thing.
+(For one thing, it makes it much harder for
+<a HREF="https://blogs.msdn.microsoft.com/reiley/2011/08/06/microsoft-binary-technologies-and-debugging/"
+  _HREF="https://www.microsoft.com/windows/cse/bit_projects.mspx">
+binary transformation tools</a> to decompose a program into basic
+blocks and recombine them in different ways.)
+</p>
+<p>
+Another stupid branch delay slot trick is editing the return address
+as part of the jump.
+</p>
+<pre>
+    BAL     somewhere
+    ADDIU   ra, ra, 4
+
+    NOP
+
+    NOP ; the routine returns here!
+</pre>
+<p>
+The <code>BAL</code> instruction sets the <var>ra</var>
+register to point to the instruction after the branch delay slot,
+which in our case is the first <code>NOP</code>.
+But in the branch delay slot, we modify the <var>ra</var> register,
+so that when execution reaches the start of the called procedure,
+it gets an artificial return address.
+</p>
+<p>
+I'm told this sort of trick is used by some
+compilers to combine a call and an unconditional jump
+into a call with fake return address.
+For example, in this code fragment
+</p>
+<pre>
+    if (...) {
+        ...
+        function1(...);
+    } else {
+        ...
+    }
+    // resume
+    x = 0;
+</pre>
+<p>
+the call to <code>function1</code> is  probably followed
+by an unconditional jump to skip over the <code>else</code> branch.
+</p>
+<pre>
+    BAL     function1
+    NOP                     ; garbage in the branch delay slot
+    B       resume
+    OR      v0, zero, zero  ; set x = 0
+
+    ... else-branch code goes here ...
+
+    OR      v0, zero, zero  ; set x = 0
+resume:
+    ...
+</pre>
+<p>
+A sneaky compiler could
+<a HREF="http://www.pagetable.com/?p=313">
+generate the following code</a>:
+</p>
+<pre>
+    BAL     function1
+    <font COLOR=blue>ADDIU   ra, ra, resume - nominal_return</font> ; tweak return address
+nominal_return:
+
+    ... else-branch code goes here ...
+
+resume:
+    OR      v0, zero, zero  ; set x = 0
+    ...
+</pre>
+<p>
+In the branch delay slot, we edit the return address so that
+when <code>function1</code> returns,
+it resumes execution at <code>resume</code> rather than
+<code>nominal_return</code>,
+thereby avoiding having to execute another branch instruction.
+(We also were able to remove the duplicate
+<code>OR v0, zero, zero</code> instruction that had been hoisted
+into the branch delay slot of the unconditional branch.)
+Note that you get this savings only because you had a garbage
+<code>NOP</code> in the branch delay slot.
+If there were a useful instruction there,
+then the transformation would go like this:
+</p>
+<pre>
+    // original code
+    BAL     function1
+    MOVE    a0, r0      ; set parameter for function
+    B       resume
+    OR      v0, zero, zero  ; set x = 0
+
+    // sneaky code
+    MOVE    a0, r0      ; set parameter for function
+    BAL     function1
+    ADDU    ra, ra, ... ; tweak return address
+
+resume:
+    OR      v0, zero, zero  ; set x = 0
+</pre>
+<p>
+The instruction in the <code>BAL</code> instruction's
+branch delay slot would have
+to go somewhere else,
+so you didn't save any time
+(though you still saved one instruction of space by avoiding
+duplication of the <code>OR v0, zero, zero</code>).
+</p>
+<p>
+But as we saw earlier,
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20041216-00/?p=36973">
+this trick defeats the return address predictor</a>,&sup1;
+so it's probably a bad idea.
+</p>
+<p>
+Okay, next time, we're going to look at the calling convention
+a bit more closely.
+</p>
+<p>
+<b>Bonus chatter</b>:
+Another extra sneaky trick is reusing the return address.
+Suppose your interpreter loop goes like this:
+</p>
+<pre>
+void interpreter_loop(interpreter_state* state)
+{
+ for (;;) {
+  uint32_t opcode = *state-&gt;pc;
+  state-&gt;pc++;
+  jump_table[opcode](state, opcode, state-&gt;pc);
+ }
+}
+</pre>
+<p>
+The interpreter loop just dispatches to the next opcode forever.
+Presumably you would break out of this loop with a <code>longjmp</code>
+or some other nonlocal transfer.
+</p>
+<p>
+The handler function is given the current interpreter state
+(so it can update it),
+and as a courtesy, it also gets the current opcode and a pointer
+to the next unparsed byte as a convenience.
+</p>
+<pre>
+interpreter_loop:
+    ...
+    MOVE    s0, a0       ; s0 points to the interpreter state
+    LA      s1, jump_table
+    LA      ra, next_opcode ; Footnote &sup2;
+next_opcode:
+    LW      v1, 80(s0)  ; get address of next opcode byte
+    ADDU    a2, v1, 1   ; move to next opcode byte (also argument for handler)
+    LBU     a1, 0(v1)   ; load current opcode byte (also argument for handler)
+    SW      a2, 80(s0)  ; save pointer to next opcode byte
+    SLL     t0, a1, 2   ; multiple by 4 to index jump table
+    ADDU    t0, t0, s1  ; calculate entry in jump table
+    LW      v0, 0(t0)   ; load the jump target
+    JR      v0          ; jump to handler - will return to next_opcode
+    MOVE    a0, s0      ; argument for handler
+</pre>
+<p>
+When we call the first handler, <var>ra</var> is set equal to
+<code>next_opcode</code>.
+That handler will do its work and then return to the caller by
+restoring the return address to the <var>ra</var> register
+and performing a <code>JR ra</code>.
+</p>
+<p>
+This means that when control returns to <code>next_opcode</code>,
+you know that <var>ra</var> is equal to <code>next_opcode</code>!
+Since that's the value you wanted to be in that register anyway,
+you can just leave it there when you jump to the next handler,
+saving you the trouble of having to branch back up to
+<code>next_opcode</code> explicitly.
+</p>
+<p>
+This seems to be a really clever trick, but it is probably not
+that useful in practice because of that return address predictor thing.
+</p>
+<p>
+&sup1;
+On the other hand, the MIPS R4000 does not have separate opcodes for
+"jump indirect to register" and
+"jump indirect to register for the purpose of returning";
+it uses the <code>JR</code> instruction for both cases.
+</p>
+<p>
+The inability to distinguish whether a jump instruction was
+semantically a return instruction was a non-issue in the original
+implementation of the MIPS architecture.
+It had only a two-stage pipeline,
+so the single branch delay slot was sufficient to avoid ever
+needing to predict any branches at all.
+</p>
+<p>
+The MIPS R4000 had a four-stage pipeline, and a branch misprediction
+would consequently suffer a 2-cycle stall.
+The MIPS designers codified existing practice
+and retroactively declared
+that if the register operand in the <code>JR</code> instruction
+is <var>ra</var>,
+then it predicts as a subroutine return;
+otherwise it predicts as a computed jump.
+</p>
+<p>
+&sup2;
+For extra sneakiness (and to save an instruction),&sup3;
+the loop preparation code could have been
+written as</p>
+<pre>
+    LA      s1, jump_table
+    BAL     next_opcode
+    MOVE    s0, a0       ; s0 points to the interpreter state
+next_opcode:
+</pre>
+<p>
+This version lets the processor calculate the address of
+<code>next_opcode</code> by performing a <code>BAL</code>.
+This sets the return address to the instruction after the
+branch delay slot, which is <code>next_opcode</code>,
+and then jumps to&hellip; <code>next_opcode</code>,
+which is where the instruction would have gone anyway.
+</p>
+<p>
+&sup3;
+Mind you, this size savings costs you a pipeline stall.
+See footnote 1.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1332885">
+				<div id="div-comment-1332885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AberAber</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332885">
+			April 12, 2018 at 9:57 am</a>		</div>
+
+		<p>Another &#8220;trick&#8221;, is you can branch to yourself.  I don&#8217;t know how useful, except for hanging your program, but you can do it (branch offset of 0). Perhaps with the display slot you can do something simple recursively.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1332895">
+				<div id="div-comment-1332895" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332895">
+			April 12, 2018 at 11:52 am</a>		</div>
+
+		<p>Speaking of the return address predictor, one of the tricks used to workaround parts of the Spectre vulnerability is to confuse the return address predictor so that the speculative execution goes to somewhere innocuous (like an infinite loop and/or a speculation barrier), while the real execution goes somewhere else. That is, it works by deliberately doing the opposite of the recommended way to deal with a return address predictor.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1332905">
+				<div id="div-comment-1332905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mZ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332905">
+			April 12, 2018 at 1:44 pm</a>		</div>
+
+		<p>If you jump into delay slot and interrupt occurs, the interrupt handler will modify return address to point to the branch instruction and program will misbehave. Am I right?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1332955">
+				<div id="div-comment-1332955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332955">
+			April 12, 2018 at 4:57 pm</a>		</div>
+
+		<p>If you jump into someone else&#8217;s delay slot, then it&#8217;s not a delay slot.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1332975">
+				<div id="div-comment-1332975" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matteo Italia</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332975">
+			April 12, 2018 at 10:47 pm</a>		</div>
+
+		<p>That&#8217;s a thing I was wondering &#8211; disregarding interrupts, if you jumped in the delay slot did it get executed twice?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1333005">
+				<div id="div-comment-1333005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mZ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1333005">
+			April 13, 2018 at 12:15 am</a>		</div>
+
+		<p>How does interrupt handler know that it&#8217;s not a delay slot?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1333165">
+				<div id="div-comment-1333165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1333165">
+			April 15, 2018 at 8:15 am</a>		</div>
+
+		<p>A delay slot is created by a branch executing directly before it, what is in the delay slot never knows that it&#8217;s a delay slot. If you jump into what is a branch delay slot, then the preceding branch has it&#8217;s delay slot elsewhere.</p>
+<p>With MIPS it helps to think of the pipeline, so a load or a branch doesn&#8217;t update the registers directly. The register you load into or the program counter doesn&#8217;t get updated until the next instruction has been executed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1333025">
+				<div id="div-comment-1333025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1333025">
+			April 13, 2018 at 7:22 am</a>		</div>
+
+		<p>To quote Raymond: &#8220;the BD bit is set if the exception occurred in a branch delay slot.&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1333045">
+				<div id="div-comment-1333045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mZ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1333045">
+			April 13, 2018 at 11:27 am</a>		</div>
+
+		<p>Thank you. I overlooked this.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1332925">
+				<div id="div-comment-1332925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332925">
+			April 12, 2018 at 2:50 pm</a>		</div>
+
+		<p>It has the value of ra already; I don&#8217;t get why the prediction is 100% accurate unless ra changed in the previous 2 instructions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1332995">
+				<div id="div-comment-1332995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stéphan Leclercq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1332995">
+			April 13, 2018 at 12:09 am</a>		</div>
+
+		<p>What if the instruction in the delay slot is itself a jump instruction?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1333065">
+				<div id="div-comment-1333065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1333065">
+			April 13, 2018 at 4:47 pm</a>		</div>
+
+		<p>As noted in the previous article, that is not allowed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1333175">
+				<div id="div-comment-1333175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kme</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495#comment-1333175">
+			April 15, 2018 at 9:56 pm</a>		</div>
+
+		<p>Would it also work to branch into the delay slot of the same branch? eg:</p>
+<p>    BEQ r1, zero, label<br />
+label:<br />
+    ADDU r2, r3</p>
+<p>Here the straight-line code performs the add once, but the branch performs it twice.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

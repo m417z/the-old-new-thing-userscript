@@ -1,0 +1,355 @@
+<html>
+<head>
+<title>A different type of dialog procedure</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A different type of dialog procedure</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 12, 2003 / year-entry #126</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20031112-00/?p=41863</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">In the discussion following my entry about dialog procedure return values, somebody suggested an alternate dialog design where you just call DefDlgProc to do default actions (the same way you write window procedures and DefWindowProc) rather than returning TRUE/FALSE. So let's do that. In fact, we're going to do it twice. I'll cover one method...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+In the discussion following my entry about dialog procedure return
+values, somebody suggested an alternate dialog design where
+you just call <code>DefDlgProc</code> to do default actions
+(the same way you write window procedures and <code>DefWindowProc</code>)
+rather than returning TRUE/FALSE.
+</p>
+<p>
+So let's do that. In fact, we're going to do it twice.
+I'll cover one method today and cover an entirely different
+method later this week. Each method consists of a simple kernel of
+an idea; the rest is just scaffolding to make the kernel work.
+</p>
+<p>
+The first way uses a recursive call from the
+dialog procedure back into
+<code>DefDlgProc</code> to trigger the default behavior.
+This technique requires that you have a flag that lets you detect
+(and therefore break) the recursion.
+Since you typically have instance data attached to your dialog box
+anyway, it's not too hard to add another member to it.
+</p>
+<p>
+The kernel 
+is to "subvert the recursive call". <code>DefDlgProc</code>
+calls your dialog procedure to see what you want to do.
+When you want to do the default action, just call
+<code>DefDlgProc</code> recursively. The inner <code>DefDlgProc</code>
+will call your dialog procedure to see if you want to override the
+default action. Detect this recursive call and return
+FALSE ("do the default").
+The recursive <code>DefDlgProc</code>
+will then perform the default action and
+return its result. Now you have the result of the default action,
+and you can modify it or augment it before returning that as
+the result for
+the dialog box procedure, back to the outer <code>DefDlgProc</code>
+which returns that value back as the final message result.
+</p>
+<p>
+Here's the flow diagram, for those who prefer pictures:
+</p>
+<pre>
+Message delivered
+-&gt; DefDlgProc
+   -&gt; your dialog procedure
+      decide what to do
+      want to do the default action
+      -&gt; DefDlgProc
+         -&gt; your dialog procedure
+            detect recursion
+         &lt;- return FALSE
+         DefDlgProc sees FALSE
+         performs default behavior
+      &lt;- returns result of default behavior
+      you do other stuff (perhaps modify
+      default behavior after it occurred)
+      set DWLP_MSGRESULT to desired result
+   &lt;- return TRUE
+   retrieve DWLP_MSGRESULT
+&lt;- return it as message result
+</pre>
+<p>
+Given this sketch, you should be able to write it up yourself.
+Here's what I came up with.  I call it a Wndproc-Like Dialog:
+</p>
+<pre>
+class WLDialogBox
+{
+public:
+  virtual LRESULT WLDlgProc(
+            HWND hdlg, UINT uMsg,
+            WPARAM wParam, LPARAM lParam)
+  {
+    return DefDlgProcEx(hdlg, uMsg, wParam, lParam,
+                        &amp;m_fRecursing);
+  }
+
+  INT_PTR DoModal(HINSTANCE hinst, LPCTSTR pszTemplate,
+                  HWND hwndParent)
+  {
+    m_fRecursing = FALSE;
+    return DialogBoxParam(hinst, pszTemplate, hwndParent,
+                          s_DlgProc, (LPARAM)this);
+  }
+
+private:
+  static INT_PTR CALLBACK s_DlgProc(
+            HWND hdlg, UINT uMsg,
+            WPARAM wParam, LPARAM lParam)
+  {
+    if (uMsg == WM_INITDIALOG) {
+      SetWindowLongPtr(hdlg, DWLP_USER, lParam);
+    }
+
+    WLDialogBox *self = (WLDialogBox*)GetWindowLongPtr(
+                            hdlg, DWLP_USER);
+    if (!self) {
+      return FALSE;
+    }
+
+    CheckDefDlgRecursion(&self->m_fRecursing);
+
+    return SetDlgMsgResult(hdlg, uMsg,
+              self->WLDlgProc(
+                hdlg, uMsg, wParam, lParam));
+  }
+
+private:
+  BOOL m_fRecursing;
+};
+</pre>
+<p>
+Let's walk through this class.
+</p>
+<p>
+The <code>WLDlgProc</code> method is virtual because we expect
+derived classes to do custom actions in their dialog procedure
+that we invoke from our <code>s_DlgProc</code>.
+The default implementation in the base class
+uses the <code>DefDlgProcEx</code>
+macro from <code>windowsx.h</code> to do the dirty work.
+That's right, this technique has been published by Microsoft
+since 1992. If you look at <code>DefDlgProcEx</code>, it sets the
+recursion flag to TRUE and then calls <code>DefDlgProc</code>,
+which triggers the recursive call.
+</p>
+<p>
+I could have had a separate <code>WLDefDlgProc</code> method which
+calls <code>DefDlgProcEx</code> and have <code>WLDlgProc</code> call
+<code>WLDefDlgProc</code>. (In fact, my first version did exactly that.)
+But I decided not to have a <code>WLDefDlgProc</code> to remove the
+temptation to bypass the base class's <code>WLDefDlgProc</code>.
+Instead, if you want default handling to take place, forward the
+call to your base class's <code>WLDefDlgProc</code>.
+</p>
+<p>
+The <code>s_DlgProc</code> method is the dialog procedure used for
+all instances of Wndproc-Like dialogs. It initializes itself in
+the <code>WM_INITDIALOG</code> message so future messages can identify
+which instance of the dialog is handling the message.
+After short-circuiting messages that arrive before the dialog box
+has initialized, it uses the <code>CheckDlgRecursion</code> macro,
+also from <code>windowsx.h</code>. This macro checks the recursion
+flag; if set, then it resets the flag and just returns FALSE immediately.
+This is what stops the recursion. Otherwise, it calls the
+<code>WLDlgProc</code> method (which has probably been overriden in
+a derived class), then sets the dialog procedure return value and
+returns.
+</p>
+<p>
+The <code>SetDlgMsgResult</code> macro also comes from
+<code>windowsx.h</code>: It stores the return value into the
+<code>DWLP_MSGRESULT</code> and returns TRUE.  Well, unless the
+message is one of the special exceptions, in which case it returns
+the value directly.  <strong>Note to 64-bit developers</strong>: There
+is a bug in this macro as currently written. The expression
+<code>(BOOL)(result)</code> should be changed to
+<code>(INT_PTR)(result)</code> so that the upper 32 bits of the return
+value is not truncated.
+</p>
+<p>
+The last method is <code>DoModal</code>, which initializes the
+recursion flag and kicks off the dialog box.
+</p>
+<p>
+Here's a sample program that illustrates the use of this class:</p>
+<pre>
+</p>
+class SampleWLDlg : public WLDialogBox
+{
+  LRESULT WLDlgProc(HWND hdlg, UINT uMsg,
+            WPARAM wParam, LPARAM lParam)
+  {
+    switch (uMsg) {
+    HANDLE_MSG(hdlg, WM_COMMAND, OnCommand);
+    HANDLE_MSG(hdlg, WM_SETCURSOR, OnSetCursor);
+    }
+    return __super::WLDlgProc(hdlg, uMsg, wParam, lParam);
+  };
+
+  void OnCommand(HWND hdlg, int id,
+                 HWND hwndCtl, UINT codeNotify)
+  {
+    switch (id) {
+    case IDCANCEL:
+      MessageBox(hdlg, TEXT("Bye"), TEXT("Title"), MB_OK);
+      EndDialog(hdlg, 1);
+      break;
+    }
+  }
+
+  BOOL OnSetCursor(HWND hdlg, HWND hwndCursor,
+                   UINT codeHitTest, UINT msg)
+  {
+    if (codeHitTest == HTCAPTION) {
+      SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+      return TRUE;
+    }
+    return FORWARD_WM_SETCURSOR(hdlg, hwndCursor,
+                  codeHitTest, msg, __super::WLDlgProc);
+  }
+};
+
+int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
+                   LPSTR lpCmdLine, int nShowCmd)
+{
+    SampleWLDlg dlg;
+    dlg.DoModal(hinst, MAKEINTRESOURCE(1), NULL);
+    return 0;
+}
+
+1 DIALOGEX DISCARDABLE  0, 0, 200,200
+STYLE DS_SHELLFONT | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+CAPTION "sample"
+FONT 8, "MS Shell Dlg"
+BEGIN
+DEFPUSHBUTTON "&amp;Bye",IDCANCEL,"Button",WS_TABSTOP,7,4,50,14
+END
+</pre>
+<p>
+To illustrate a custom return value, I override the <code>WM_SETCURSOR</code>
+message to display a custom cursor when the mouse is over the caption area.
+It's not exciting, but it gets the point across.
+</p>
+<p>
+Observe that in two places, we invoked
+the default handler by calling <code>__super::WLDlgProc</code>.
+<code>__super</code> is a Visual C++ extension that resolves to
+the base class of your derived class. This is quite handy since it
+saves the reader the trouble of figure out "So which level in the class
+hierarchy are we forwarding this call to?"  If you wanted to forward
+a call to your grandparent class, you would use
+<code>__super::__super::WLDlgProc</code>.
+</p>
+<p>
+If your compiler doesn't support <code>__super</code>, you can fake it
+by adding this line to the definition of <code>SampleWLDlg</code>:
+</p>
+<pre>
+  typedef WLDialogBox super;
+</pre>
+<p>
+and using <code>super::WLDlgProc</code> without the underscores.
+In fact, this is the technique I use because I was doing it 
+before the VC folks added the <code>__super</code> keyword and
+now it's just habit.
+</p>
+<p><strong>Exercise</strong>: Does the <code>m_fRecursing</code> member
+really have to be per-instance? Can it be global?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-131123">
+				<div id="div-comment-131123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Oliver Anhuth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031112-00/?p=41863#comment-131123">
+			November 12, 2003 at 6:46 am</a>		</div>
+
+		<p>I thought that DefDlgProc does not only pass message on to the dialog proc but also generates new ones like WM_INITDIALOG. What happens when these messages are sent to DefDlgProc?</p>
+<p>And wouldn&#8217;t it be simpler to just subclass the dialog and handle the messages before they arrive at DefDlgProc?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-568043">
+				<div id="div-comment-568043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.shugye.com/2007/11/why-do-we-even-have-the-defwindowproc-function-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%88%91%e4%bb%ac%e9%9c%80%e8%a6%81defwindowproc-%e5%87%bd%e6%95%b0-48.html' rel='external nofollow' class='url'>Why do we even have the DefWindowProc function? 为什么我们需要DefWindowProc 函数 &laquo; Cloudsun&#8217;s Daily Review</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031112-00/?p=41863#comment-568043">
+			November 17, 2007 at 10:05 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.shugye.com/2007/11/why-do-we-even-have-the-defwindowproc-function-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%88%91%e4%bb%ac%e9%9c%80%e8%a6%81defwindowproc-%e5%87%bd%e6%95%b0-48.html" rel="nofollow">http://www.shugye.com/2007/11/why-do-we-even-have-the-defwindowproc-function-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%88%91%e4%bb%ac%e9%9c%80%e8%a6%81defwindowproc-%e5%87%bd%e6%95%b0-48.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

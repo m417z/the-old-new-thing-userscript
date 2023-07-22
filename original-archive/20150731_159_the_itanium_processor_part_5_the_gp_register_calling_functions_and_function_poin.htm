@@ -1,0 +1,655 @@
+<html>
+<head>
+<title>The Itanium processor, part 5: The GP register, calling functions, and function pointers</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Itanium processor, part 5: The GP register, calling functions, and function pointers</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 31, 2015 / year-entry #160</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>22</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">We saw a brief mention of the gp register last time, where we saw it used when we calculated the address of a global variable. The only addressing mode supported by the Itanium processor is register indirect (possibly with post-increment). There is no absolute addressing mode. If you want to access a global variable, you...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+We saw a brief mention of the <var>gp</var> register
+last time, where we saw it used when we calculated the address
+of a global variable.
+</p>
+<p>
+The only addressing mode supported by the Itanium processor
+is register indirect (possibly with post-increment).
+There is no absolute addressing mode.
+If you want to access a global variable,
+you need to calculate its address,
+and the convention for this is that the
+<var>gp</var> register points to the module's global variables.
+If you want to access a global variable stored at offset
+<var>n</var> in the global data segment, you do it in
+two steps:
+</p>
+<pre>
+        addl    r30 = n, gp ;;    // r30 -&gt; global variable
+        ld4     r30 = [r30]       // load 4 bytes from the global variable
+</pre>
+<p>
+The name <var>gp</var> stands for <i>global pointer</i>
+since it is the pointer used to access global variables.
+(Note that since immediates are signed,
+the range of values of <var>n</var> is &minus;2MB to +2MB.)
+</p>
+<p>
+Those of you familiar with the PowerPC will recognize this model,
+since it is very similar to the Table of Contents model,
+except that Itanium uses a single table of contents for
+the entire module,
+as opposed to the PowerPC which gives each function its own
+table of contents.
+</p>
+<p>
+The Itanium <var>addl</var> instruction is limited to a
+22-bit immediate, which provides a reach of
+4<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2009/06/11/9725386.aspx">MB</a>.
+This means that the above pattern is viable only for 4MB
+of global variables.
+Since some modules have more than 4MB of global data,
+the compiler separates global data into two categories,
+<i>large</i> and <i>small</i>.
+Small data objects are stored directly in the global data segment,
+but large data objects are not.
+Instead,
+the large data object is placed outside the global data segment,
+and
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/01/20/60603.aspx">
+all that is placed in the global data segment is a pointer
+to the large object</a>.
+This means that accessing a large object actually takes three
+instructions.
+</p>
+<pre>
+        addl    r30 = n, gp ;; // r30 -&gt; global variable forwarder
+        ld8     r30 = [r30] ;; // r30 -&gt; global variable
+        ld4     r30 = [r30]    // load 4 bytes from the global variable
+</pre>
+<p>
+We see that it is vitally important that the <var>gp</var>
+register be set properly.
+Otherwise,
+the code has no idea where its global variables are.
+The Itanium calling convention says that
+on entry to a function, the <var>gp</var> register
+must be set to that function's global pointer.
+</p>
+<p>
+Okay, so if you're going to call a function,
+how do you know what global pointer it expects?
+</p>
+<p>
+Since all functions in the same module share the same
+global variables, the answer is easy if you are calling
+a function within the same module:
+You don't need to do anything special with <var>gp</var>,
+since the caller's <var>gp</var> is the same as the
+callee's <var>gp</var>.
+You also don't need to perform an indirect call;
+you know where the target is and can use a direct
+<code>br.call OtherFunction</code>.&sup1;
+</p>
+<p>
+On the other hand, if you are calling a function
+through a function pointer, then the target of the call
+might belong to another module.
+How are you supposed to know what the target function
+wants <var>gp</var> to be?
+</p>
+<p>
+The answer is that on Itanium, a function pointer
+is not the address of the first instruction.
+Rather, it is a pointer to a structure containing
+two pointers.
+The first pointer in the structure points to
+the first instruction of the target function.
+The second pointer is the target function's
+<var>gp</var>.
+Therefore, calling a function through a function
+pointer looks like this:
+</p>
+<pre>
+        // suppose the function pointer is in r30
+        ld8     r31 = [r30], 8 ;;       // get the function address
+                                        // then add 8 to r30
+        ld8     gp = [r30]              // get the function's gp
+        mov     b6 = r31                // move to branch register
+        br.call.dptk.many rp = b6 ;;    // call function in b6
+        or      gp = r41, r0            // gp = r41 OR 0 = r41
+</pre>
+<p>
+First, we load the address of the first instruction
+into the <var>r31</var> register, using a post-increment
+addressing mode so that <var>r30</var> after the
+instruction points to the callee's <var>gp</var>.
+</p>
+<p>
+Next, we load the <var>gp</var> register with the
+caller's <var>gp</var>.
+Simultaneously, we move <var>r31</var> to <var>b6</var>
+so that we can use it as the target of the <var>br.call</var>.
+(Branch registers cannot be the target of a <var>ld8</var>
+instruction, which is why we needed to use <var>r31</var>
+as a middle-man.)
+</p>
+<p>
+Now that <var>gp</var> is set up properly,
+we can call the function through the branch register.
+</p>
+<p>
+After the call returns, the <var>gp</var> register
+is now whatever value is left over by the function
+we called.
+We need to set <var>gp</var> to the current function's
+global pointer, which for the sake of example we'll
+assume had been saved in the <var>r41</var> register.
+</p>
+<p>
+There's yet another wrinkle:
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2006/07/21/673830.aspx">
+The na&iuml;ve imported function</a>.
+In the case of an imported function not declared
+with the <code>dllimport</code> attribute,
+the compiler doesn't know that the function is imported.
+It acts as if the function is part of the current module.
+On x86, this is simulated by making a stub function
+which jumps to the real (imported) function.
+On Itanium, the same thing is done,
+with a stub function that looks like this:
+</p>
+<pre>
+.ImportedFunction:
+        addl    r30 = n, gp ;;      // r30 -&gt; function descriptor
+        ld8     r31 = [r30], 8;;    // get the function address
+                                    // then add 8 to r30
+        ld8     gp = [r30]          // get the function's gp
+        mov     b6 = r31            // move to branch register
+        br.cond.sptk.many b6 ;;     // jump there
+</pre>
+<p>
+The stub function loads the <var>gp</var> register
+with the value expected by the imported function
+then jumps to the imported function.
+Unconditional computed jumps are encoded as
+conditional jumps where the
+qualifying predicate is <var>p0</var>,
+which is always true.
+</p>
+<p>
+The possibility that any function is really
+a stub function for an imported function
+this creates a problem for the compiler:
+Since any function could be an imported function
+in disguise,
+the compiler must assume that <i>any function</i>
+is potentially imported
+and therefore may result in the <var>gp</var>
+register being trashed.
+Therefore, the compiler needs to restore the
+<var>gp</var> register after <i>any</i>
+function call.
+</p>
+<p>
+Now, the above pessimistic assumption can be
+relaxed if the compiler has other information
+available to it.
+For example, if the function being called
+is in the same translation unit,
+then the compiler can see by inspection
+that the target function is not a stub
+and therefore can elide the restoration of
+<var>gp</var>.
+Similarly, if link-time code generation
+is enabled,
+then the linker can see all the code
+in the module and see whether the target
+function is a stub or a real function.
+</p>
+<p>
+<b>Exercise</b>:
+How does tail-call elimination affect this optimization?
+</p>
+<p>
+<b>Bonus reading</b>:
+<a HREF="http://msdn.microsoft.com/en-us/magazine/bb985017.aspx">
+<i>Programming for 64-bit Windows</i></a>
+which spends nearly all its time talking about the <var>gp</var>
+register.</p>
+<p>
+<p>
+&sup1; The direct call instruction has a reach of 16MB,
+so if the function you want to call is too far away,
+the linker redirects the <var>br.call</var> to a stub
+function which in turn jumps to the final destination.
+</p>
+<pre>
+    br.call.dptk.many stub_for_OtherFunction
+...
+
+stub_for_OtherFunction:
+    ... jump to OtherFunction ...
+</pre>
+<p>
+You have a few options for jumping to the
+function.
+</p>
+<ul>
+<li>If the stub is within 16MB of the target,
+    it can use a <var>br.cond</var> direct jump:
+</ul>
+<pre>
+stub_for_OtherFunction:
+    br.cond.sptk.many OtherFunction
+</pre>
+<ul>
+<li>The stub can load the target address
+    from the data segment and use an indirect jump:
+</ul>
+<pre>
+stub_for_OtherFunction:
+    addl r3 = n, gp ;;  // look up the function address
+    ld8  r3 = [r3] ;;   // fetch it
+    mov  b6 = r3 ;;     // prepare to jump there
+    br.cond.sptk.many b6 ;; // and off we go
+</pre>
+<ul>
+<li>The stub can load the target address offset
+    from data stored in the code segment,
+    then apply the offset to the current instruction
+    pointer to determine the target:
+</ul>
+<pre>
+stub_for_OtherFunction:
+    mov  r3 = iip ;;    // get current location
+    addl r3 = n, r3 ;;  // find the offset
+    ld8  r2 = [r3] ;;   // load the offset
+    addl r2 = r2, r3 ;; // apply to current location
+    mov  b6 = r2 ;;     // prepare to jump there
+    br.cond.sptk.many b6 ;; // and off we go
+</pre>
+<p>
+This last case is tricky because
+the Itanium conventions forbid relocations in the
+code segment; all code is position-independent.
+Therefore, the data in the code segment must not be
+relocatable.
+We work around this by storing an offset rather than
+the absolute address
+and applying the offset at runtime.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (22)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1222242">
+				<div id="div-comment-1222242" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1222242">
+			July 31, 2015 at 7:07 am</a>		</div>
+
+		<p>I&#39;m surprised the Windows team didn&#39;t reuse the old rule in C that allows sizeof (void (*)()) &gt; sizeof (void *).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234306">
+				<div id="div-comment-1234306" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234306">
+			July 31, 2015 at 7:25 am</a>		</div>
+
+		<p>How you don&#39;t totally hate Itanium?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1222232">
+				<div id="div-comment-1222232" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Xv8</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1222232">
+			July 31, 2015 at 7:29 am</a>		</div>
+
+		<p>@Joshua</p>
+<p>Because you would break so much existing code. (POSIX defines sizeof(void(*)() &lt;= sizeof(void *), and it&#39;s been an assumption on win16 and existing win32 code since forever).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234296">
+				<div id="div-comment-1234296" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234296">
+			July 31, 2015 at 9:45 am</a>		</div>
+
+		<p>The lack of a reg+imm addressing mode is a strong contender for the single worst design decision in this architecture. &nbsp;And the existence of the postincrement mode (together with the rotating register feature) tells you something about the kind of code the designers thought was worth caring about &#8212; namely, the same kind of code a DSP is good at.</p>
+<p>In fact, there&#39;s a case to be made that the Itanium isn&#39;t a general purpose CPU at all, but rather a ridiculously feature-rich DSP.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234286">
+				<div id="div-comment-1234286" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234286">
+			July 31, 2015 at 10:38 am</a>		</div>
+
+		<p>1, 2, 3, 3b, 5?</p>
+<div class="post">[<em>Actually, 1, 2, 3, 4, 3b, 5. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-zlynx odd alt thread-odd thread-alt depth-1" id="comment-1234276">
+				<div id="div-comment-1234276" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Zan+Lynx%27' rel='external nofollow' class='url'>Zan Lynx'</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234276">
+			July 31, 2015 at 10:48 am</a>		</div>
+
+		<p>Zack, how many bits would a reg+imm instruction take up? Now compare that to doing a register load, add a value to the register, and load indirect from that register.</p>
+<p>Remember that it is a bit like RISC. Instructions have to fit into slots. They cannot be just whatever length is convenient.</p>
+<p>So just believe in your mind that the three instructions make a single reg+imm address mode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234266">
+				<div id="div-comment-1234266" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234266">
+			July 31, 2015 at 11:01 am</a>		</div>
+
+		<p>@zack A load of the Itanium designers were poached by AMD in 2006, so hopefully they learnt their lesson about what kind of code a CPU needs to be good at. They may not have done, AMD had already made their 64 bit chips and Intel were nowhere close to matching them but since then Intel have really excelled and AMD are essentially back where they started trying to make money on cheap hardware.</p>
+<p>In the mean time Itanium has been like the Terminator, it absolutely will not stop, ever. Anyone who tries to stop supporting it gets sued. However Kittson is supposed to be out soon/now and there is no sign. Maybe Intel has figured that not enough people care anymore.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234256">
+				<div id="div-comment-1234256" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234256">
+			July 31, 2015 at 11:30 am</a>		</div>
+
+		<p>&gt; Zack, how many bits would a reg+imm instruction take up? &#8230; Remember that it is a bit like RISC.</p>
+<p>Somehow reg+imm addressing modes are very common even on RISC architectures, even on those with 32-bit instructions. The Itanium needs two more bits to address each register and a typical RISC ISA has ld/str instructions with two register operands, which would take up only 4 of the 9 extra bits per instruction. ARM, for example, supports predicating all (or at least almost all) instructions and yet supports reg+imm.</p>
+<p>Now, you may well be right that Intel decided that they needed more than even five extra bits/instruction on other things, but that&#39;s not necessarily contradictory to believing that&#39;s a bad decision. :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234246">
+				<div id="div-comment-1234246" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234246">
+			July 31, 2015 at 12:16 pm</a>		</div>
+
+		<p>Normally I love all the arcane details you give us, but this is the most boring series of blog posts EVER. &nbsp;I remember looking at disassembly for this processor, and decided my days as an asm coder were over. &nbsp;Then the x64 arrived, and I got a contract to port old x86 code over &#8211; and I was back in business! &nbsp;Still, x64 asm is hard to read, too bad they couldn&#39;t think up slightly more meaningful mnemonics than &quot;r#&quot;. &nbsp;</p>
+<p> &nbsp;&quot;Anyone who tries to stop supporting it gets sued.&quot;</p>
+<p>Well, then, my prescience was fortuitous, because I can&#39;t get sued for stopping, because I never started!</p>
+<p> &nbsp;&quot;In fact, there&#39;s a case to be made that the Itanium isn&#39;t a general purpose CPU at all, but rather a ridiculously feature-rich DSP&quot;</p>
+<p>That is the best explanation I ever heard for it! &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234236">
+				<div id="div-comment-1234236" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234236">
+			July 31, 2015 at 1:06 pm</a>		</div>
+
+		<p>@boogaloo: Who is included in &quot;anyone&quot; other than Oracle?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1222222">
+				<div id="div-comment-1222222" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zack</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1222222">
+			July 31, 2015 at 1:41 pm</a>		</div>
+
+		<p>As Evan points out, reg+imm is ubiquitous or nearly so on classic RISC, and for damn good reason: it&#39;s good for something like 33% code size reduction on SPECint-like code. &nbsp;Yes, 33%. &nbsp;That is how often it gets used. &nbsp;Itanium doesn&#39;t need it for spilling registers to the stack, which account for a fair chunk of that 33%, but it does need it for globals, structure members, vtable slots, unrolled loops (which Itanium otherwise *loves*), aggregates on the stack, etc.</p>
+<p>I don&#39;t *know*, but I suspect it was left out not because of any lack of instruction encoding space, but because they didn&#39;t want complex address-generation circuitry and/or could send memory accesses out to the cache a pipeline stage earlier without it.</p>
+<p>Many of the Itanium design decisions I don&#39;t like, have in common that they make code less dense, particularly when there isn&#39;t much ILP to be had. &nbsp;Code density translates directly to better I-cache utilization and thus to better performance across the board. &nbsp;I *think* it was obvious even at the time that efficient cache utilization was becoming *the* dominant factor in overall performance, but I could be misremembering.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234226">
+				<div id="div-comment-1234226" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234226">
+			July 31, 2015 at 4:36 pm</a>		</div>
+
+		<p>Itanium doesn&#39;t have any addressing mode because it is supposed to be explicit parallel with absolutely no form of reordering inside the processor, making the load pipeline longer by adding address modes would either reduce clock or increase load latency to 2 cycles, in other words, the same latency as addl/ld8 sequence, Intel avoided multi-cycle latency instructions at all costs, even integer multiplication suffered as a result.</p>
+<p>About code density, at 128 bits per 3 instructions is outrageous, x86 lives with an average of 3 bytes per much more complex instruction and ARM is a mix of 16 and 32 bits instructions, lack of addressing modes is the least of code density problems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1234216">
+				<div id="div-comment-1234216" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Muzer_</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234216">
+			July 31, 2015 at 5:02 pm</a>		</div>
+
+		<p>@ZZZzzz&#8230; snarf I disagree with your first sentence.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234196">
+				<div id="div-comment-1234196" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1234196">
+			July 31, 2015 at 5:27 pm</a>		</div>
+
+		<p>@Raymond, sorry for the content-free comment, but I also disagree with &quot;ZZZzzz&#8230; snarf&quot;: this has been one of your most interesting blog series so far. It&#39;s one thing to read dry descriptions about that esoteric beast of an architecture, it&#39;s another thing to read about it from somebody who worked with it before it was known to be a dead end.</p>
+<p>And for those who need some &quot;brain bleach&quot; after reading about IA-64, here&#39;s the ISA documentation for a very clean modern RISC variant: <a rel="nofollow" target="_new" href="http://riscv.org/spec/riscv-spec-v2.0.pdf">riscv.org/&#8230;/riscv-spec-v2.0.pdf</a> (from the makers of the original RISC).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197051">
+				<div id="div-comment-1197051" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bill P. Godfrey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1197051">
+			August 3, 2015 at 2:30 am</a>		</div>
+
+		<p>I&#39;m enjoying this and I&#39;d be very interested in a similar series on the ARM processor.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197041">
+				<div id="div-comment-1197041" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1197041">
+			August 3, 2015 at 2:41 am</a>		</div>
+
+		<p>You must have waited for this question: What happens if a module wants to have 524289 global objects?</p>
+<div class="post">[<em>That issue never came up. I assume you got a linker error. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197031">
+				<div id="div-comment-1197031" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bulletmagnet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1197031">
+			August 3, 2015 at 3:03 am</a>		</div>
+
+		<p>The &quot;Programming for 64-bit Windows&quot; link doesn&#39;t work for me: it redirects to &quot;MSDN Magazine Issues and Downloads&quot; (<a rel="nofollow" target="_new" href="https://msdn.microsoft.com/en-us/magazine/ee310108.aspx">msdn.microsoft.com/&#8230;/ee310108.aspx</a>) &nbsp;:(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197021">
+				<div id="div-comment-1197021" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1197021">
+			August 3, 2015 at 6:18 am</a>		</div>
+
+		<p>Anybody knows when approximately the article &quot;Programming for 64-bit Windows&quot; appeared, it&#39;s hard finding it otherwise? Unfortunately old issues of MSDN mag are CHM files between 2003 and 2008 and online only from 2009 on, so even search doesn&#39;t work. Archive.org seems not to have it too under the given ee310108.aspx link.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197011">
+				<div id="div-comment-1197011" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1197011">
+			August 3, 2015 at 6:23 am</a>		</div>
+
+		<p>Bulletmagnet: <a rel="nofollow" target="_new" href="https://web.archive.org/web/20120418084630/http://msdn.microsoft.com/en-us/magazine/bb985017.aspx">web.archive.org/&#8230;/bb985017.aspx</a></p>
+<p>(That was hard.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197001">
+				<div id="div-comment-1197001" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1197001">
+			August 3, 2015 at 6:25 am</a>		</div>
+
+		<p>acq: ee310108 is the one that MSDN redirects to now that the pre-2003 issues have been removed. You need to use the one Raymond linked (or my previous link).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196991">
+				<div id="div-comment-1196991" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1196991">
+			August 3, 2015 at 6:25 am</a>		</div>
+
+		<p>Oh, and I&#39;ve also enjoyed reading these articles, I don&#39;t care that I&#39;ve never worked with the computer with such a CPU and that they are probably never going to be used more.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196921">
+				<div id="div-comment-1196921" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrei Warkentin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771#comment-1196921">
+			August 3, 2015 at 11:40 am</a>		</div>
+
+		<p>While perhaps the NT LE calling convention was different, at least for the PowerPC64 ABI the TOC is per-module, so each function in a module is entered with the same TOC value. It would be strange to have a per-function TOC, given that the TOC describes a module&#39;s globals, and maintaining multiple TOC tables would be a strange burden. Now, every function has their own calculation for computing the TOC when called as global function, because the TOC = function address + offset.</p>
+<p>Btw, it would be great to see a line of articles about NT on the PPC PreP machines&#8230;</p>
+<p>A</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

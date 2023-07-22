@@ -1,0 +1,324 @@
+<html>
+<head>
+<title>If dynamic DLL dependencies were tracked, they'd be all backwards</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>If dynamic DLL dependencies were tracked, they&#8217;d be all backwards</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 10, 2009 / year-entry #211</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Whenever the issue of DLL dependencies arises, I can count on somebody arguing that these dynamic dependencies should be tracked, even if doing so cannot be proven to be reliable. Even if one could walk the call stack reliably, you would still get it wrong. The example I gave originally was the common helper library,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Whenever the issue of DLL dependencies arises, I can count on somebody arguing that <a href="http://blogs.msdn.com/oldnewthing/archive/2008/06/09/8582411.aspx#8588111"> these dynamic dependencies should be tracked, even if doing so cannot be proven to be reliable</a>. Even if one could walk the call stack reliably, you would <i>still</i> get it wrong.</p>
+<p> The example I gave originally was the common helper library, where <code>A.DLL</code> loads <code>B.DLL</code> via an intermediate function in <code>MIDDLE.DLL</code>. You want the dependency to be that <code>A.DLL</code> depends on <code>B.DLL</code>, but instead the dependency gets assigned to <code>MIDDLE.DLL</code>. </p>
+<p> "But so what? Instead of a direct dependency from <code>A.DLL</code> to <code>B.DLL</code>, we just have two dependencies, one from <code>A.DLL</code> to <code>MIDDLE.DLL</code>, and another from <code>MIDDLE.DLL</code> to <code>B.DLL</code>. It all comes out to the same thing in the end." </p>
+<p> Actually, it doesn't. It comes out much worse. </p>
+<p> After all, <code>MIDDLE.DLL</code> is your common helper library. All of the DLLs in your project depend on it. Therefore, the dependency diagram in reality looks like this: </p>
+<table border="0">
+<tr>
+<td><code>A.DLL</code></td>
+<td>&rarr;</td>
+<td><code>B.DLL</code></td>
+</tr>
+<tr>
+<td></td>
+<td>&#8600;</td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td></td>
+<td colspan="2"><code>MIDDLE.DLL</code></td>
+</tr>
+</table>
+<p> <code>A.DLL</code> depends on <code>B.DLL</code>, and both DLLs depend on <code>MIDDLE.DLL</code>. That common DLL really should be called <code>BOTTOM.DLL</code> since everybody depends on it. </p>
+<p> Now you can see why the dependency chain <code>A.DLL &rarr; MIDDLE.DLL &rarr; B.DLL</code> is horribly wrong. Under the incorrect dependency chain, the DLLs would be uninitialized in the order <code>A.DLL</code>, <code>MIDDLE.DLL</code>, <code>B.DLL</code>, even though <code>B.DLL</code> depends on <code>MIDDLE.DLL</code>. That's because your "invented" dependency <i>introduces a cycle in the dependency chain</i>, and a bogus one at that. Once you have cycles in the dependency chain, everything falls apart. You took something that might have worked into something that explodes upon impact. </p>
+<p> This situation appears much more often than you think. In fact it happens <i>all the time</i>. Because in real life, the loader is implemented in the internal library <code>NTDLL.DLL</code>, and <code>KERNEL32.DLL</code> is just a wrapper function around the real DLL loader. In other words, if your <code>A.DLL</code> calls <code>LoadLibrary("B.DLL")</code>, you are already using a middle DLL; its name is <code>KERNEL32.DLL</code>. If this "dynamic dependency generation" were followed, then <code>KERNEL32.DLL</code> would be listed as <i>dependent on everything</i>. When it came time to uninitialize, <code>KERNEL32.DLL</code> would uninitialized before all dynamically-loaded DLLs, because it was the one who loaded them, and then all the dynamically-loaded DLLs would find themselves in an interesting world where <code>KERNEL32.DLL</code> no longer existed. </p>
+<p> Besides, the original problem arises when <code>A.DLL</code> calls a function in <code>B.DLL</code> during its <code>DLL_PROCESS_DETACH</code> handler, going against the rule that you shouldn't call anything outside your DLL from your <code>DllMain</code> function (except perhaps a little bit of <code>KERNEL32</code> but even then, it's still not the best idea). It's one thing to make accommodations so that existing bad programs continue to run, but it's another to build an entire infrastructure built on unreliable heuristics in order to encourage people to do something they shouldn't be doing in the first place, and whose guesses end up taking a working situation and breaking it. </p>
+<p> You can't even write programs to take advantage of this new behavior because walking the stack is itself unreliable. You recompile your program with different optimizations, and all of a sudden the stack walking stops working because you enabled tail call elimination. If somebody told you, "Hey, we added this feature that isn't reliable," I suspect your reaction would not be "Awesome, let me start depending on it!" </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-754053">
+				<div id="div-comment-754053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexandre Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754053">
+			July 10, 2009 at 10:21 am</a>		</div>
+
+		<p>I don&#8217;t get your point about KERNEL32.DLL. It doesn&#8217;t need to uninitialize anything in PROCESS_DETACH. You can&#8217;t unload it. When it&#8217;s time for it to go, the process is on the way down.</p>
+<div class=post>[<i>You&#8217;re getting too caught up in implementation details and missing the point of the article. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754063">
+				<div id="div-comment-754063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754063">
+			July 10, 2009 at 10:23 am</a>		</div>
+
+		<p>Editorial note: &nbsp;The sentence fragment &#8216;even if doing so is cannot be proven to be reliable.&#8217; has a superfluous &#8216;is&#8217; and should be &#8216;even if doing so cannot be proven to be reliable.&#8217;.</p>
+<div class=post>[<i>Fixed. Thanks. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-754073">
+				<div id="div-comment-754073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark (The other Mark)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754073">
+			July 10, 2009 at 10:44 am</a>		</div>
+
+		<p>&quot;If somebody told you, &quot;Hey, we added this feature that isn&#8217;t reliable,&quot; I suspect your reaction would not be &quot;Awesome, let me start depending on it!&quot;&quot;</p>
+<p>My reaction might not be, but I suspect many people would say exactly that. Check out Raymond Chen&#8217;s blog, especially the parts about compatibility shims, or people depending on undocumented implementation details&#8230; :-)</p>
+<p>Note: The Smiley indicates this is intended to be a &quot;funny&quot; comment, as many entries in your blog point out that yes, people are silly enough to depend on unreliable behavior.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754083">
+				<div id="div-comment-754083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone You Know</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754083">
+			July 10, 2009 at 10:57 am</a>		</div>
+
+		<p>&quot;&#8230;all the dynamically-loaded DLLs would find themselves in an interesting world where KERNEL32.DLL no longer existed.&quot;</p>
+<p>This reminds me of that supposedly ancient curse that goes: &quot;May you live in interesting times.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-754153">
+				<div id="div-comment-754153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Bindels</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754153">
+			July 10, 2009 at 4:16 pm</a>		</div>
+
+		<p>This is exactly why there is no definite implementation of a singleton in C++ (or any other language for that matter) &#8211; you have the same kind of fake dependencies, where the order of destruction is wrong no matter how you construct them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754183">
+				<div id="div-comment-754183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">porter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754183">
+			July 10, 2009 at 4:55 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; shouldn&#8217;t call anything outside your DLL from your DllMain function (except perhaps a little bit of KERNEL32 but even then, it&#8217;s still not the best idea).
+</p></blockquote>
+<p>What about initializing my DLL&#8217;s global critical section?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-754263">
+				<div id="div-comment-754263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754263">
+			July 10, 2009 at 7:22 pm</a>		</div>
+
+		<blockquote><p>
+  What about initializing my DLL&#8217;s global critical section?
+</p></blockquote>
+<p>It is safe to call other functions in Kernel32.dll, because this DLL is guaranteed to be loaded in the process address space when the entry-point function is called. It is common for the entry-point function to create synchronization objects such as critical sections and mutexes, and use TLS. Do not call the registry functions, because they are located in Advapi32.dll. If you are dynamically linking with the C run-time library, do not call malloc; instead, call HeapAlloc.</p>
+<p>-the Platform SDK</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754293">
+				<div id="div-comment-754293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Doug</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754293">
+			July 10, 2009 at 10:07 pm</a>		</div>
+
+		<p>What I find amusing, having been down the Dllmain path many times, from the MSDN reading developer perspective, is the number of rules that are either not written or described in a cryptic manner.</p>
+<p>It wouldn&#8217;t have been so bad, except that Visual Basic liked to unload DLLs at times other than process death, meaning you HAD to make sure your threads were stopped. &nbsp;No matter what they were doing. &nbsp;Getting that to work correctly is not a simple task.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-754333">
+				<div id="div-comment-754333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754333">
+			July 11, 2009 at 10:37 am</a>		</div>
+
+		<p>&#8220;A.DLL loads B.DLL [&#8230;] You want the dependency to be that A.DLL depends on B.DLL&#8221;</p>
+<p>And that&#8217;s where things have gotten backwards.</p>
+<p>If RANDOM.DLL depends on CORE.DLL (e.g. kernel32.dll), then CORE.DLL must be loaded and intialised *before* RANDOM.DLL, and CORE.DLL must be around until after RANDOM.DLL has been released/unloaded.</p>
+<p>If RANDOM.DLL dynamically loads MODULE.DLL, then it follows that RANDOM.DLL must have been loaded, initialised and running before MODULE.DLL. It is therefore inherently erroneous to say that RANDOM.DLL &#8220;depends on&#8221; MODULE.DLL. If anything, you&#8217;d want to introduce a fake dependency saying that the dynamically loaded MODULE.DLL depends on RANDOM.DLL.</p>
+<p>That way, if RANDOM.DLL starts to go away, you&#8217;d want to unload MODULE.DLL *first*, releasing your resources in the opposite order to that which they were acquired. However, that cannot work in the general case because it&#8217;s possible in the semantics of that application for RANDOM.DLL to have &#8220;transferred ownership/cleanup responsibility&#8221; of MODULE.DLL to CORE.DLL, and CORE.DLL might still be using MODULE.DLL.</p>
+<div class=post>[<i>And if we followed your rules, then all delay-loads would have backwards dependencies. FANCY.DLL uses WININET.DLL only in certain scenarios, so instead of declaring a load-time dependency, it loads WININET.DLL on demand. According to your logic, this means that WININET.DLL depends on FANCY.DLL and therefore WININET.DLL should be shut down before FANCY.DLL. When FANCY.DLL calls InternetCloseHandle() in its DLL_PROCESS_DETACH, it ends up calling into a DLL that has already been uninitialized. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754343">
+				<div id="div-comment-754343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754343">
+			July 11, 2009 at 7:04 pm</a>		</div>
+
+		<p>&gt;When FANCY.DLL calls InternetCloseHandle() in its DLL_PROCESS_DETACH, it ends up calling into a DLL that has already been uninitialized.</p>
+<p>Good! &nbsp;Serves the bastards right for breaking the DllMain contract. &nbsp;But I guess Microsoft wouldn&#8217;t know anything about that. &nbsp;Do you guys enjoy being slaves to design/compatibility decisions made 25+ years ago? &nbsp;I bet there is an alternate dimension where Windows 7 only allows 8.3 filenames.</p>
+<div class=post>[<i>You missed the underlying counterfactual, which was &#8220;If Windows tracked DLL dependencies better, then we wouldn&#8217;t need these crazy rules about DLL_PROCESS_DETACH.&#8221; Your argument is therefore circular: &#8220;Changing the rules by tracking dependencies better is a bad idea because that would make it possible to change the rules!&#8221; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-754353">
+				<div id="div-comment-754353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">porter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754353">
+			July 11, 2009 at 9:18 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; It wouldn&#8217;t have been so bad, except that Visual Basic liked to unload DLLs at times other than process death, meaning you HAD to make sure your threads were stopped.
+</p></blockquote>
+<p>32bit OS/2 required all threads to terminate before a process ended.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754363">
+				<div id="div-comment-754363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754363">
+			July 11, 2009 at 11:25 pm</a>		</div>
+
+		<p>I understand that, but my comment wasn&#8217;t specifically aimed at this topic; it was more about (breaking) backward compatibility in general.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aaron-margosis even thread-even depth-1" id="comment-754373">
+				<div id="div-comment-754373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Aaron+Margosis' rel='external nofollow' class='url'>Aaron Margosis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754373">
+			July 12, 2009 at 1:08 am</a>		</div>
+
+		<p>@John &#8211; yes, compatibility is a bitch. &nbsp;But throwing away compatibility hurts customers (which hurts business). &nbsp;So you just acknowledge it and deal with it.</p>
+<p>It&#8217;s hardly unique to Microsoft, though, or to the software industry. &nbsp;Look around and you&#8217;ll see all kinds of decisions based on backward compatibility. &nbsp;E.g., &quot;cigarette lighter&quot; jacks in (American) cars becoming the standard form factor for power outlets.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-754463">
+				<div id="div-comment-754463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bahbar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754463">
+			July 13, 2009 at 8:45 am</a>		</div>
+
+		<p>@Aaron,</p>
+<p>Actually, those jacks are probably one of the best followed de facto standards throughout the world. Try and plug a US standard power plug in Europe, and then try your car-jack plug. Guess which one works&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aaron-margosis even thread-even depth-1" id="comment-754513">
+				<div id="div-comment-754513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Aaron+Margosis' rel='external nofollow' class='url'>Aaron Margosis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090710-00/?p=17543#comment-754513">
+			July 13, 2009 at 11:16 am</a>		</div>
+
+		<p>@bahbar &#8211; I didn&#8217;t want to assume that what&#8217;s true in the US is true around the world, but I&#8217;m not surprised that this one is. &nbsp;The point is, though, that if you were designing a standard form factor for a power outlet, would your first idea be something that you could easily stick large fingers or thumbs into? &nbsp;Oh &#8211; and the English language itself. &nbsp;It&#8217;s a total mess, but it&#8217;s what we&#8217;ve got.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,494 @@
+<html>
+<head>
+<title>What possible use are those extra bits in kernel handles? Part 1: Sentinels</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What possible use are those extra bits in kernel handles? Part 1: Sentinels</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 27, 2008 / year-entry #290</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Kernel handles are always a multiple of four; the bottom two bits are available for applications to use. But why would an application need those bits anyway? The short answer is extending the handle namespace. The long answer will take a few days to play out. (This series was written in response to Igor Levicki...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2005/01/21/358109.aspx">
+Kernel handles are always a multiple of four</a>;
+the bottom two bits are available for applications to use.
+But why would an application need those bits anyway?
+</p>
+<p>
+The short answer is <i>extending the handle namespace</i>.
+The long answer will take a few days to play out.
+(This series was written in response to
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/02/28/7925962.aspx#7939157">
+Igor Levicki being unable to imagine "how this can save anything
+(in terms of performance)"</a>.
+Then again, who said that it had anything to do with performance?
+Actually, I'm surprised that my dear readers weren't familiar
+with the techniques described in this series.
+Perhaps I shouldn't have written this series and merely replied,
+"If you can't think of how this could be useful, then you are not
+my target audience."
+On the other hand, reader Aaargh! believes that
+whoever thought to make the bottom two bits of handles available to
+applications
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/06/06/8576557.aspx#8578571">
+should receive an asswhooping</a>.)
+</p>
+<p>
+But we'll start with a warm-up.
+If you need some sentinel values for a <code>HANDLE</code>,
+you need to make sure your chosen sentinel value will never
+conflict with a valid <code>HANDLE</code> value.
+If you decide that your sentinel value is something like
+</p>
+<pre>
+<i>// code in italics is wrong
+#define DEBUGWINDOW_HANDLE ((HANDLE)0x1234)</i>
+</pre>
+<p>
+then your program is going to start acting really strange
+if the kernel ever gave you handle value of 0x1234.
+Knowing that kernel handles are always multiples of four
+means that you can choose a value that <i>isn't</i>
+a multiple of four and use it as your sentinel value.</p>
+<pre>
+#define DEBUGWINDOW_HANDLE ((HANDLE)0x1233)
+</pre>
+<p>
+Since 0x1233 is not a multiple of four, you can rest assured
+that no actual kernel handle will have this value,
+and you can write your logging function like this:
+</p>
+<pre>
+void LogOutput(HANDLE hOutput, LPCVOID pv, DWORD cb)
+{
+ if (hOutput == NULL) {
+   // logging disabled
+ } else if (hOutput == DEBUGWINDOW_HANDLE) {
+  AddToDebugWindow(pv, cb);
+ } else {
+  DWORD cbWritten;
+  WriteFile(hOutput, pv, cb, NULL, &amp;cbWritten);
+ }
+}
+</pre>
+<p>
+Since you can't <code>WriteFile</code> to a window handle,
+your logging function has to do something special if somebody
+decided that their output should go to the debug window.
+But if they chose to log to a normal kernel object (a file,
+the console, a serial port, whatever) then you can just write
+the data to that kernel object.</p>
+<p>
+You've already seen this before; you just didn't realize it.
+The special values for <code>INVALID_HANDLE_VALUE</code> and
+kernel pseudo-handles 
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/getcurrentprocess.asp">
+such as <code>GetCurrentProcess</code></a>
+are not multiples of four for exactly this reason.
+</p>
+<p>
+Now, sure, you could have defined your own <code>LogHandle</code>
+type and have all the logging go through that type instead of just
+logging to <code>HANDLE</code>s:
+</p>
+<pre>
+class LogHandle {
+public:
+  static LogHandle *GetDebugLogHandle();
+  BOOL IsDebugWindow();
+  HANDLE GetKernelHandle();
+  static LogHandle *CreateFromKernelHandle(HANDLE KernelHandle);
+  ~LogHandle() { }
+
+private:
+  LogHandle(BOOL IsDebugWindow, HANDLE KernelHandle);
+  static LogHandle DebugWindow;
+
+  BOOL IsLogToDebugWindow;
+  HANDLE RegularKernelHandle;
+};
+</pre>
+<p>
+Throughout, your program would use pointers to
+<code>LogHandle</code>s instead of actual handles,
+using functions like these to convert between them:
+</p>
+<pre>
+// Does not take ownership of the handle
+LogHandle::LogHandle(BOOL IsDebugWindow, HANDLE KernelHandle)
+    : IsLogToDebugWindow(IsDebugWindow)
+    , RegularKernelHandle(KernelHandle)
+{
+}
+
+LogHandle LogHandle::DebugWindow(TRUE, NULL);
+
+LogHandle* LogHandle::GetDebugWindowLogHandle()
+{
+  return &amp;DebugWindow;
+}
+
+BOOL LogHandle::IsDebugWindow()
+{
+  return IsLogToDebugWindow;
+}
+
+HANDLE LogHandle::GetKernelHandle()
+{
+  assert(!IsDebugWindow());
+  return RegularKernelHandle;
+}
+
+LogHandle *LogHandle::CreateFromKernelHandle(HANDLE KernelHandle)
+{
+  return new LogHandle(FALSE, KernelHandle);
+}
+</pre>
+<p>
+Or you could make everybody pass two parameters instead of one.
+For example, a class that went
+</p>
+<pre>
+class SomeObject {
+public:
+  SomeObject(int SomeParameter, BOOL SomeParameter,
+             HANDLE LogHandle);
+...
+private:
+  ...
+  HANDLE LogHandle; // log to this handle
+};
+</pre>
+<p>
+would have to change to
+</p>
+<pre>
+class SomeObject {
+public:
+  SomeObject(int SomeParameter, BOOL SomeParameter,
+             BOOL LogToDebugWindow, HANDLE LogHandle);
+...
+private:
+  ...
+  BOOL LogToDebugWindow; // if TRUE, log to window
+  HANDLE LogHandle; // if not logging to window, then log to here
+};
+</pre>
+<p>
+Either way is an awful lot of work just to define a sentinel value.
+But still, at least you can avoid the need for a sentinel value
+by just passing more parameters.
+But sometimes that option isn't available.
+We'll look at that next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-662313">
+				<div id="div-comment-662313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">steven</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662313">
+			August 27, 2008 at 10:31 am</a>		</div>
+
+		<p>Hmmm&#8230; 1234 isn&#8217;t a multiple of 4, unless you mean 0x1234, of course.</p>
+<div class=post>[<i>Thanks. Fixed. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-662323">
+				<div id="div-comment-662323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">keithmo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662323">
+			August 27, 2008 at 10:31 am</a>		</div>
+
+		<p>I wonder if &#8220;next time&#8221; will concern the disgusting &#8220;set the low bit of the event handle in an OVERLAPPED structure to suppress the I/O completion indication&#8221; hack&#8230;</p>
+<div class=post>[<i>Um, that topic was the inspiration for this one. Try clicking that first link. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662373">
+				<div id="div-comment-662373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662373">
+			August 27, 2008 at 11:10 am</a>		</div>
+
+		<p>This whole thing just seems like too much of a hack for me. &nbsp;I much prefer adding a second parameter to a function. &nbsp;My personal feeling is that an opaque handle should mean one thing and one thing only. &nbsp;If you want to associate some extra information with a handle perhaps you should implement SetHandleLong() or something.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-662403">
+				<div id="div-comment-662403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.koroirc.com/' rel='external nofollow' class='url'>Koro</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662403">
+			August 27, 2008 at 11:34 am</a>		</div>
+
+		<p>But one must still be careful. &quot;Console&quot; pseudo-handles returned by GetStdHandle have some lower bits set, that WriteFile uses to determine if it should redirect the call to WriteConsoleA.</p>
+<p>All this because console handle are not real handles.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662543">
+				<div id="div-comment-662543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor Levicki</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662543">
+			August 27, 2008 at 7:03 pm</a>		</div>
+
+		<p>I am glad that my &quot;ignorance&quot; on the subject has inspired Raymond to write an educational article.</p>
+<p>As for my imagination shortage &#8212; still there is nothing here to convince me that such implementation is actually faster. Why not write two test cases along with some timing code and post them in one of the future blog posts?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding odd alt thread-odd thread-alt depth-1" id="comment-662553">
+				<div id="div-comment-662553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662553">
+			August 27, 2008 at 7:10 pm</a>		</div>
+
+		<p>&quot;still there is nothing here to convince me that such implementation is actually faster&quot;</p>
+<p>Quote from Raymond: &quot;Then again, who said that it had anything to do with performance?&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662583">
+				<div id="div-comment-662583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bruno Mart&#237;nez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662583">
+			August 27, 2008 at 7:59 pm</a>		</div>
+
+		<p>You can use boost::optional to do this cleanly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-662593">
+				<div id="div-comment-662593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662593">
+			August 27, 2008 at 8:22 pm</a>		</div>
+
+		<p>Of course, just because you /can/ doesn&#8217;t mean you /should/.</p>
+<p>// works, but ew</p>
+<p>switch (h) {</p>
+<p>// technically NULL % 4 == 0 but, hey, it&#8217;s special</p>
+<p>case NULL: &#8230;; break;</p>
+<p>case INVALID_HANDLE_VALUE: &#8230;; break;</p>
+<p>// probably need to unwrap this</p>
+<p>case GetCurrentProcess(): &#8230;; break;</p>
+<p>case YOUR_FAVORITE_NON_MULTIPLE_OF_FOUR_SENTINEL1: &#8230;; break;</p>
+<p>case YOUR_FAVORITE_NON_MULTIPLE_OF_FOUR_SENTINEL2: &#8230;; break;</p>
+<p>&#8230;</p>
+<p>case YOUR_FAVORITE_NON_MULTIPLE_OF_FOUR_SENTINEL/n/: &#8230;; break;</p>
+<p>default: assert((h % 4) == 0); WriteFile(h, &#8230;);</p>
+<p>}</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662603">
+				<div id="div-comment-662603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MadQ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662603">
+			August 27, 2008 at 8:31 pm</a>		</div>
+
+		<p>I&#8217;ve taken advantage of those lower two bits in a different way when I was writing a little debugging tool. It needed to keep track of process IDs (which aren&#8217;t handles, but also have the lower two buts set to zero), and it was important to be able to look up process handles by process ID very fast. It used a hash table with the simplest hash function ever: right-shift the process ID by two.</p>
+<p>Nitpickery: &quot;But if the lower two bits weren&#8217;t always zero, you wouldn&#8217;t need a hash function at all!&quot;</p>
+<p>Yeah, but then I wouldn&#8217;t have had a possibly mildly interesting anecdote to tell.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-662643">
+				<div id="div-comment-662643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662643">
+			August 28, 2008 at 12:19 am</a>		</div>
+
+		<p>For some reason this reminds of that Mistakes Demotivator with the caption &quot;It could be that the purpose of your life is only to serve as a warning to others&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662663">
+				<div id="div-comment-662663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Me</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662663">
+			August 28, 2008 at 3:26 am</a>		</div>
+
+		<p>John wrote on Wednesday, August 27, 2008 11:10 AM:</p>
+<blockquote><p>
+  My personal feeling is that an opaque handle should mean one thing and one thing only.
+</p></blockquote>
+<p>But if this were always followed, we would not know the FILENOTFOUND value for a boolean enum:</p>
+<p><a rel="nofollow" target="_new" href="http://thedailywtf.com/Articles/What_Is_Truth_0x3f_.aspx" rel="nofollow">http://thedailywtf.com/Articles/What_Is_Truth_0x3f_.aspx</a></p>
+<p>But I think we all know this same from some other circumstance, don&#8217;t we?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-662623">
+				<div id="div-comment-662623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Erzengel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-662623">
+			August 27, 2008 at 10:35 pm</a>		</div>
+
+		<p>I can see what Raymond is getting at, but I personally would have done:</p>
+<p>class LogHandle</p>
+<p>{</p>
+<p>public:</p>
+<p>virtual ~LogHandle(){}</p>
+<p>virtual void Write(LPCVOID ToWrite, DWORD Len)=0;</p>
+<p>};</p>
+<p>class LogFileHandle : public LogHandle</p>
+<p>{</p>
+<p>HANDLE regularHandle;</p>
+<p>public:</p>
+<p>LogFileHandle(HANDLE);</p>
+<p>~LogFileHandle();</p>
+<p>virtual void Write(LPCVOID ToWrite, DWORD Len)</p>
+<p>{</p>
+<p>DWORD WrittenLen = 0;</p>
+<p>WriteFile(regularHandle, ToWrite, Len, 0, &amp;WrittenLen);</p>
+<p>}</p>
+<p>};</p>
+<p>class LogDebugHandle : public LogHandle</p>
+<p>{</p>
+<p>public:</p>
+<p>virtual void Write(LPCVOID ToWrite, DWORD Len)</p>
+<p>{</p>
+<p>AddToDebugWindow(ToWrite, Len);</p>
+<p>}</p>
+<p>};</p>
+<p>__declspec(dllexport) LogHandle* NewLogHandle(HANDLE WriteTo)</p>
+<p>{</p>
+<p>return new LogFileHandle(WriteTo);</p>
+<p>}</p>
+<p>__declspec(dllexport) void FreeHandle(LogHandle* ToDelete)</p>
+<p>{</p>
+<p>delete ToDelete;</p>
+<p>}</p>
+<p>__declspec(dllexport) LogHandle* GetDebugHandle()</p>
+<p>{</p>
+<p>//Yes, I could use a singleton, but I&#8217;d need a</p>
+<p>//way to allow the &#8220;free&#8221; function to recognize</p>
+<p>//the static variable, and that&#8217;s beyond</p>
+<p>//the scope of this example.</p>
+<p>return new LogDebugHandle();</p>
+<p>}</p>
+<p>__declspec(dllexport) void LogOutput(LogHandle* LogTo, LPCVOID ToLog, DWORD Len)</p>
+<p>{</p>
+<p>LogTo-&gt;Write(ToLog, Len);</p>
+<p>}</p>
+<p>Yes, this may be slower (function pointers rather than if branches), but really, do you need to be fast when outputting to a file, debug window, etc? Wouldn&#8217;t the actual writing be orders of magnitude slower than a function pointer? Plus, this is extensible. What if I want to output via WM_COPYDATA? Or across a network? I could create COPYDATA_HANDLE and add an if, but how would I know what window I&#8217;m sending to? Using a class allows me a great deal of flexibility.</p>
+<p>So I honestly, sincerely want to get your opinions: how would using a HANDLE sentinal be better than the above?</p>
+<div class="post">[<i>It&#8217;s a lot easier if you&#8217;re retrofitting an existing code base that originally used <code>HANDLE</code>s. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-663313">
+				<div id="div-comment-663313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2008/08/29/8904342.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080827-00/?p=21073#comment-663313">
+			August 31, 2008 at 11:05 pm</a>		</div>
+
+		<p>Extending the namespace to cover new object types.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

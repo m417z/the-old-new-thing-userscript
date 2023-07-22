@@ -1,0 +1,498 @@
+<html>
+<head>
+<title>COM object destructors are very sensitive functions</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>COM object destructors are very sensitive functions</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 27, 2005 / year-entry #281</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">If you try to do too much, you can find yourself in trouble. For example, if your destructor hands a reference to itself to other functions, those functions might decide to call your IUnknown::AddRef and IUnknown::Release methods as part of their internal operations. Consider: ULONG MyObject::Release() { LONG cRef = InterlockedDecrement(&m_cRef); if (cRef == 0)...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+If you try to do too much, you can find yourself in trouble.
+</p>
+<p>
+For example, if your destructor hands a reference to itself
+to other functions,
+those functions might decide to call your
+<code>IUnknown::AddRef</code>
+and
+<code>IUnknown::Release</code>
+methods as part of their internal operations.
+Consider:
+</p>
+<pre>
+ULONG MyObject::Release()
+{
+ LONG cRef = InterlockedDecrement(&amp;m_cRef);
+ if (cRef == 0) {
+  delete this;
+ }
+ return cRef;
+}
+
+MyObject::~MyObject()
+{
+ if (m_fNeedSave) Save();
+}
+</pre>
+<p>
+That doesn't look so scary now does it?
+The object saves itself when destructed.
+</p>
+<p>
+However, the <code>Save</code> method might do something
+like this:
+</p>
+<pre>
+HRESULT MyObject::Save()
+{
+ CComPtr&lt;IStream&gt; spstm;
+ HRESULT hr = GetSaveStream(&amp;spstm);
+ if (SUCCEEDED(hr)) {
+  CComQIPtr&lt;IObjectWithSite, &amp;IID_IObjectWithSite&gt; spows(spstm);
+  if (spows) spows-&gt;SetSite(this);
+  hr = SaveToStream(spstm);
+  if (spows) spows-&gt;SetSite(NULL);
+ }
+ return hr;
+}
+</pre>
+<p>
+On its own, this looks pretty normal.
+Get a stream and save to it,
+setting ourselves as its site in case the stream
+wants to get additional information about the object
+as part of the saving process.
+</p>
+<p>
+But in conjunction with the fact that we call it from
+our destructor, we have a recipe for disaster.
+Watch what happens when the last reference is released.
+</p>
+<ul>
+<li>The <code>Release()</code> method decrements the reference
+    count to zero and performs a <code>delete this</code>.</p>
+<li>The destructor attempts to save the object.
+<li>The <code>Save()</code> method obtains the save stream
+    and sets itself as the site.  This increments the reference
+    count from zero to one.</p>
+<li>The <code>SaveToStream()</code> method saves the object.
+<li>The <code>Save()</code> method clears the site on the stream.
+    This decrements the reference count from one back to zero.</p>
+<li>The <code>Release()</code> method therefore attempts to destructor
+    the object a second time.
+</ul>
+<p>
+Destructing the object a second time tends to result in widespread
+mayhem.
+If you're lucky, you'll crash inside the recursive destruction
+and identify the source,
+but if you're not lucky, the resulting heap corruption won't go
+detected for quite some time, at which point you'll just be left
+scratching your head.
+</p>
+<p>
+Therefore, at a minimum, you should assert in your <code>AddRef()</code>
+method that you aren't incrementing the reference count from zero.
+</p>
+<pre>
+ULONG MyObject::AddRef()
+{
+ <font COLOR=blue>assert(m_cRef != 0);</font>
+ return InterlockedIncrement(&amp;m_cRef);
+}
+</pre>
+<p>
+This would catch the "case of the mysteriously double-destructed
+object" much earlier in the game, giving you a fighting chance
+of identifying the problem.
+But once you've isolated the problem,
+what can you do about it?
+We'll look into that next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-309103">
+				<div id="div-comment-309103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frederik Slijkerman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309103">
+			September 27, 2005 at 10:09 am</a>		</div>
+
+		<p>It looks like you should bump the reference count in the destructor before the Save() call.<br />
+<br />Something like:</p>
+<p>MyObject::~MyObject()<br />
+<br />{<br />
+<br />  assert(m_cRef == 0);<br />
+<br />  m_cRef = 1; // Set refcount back to valid state for other function calls.<br />
+<br />  if (m_fNeedSave) Save();<br />
+<br />}<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309113">
+				<div id="div-comment-309113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Becke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309113">
+			September 27, 2005 at 10:52 am</a>		</div>
+
+		<p>You can&#8217;t do the cleanup in the destructor as you cannot guarantee that the external object &#8211; now that it has a reference &#8211;  won&#8217;t hold onto it for a while &#8211; and that delete this is going to continue cleaning up your object regardless of any (now) oustanding references.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309123">
+				<div id="div-comment-309123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Centaur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309123">
+			September 27, 2005 at 11:17 am</a>		</div>
+
+		<p>C++ object destructors are very sensitive functions.</p>
+<p>According to the Holy Standard, Chapter 3.8, Verse 1, after the destructor has started running, the object is officially dead. Any and all operations on it as a whole are considered necrophily and may be punishable by Undefined Behavior.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309133">
+				<div id="div-comment-309133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andy Walldorff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309133">
+			September 27, 2005 at 11:20 am</a>		</div>
+
+		<p>I don’t think the change to AddRef would work.  When the object is first constructed, the reference count should be 0 and AddRef should be called at some point (probably via QueryInterface) to increment the reference count.  If this is not done, then the reference will never go to 0 and the object is not deleted.  I guess that is one reason why ATL destructors are not virtual and the FinalRelease method is provided.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309143">
+				<div id="div-comment-309143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul C.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309143">
+			September 27, 2005 at 11:22 am</a>		</div>
+
+		<p>Wow, that is pretty freakish.  The best solution is probably to avoid doing anything other than memory deallocation in your destructor, and make sure it only gets called once.  To do that, in Release() if the reference count has gone to zero, set a flag that says you&#8217;re in cleanup.  If that flag is set, don&#8217;t initiate cleanup again.  So, you&#8217;d end up with a Release() that looks something like this:</p>
+<p>ULONG MyObject::Release()<br />
+<br />{<br />
+<br /> LONG cRef, cCleanup;</p>
+<p> cRef = InterlockedDecrement(&amp;m_cRef);<br />
+<br /> if (cRef == 0) {<br />
+<br />  // Constructor sets cCleanup to zero<br />
+<br />  cCleanup = InterlockedIncrement(&amp;m_cCleanup);<br />
+<br />  if (cCleanup == 1) {<br />
+<br />    if (m_fNeedSave) Save();<br />
+<br />    delete this;<br />
+<br />  }<br />
+<br /> }<br />
+<br /> return cRef;<br />
+<br />}</p>
+<p>Now, we can be certain that we only deallocate ourselves once.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309153">
+				<div id="div-comment-309153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">memet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309153">
+			September 27, 2005 at 12:05 pm</a>		</div>
+
+		<p>My guess would be to create an internal (COM) object to pass to the save method &#8211; if we must call the save method.<br />
+<br /> Somehow serialize our data, pass it to this temporary object and then call the SaveToStream on that object.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309163">
+				<div id="div-comment-309163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lewis Jones</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309163">
+			September 27, 2005 at 12:34 pm</a>		</div>
+
+		<p>I ran across this with a COM-like environment (Reference counted objects, interface-based accessor, just without MS&#8217;s overhead&#8230; It was for a set of all inproc DLLs so marshalling wasn&#8217;t necessary, also we were trying for cross-platform).</p>
+<p>Anyways, we had a strange sequence of strong references that caused the situation above. Our solution was in our implementation of the Release() method to set the reference count to something out-of-range (like -100) immediately prior to calling &quot;delete this&quot;.</p>
+<p>This way any AddRef()/Release() would not have any effect (we only cared if the reference count == 0).</p>
+<p>Not pretty, but it worked&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309173">
+				<div id="div-comment-309173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">X</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309173">
+			September 27, 2005 at 12:57 pm</a>		</div>
+
+		<p>Calling functions that could fail from a destructor is a bad idea, not only in COM.  A Save() function falls in this category.</p>
+<p></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309183">
+				<div id="div-comment-309183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Moasat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309183">
+			September 27, 2005 at 1:00 pm</a>		</div>
+
+		<p>I think I would just find a better way to save the object rather than doing it in the destructor.  Especially if the code required to save it involved Addref&#8217;ing the object being deleted.  If the SetSite didn&#8217;t require an interface to &#8216;this&#8217;, then there&#8217;d be no problem here.  I think, regardless of any type of refcnt hacks, handing out an interface pointer to &#8216;this&#8217; from the destructor is a Very Bad Thing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ericlippert odd alt thread-odd thread-alt depth-1" id="comment-309193">
+				<div id="div-comment-309193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Eric+Lippert' rel='external nofollow' class='url'>Eric Lippert</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309193">
+			September 27, 2005 at 1:40 pm</a>		</div>
+
+		<p>VBScript needed to be designed around this exact issue.</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/ericlippert/archive/2004/12/22/330276.aspx" rel="nofollow">http://blogs.msdn.com/ericlippert/archive/2004/12/22/330276.aspx</a></p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/ericlippert/archive/2004/12/29/344074.aspx" rel="nofollow">http://blogs.msdn.com/ericlippert/archive/2004/12/29/344074.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309203">
+				<div id="div-comment-309203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rburhum</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309203">
+			September 27, 2005 at 1:43 pm</a>		</div>
+
+		<blockquote><p>
+  When the object is first constructed, the    reference count should be 0 and AddRef should be  called at some point (probably via  QueryInterface) to increment the reference count.</p>
+<p>Although I agree with you that this wouldn&#8217;t work, I wanted to point out that I have seen implementations of an Unknown object that start with a reference count of 1 &#8211; this is not too uncommon.</p>
+<p>Another solution would be to model the save behavior with finer grained granularity; an explicit call to Save() before you reach the destructor.</p>
+<p>Either way&#8230; do I sense a series of articles on COM? I can&#8217;t wait!
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309213">
+				<div id="div-comment-309213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rburhum</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309213">
+			September 27, 2005 at 1:50 pm</a>		</div>
+
+		<blockquote><p>
+  If the SetSite didn&#8217;t require an interface to &#8216;this&#8217;, then there&#8217;d be no problem here. I think, regardless of any type of refcnt hacks, handing out an interface pointer to &#8216;this&#8217; from the destructor is a Very Bad Thing.</p>
+<p>Handing out pointers to &#8216;this&#8217; is not necessarily a &quot;bad thing&quot; or hack. In fact, this is very common with event sink objects and such kind of COM objects.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309233">
+				<div id="div-comment-309233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Moasat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309233">
+			September 27, 2005 at 2:58 pm</a>		</div>
+
+		<blockquote><p>
+  Handing out pointers to &#8216;this&#8217; is not necessarily a &quot;bad thing&quot; or hack. In fact, this is very common with event sink objects and such kind of COM objects.</p>
+<p>I was referring to the idea of handing it out from within the destructor and the &#8216;hacks&#8217; of playing with the refcnt so that the destructor is not called twice.  While it might not directly be a bad thing, it could lead to bad things and is not very nice for any other developers to have to maintain.</p>
+<p>If I was working on a &#8216;SetSite&#8217;-type function, I certainly wouldn&#8217;t want to have to deal with the fact that the interface I&#8217;m getting may point to an object that is being destroyed.</p>
+<p>Alternatively, if I was working on the object being destroyed, I would question code that looked like this:</p>
+<p>if (refcnt &lt; 0) &#8230;</p>
+<p>or</p>
+<p>if (refcnt == -100) &#8230;</p>
+</blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309253">
+				<div id="div-comment-309253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">waleri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309253">
+			September 27, 2005 at 5:57 pm</a>		</div>
+
+		<p>ULONG CMyObject::Release(void)<br />
+<br />{<br />
+<br />  assert(0 != m_cRef); // Somebody calling us twice?</p>
+<p>  if (1 == m_cRef) // Time to save, we&#8217;re about to be destroyed<br />
+<br />    Save();</p>
+<p>  // Save() could increase the counter<br />
+<br />  LONG cRef = InterlockedDecrement(&amp;m_cRef);<br />
+<br />  if (0 == cRef)<br />
+<br />    delete this;</p>
+<p>  return cRef;<br />
+<br />}<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309263">
+				<div id="div-comment-309263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ipoverscsi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309263">
+			September 27, 2005 at 6:35 pm</a>		</div>
+
+		<p>I&#8217;ve done some research into C++ destructors (on my own geek time), and using AddRef() in the destructor is just bad business.</p>
+<p>Classes with virtual methods use a vtable to determine which methods to call at runtime.  In most C++ implementations the vtable is actually changed as the destructor deletes from most derived to base class; this is to ensure that base classes calling virtual methods to not access methods or fields of derived classes that have already been destroyed.  This means that even you somehow manage to prevent the memory from being reclaimed by the memory manager, virtual functions will only call the root classes methods.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309283">
+				<div id="div-comment-309283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.eightypercent.net' rel='external nofollow' class='url'>Joe Beda</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309283">
+			September 27, 2005 at 9:58 pm</a>		</div>
+
+		<p>My favorite is a component that pushed a message loop during the final release.  The component in question will remain nameless&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-309643">
+				<div id="div-comment-309643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">abc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309643">
+			September 29, 2005 at 4:00 pm</a>		</div>
+
+		<p>All the discussions do prove that &quot;COM object destructors are very sensitive functions&quot;.</p>
+<p>At least it&#8217;s as same sensitve as ctr and dtr.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-309693">
+				<div id="div-comment-309693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">autist0r</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-309693">
+			September 30, 2005 at 2:12 am</a>		</div>
+
+		<p>What about NOT saving in the destructor? I find it cleaner and more flexible to have an explicit call to save rather than an automatic save. Ok, sometimes it&#8217;s not your choice&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-480943">
+				<div id="div-comment-480943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.antcassidy.com/code/?p=44' rel='external nofollow' class='url'>Code &raquo; Blog Archive &raquo; Adding reference counting to something.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-480943">
+			March 11, 2007 at 3:50 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.antcassidy.com/code/?p=44" rel="nofollow">http://www.antcassidy.com/code/?p=44</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-480983">
+				<div id="div-comment-480983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.antcassidy.com/code/?p=8' rel='external nofollow' class='url'>Code &raquo; Blog Archive &raquo; My first use of CComObjectStackEx</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050927-13/?p=34023#comment-480983">
+			March 11, 2007 at 4:16 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.antcassidy.com/code/?p=8" rel="nofollow">http://www.antcassidy.com/code/?p=8</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,613 @@
+<html>
+<head>
+<title>Enumerating notification icons via UI Automation</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Enumerating notification icons via UI Automation</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 13, 2014 / year-entry #243</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today's Little Program uses accessibility to enumerate the current notification icons (and possibly click on one of them). This could be done manually via IAccessible, but the BCL folks conveniently created the System.Windows.Automation namespace which contains classes that take a lot of the grunt work out of walking the accessibility tree. While it's true that...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today's Little Program uses accessibility to enumerate the
+current notification icons (and possibly click on one of them).
+This could be done manually via <code>IAccessible</code>,
+but the BCL folks conveniently created the
+<code>System.<wbr>Windows.<wbr>Automation</code>
+namespace which contains classes that take a lot of the
+grunt work out of walking the accessibility tree.
+</p>
+<p>
+While it's true that the
+<code>System.<wbr>Windows.<wbr>Automation</code>
+namespace takes a lot of the grunt work out of accessibility,
+it is still rather verbose, so
+I'm going to start with some helper functions.
+They're all one-liners since they simply pass their parameters
+through with a little bit of extra typing.
+</p>
+<pre>
+using System.Collections.Generic;
+using System.Windows.Automation;
+using System.Linq;
+
+static class AutomationElementHelpers
+{
+ public static AutomationElement
+ Find(this AutomationElement root, string name)
+ {
+  return root.FindFirst(
+   TreeScope.Descendants,
+   new PropertyCondition(AutomationElement.NameProperty, name));
+ }
+</pre>
+<p>
+The <code>Automation&shy;Element.<wbr>Find</code> extension method
+searches for a descendant of an accessible element
+with a particular name.
+</p>
+<pre>
+ public static IEnumerable&lt;AutomationElement&gt;
+ EnumChildButtons(this AutomationElement parent)
+ {
+  return parent == null ? Enumerable.Empty&lt;AutomationElement&gt;()
+                        : parent.FindAll(TreeScope.Children,
+    new PropertyCondition(AutomationElement.ControlTypeProperty,
+                          ControlType.Button)).Cast&lt;AutomationElement&gt;();
+ }
+</pre>
+<p>
+The
+<code>Automation&shy;Element.<wbr>Enum&shy;Child&shy;Buttons</code>
+extension method
+enumerates the button controls which are immediate children
+of a parent element.
+</p>
+<pre>
+ public static bool
+ InvokeButton(this AutomationElement button)
+ {
+  var invokePattern = button.GetCurrentPattern(InvokePattern.Pattern)
+                     as InvokePattern;
+  if (invokePattern != null) {
+   invokePattern.Invoke();
+  }
+  return invokePattern != null;
+ }
+}
+</pre>
+<p>
+The <code>Automation&shy;Element.<wbr>Invoke&shy;Button</code>
+extension method checks if the element is invokable (which buttons
+are), and if so invokes its default action.
+</p>
+<p>
+Okay, given those helpers, we can write the actual enumerator.
+</p>
+<pre>
+class Program {
+
+ public static IEnumerable&lt;AutomationElement&gt; EnumNotificationIcons()
+ {
+  foreach (var button in AutomationElement.RootElement.Find(
+                  "User Promoted Notification Area").EnumChildButtons()) {
+   yield return button;
+  }
+
+  foreach (var button in AutomationElement.RootElement.Find(
+                "System Promoted Notification Area").EnumChildButtons()) {
+   yield return button;
+  }
+
+  var chevron = AutomationElement.RootElement.Find("Notification Chevron");
+  if (chevron != null &amp;&amp; chevron.InvokeButton()) {
+   foreach (var button in AutomationElement.RootElement.Find(
+                      "Overflow Notification Area").EnumChildButtons()) {
+    yield return button;
+   }
+  }
+ }
+</pre>
+<p>
+Okay, here's what's going on.
+</p>
+<p>
+First, we enumerate all the buttons that are children of an
+object called
+<i>User Promoted Notification Area</i>.
+</p>
+<p>
+Next, we enumerate all the buttons that are children of an object called
+<i>System Promoted Notification Area</i>.
+This object is usually empty, but it may contain an icon if a
+demoted icon is temporarily promoted because it is showing a balloon.
+</p>
+<p>
+Finally, if we are asked to enumerate hidden icons,
+we also find the <i>Notification Chevron</i> button and push it.
+That pops up a dialog called
+<i>Overflow Notification Area</i>,
+and we enumerate all the buttons from that dialog as well.
+</p>
+<p>
+Okay, let's take this function out for a spin.
+</p>
+<pre>
+ public static void Main()
+ {
+  foreach (var icon in EnumNotificationIcons())
+  {
+   var name = icon.GetCurrentPropertyValue(AutomationElement.NameProperty)
+              as string;
+   System.Console.WriteLine(name);
+   System.Console.WriteLine("---");
+  }
+ }
+}
+</pre>
+<p>
+When you run this program, it should print the names of all
+the icons in your notification area,
+including the hidden ones (for which it needs to open the overflow
+dialog).
+</p>
+<p>
+You may have noticed that it takes a long time to generate
+the icons in the <i>System Promoted Notification Area</i>;
+that's because the accessibility system is going crazy looking
+for something that usually doesn't exist.
+Let's speed things up by reducing the scope of the search.
+Once we find the <i>User Promoted Notification Area</i>,
+we will search for the
+<i>System Promoted Notification Area</i> inside the same window.
+That should save a lot of time.
+</p>
+<pre>
+// in static class AutomationElementHelpers
+
+ static public AutomationElement
+ GetTopLevelElement(this AutomationElement element)
+ {
+  AutomationElement parent;
+  while ((parent = TreeWalker.ControlViewWalker.GetParent(element)) !=
+       AutomationElement.RootElement) {
+   element = parent;
+  }
+  return element;
+ }
+</pre>
+<p>
+The <code>Automation&shy;Element.<wbr>Get&shy;Top&shy;Level&shy;Element</code>
+extension method walks up the control view and returns the ancestor
+element that is a direct child of the root.
+</p>
+<pre>
+ public static IEnumerable&lt;AutomationElement&gt; EnumNotificationIcons()
+ {
+  <font COLOR=blue>var userArea = AutomationElement.RootElement.Find(
+                  "User Promoted Notification Area");
+  if (userArea != null) {</font>
+   foreach (var button in <font COLOR=blue>userArea</font>.EnumChildButtons()) {
+    yield return button;
+   }
+
+   foreach (var button in <font COLOR=blue>userArea.GetTopLevelElement()</font>.Find(
+                 "System Promoted Notification Area").EnumChildButtons()) {
+     yield return button;
+   }
+  <font COLOR=blue>}</font>
+
+  var chevron = AutomationElement.RootElement.Find("Notification Chevron");
+  if (chevron != null &amp;&amp; chevron.InvokeButton()) {
+   foreach (var button in AutomationElement.RootElement.Find(
+                      "Overflow Notification Area").EnumChildButtons()) {
+    yield return button;
+   }
+  }
+ }
+</pre>
+<p>
+Of course, what's the point of enumerating the icons if you can't
+also click them?
+Let's go look for the volume control icon and click it.
+</p>
+<pre>
+ public static void Main()
+ {
+  foreach (var icon in EnumNotificationIcons())
+  {
+   var name = icon.GetCurrentPropertyValue(AutomationElement.NameProperty) as string;
+   <font COLOR=blue>if (name.StartsWith("Speakers:")) {
+    icon.InvokeButton();
+    break;
+   }</font>
+  }
+ }
+</pre>
+<p>
+So far, this program relies on the accessible tree structure
+used by Windows&nbsp;7 and Windows&nbsp;8.
+If you run the program on earlier versions of Windows
+(or later ones), it may not work.
+That's because the accessible tree changed.
+The accessibiliy tree is not part of the API.
+It's something that is exposed for accessibility purposes to the end user,
+and the fact that there is a programmatic interface to it
+is an artifact of the accessibility.
+</p>
+<p>
+In Windows Vista, there is not a separate overflow area for
+notification icons.
+Instead, you use the chevron button to expand or contract the notification
+area.
+Let's tweak our program to work on Windows Vista
+instead of Windows&nbsp;7:
+</p>
+<pre>
+ public static IEnumerable&lt;AutomationElement&gt; EnumNotificationIcons()
+ {
+  var userArea = AutomationElement.RootElement.Find("Notification Area");
+  if (userArea != null) {
+   // If there is a chevron, click it. There may not be a chevron if no
+   // icons are hidden.
+   var chevron = userArea.GetTopLevelElement().Find("NotificationChevron");
+   if (chevron != null) {
+    chevron.InvokeButton();
+   }
+   foreach (var button in userArea.EnumChildButtons()) {
+    yield return button;
+   }
+  }
+ }
+</pre>
+<p>
+The name of the notification area in Windows Vista is simply
+<i>Notification Area</i>,
+and the name of the chevron is
+<i>Notification&shy;Chevron</i> with no space.
+(Somebody was apparently trying to save two bytes.)
+</p>
+<p>
+Okay, now that you see the general idea, I'll leave Windows&nbsp;XP,
+Windows 2000, and Windows&nbsp;NT support as an exercise.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1155363">
+				<div id="div-comment-1155363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155363">
+			October 13, 2014 at 7:34 am</a>		</div>
+
+		<p>Shell_NotifyIconGetRect was added in Win7 so people creating toasts should use that if all they need is the location. This API did not exist in Vista but Vista had toasts/flyouts for several of its system icons, was automation used to get the location on Vista?</p>
+<div class="post">[<em>Hardly. Automation names are not part of the API, so if you use automation for business logic, you are going to break the next time the UI changes. System icons which used the automation API would have been broken in Windows 7. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155373">
+				<div id="div-comment-1155373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155373">
+			October 13, 2014 at 10:36 am</a>		</div>
+
+		<p>UIA was not backported to Windows 2000, Windows NT, or pre-SP3 Windows XP. That might make support for those versions of the OS problematic.</p>
+<p><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/windows/desktop/ee684009%28v=vs.85%29.aspx#downlevel_support">msdn.microsoft.com/&#8230;/ee684009%28v=vs.85%29.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155393">
+				<div id="div-comment-1155393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155393">
+			October 13, 2014 at 11:35 am</a>		</div>
+
+		<p>Funny I remember doing some kind of UIA on XP SP1. Obviously not the same one as it literally moved the cursor across the screen.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155433">
+				<div id="div-comment-1155433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Azarien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155433">
+			October 13, 2014 at 2:31 pm</a>		</div>
+
+		<p>What&#39;s the point of doing &quot;foreach &#8230; yield return&quot; instead of just &quot;return&quot;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155443">
+				<div id="div-comment-1155443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155443">
+			October 13, 2014 at 2:39 pm</a>		</div>
+
+		<p>Since Azarian can&#39;t be bothered to use Google: <a rel="nofollow" target="_new" href="http://stackoverflow.com/questions/410026/proper-use-of-yield-return">stackoverflow.com/&#8230;/proper-use-of-yield-return</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155453">
+				<div id="div-comment-1155453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nick</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155453">
+			October 13, 2014 at 2:44 pm</a>		</div>
+
+		<p>@Azarien: It&#39;s the easiest way to merge three Enumerables together plus you don&#39;t have to fill all three sets before you start doing work on the first one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155463">
+				<div id="div-comment-1155463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Azarien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155463">
+			October 13, 2014 at 2:48 pm</a>		</div>
+
+		<p>@Joshua: that doesn&#39;t answer my question. Which is:</p>
+<p>why</p>
+<p> &nbsp; &nbsp;foreach (var item in collection) yield return item;</p>
+<p>instead of just</p>
+<p> &nbsp; &nbsp;return collection;</p>
+<p>Both are lazy evaluated if collection is lazy evaluated, so why bother with additional overhead?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155473">
+				<div id="div-comment-1155473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Azarien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155473">
+			October 13, 2014 at 2:50 pm</a>		</div>
+
+		<p>Okay, ignore last comment. Now I see there are three iterations in one function. I thought there are separate functions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155483">
+				<div id="div-comment-1155483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155483">
+			October 13, 2014 at 2:59 pm</a>		</div>
+
+		<p>@parkrrrr: &nbsp;Support for those versions of Windows (Windows 2000, Windows NT, or pre-SP3 Windows XP) is &quot;problematic&quot; anyway. &nbsp;What is your point? &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155503">
+				<div id="div-comment-1155503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JW</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155503">
+			October 13, 2014 at 8:11 pm</a>		</div>
+
+		<p>So I have been wondering for a while (read: pretty much every UI Automation post you&#39;ve posted), and it makes me wonder &#39;Why?&#39;&#8230;</p>
+<p>I understand UI Automation makes things possible and slightly more accessible for the right uses. But all of your posts and examples just make me feel like these are mis-uses and abuses of the API.</p>
+<p>Ever since the old days of Windows, there&#39;s been problems with compatibility, people finding window class names and manipulating the UI that manner. Yet in this post we get something really similar: version specific strings and tree structures that are supposed to make those same old things + more possible. You say these will differ per version, but how do you prevent the must-stay-the-same compatibility issues as before from creeping in? And similarly, how is this going to keep coders from messing with things they shouldn&#39;t mess with? (Unless I misunderstand your post, clicking a taskbar chevron and similar Windows UI are things I would not expect to be touched by other programs.)</p>
+<p>Simply put&#8230; do your posts on this subject not encourage the wrong kinds of uses for this API? Or is it really intended as a FindWindow()-style replacement to poke and prod everything on the system with by every application out there?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155513">
+				<div id="div-comment-1155513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Baltasar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155513">
+			October 14, 2014 at 3:25 am</a>		</div>
+
+		<p>Is this the proper way to recognize the system volume notifier:</p>
+<p>var name = icon.GetCurrentPropertyValue(AutomationElement.NameProperty) as string;</p>
+<p>if (name.StartsWith(&quot;Speakers:&quot;)) {</p>
+<p> &nbsp; &nbsp;// &#8230;</p>
+<p>}</p>
+<p>Looks clumsy to me. I hope that i18n does not affect the code, i.e., the name for the icons is stable among all international versions of Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155523">
+				<div id="div-comment-1155523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155523">
+			October 14, 2014 at 5:18 am</a>		</div>
+
+		<p>Baltasar: If you&#39;re looking for something that wouldn&#39;t be affected by i18n, see AutomationIdProperty. The documentation <a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/system.windows.automation.automationelement.automationelementinformation.automationid.aspx">msdn.microsoft.com/&#8230;/system.windows.automation.automationelement.automationelementinformation.automationid.aspx</a> states this:</p>
+<p>&quot;While support of an AutomationId is always recommended for better testability, this property is not mandatory. Where it is supported, an AutomationId is useful for creating test automation scripts that run regardless of UI language. Clients should make no assumptions regarding the AutomationIds exposed by other applications. An AutomationId is not necessarily guaranteed to be stable across different releases or builds of an application.&quot;</p>
+<p>In other words, you would use it to find a given control regardless of what the UI language is, but don&#39;t expect to be able to find the Speakers icon the same way across different versions of Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155533">
+				<div id="div-comment-1155533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155533">
+			October 14, 2014 at 5:50 am</a>		</div>
+
+		<p>Baltasar: It breaks even before i18n. For me the full name is &quot;Speakers (USB): 2%&quot; so it would not match with the search. UI Automation API is very clumsy when the target application is not carefully designed for the automation. However, it is usually better than the alternatives when you have to automate interaction with the user interface.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155563">
+				<div id="div-comment-1155563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155563">
+			October 14, 2014 at 6:29 am</a>		</div>
+
+		<p>@DWalker:</p>
+<p>My point is, Raymond specifically mentioned support for those operating systems as &quot;an exercise,&quot; presumably on the assumption that the names and tree structure and whatnot would be somewhat different, but manageable. But the fact that the entire UIA subsystem is missing in those versions makes it a rather more difficult exercise.</p>
+<p>You could use Active Accessibility, the predecessor to UIA, but even that will fail on Windows NT if it isn&#39;t at least NT4 SP6.</p>
+<p>I know you&#39;re trying to say that all of those versions are EOLed, anyway, so there&#39;s no point in supporting them. But some of us live in the real world where we still encounter those versions &#8211; especially XP but even NT4, believe it or not &#8211; on a regular basis.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155603">
+				<div id="div-comment-1155603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155603">
+			October 14, 2014 at 8:18 am</a>		</div>
+
+		<p>@JW</p>
+<p>We use the UIAutomation Framework heavily here for an in house Automated Testing Framework (similar to White and other UI Test Frameworks/products) to perform integration testing of our software. Combined with good ol&#39; FindWindow and EnumThreadWindows its very powerful, and allows us to automate repetitive testing tasks freeing up our testers to focus on more actively developed portions of our product.</p>
+<div class="post">[<em>UIAutomation is for accessibility and automated testing. In this case, it&#39;s so you can write an automated test to verify that your program is showing its notification icon when it should. It is not for shipping business logic because the accessibility tree is not contractual. (If a service pack breaks your tests, then you update your tests. If a service pack breaks your app, then you have a lot of unhappy customers.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1155653">
+				<div id="div-comment-1155653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JW</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155653">
+			October 14, 2014 at 1:54 pm</a>		</div>
+
+		<p>So, I take from that then that no, UI Automation is not intended for production code used by end-users. I really hope that is how programmers will use it, but I&#39;ve got a feeling it is going to be popular in a lot of products to &#39;unlock special functionality&#39; regardless. :/</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1155683">
+				<div id="div-comment-1155683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1155683">
+			October 15, 2014 at 5:19 am</a>		</div>
+
+		<p>UI Automation is absolutely intended for production code used by end-users. As long as your production code is accessibility or test software, and that&#39;s what your end users are using it for.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1156193">
+				<div id="div-comment-1156193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1156193">
+			October 16, 2014 at 5:06 pm</a>		</div>
+
+		<p>The enumeration should definitely not be lazily evaluated. &nbsp;What happens if you take so much time with an item that user interaction, which typically close the overflow area, gets in the way of the enumeration? &nbsp;Just take a snapshot of it with ToArray or ToList.</p>
+<p>It gets more unreliable if you think that the area might actually be open to start with, so by clicking on it will close it! &nbsp;Actually, if you run the enumeration twice fast, the second time will yield fewer items. &nbsp;You must also check if the overflow area is open or not.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1156243">
+				<div id="div-comment-1156243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141013-00/?p=43863#comment-1156243">
+			October 17, 2014 at 3:28 am</a>		</div>
+
+		<p>@John Doe:</p>
+<p>Lazy evaluation is good enough considering that the properties are not cached. Taking a snapshot of automation elements does not help if you are later going to ask their property values or you try to interact with them (i.e. the element must exist at that point anyway). There are other, more significant problems with the implementation. For example, FindFirst() should not be used with TreeScope.Descendants when enumerating root element, because it may iterate over thousands of elements and lead to a stack overflow (according to MSDN).</p>
+<p>More robust implementation could use CacheRequest to get the property values and then take a snapshot of all needed automation elements. Also a custom implementation of FindFirst() method with breadth-first algorithm and an optional maxDepth parameter would be a good idea, but the implementation is a bit tricky because the tree traversal may fail whenever the automation tree changes.</p>
+<p>However, the automation element of speaker icon must still be alive when you try to click it so these actions have limited benefits for that scenario.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

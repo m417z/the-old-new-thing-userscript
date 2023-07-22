@@ -1,0 +1,689 @@
+<html>
+<head>
+<title>Debugging walkthrough: Access violation on nonsense instruction</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Debugging walkthrough: Access violation on nonsense instruction</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 26, 2014 / year-entry #300</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A colleague of mine asked for help puzzling out a mysterious crash dump which arrived via Windows Error Reporting. rax=00007fff219c5000 rbx=00000000023c8380 rcx=00000000023c8380 rdx=0000000000000000 rsi=00000000043f0148 rdi=0000000000000000 rip=00007fff21af2d22 rsp=000000000392e518 rbp=000000000392e580 r8=00000000276e4639 r9=00000000043b2360 r10=00000000ffffffff r11=0000000000000000 r12=0000000000000001 r13=0000000000000000 r14=000000000237cfc0 r15=00000000023d3ea0 iopl=0 nv up ei pl zr na po nc cs=0033 ss=002b ds=002b es=002b fs=0053 gs=002b efl=00010246 nosebleed!CNosebleed::OnFrimble+0x1f891a: 00007fff`21af2d22 30488b...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A colleague of mine asked for help puzzling out a mysterious crash
+dump which arrived via Windows Error Reporting.
+</p>
+<pre>
+rax=00007fff219c5000 rbx=00000000023c8380 rcx=00000000023c8380
+rdx=0000000000000000 rsi=00000000043f0148 rdi=0000000000000000
+rip=00007fff21af2d22 rsp=000000000392e518 rbp=000000000392e580
+ r8=00000000276e4639  r9=00000000043b2360 r10=00000000ffffffff
+r11=0000000000000000 r12=0000000000000001 r13=0000000000000000
+r14=000000000237cfc0 r15=00000000023d3ea0
+iopl=0         nv up ei pl zr na po nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010246
+nosebleed!CNosebleed::OnFrimble+0x1f891a:
+00007fff`21af2d22 30488b xor byte ptr [rax-75h],cl ds:00007fff`219c4f8b=41
+</pre>
+<p>
+Well that's a pretty strange instruction.
+Especially since it doesn't match up with the source code at all.
+</p>
+<pre>
+void CNosebleed::OnFrimble(...)
+{
+    ...
+    if (CanFrumble(...))
+    {
+        ...
+    }
+    else
+    {
+        hr = pCereal-&gt;AddMilk(pCarton);
+        if (SUCCEEDED(hr))
+        {
+            pCereal-&gt;Snap();
+            pCereal-&gt;Crackle(false);
+            if (SUCCEEDED(pCereal-&gt;Pop(uId)) // &larr; crash here
+            {
+                ....
+            }
+        }
+    }
+    ....
+}
+</pre>
+<p>
+There is no bit-toggling in the actual code.
+The method calls to
+<a HREF="http://www.ricekrispies.com/snap-crackle-pop">
+<code>Snap</code>,
+<code>Crackle</code>, and
+<code>Pop</code></a>
+are all interface calls and therefore should be vtable calls.
+We are clearly in a case of a bogus return address,
+possibly a stack smash (and therefore cause for concern from
+a security standpoint).
+</p>
+<p>
+My approach was to try to figure out what was happening
+just before the crash.
+And that meant figuring out how we ended up in the middle of
+an instruction.
+</p>
+<p>
+Here is the code surrounding the crash point.
+</p>
+<pre>
+00007fff`21af2d17 ff90d0020000    call    qword ptr [rax+2D0h]
+00007fff`21af2d1d 488b03          mov     rax,qword ptr [rbx]
+00007fff`21af2d20 8b5530          mov     edx,dword ptr [rbp+30h]
+00007fff`21af2d23 488bcb          mov     rcx,rbx
+</pre>
+<p>
+Notice that the code that crashed is actually the last byte of
+the <code>mov edx, dword ptr [rbp+30h]</code> (the <code>30</code>)
+and the first two bytes of the <code>mov rcx, rbx</code> (the
+<code>488b</code>).
+</p>
+<p>
+Disassembling backward is a tricky business on a processor with
+variable-length
+instructions, so
+to get my bearings, I looked for the call to
+<code>Can&shy;Frumble</code>:
+</p>
+<pre>
+0:011&gt; #CanFrumble nosebleed!CNosebleed::OnFrimble
+nosebleed!CNosebleed::OnFrimble+0x1f883b
+00007fff`21af2c43 e8e0e40f00 call nosebleed!CNosebleed::CanFrumble
+</pre>
+<p>
+The <code>#</code> command means
+"Start disassembling at the specified location and stop when you
+see the string I passed."
+This is an automated way of just hitting <code>u</code> until you
+get to the thing you are looking for.
+</p>
+<p>
+Now that I am at some known good code, I can disassemble forward:
+</p>
+<pre>
+00007fff`21af2c48 488bcb          mov     rcx,rbx
+00007fff`21af2c4b 84c0            test    al,al
+00007fff`21af2c4d 0f849a000000    je      nosebleed!CNosebleed::OnFrimble+0x1f88e5 (00007fff`21af2ced)
+</pre>
+<p>
+The above instructions check whether the <code>Can&shy;Frumble</code>
+returned <code>true</code>, and if not, it jumps to
+<code>00007fff`21af2ced</code>.
+Since we know that we are in the <code>false</code> path,
+we follow the jump.
+</p>
+<pre>
+// Make a vtable call into pCereal-&gt;AddMilk()
+00007fff`21af2ced 488b03          mov     rax,qword ptr [rbx] ; vtable
+00007fff`21af2cf0 498bd7          mov     rdx,r15 ; pCarton
+00007fff`21af2cf3 ff9068010000    call    qword ptr [rax+168h] ; call
+00007fff`21af2cf9 8bf8            mov     edi,eax ; save to hr
+00007fff`21af2cfb 85c0            test    eax,eax ; succeeded?
+00007fff`21af2dfd 0f880dffffff    js      nosebleed!CNosebleed::OnFrimble+0x1f8808 (00007fff`21af2c10)
+
+// Now call Snap()
+00007fff`21af2d03 488b03          mov     rax,qword ptr [rbx] ; vtable
+00007fff`21af2d06 488bcb          mov     rcx,rbx ; "this"
+00007fff`21af2d09 ff9070020000    call    qword ptr [rax+270h] ; Snap
+
+/ Now call Crackle
+00007fff`21af2d0f 488b03          mov     rax,qword ptr [rbx] ; vtable
+00007fff`21af2d12 33d2            xor     edx,edx ; parameter: false
+00007fff`21af2d14 488bcb          mov     rcx,rbx ; "this"
+00007fff`21af2d17 ff90d0020000    call    qword ptr [rax+2D0h] ; Crackle
+
+// Get ready to Pop
+00007fff`21af2d1d 488b03          mov     rax,qword ptr [rbx] ; vtable
+00007fff`21af2d20 8b5530          mov     edx,dword ptr [rbp+30h] ; uId
+00007fff`21af2d23 488bcb          mov     rcx,rbx ; "this"
+</pre>
+<p>
+But we never got to execute the <code>Pop</code>
+because our return address from <code>Crackle</code> got messed up.
+</p>
+<p>
+Let's follow the call into <code>Crackle</code>.
+</p>
+<pre>
+0:011&gt; dps @rbx l1
+00000000`02b4b790  00007fff`219c50a0 nosebleed!CCereal::`vftable'
+0:011&gt; dps 00007fff`219c50a0+2d0 l1
+00007fff`219c5370  00007fff`21aa5c28 nosebleed!CCereal::Crackle
+0:011&gt; u 00007fff`21aa5c28
+nosebleed!CCereal::Crackle:
+00007fff`21aa5c28 889163010000    mov     byte ptr [rcx+163h],dl
+00007fff`21aa5c2e c3              ret
+</pre>
+<p>
+So at least the <code>pCereal</code> pointer seems to be okay.
+It has a vtable and the slot in the vtable points to the function
+we expect.
+The <code>Crackle</code> method merely stashes the
+<code>bool</code> parameter
+into a member variable.
+No stack corruption here because <code>rbx</code> is nowhere near
+<code>rsp</code>.
+</p>
+<pre>
+0:012&gt; db @rbx+163 l1
+00000000`02b4b8f3  ??                                               ?
+</pre>
+<p>
+Sadly, the byte in question was not captured in the dump,
+so we cannot verify whether the call actually was made.
+Similarly, the members of <code>CCereal</code> manipulated by the
+<code>Snap</code> method were also not captured in the dump,
+so we can't verify that either.
+(The only member of <code>CCereal</code> captured in the dump
+is the vtable itself.)
+</p>
+<p>
+So we can't find any evidence one way or the other as to whether
+any of the calls leading up to <code>Pop</code> actually occurred.
+Maybe we can try to figure out how many misaligned instructions
+we managed to execute before we crashed, see if that reveals
+anything.
+To do this,
+I'm going to disassemble at varying incorrect offsets and see which
+ones lead to the instruction that crashed.
+</p>
+<pre>
+0:011&gt; u .-1 l2
+nosebleed!CNosebleed::OnFrimble+0x1f8919:
+00007fff`21af2d21 55              push    rbp
+00007fff`21af2d22 30488b          xor     byte ptr [rax-75h],cl
+// ^^ this looks interesting; we'll come back to it
+
+0:011&gt; u .-3 l2
+nosebleed!CNosebleed::OnFrimble+0x1f8917:
+00007fff`21af2d1f 038b5530488b    add     ecx,dword ptr [rbx-74B7CFABh]
+00007fff`21af2d25 cb              retf
+// ^^ this doesn't lead to the crashed instruction
+
+0:011&gt; u .-4 l2
+nosebleed!CNosebleed::OnFrimble+0x1f8916:
+00007fff`21af2d1e 8b03            mov     eax,dword ptr [rbx]
+00007fff`21af2d20 8b5530          mov     edx,dword ptr [rbp+30h]
+// ^^ this doesn't lead to the crashed instruction
+
+0:012&gt; u .-5 l3
+nosebleed!CNosebleed::OnFrimble+0x1f8914:
+00007fff`21af2d1c 00488b          add     byte ptr [rax-75h],cl
+00007fff`21af2d1f 038b5530488b    add     ecx,dword ptr [rbx-74B7CFABh]
+00007fff`21af2d25 cb              retf
+// ^^ this doesn't lead to the crashed instruction
+
+0:012&gt; u .-6 l3
+nosebleed!CNosebleed::OnFrimble+0x1f8913:
+00007fff`21af2d1b 0000            add     byte ptr [rax],al
+00007fff`21af2d1d 488b03          mov     rax,qword ptr [rbx]
+00007fff`21af2d20 8b5530          mov     edx,dword ptr [rbp+30h]
+// ^^ this doesn't lead to the crashed instruction
+</pre>
+<p>
+<b>Exercise</b>: Why didn't I bother checking
+<code>.-2</code>?
+</p>
+<p>
+You only need to test as far back as the maximum instruction length,
+and in practice you can give up much sooner because the maximimum
+instruction length involves a lot of prefixes which are unlikely to
+occur in real code.
+</p>
+<p>
+The only single-instruction rewind that makes sense is the
+<code>push rbp</code>.
+Let's see if it matches.
+</p>
+<pre>
+0:011&gt; ?? @rbp
+unsigned int64 0x453e700
+0:011&gt; dps @rsp l1
+00000000`0453e698  00000000`0453e700
+</pre>
+<p>
+Yup, it lines up.
+This wayward push is also consistent with the stack frame layout
+for the function.
+</p>
+<pre>
+nosebleed!CNosebleed::OnFrimble:
+00007fff`218fa408 48895c2410      mov     qword ptr [rsp+10h],rbx
+00007fff`218fa40d 4889742418      mov     qword ptr [rsp+18h],rsi
+00007fff`218fa412 55              push    rbp
+00007fff`218fa413 57              push    rdi
+00007fff`218fa414 4154            push    r12
+00007fff`218fa416 4156            push    r14
+00007fff`218fa418 4157            push    r15
+00007fff`218fa41a 488bec          mov     rbp,rsp
+00007fff`218fa41d 4883ec60        sub     rsp,60h
+</pre>
+<p>
+The values of <code>rbp</code> and <code>rsp</code>
+should differ by <code>0x60</code>.
+</p>
+<pre>
+0:012&gt; ?? @rbp-@rsp
+unsigned int64 0x68
+</pre>
+<p>
+The difference is in error by 8 bytes, exactly the size of the
+<code>rbp</code> register that was pushed.
+</p>
+<p>
+It therefore seems highly likely that the
+<code>push rbp</code> was executed.
+</p>
+<p>
+Repeating the exercise to find the instruction before the
+<code>push rbp</code> shows that no instruction fell through to
+the <code>push rbp</code>.
+Therefore, execution jumped to
+<code>00007fff`21af2d21</code> somehow.
+</p>
+<p>
+Another piece of data is that <code>rax</code> matches the value
+we expect it to have, sort of.
+Here are some selected lines from earlier in the debug session:
+</p>
+<pre>
+// What we expected to have executed
+00007fff`21af2d1e 8b03            mov     eax,dword ptr [rbx]
+
+// The value we expected to have fetched
+0:011&gt; dps @rbx l1
+00000000`02b4b790  00007fff`219c50a0 nosebleed!CCereal::`vftable'
+
+// The value in the rax register
+rax=00007fff219c5000 ...
+</pre>
+<p>
+The value we expect is
+<code>00007fff`219c50a0</code>,
+but the value in the register has the bottom eight bits cleared.
+</p>
+<p>
+Putting this all together, my theory is that the CPU executed
+the instruction at
+<code>00007fff`21af2d1e</code>,
+and then due to some sort of hardware failure,
+instead of incrementing the <code>rip</code> register by two,
+it (1)&nbsp;incremented it by three, and then
+(2)&nbsp;as part of its confusion,
+zeroed out the bottom byte of <code>rax</code>.
+The erroneous <code>rip</cODE> led
+to the rogue <code>push rbp</code> and the crash
+on the nonsensical <code>xor</code>.
+</p>
+<p>
+It's not a great theory, but it's all I got.
+</p>
+<p>
+As to what sort of hardware failure could have occurred:
+This particular failure was reported twice,
+so a cosmic ray is less likely to be the culprit
+(because you have to get lightning to strike twice)
+than overheating or
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2005/04/12/407562.aspx">
+overclocking</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1168603">
+				<div id="div-comment-1168603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sense</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168603">
+			December 26, 2014 at 7:27 am</a>		</div>
+
+		<p>A nonsensical bug needs a nonsensical conclusion: It just makes sense!</p>
+<p>As a colleague of mine once said, when a program works illogically, don&#39;t try to fix it by using logic. Illogical problems need illogical solutions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168613">
+				<div id="div-comment-1168613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168613">
+			December 26, 2014 at 7:56 am</a>		</div>
+
+		<p>If this sort of error happened more than once, could that point to a processor erratum?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168633">
+				<div id="div-comment-1168633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168633">
+			December 26, 2014 at 8:16 am</a>		</div>
+
+		<p>Does the dump capture the code, or just the data? If it doesn&#39;t capture the code, could it be that the code on disk on the victim&#39;s computer was corrupted, or that the code on the victim&#39;s memory (the disk cache to be more precise) was corrupted?</p>
+<p>Another possible culprit: interrupts. An interrupt can happen anywhere, and a broken interrupt handler could either fail at restoring the state (unlikely since it&#39;s heavily exercised common code), or more likely corrupt the state save area (I don&#39;t know how it&#39;s on Windows, but on Linux the state save area is part of the kernel stack).</p>
+<p>Yet another possible culprit: SMI interrupts. They can happen anywhere (even when normal interrupts are disabled), what they do can depend on the motherboard and BIOS revision, they do mysterious things in response to unknown inputs (for instance, a temperature threshold being crossed could result in a fan speed adjustment, both the input and output being via magic undocumented registers), and they come from the BIOS (which does not have a reputation for code quality).</p>
+<p>And how about this one? The code might have been running under virtualization (does the dump have DMI strings which could reveal the presence of a VM?), and the virtualization software&#39;s JIT could have a bug which mistranslates a particular sequence of instructions.</p>
+<p>And there&#39;s the always-popular &quot;blame a virus&quot; option: some sort of badware hooking the software, and failing to correctly emulate the code it replaced.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168643">
+				<div id="div-comment-1168643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168643">
+			December 26, 2014 at 8:22 am</a>		</div>
+
+		<p>The counting is incorrect:</p>
+<p>00007fff`21af2d22 = &nbsp;0; Ok</p>
+<p>00007fff`21af2d21 = -1; Ok</p>
+<p>00007fff`21af2d1f = -3; Ok; Did you skiped -2 because it was already disassembled in the correct path?</p>
+<p>00007fff`21af2d1e = -4; Ok; </p>
+<p>00007fff`21af2d1e = -5; Ops&#8230; Shouldn&#39;t be -6? You skiped the correct return address</p>
+<p>00007fff`21af2d1e = -6; Ops&#8230; Shouldn&#39;t be -7?</p>
+<p>Also, I am not sure you can blame overclocking for it, but I am sure you don&#39;t have enough information to point the exact reason.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168673">
+				<div id="div-comment-1168673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Azarien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168673">
+			December 26, 2014 at 1:05 pm</a>		</div>
+
+		<p>@Cesar: I&#39;d say that VM bug still counts as (emulated) hardware error ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168683">
+				<div id="div-comment-1168683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168683">
+			December 26, 2014 at 5:52 pm</a>		</div>
+
+		<p>Did you have full (user) memory dump but not minidump only, so you can be sure that instructions you see are really were in user&#39;s memory, but not loaded by your debugger from your local symbols/images store? I&#39;ve seen &#39;magic&#39; crashes due to few bytes corrupted of executable disk image placed on flash stick (think same can happen with HDD/SDD). This would explain double-lightning-strike: just virtually replace 2 bytes @21af2d20 with xor al, al (30 c0 ) and you will get same crash if I didn&#39;t miss something important.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168693">
+				<div id="div-comment-1168693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168693">
+			December 26, 2014 at 7:46 pm</a>		</div>
+
+		<p>However, from &#39;the byte in question was not captured in the dump,&#39; I can assume that dump was not full so /me 90% sure that either image was corrupted on disk either FS cache memory corruption occurred, so couple of executions crashed in same place. However one of the simple but useful tests after inserting new RAM into you computer &#8211; is to perform cached copy of several tens GB of files and to compare results with fc /b. Sometimes system works rather stable but couple of faulty bytes of RAM poison your data.. drop by drop..</p>
+<div class="post">[<em>The minidump captures the bytes near the crashing EIP, so if the code were corrupted in memory/on disk, the corrupted values would have been captured. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168743">
+				<div id="div-comment-1168743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rgorton</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168743">
+			December 27, 2014 at 9:44 am</a>		</div>
+
+		<p>The odds are high that pCereal-&gt;Crackle(false) or part of pCereal-&gt;Pop(uId) is running the desctructor for pCereal, and the random values in memory are mostly correct. &nbsp;You might try explicitly setting the pCereal pointer to be 0xdeadbeefdeadbeef or some such in the desctructor.</p>
+<p>The second most likely case is that there is a multi-threaded race condition</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168763">
+				<div id="div-comment-1168763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168763">
+			December 27, 2014 at 11:10 am</a>		</div>
+
+		<p>[The minidump captures the bytes near the crashing EIP, so if the code were corrupted in memory/on disk, the corrupted values would have been captured. -Raymond]</p>
+<p>If only corrupted cache page was not reset&#39;ed after crash and reloaded from image before dump. But chances to happen that twice even more reduces chances of all that disaster (if code in both dumps was checked).</p>
+<p>BTW its also interesting to see Pop()&#39;s code. And code that checks result of Pop(). Another possible reason is erroneous decrementing of some on-stack value inside Pop(), so return address was decremented by 10, so after return from Pop() rip occasionally pointed to 10 bytes before than it should be.</p>
+<p>Corrupted rax could be explained by optimizer treated return value to fit into byte instead of full-sized HRESULT. Showing coede of call&#39;ing Pop and checking its result would give hint if that can be true or eax can&#39;t has such value and in such case whole guess is incorrect.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168793">
+				<div id="div-comment-1168793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">stephen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168793">
+			December 27, 2014 at 9:35 pm</a>		</div>
+
+		<p>Try !chkimg or capture 16 bytes before and 16 bytes after the EIP, perhaps it&#39;s inline hooked :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168813">
+				<div id="div-comment-1168813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168813">
+			December 28, 2014 at 1:24 pm</a>		</div>
+
+		<p>Killer{R}: highly unlikely the corrupted page would be freed and then reloaded from disk while the process is crashing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168823">
+				<div id="div-comment-1168823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168823">
+			December 28, 2014 at 1:53 pm</a>		</div>
+
+		<p>IMHO there is lim(0/0). Upper 0 &#8211; is probability to happen two different hardware malfunctions appeared as crash on same instruction, lower 0 &#8211; probability of one malfunction * probability to happen that things with cache page preemption. However there is nothing strange to happen that &#8211; &#39;process crashing&#39; means that crashed process&#39;s thread stopped execution (went to wait to something), then another process being launched (debugger, werfault etc) and then that another process reads memory of crashed one. Under low memory condition cache can be shrinked easily in between to get some place for debugger&#39;s stuff. Another example: its usual situation when got full (kernel) memory dump in which PEB/TEB/stack of some (usually, thanks 2 Murphy&#39;s law &#8211; most important) process is paged out.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1168853">
+				<div id="div-comment-1168853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168853">
+			December 29, 2014 at 12:19 am</a>		</div>
+
+		<p>I read somewhere something similar to the following: The crash dump is generated by immediately page out the current memory at the time of crash as separate file. (The memory is blurred one so I can&#39;t find a direct reference)</p>
+<p>So I think at the time a process is crashed, the dump file is very very unlikely to be a freed and reloaded one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168863">
+				<div id="div-comment-1168863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168863">
+			December 29, 2014 at 3:04 am</a>		</div>
+
+		<p>Killer{R}, if a given processor model is overclocked it is more likely to fail in some cases, let&#39;s call &quot;critical path&quot;, and it is perfectly plausible to two users overclock the same model of a processor.</p>
+<p>The only thing I think is strange about this theory is the fact of the least significant byte or the second short instruction in decoding window being the &quot;critical path&quot;, yet, still a plausible theory.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168883">
+				<div id="div-comment-1168883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168883">
+			December 29, 2014 at 6:21 am</a>		</div>
+
+		<p>Overclocking? &nbsp;BUT IT WORKS WITH EVERYTHING ELSE!!!!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1168893">
+				<div id="div-comment-1168893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168893">
+			December 29, 2014 at 6:57 am</a>		</div>
+
+		<p>&gt; 00007fff`21af2c43 e8e0e40f00 call nosebleed!CNosebleed::OnFrimble</p>
+<p>Should be &#8230;::CanFrumble, surely</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168903">
+				<div id="div-comment-1168903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">C V</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168903">
+			December 29, 2014 at 10:33 am</a>		</div>
+
+		<p>Gotta wonder what the WER diagnostic checklist looks like.</p>
+<p>1) Check for HRESULT</p>
+<p>2) Check for exceptions in minidump</p>
+<p>&#8230;</p>
+<p>100) Ask Raymond</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168983">
+				<div id="div-comment-1168983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1168983">
+			December 29, 2014 at 11:28 pm</a>		</div>
+
+		<p>Quote: &quot;As to what sort of hardware failure could have occurred: This particular failure was reported twice, so a cosmic ray is less likely to be the culprit (because you have to get lightning to strike twice) than overheating or overclocking.&quot; Or this =&gt; <a rel="nofollow" target="_new" href="http://www.zdnet.com/article/flipping-dram-bits-maliciously/#ftag=YHFb1d24ec">http://www.zdnet.com/&#8230;/flipping-dram-bits-maliciously</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1169143">
+				<div id="div-comment-1169143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1169143">
+			December 30, 2014 at 5:59 pm</a>		</div>
+
+		<p>@Danny: Except you&#39;re running kernel code, since all programs are now loaded in random address, there are gaps in between and that problem will most likely only affect your program.</p>
+<p>If you&#39;re writing kernel code, you probably wouldn&#39;t want to repetitively read from the same address on RAM (unless you&#39;re doing it on purpose and taken special measure, the location should have been loaded to cache on CPU so repetitive read to RAM on motherboard is not needed)</p>
+<p>So you can safely say that for most people, that is non-issue.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1169153">
+				<div id="div-comment-1169153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141226-00/?p=43293#comment-1169153">
+			December 30, 2014 at 8:31 pm</a>		</div>
+
+		<p>There&#39;re no confidence what physical addresses and &#39;gaps&#39; between them are used for particular process&#39;s working set. Furthermore &#8211; they continuously shuffled due to paging. So its a real security risk, &#8211; at least it gives probability to crash system (DoS) by code running as unprivileged account. More interesting if its possible to perform some &#39;predictable&#39; corruption and say change some specific &#39;0&#39; to &#39;1&#39; in memory, that will give you root access or something like that :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

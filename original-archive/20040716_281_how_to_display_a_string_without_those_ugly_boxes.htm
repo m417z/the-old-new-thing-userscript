@@ -1,0 +1,604 @@
+<html>
+<head>
+<title>How to display a string without those ugly boxes</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to display a string without those ugly boxes</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 16, 2004 / year-entry #282</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">You've all seen those ugly boxes. When you try to display a string and the font you have doesn't support all of the characters in it, you get an ugly box for the characters that aren't available in the font. Start with our scratch program and add this to the PaintContent function: void PaintContent(HWND hwnd,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+You've all seen those ugly boxes.  When you try to display a string
+and the font you have doesn't support all of the characters in it,
+you get an ugly box for the characters that aren't available in the
+font.
+</p>
+<p>
+Start with
+<a href="http://weblogs.asp.net/oldnewthing/archive/2003/07/23/54576.aspx">
+our scratch program</a> and add this to the
+<code>PaintContent</code> function:
+</p>
+<pre>
+void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+<font COLOR=blue>    TextOutW(pps-&gt;hdc, 0, 0,
+            L"ABC\x0410\x0411\x0412\x0E01\x0E02\x0E03", 9);</font>
+}
+</pre>
+<p>
+That string contains the first three letters from 
+three different alphabets: "ABC" from the Roman alphabet;
+"&#x0410;&#x411;&#x412;"
+from the Cyrillic alphabet; and
+"&#xE01;&#xE02;&#xE03;" from the Thai alphabet.
+</p>
+<p>
+If you run this program, you get a bunch of ugly boxes for the
+non-Roman characters because the SYSTEM font is very limited in
+its character set support.
+</p>
+<p>
+But how to pick the right font?  What if the string contained
+Korean or Japanese characters?  There is no single font that
+contains every character defined by Unicode. (Or at least,
+none that is commonly available.)  What do you do?
+</p>
+<p>
+This is where
+<a HREF="http://msdn.microsoft.com/workshop/misc/mlang/tutorials/fontlinking.asp">
+font linking</a> comes in.
+</p>
+<p>
+Font linking allows you to take a string and break it into
+pieces, where each piece can be displayed in an appropriate font.
+</p>
+<p>
+<a HREF="http://msdn.microsoft.com/workshop/misc/mlang/reference/ifaces/imlangfontlink2/imlangfontlink2.asp">
+The IMLangFontLink2 interface</a> provides the methods necessary
+to do this breaking.
+<a HREF="http://msdn.microsoft.com/workshop/misc/mlang/reference/ifaces/imlangcodepages/getstrcodepages.asp">
+GetStrCodePages</a> takes the string apart into chunks, such that
+all the characters in a chunk
+can be displayed by the same font, and
+<a HREF="http://msdn.microsoft.com/workshop/misc/mlang/reference/ifaces/imlangfontlink/mapfont.asp">
+MapFont</a> creates the font.
+</p>
+<p>
+Okay, so let's write our font-link-enabled version of the
+TextOut function.  We'll do this in stages,
+starting with the
+<a href="http://weblogs.asp.net/oldnewthing/archive/2003/11/12/55659.aspx">idea kernel</a>.
+</p>
+<pre>
+#include &lt;mlang.h&gt;
+
+HRESULT TextOutFL(HDC hdc, int x, int y, LPCWSTR psz, int cch)
+{
+  ...
+  while (cch &gt; 0) {
+    DWORD dwActualCodePages;
+    long cchActual;
+    pfl-&gt;GetStrCodePages(psz, cch, 0, &amp;dwActualCodePages, &cchActual);
+    HFONT hfLinked;
+    pfl-&gt;MapFont(hdc, dwActualCodePages, 0, &hfLinked);
+    HFONT hfOrig = SelectFont(hdc, hfLinked);
+    TextOut(hdc, ?, ?, psz, cchActual);
+    SelectFont(hdc, hfOrig);
+    pfl-&gt;ReleaseFont(hfLinked);
+    psz += cchActual;
+    cch -= cchActual;
+  }
+  ...
+}
+</pre>
+<p>
+After figuring out which code pages the default font supports,
+we walk through the string asking GetStrCodePages to give us
+the next chunk of characters. From that chunk, we create a matching font
+and draw the characters in that font at "the right place".
+Repeat until all the characters
+are done.
+</p>
+<p>
+The rest is refinement and paperwork.
+</p>
+<p>
+First of all, what is "the right place"?
+We want the next chunk to resume where the previous chunk left off.
+For that, we take advantage of the TA_UPDATECP text alignment style,
+which says that GDI should draw the text at the current position,
+and update the current position to the end of the drawn text
+(therefore, in position for the next chunk).
+</p>
+<p>
+Therefore, part of the paperwork is to set the DC's current position
+and set the text mode to TA_UPDATECP:</p>
+<pre>
+  SetTextAlign(hdc, GetTextAlign(hdc) | TA_UPDATECP);
+  MoveToEx(hdc, x, y, NULL);
+</pre>
+<p>
+Then we can just pass "0,0" as the coordinates to TextOut,
+because the coordinates passed to TextOut are ignored if
+the text alignment mode is TA_UPDATECP;
+it always draws at the current position.
+</p>
+<p>
+Of course, we can't just mess with the DC's settings like this.
+If the caller did not set TA_UPDATECP, then the caller
+is not expecting us to be meddling with the current
+position.  Therefore, we have to save the original position
+and restore it (and the original text alignment mode) afterwards.
+</p>
+<pre>
+<font COLOR=blue>  POINT ptOrig;
+  DWORD dwAlignOrig = GetTextAlign(hdc);
+  SetTextAlign(hdc, dwAlignOrig | TA_UPDATECP);
+  MoveToEx(hdc, x, y, &amp;ptOrig);</font>
+  while (cch &gt; 0) {
+    ...
+    TextOut(hdc, <font COLOR=blue>0, 0</font>, psz, cchActual);
+    ...
+  }
+<font COLOR=blue>  // if caller did not want CP updated, then restore it
+  // and restore the text alignment mode too
+  if (!(dwAlignOrig & TA_UPDATECP)) {
+    SetTextAlign(hdc, dwAlignOrig);
+    MoveToEx(hdc, ptOrig.x, ptOrig.y, NULL);
+  }</font>
+</pre>
+<p>
+Next is a refinement:
+We should take advantage of the second parameter to
+GetStrCodePages, which specifies the code pages we would prefer to use
+if a choice is avialable.
+Clearly we should prefer to use the code pages supported by the font
+we want to use, so that if the character can be displayed in that font
+directly, then we shouldn't map an alternate font.
+</p>
+<pre>
+<font COLOR=blue>  HFONT hfOrig = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
+  DWORD dwFontCodePages = 0;
+  pfl-&gt;GetFontCodePages(hdc, hfOrig, &dwFontCodePages);</font>
+  ...
+  while (cch &gt; 0) {
+    pfl-&gt;GetStrCodePages(psz, cch, <font COLOR=blue>dwFontCodePages</font>, &amp;dwActualCodePages, &amp;cchActual);
+    <font COLOR=blue>if (dwActualCodePages &amp; dwFontCodePages) {
+      // our font can handle it - draw directly using our font
+      TextOut(hdc, 0, 0, psz, cchActual);
+    } else {</font>
+      ... MapFont etc ...
+    <font COLOR=blue>}</font>
+  }
+  ...
+</pre>
+<p>
+Of course, you probably wonder this magical <code>pfl</code> comes
+from.  It comes from
+<a HREF="http://msdn.microsoft.com/workshop/misc/mlang/reference/objects/cmultilanguage.asp">
+the Multilanguage Object</a> in mlang.</p>
+<pre>
+<font COLOR=blue>  IMLangFontLink2 *pfl;
+  CoCreateInstance(CLSID_CMultiLanguage, NULL,
+                   CLSCTX_ALL, IID_IMLangFontLink2, (void**)&amp;pfl);</font>
+  ...
+<font COLOR=blue>  pfl-&gt;Release();</font>
+</pre>
+<p>
+And of course, all the errors we've been ignoring need to be taken care of.
+This does create a big of a problem if we run into an error after we have
+already made it through a few chunks.  What should we do?
+</p>
+<p>
+I'm going to handle the error by drawing the string in the original font,
+ugly boxes and all.  We can't erase the characters we already drew,
+and we can't just draw half of the string (for our caller won't know where
+to resume).
+So we just draw with the original font and hope for the best.
+At least it's no worse than it was before font linking.
+</p>
+<p>
+Put all of these refinements together and you get this final function:
+</p>
+<pre>
+HRESULT TextOutFL(HDC hdc, int x, int y, LPCWSTR psz, int cch)
+{
+  HRESULT hr;
+  IMLangFontLink2 *pfl;
+  if (SUCCEEDED(hr = CoCreateInstance(CLSID_CMultiLanguage, NULL,
+                      CLSCTX_ALL, IID_IMLangFontLink2, (void**)&amp;pfl))) {
+    HFONT hfOrig = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
+    POINT ptOrig;
+    DWORD dwAlignOrig = GetTextAlign(hdc);
+    if (!(dwAlignOrig &amp; TA_UPDATECP)) {
+      SetTextAlign(hdc, dwAlignOrig | TA_UPDATECP);
+    }
+    MoveToEx(hdc, x, y, &amp;ptOrig);
+    DWORD dwFontCodePages = 0;
+    hr = pfl-&gt;GetFontCodePages(hdc, hfOrig, &amp;dwFontCodePages);
+    if (SUCCEEDED(hr)) {
+      while (cch &gt; 0) {
+        DWORD dwActualCodePages;
+        long cchActual;
+        hr = pfl-&gt;GetStrCodePages(psz, cch, dwFontCodePages, &amp;dwActualCodePages, &amp;cchActual);
+        if (FAILED(hr)) {
+          break;
+        }
+
+        if (dwActualCodePages &amp; dwFontCodePages) {
+          TextOut(hdc, 0, 0, psz, cchActual);
+        } else {
+          HFONT hfLinked;
+          if (FAILED(hr = pfl-&gt;MapFont(hdc, dwActualCodePages, 0, &amp;hfLinked))) {
+            break;
+          }
+          SelectFont(hdc, hfLinked);
+          TextOut(hdc, 0, 0, psz, cchActual);
+          SelectFont(hdc, hfOrig);
+          pfl-&gt;ReleaseFont(hfLinked);
+        }
+        psz += cchActual;
+        cch -= cchActual;
+      }
+      if (FAILED(hr)) {
+        //  We started outputting characters so we have to finish.
+        //  Do the rest without font linking since we have no choice.
+        TextOut(hdc, 0, 0, psz, cch);
+        hr = S_FALSE;
+      }
+    }
+
+    pfl-&gt;Release();
+
+    if (!(dwAlignOrig &amp; TA_UPDATECP)) {
+      SetTextAlign(hdc, dwAlignOrig);
+      MoveToEx(hdc, ptOrig.x, ptOrig.y, NULL);
+    }
+  }
+
+  return hr;
+}
+</pre>
+<p>
+Finally, we can wrap the entire operation inside a helper function
+that first tries with font linking and if that fails, then just draws
+the text the old-fashioned way.
+</p>
+<pre>
+void TextOutTryFL(HDC hdc, int x, int y, LPCWSTR psz, int cch)
+{
+  if (FAILED(TextOutFL(hdc, x, y, psz, cch)) {
+    TextOut(hdc, x, y, psz, cch);
+  }
+}
+</pre>
+<p>
+Okay, now that we have our font-linked TextOut with fallback,
+we can go ahead and adjust our <code>PaintContent</code> function to use it.
+</p>
+<pre>
+void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+  TextOutTryFL(pps->hdc, 0, 0,
+               TEXT("ABC\x0410\x0411\x0412\x0E01\x0E02\x0E03"), 9);
+}
+</pre>
+<p>
+Observe that the string is now displayed with no black boxes.
+</p>
+<p>
+One refinement I did not do was to avoid creating the
+IMlangFontLink2 pointer each time we want to draw text.
+In a "real program" you would probably create the multilanguage
+object once per drawing context (per window, perhaps) and re-use it
+to avoid going through the whole object creation codepath each time
+you want to draw a string.
+</p>
+<p>
+[Raymond is currently on vacation; this message was pre-recorded.]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-195903">
+				<div id="div-comment-195903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/larryosterman' rel='external nofollow' class='url'>Larry Osterman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-195903">
+			July 16, 2004 at 7:36 am</a>		</div>
+
+		<p>Does this work for RTL languages as well?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-195923">
+				<div id="div-comment-195923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrPizza</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-195923">
+			July 16, 2004 at 8:23 am</a>		</div>
+
+		<p>It seems curious to me that this functionality is (apparently) part of IE, and not part of something such as Uniscribe.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-195933">
+				<div id="div-comment-195933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.accidentalscientist.com' rel='external nofollow' class='url'>Simon Cooke [exMSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-195933">
+			July 16, 2004 at 8:52 am</a>		</div>
+
+		<p>You know, DrPizza, I was just thinking that myself.</p>
+<p>I was incredibly surprised that this code didn&#8217;t touch Uniscribe at all.</p>
+<p>Mind you, I find Uniscribe a bear to work with anyway, so I&#8217;m not entirely surprised.</p>
+<p>Raymond &#8211; why not Uniscribe?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-195943">
+				<div id="div-comment-195943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nicholas Allen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-195943">
+			July 16, 2004 at 8:54 am</a>		</div>
+
+		<p>Larry, I believe this will fail for things like embedded bidi.</p>
+<p>Uniscribe has built in support for linking and fallback.  It probably does something similar to this internally because a lot of it boils down to calls to something like ExtTextOut.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-195973">
+				<div id="div-comment-195973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-195973">
+			July 16, 2004 at 10:29 am</a>		</div>
+
+		<p>I didn&#8217;t know about Uniscribe. MLang was added in Internet Explorer 4.0; Uniscribe didn&#8217;t show up until Internet Explorer 5.0.</p>
+<p>I welcome anybody to write an equivalent version that uses Uniscribe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-196003">
+				<div id="div-comment-196003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jordan Russell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196003">
+			July 16, 2004 at 11:34 am</a>		</div>
+
+		<p>I thought the font &quot;Microsoft Sans Serif&quot; (added in Windows 2000) was supposed to solve this problem. It seems to be capable of displaying Roman/Cyrillic/Thai/Korean/Japanese/etc. characters, provided the necessary language support is installed on the system.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-196013">
+				<div id="div-comment-196013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.accidentalscientist.com' rel='external nofollow' class='url'>Simon Cooke [exMSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196013">
+			July 16, 2004 at 11:37 am</a>		</div>
+
+		<p>Raymond: Fair enough :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-196053">
+				<div id="div-comment-196053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196053">
+			July 16, 2004 at 1:25 pm</a>		</div>
+
+		<ol>
+<li>I thought Arial Unicode MS does include all Unicode characters (or a pretty good approximation thereof).
+<p>2. How does this handle bidi? How about combining characters?</li>
+</ol>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-196063">
+				<div id="div-comment-196063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.io.com/~mdahmus/blog/' rel='external nofollow' class='url'>M1EK</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196063">
+			July 16, 2004 at 1:37 pm</a>		</div>
+
+		<p>I had to do this on OS/2 in order to get Unicode text display working for Java, which sneers at puny concepts like codepages.</p>
+<p>And I like how you picked Thai, which is the weirdest character set I ever had the displeasure to attempt to handle.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-196083">
+				<div id="div-comment-196083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196083">
+			July 16, 2004 at 2:15 pm</a>		</div>
+
+		<p>Jonathan,</p>
+<p>Arial Unicode MS isn&#8217;t part of the stock Windows distribution, and it&#8217;s also HUGE (about 25MB!) so it&#8217;s not really something most people want to have loaded when it&#8217;s not necessary.</p>
+<p>It&#8217;s a pity there isn&#8217;t a GDI mode or an alternative function which does all this stuff for you. Obviously it can&#8217;t be the default, because in some cases it&#8217;s important to use one font and one font alone and there are already loads of apps out there, but the option to have Windows do the right thing to solve this very common problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-196093">
+				<div id="div-comment-196093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196093">
+			July 16, 2004 at 3:01 pm</a>		</div>
+
+		<p>If you have Windows 2000 or better, my understanding is that GDI will do font linking automatically if your font is Tahoma, MS Sans Serif, a few select others. (I&#8217;m not the expert on this subject, so my answer to follow-up questions will likely be &quot;I don&#8217;t know.&quot;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-196043">
+				<div id="div-comment-196043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.stevex.org/dottext/archive/2004/07/16/531.aspx' rel='external nofollow' class='url'>stevex.Text</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196043">
+			July 16, 2004 at 3:29 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-196103">
+				<div id="div-comment-196103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196103">
+			July 16, 2004 at 3:56 pm</a>		</div>
+
+		<p>As a test I opened Notepad (first simple Unicode-enabled app which sprang to mind) and created an empty file with a name containing Thai, Cyrillic, Arabic and Greek characters to see what would happen in the title bar, which on my system is rendered in Tahoma. I assume title bar captions are rendered through TextOut, although of course they might not be!</p>
+<p>It doesn&#8217;t appear to have worked, although the copy of Tahoma on my system does seem to contain lots of Thai, Cyrillic and Arabic characters. It did stumble on a few of the Arabic ones, though.</p>
+<p>I&#8217;ll have to test this properly with a simple test app sometime, I guess.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-196173">
+				<div id="div-comment-196173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.binaryc.com/' rel='external nofollow' class='url'>Brian</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196173">
+			July 17, 2004 at 11:05 am</a>		</div>
+
+		<p>I&#8217;m curious as to the point of TextOutTryFL.  Why not just put else { TextOut(hdc, x, y, psz, cch); } inside TextOutFL ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-196183">
+				<div id="div-comment-196183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">J. Edward Sanchez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-196183">
+			July 17, 2004 at 11:42 am</a>		</div>
+
+		<p>Because the caller might want to know whether the operation succeeded as requested. You could accomplish that using a special return code, but then the caller might also want to take some other action (i.e., warn the user) instead of just falling back to TextOut() in case of a problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-200353">
+				<div id="div-comment-200353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-200353">
+			August 2, 2004 at 10:23 am</a>		</div>
+
+		<p>Commenting closes after two weeks.</p>
+<p><a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/02/21/77681.aspx" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/02/21/77681.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662213">
+				<div id="div-comment-662213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.jdlh.com/en/2008/08/26/simple_script_detection/' rel='external nofollow' class='url'>Jim DeLaHunt, world-ready &raquo; Simple script-detection algorithm for font switching?</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040716-00/?p=38413#comment-662213">
+			August 26, 2008 at 7:03 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://blog.jdlh.com/en/2008/08/26/simple_script_detection/" rel="nofollow">http://blog.jdlh.com/en/2008/08/26/simple_script_detection/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

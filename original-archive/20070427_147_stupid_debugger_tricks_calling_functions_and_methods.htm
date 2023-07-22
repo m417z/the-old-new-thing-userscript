@@ -1,0 +1,400 @@
+<html>
+<head>
+<title>Stupid debugger tricks: Calling functions and methods</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Stupid debugger tricks: Calling functions and methods</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 27, 2007 / year-entry #148</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>14</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Back in the old days, if you wanted to call a function from inside the debugger, you had to do it by hand: Save the registers, push the parameters onto the stack (or into registers if the function uses fastcall or thiscall) push the address of the ntdll!DbgBreakPoint function, move the instruction pointer to the...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Back in the old days, if you wanted to call a function from
+inside the debugger, you had to do it by hand:
+Save the registers, push the parameters onto the stack
+(or into registers if the function uses <code>fastcall</code>
+or <code>thiscall</code>)
+push the address of the <code>ntdll!DbgBreakPoint</code> function,
+move the instruction pointer to the start of the function you want to call,
+then hit "g" to resume execution.
+The function runs then returns to the <code>ntdll!DbgBreakPoint</code>,
+where the debugger regains control and you can look at the results.
+Then restore the registers (including the original instruction pointer)
+and resume debugging.
+(That paragraph was just a quick recap;
+I'm assuming you already knew that.)
+</p>
+<p>
+The Windows symbolic debugger engine (the debugging engine
+behind <code>ntsd</code>, <code>cdb</code> and <code>windbg</code>)
+can now automate this process.
+Suppose you want to call this function:
+</p>
+<pre>
+int DoSomething(int i, int j);
+</pre>
+<p>
+You can ask the debugger to do all the heavy lifting:
+</p>
+<pre>
+0:001&gt; .call ABC!DoSomething(1,2)
+Thread is set up for call, 'g' will execute.
+WARNING: This can have serious side-effects,
+including deadlocks and corruption of the debuggee.
+0:001&gt; r
+eax=7ffde000 ebx=00000001 ecx=00000001 edx=00000003 esi=00000004 edi=00000005
+eip=10250132 esp=00a7ffbc ebp=00a7fff4 iopl=0         nv up ei pl zr na po nc
+cs=001b  ss=0023  ds=0023  es=0023  fs=0038  gs=0000             efl=00000246
+ABC!DoSomething:
+10250132 55               push    ebp
+0:001&gt; dd esp
+00a7ffbc  00a7ffc8 <font COLOR=blue>00000001 00000002</font> ccfdebcc
+</pre>
+<p>
+Notice that the debugger nicely pushed the parameters onto the stack
+and set the <code>eip</code> register for you.
+All you have to do is hit "g" and the <code>DoSomething</code>
+function will run.
+Once it returns, the debugger will restore the original state.
+</p>
+<p>
+This technique even works with C++ methods:
+</p>
+<pre>
+// pretend that we know that 0x00131320 is an IStream pointer
+0:001&gt; .dvalloc 1000
+Allocated 1000 bytes starting at 00a80000
+0:001&gt; .call ABC!CAlphaStream::Read(0x00131320, 0xa80000, 0x1000, 0)
+Thread is set up for call, 'g' will execute.
+WARNING: This can have serious side-effects,
+including deadlocks and corruption of the debuggee.
+</pre>
+<p>
+Notice that when calling a nonstatic C++ method,
+you have to pass the "this" parameter as an explicit first parameter.
+The debugger knows what calling convention to use and puts the registers
+in the correct location.
+In this case, it knew that <code>CAlphaStream::Read</code> uses
+the <code>stdcall</code> calling convention, so the parameters have
+all been pushed onto the stack.
+</p>
+<p>
+And what's with that <code>.dvalloc</code> command?
+That's another debugger helper function that allocates some memory
+in the debugged process's address space.
+Here, we used it to allocate a buffer that we want to read into.
+</p>
+<p>
+But what if you want to call a method on an interface, and you
+don't have the source code to the implementation?
+For example, you want to read from a stream that was passed to you
+from some external component.
+Well, you can play a little trick.
+You can pretend to call a function that you <strong>do</strong>
+have the source code to, one that has the same function signature,
+and then move the <code>eip</code> register to the desired
+entry point.
+</p>
+<pre>
+// pretend that we know that 0x00131320 is an IStream pointer
+0:000&gt;  dp 131320 l1
+00131320  77f6b5e8 <font COLOR=blue>// vtable</font>
+0:000&gt; dps 77f6b5e8 l4
+77f6b5e8  77fbff0e SHLWAPI!CFileStream::QueryInterface
+77f6b5ec  77fb34ed SHLWAPI!CAssocW2k::AddRef
+77f6b5f0  77f6b670 SHLWAPI!CFileStream::Release
+77f6b5f4  77f77474 SHLWAPI!CFileStream::Read
+0:000&gt; .call SHLWAPI!CFileStream::Read(0x00131320, 0xa80000, 0x1000, 0)
+                ^ Symbol not a function in '.call SHLWAPI!CFileStream::Read'
+</pre>
+<p>
+That error message is the debugger's somewhat confusing way of saying,
+"I don't have enough information available to make that function call."
+But that's okay, because we have a function that's "close enough",
+namely <code>CAlphaStream::Read</code>:
+</p>
+<pre>
+0:001&gt; .call ABC!CAlphaStream::Read(0x00131320, 0xa80000, 0x1000, 0)
+Thread is set up for call, 'g' will execute.
+WARNING: This can have serious side-effects,
+including deadlocks and corruption of the debuggee.
+0:000&gt; r eip=SHLWAPI!CFileStream::Read
+0:000&gt; r
+eax=00131320 ebx=0007d628 ecx=00130000 edx=0013239e esi=00000000 edi=00000003
+eip=77f77474 esp=0007d384 ebp=0007d3b0 iopl=0         nv up ei pl zr na po nc
+cs=001b  ss=0023  ds=0023  es=0023  fs=003b  gs=0000             efl=00000246
+SHLWAPI!CFileStream::Read:
+77f77474 8bff             mov     edi,edi
+</pre>
+<p>
+Woo-hoo!
+We got <code>ABC!CAlphaStream::Read</code> to push all the parameters
+for us, and then <strong>whoosh</strong> we swap out that function
+and slip <code>CFileStream::Read</code> in its place.
+Now you can hit "g" to execute the <code>CFileStream::Read</code> call.
+</p>
+<p>
+This just skims the surface of what you can do with the
+<code>.call</code> command.
+Mix in some C++ expression evaluation and you've got yourself
+a pretty nifty "pseudo-immediate mode" expression evaluator.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (14)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-497343">
+				<div id="div-comment-497343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://arcticus.com' rel='external nofollow' class='url'>Chris Hanson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497343">
+			April 27, 2007 at 10:45 am</a>		</div>
+
+		<p>Neat trick. I&#8217;ll bookmark that for the future, but I&#8217;ve never been hardcore enough to use ntsd, cdb or windbg. I&#8217;m just fishing, but is there a similar technique to insert a temporary function call under VC++ (any recent version) without recompiling and using Edit and Continue?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-497353">
+				<div id="div-comment-497353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Asztal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497353">
+			April 27, 2007 at 10:58 am</a>		</div>
+
+		<p>Chris: the Immediate Window is your friend. When it works, that is ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-497363">
+				<div id="div-comment-497363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt Green</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497363">
+			April 27, 2007 at 10:59 am</a>		</div>
+
+		<p>This is the coolest thing I&#8217;ve seen in a long time. Thank you.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-497383">
+				<div id="div-comment-497383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497383">
+			April 27, 2007 at 11:20 am</a>		</div>
+
+		<p>It&#8217;s been ~3 years since I&#8217;ve fired up windbg (either for a crash-dump analysis or to debug a driver over a serial cable. hah. Old boot param changes).</p>
+<p>Do you find yourself doing this a lot ? (if that&#8217;s an answerable question in and of itself).. I mean, this is really neat stuff, but in my application experience, I&#8217;ve never had to do anything close to this. (Granted, I also don&#8217;t use COM, which from looking at your previous debugging posts, might be a good thing). Are you doing it for internal code, or external code ? (since you hint at &quot;if you don&#8217;t have the source &#8230; &quot;)</p>
+<p>As others said, I now know where to look if I come across such a problem, but I feel too shortsighted to know/see where I would find myself in such a situation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-497433">
+				<div id="div-comment-497433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Luz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497433">
+			April 27, 2007 at 12:55 pm</a>		</div>
+
+		<p>Raymond, aren&#8217;t you allocating a buffer of 1000 bytes and then passing it as being 0x1000 bytes long?</p>
+<p>Of course, I&#8217;m assuming the third parameter to CAlphaStream::Read is the size of the buffer passed, and I could be completely wrong here.</p>
+<div class="post">[<i>My default radix is 16. I don&#8217;t know what the default radix is for C++ expressions, so I played it safe and put the 0x prefix on. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-497483">
+				<div id="div-comment-497483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pierre B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497483">
+			April 27, 2007 at 3:22 pm</a>		</div>
+
+		<p>Is there an undo function for .call?</p>
+<p>If I thought I&#8217;d call something then realized I passed bad arguments, can I revert the register without actually doing the call?</p>
+<p>(Maybe it&#8217;s in some documentation somewhere, maybe not. Beside, the answer will help millions of developpers. Or, at least, one.)</p>
+<div class=post>[<i>If you know how to do what I described in the opening paragraph (and I&#8217;m assuming that you do), then you should know how to undo a .call. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-497503">
+				<div id="div-comment-497503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Steward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497503">
+			April 27, 2007 at 5:53 pm</a>		</div>
+
+		<p>Pierre: read the documentation for .call. &nbsp;It&#8217;s call /c.</p>
+<p>I wish there were a way of doing .call even if you have no symbols at all (it would make scripts easier to manage)&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-497543">
+				<div id="div-comment-497543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nksingh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497543">
+			April 27, 2007 at 8:41 pm</a>		</div>
+
+		<p>Mark Steward:</p>
+<p>You could do an extension !call that accepts a calling convention in addition to a list of parameters. &nbsp;It&#8217;d be very hard to do this entirely without symbols though&#8230; &nbsp;trying to reverse engineer something interesting? :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-497553">
+				<div id="div-comment-497553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497553">
+			April 27, 2007 at 9:31 pm</a>		</div>
+
+		<p>BTW, the ? command that lets you evaluate expressions also allow calling functions. It existed in SYMDEB, but did not allow you to call functions until CodeView.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-497563">
+				<div id="div-comment-497563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.divelements.co.uk' rel='external nofollow' class='url'>Tim Dawson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497563">
+			April 28, 2007 at 5:17 am</a>		</div>
+
+		<p>Hooray for Visual Studio.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-497613">
+				<div id="div-comment-497613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497613">
+			April 29, 2007 at 2:51 pm</a>		</div>
+
+		<p>Am I doing something wrong or do the public symbols not suffice to do this for the Win32 API?</p>
+<div class="post">[<i>Please read the article again, particularly the second half. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-497643">
+				<div id="div-comment-497643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">64-bit</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-497643">
+			April 30, 2007 at 5:47 am</a>		</div>
+
+		<p>Is this supported on Win64?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-500283">
+				<div id="div-comment-500283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">vkzffnhfru</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-500283">
+			May 5, 2007 at 8:05 am</a>		</div>
+
+		<p>8irik66w9p4y6my 397n53dy 85j5erh9wopnxfax 65hkv649yb</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-500293">
+				<div id="div-comment-500293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">vkzffnhfru</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070427-00/?p=27083#comment-500293">
+			May 5, 2007 at 8:05 am</a>		</div>
+
+		<p>8irik66w9p4y6my 85j5erh9wopnxfax 65hkv649yb</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

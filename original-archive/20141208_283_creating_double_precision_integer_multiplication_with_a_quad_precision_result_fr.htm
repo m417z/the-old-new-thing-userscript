@@ -1,0 +1,603 @@
+<html>
+<head>
+<title>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 8, 2014 / year-entry #284</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Suppose you want to multiply two double-word values producing a quad-word result, but your processor supports only single-word multiplication with a double-word result. For concreteness, let's say that your processor supports 32 × 32 &rarr; 64 multiplication and you want to implement 64 × 64 &rarr; 128 multiplication. (Sound like any processor you know?) Oh...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Suppose you want to multiply two double-word values
+producing a quad-word result,
+but your processor supports only single-word multiplication
+with a double-word result.
+For concreteness, let's say that your processor supports
+<nobr>32 &times; 32 &rarr; 64</nobr> multiplication
+and you want to implement
+<nobr>64 &times; 64 &rarr; 128</nobr> multiplication.
+(Sound like any processor you know?)
+</p>
+<p>
+Oh boy, let's do some high school algebra.
+Let's start with unsigned multiplication.
+</p>
+<p>
+Let
+<var>x</var> =
+<var>A</var> &times; 2&sup3;&sup2; + <var>B</var>
+and
+<var>y</var> =
+<var>C</var> &times; 2&sup3;&sup2; + <var>D</var>,
+where <var>A</var>, <var>B</var>,
+<var>C</var>, and <var>D</var>
+are all in the range
+0 &hellip; 2&sup3;&sup2; &minus; 1.
+</p>
+<table BORDER=0 CELLPADDING=0 CELLSPACING=0 STYLE="text-align: center">
+<tr>
+<td VALIGN=baseline ALIGN=right>
+        <var>x </var>&times; <var>y</var> =&nbsp;
+    </td>
+<td VALIGN=baseline COLSPAN=3>
+        <var>A</var><var>C</var> &times; 2<sup>64</sup> +
+        (<var>A</var><var>D</var> + <var>B</var><var>C</var>) &times; 2<sup>32</sup> +
+        <var>B</var><var>D</var>
+    </td>
+</tr>
+<tr>
+<td VALIGN=baseline ALIGN=right>=&nbsp;</td>
+<td VALIGN=baseline>
+        <var>A</var><var>C</var> &times; 2<sup>64</sup> +
+        <var>B</var><var>D</var>
+    </td>
+<td VALIGN=baseline>&nbsp;+&nbsp;</td>
+<td VALIGN=baseline>
+        (<var>A</var><var>D</var> + <var>B</var><var>C</var>) &times; 2<sup>32</sup></td>
+</tr>
+<tr>
+<td VALIGN=baseline></td>
+<td VALIGN=baseline STYLE="border-top: solid black 1px">
+        provisional result
+    </td>
+<td></td>
+<td VALIGN=baseline STYLE="border-top: solid black 1px">
+        cross-terms
+    </td>
+</tr>
+</table>
+<p>
+Each of the multiplications (not counting the power-of-two multiplications)
+is a
+<nobr>32 &times; 32 &rarr; 64</nobr> multiplication,
+so they are something we have as a building block.
+And the basic implementation is simply to perform the four
+multiplications and add the pieces together.
+But if you have SSE,
+you can perform two multiplies in a single instruction.
+</p>
+<pre>
+    // Prepare our source registers
+    movq xmm0, x         // xmm0 = { 0, 0, A, B } = { *, *, A, B }
+    movq xmm1, y         // xmm1 = { 0, 0, C, D } = { *, *, C, D }
+    punpckldq xmm0, xmm0 // xmm0 = { A, A, B, B } = { *, A, *, B }
+    punpckldq xmm1, xmm1 // xmm1 = { C, C, D, D } = { *, C, *, D }
+    pshufd xmm2, xmm1, _MM_SHUFFLE(2, 0, 3, 1)
+                         // xmm2 = { D, D, C, C } = { *, D, *, C }
+</pre>
+<p>
+The <code>PMULUDQ</code> instruction multiplies 32-bit lanes 0 and 2
+of its source and destination registers,
+producing 64-bit results.
+The values in lanes 1 and 3 do not participate in the multiplication,
+so it doesn't matter what we put there.
+It so happens that the <code>PUNPCKLDQ</code> instruction duplicates
+the value, but we really don't care.
+I used <code>*</code> to represent a don't-care value.
+</p>
+<pre>
+    pmuludq xmm1, xmm0 // xmm1 = { AC, BD } // provisional result
+    pmuludq xmm2, xmm0 // xmm2 = { AD, BC } // cross-terms
+</pre>
+<p>
+In two <code>PMULUDQ</code> instructions,
+we created the provisional result and the cross-terms.
+Now we just need to add the cross-terms to the provisional result.
+Unfortunately, SSE does not have a 128-bit addition (or at least SSE2
+doesn't; who knows what they'll add in the future),
+so we need to do that the old-fashioned way.
+</p>
+<pre>
+    movdqa result, xmm1
+    movdqa crossterms, xmm2
+
+    mov    eax, crossterms[0]
+    mov    edx, crossterms[4] // edx:eax = BC
+    add    result[4], eax
+    adc    result[8], edx
+    adc    result[12], 0      // add the first cross-term
+
+    mov    eax, crossterms[8]
+    mov    edx, crossterms[12] // edx:eax = AD
+    add    result[4], eax
+    adc    result[8], edx
+    adc    result[12], 0      // add the second cross-term
+</pre>
+<p>
+There we go, a
+<nobr>64 &times; 64 &rarr; 128</nobr> multiply
+constructed from 
+<nobr>32 &times; 32 &rarr; 64</nobr> multiplies.
+</p>
+<p>
+<b>Exercise</b>: Why didn't I use the <code>rax</code> register
+to perform the 64-bit addition?
+(This is sort of a trick question.)
+</p>
+<p>
+That calculates an unsigned multiplication, but how do we do
+a signed multiplication?
+Let's work modulo 2<sup>128</sup> so that signed and unsigned
+multiplication are equivalent.
+This means that we need to expand <var>x</var> and <var>y</var>
+to 128-bit values
+<var>X</var> and <var>Y</var>.
+</p>
+<p>
+Let
+<var>s</var> = the sign bit of <var>x</var> expanded
+to a 64-bit value, and similarly
+<var>t</var> = the sign bit of <var>y</var> expanded
+to a 64-bit value.
+In other words,
+<var>s</var> is <code>0xFFFFFFFF`FFFFFFFF</code> if
+<var>x</var> &lt; 0
+and zero if <var>x</var> &ge; 0.
+</p>
+<p>
+The 128-bit values being multiplied are
+</p>
+<table BORDER=0 CELLPADDING=0 CELLSPACING=0>
+<tr>
+<td VALIGN=baseline><var>X</var> =&nbsp;</td>
+<td VALIGN=baseline><var>s</var> &times 2<sup>64</sup> + <var>x</var></td>
+</tr>
+<tr>
+<td VALIGN=baseline><var>Y</var> =&nbsp;</td>
+<td VALIGN=baseline><var>t</var> &times 2<sup>64</sup> + <var>y</var></td>
+</tr>
+</table>
+<p>
+The product is therefore
+</p>
+<table BORDER=0 CELLPADDING=0 CELLSPACING=0 STYLE="text-align: center">
+<tr>
+<td VALIGN=baseline ALIGN=right>
+        <var>X </var>&times; <var>Y</var> =&nbsp;
+    </td>
+<td VALIGN=baseline>
+        <var>s</var><var>t</var> &times; 2<sup>128</sup>&nbsp;
+    </td>
+<td VALIGN=baseline>
+        +&nbsp;
+    </td>
+<td VALIGN=baseline>
+        (<var>s</var><var>y</var> + <var>t</var><var>x</var>) &times; 2<sup>64</sup>&nbsp;
+    </td>
+<td VALIGN=baseline>
+        &nbsp;+&nbsp;
+    </td>
+<td VALIGN=baseline>
+        <var>x</var><var>y</var>
+    </td>
+</tr>
+<tr>
+<td></td>
+<td STYLE="border-top: solid black 1px">zero</td>
+<td></td>
+<td STYLE="border-top: solid black 1px">adjustment</td>
+<td></td>
+<td STYLE="border-top: solid black 1px; text-align: left; position: relative" NOWRAP>
+      <span STYLE="position: absolute">unsigned product</span>
+    </td>
+</tr>
+</table>
+<p>
+The first term is zero because it overflows the 128-bit result.
+That leaves the second term as the adjustment, which simplifies to
+"If <var>x &lt; 0</var> then subtract <var>y</var> from the high 64 bits;
+if <var>y &lt; 0</var> then subtract <var>x</var> from the high 64 bits."
+</p>
+<pre>
+    if (x &lt; 0) result.m128i_u64[1] -= y;
+    if (y &lt; 0) result.m128i_u64[1] -= x;
+</pre>
+<p>
+If we were still playing with SSE, we could compute this as follows:
+</p>
+<pre>
+    movdqa xmm0, result   // xmm0 = { high, low }
+    movq   xmm1, x        // xmm1 = { 0, x }
+    movq   xmm2, y        // xmm2 = { 0, y }
+    pshufd xmm3, xmm1, _MM_SHUFFLE(1, 1, 3, 2) // xmm3 = { xhi, xhi, 0, 0 }
+    pshufd xmm1, xmm1, _MM_SHUFFLE(1, 0, 3, 2) // xmm1 = { x, 0 }
+    pshufd xmm4, xmm2, _MM_SHUFFLE(1, 1, 3, 2) // xmm4 = { yhi, yhi, 0, 0 }
+    pshufd xmm2, xmm2, _MM_SHUFFLE(1, 0, 3, 2) // xmm2 = { y, 0 }
+    psrad  xmm3, 31       // xmm3 = { s, s, 0, 0 } = { s, 0 }
+    psrad  xmm4, 31       // xmm4 = { t, t, 0, 0 } = { t, 0 }
+    pand   xmm3, xmm2     // xmm3 = { x &lt; 0 ? y : 0, 0 }
+    pand   xmm4, xmm1     // xmm4 = { y &lt; 0 ? x : 0, 0 }
+    psubq  xmm0, xmm3     // first adjustment
+    psubq  xmm0, xmm4     // second adjustment
+    movdqa result, xmm0   // update result
+</pre>
+<p>
+The code is a bit strange because SSE2 doesn't have a
+full set of 64-bit integer opcodes.
+We would have liked to have used a
+<code>psraq</code> instruction to fill a 64-bit field with a sign bit.
+But there is no such instruction, so instead we
+duplicate the 64-bit sign bit into two 32-bit sign bits (one in lane 2
+and one in lane 3)
+and then fill the lanes with that bit using <code>psrad</code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1165423">
+				<div id="div-comment-1165423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dasyatid1</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165423">
+			December 8, 2014 at 7:28 am</a>		</div>
+
+		<p>Lbh qvqa&#39;g hfr gur enk ertvfgre orpnhfr ba n cebprffbe fhccbegvat gung, lbh jbhyq unir nyernql unq n zhygvcyvpngvba lvryqvat bar uhaqerq gjragl rvtug ovgf sebz gjb fvkgl sbhe ovg ertvfgref angviryl ninvynoyr.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165433">
+				<div id="div-comment-1165433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Falcon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165433">
+			December 8, 2014 at 7:36 am</a>		</div>
+
+		<p>re. Exercise: You&#39;re writing 32-bit code, therefore have no access to the RAX register, otherwise you would have just used 64-bit operands and a single multiplication instruction in the first place!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1165443">
+				<div id="div-comment-1165443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">innocenat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165443">
+			December 8, 2014 at 8:18 am</a>		</div>
+
+		<p>Shouldn&#39;t it be</p>
+<p>&nbsp; &nbsp;add &nbsp; &nbsp;result[4], eax</p>
+<p>&nbsp; &nbsp;adc &nbsp; &nbsp;result[8], edx</p>
+<p>&nbsp; &nbsp;adc &nbsp; &nbsp;result[12], 0</p>
+<p>? I think we need to carry the first term too?</p>
+<div class="post">[<em>Good catch. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165453">
+				<div id="div-comment-1165453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scooby Doo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165453">
+			December 8, 2014 at 8:44 am</a>		</div>
+
+		<p>Is ROT13 common on this board, or is Dasyatid1 a geocacher?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-zlynx even thread-even depth-1" id="comment-1165463">
+				<div id="div-comment-1165463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Zan+Lynx%27' rel='external nofollow' class='url'>Zan Lynx'</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165463">
+			December 8, 2014 at 9:36 am</a>		</div>
+
+		<p>I see that it IS ROT13. At first I thought it was just insane gibbering.</p>
+<p>Luckily I remembered the arcane Unix incantation: tr &#39;[A-Za-z]&#39; &#39;[N-ZA-Mn-za-m]&#39;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165473">
+				<div id="div-comment-1165473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165473">
+			December 8, 2014 at 9:56 am</a>		</div>
+
+		<p>I need to benchmark but I suspect there are more efficient ways of doing this</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1165483">
+				<div id="div-comment-1165483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Colin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165483">
+			December 8, 2014 at 10:02 am</a>		</div>
+
+		<p>I just thought it was a reference to all the movdqa, pmuludq, punpckldq making the post look like gibberish.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165493">
+				<div id="div-comment-1165493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165493">
+			December 8, 2014 at 1:23 pm</a>		</div>
+
+		<p>For the signed portion of the question, I think that the below shorter code will work. &nbsp;Whether it&#39;s faster, I have no idea. &nbsp;It uses the following identity, which is true assuming signed overflow is well-defined as wraparound: 1 + ~a == -a. &nbsp;To complete the explanation behind it, NOT is the same as XOR with all 1&#39;s (-1) and subtracting -1 is the same as adding 1.</p>
+<p>mov eax, [x + 4] &nbsp;// high dword of x</p>
+<p>mov edx, [y + 4] &nbsp;// high dword of y</p>
+<p>xor eax, edx &nbsp;// XOR the sign bits</p>
+<p>sra eax, 31 &nbsp;// ((x &lt; 0) ^ (y &lt; 0)) ? -1 : 0</p>
+<p>xor [result + 8], eax</p>
+<p>xor [result + 12], eax</p>
+<p>sub [result + 8], eax</p>
+<p>sbb [result + 12], eax</p>
+<p>I tried running the original code and was not getting a correct answer in result dwords 1 and 2 out of 0-3. &nbsp;Thus, I haven&#39;t tested mine.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1165503">
+				<div id="div-comment-1165503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165503">
+			December 8, 2014 at 5:57 pm</a>		</div>
+
+		<p>Once in a while, you&#39;d find that you missed the ROT13 encoder that comes with Outlook Express.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165513">
+				<div id="div-comment-1165513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165513">
+			December 8, 2014 at 8:38 pm</a>		</div>
+
+		<p>&quot;Luckily I remembered the arcane Unix incantation&quot;</p>
+<p>Fortunately, you are also (presumably) using a web browser to read this page, so you could paste that text into the textbox at rot13.com and get the result.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1165523">
+				<div id="div-comment-1165523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GWO</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165523">
+			December 9, 2014 at 1:30 am</a>		</div>
+
+		<p>@RickC: &#8230; you could paste that text into the textbox at rot13.com and get the result.</p>
+<p>M-x rot13-region</p>
+<p>M-x all-hail-emacs</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165533">
+				<div id="div-comment-1165533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165533">
+			December 9, 2014 at 2:32 am</a>		</div>
+
+		<p>SFU for Windows XP didn&#39;t like that tr incantation for some reason, I had to use tr A-Ma-mN-Zn-z N-Zn-zA-Ma-m instead. (The square brackets are only needed for System V compatibility.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1165563">
+				<div id="div-comment-1165563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165563">
+			December 9, 2014 at 7:05 am</a>		</div>
+
+		<p>Thanks! I knew I was missing something.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman odd alt thread-odd thread-alt depth-1" id="comment-1165613">
+				<div id="div-comment-1165613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165613">
+			December 9, 2014 at 8:13 am</a>		</div>
+
+		<p>I found this an interesting read and it made me wonder if I could do a similar trick with my 16-bit microcontroller that has an MPY32 peripheral (32&#215;32=64 with 16-bit register interfaces). Then I wondered &quot;What the heck would I do with a 128-bit number on a 16-bit MCU?&quot; Not to mention figuring out how to represent it since the compiler tops out at 64-bit long long.</p>
+<p>Certainly a trick to remember though, it may be useful in trying to implement a constant-time Curve25519 ECC computation algorithm&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1165543">
+				<div id="div-comment-1165543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165543">
+			December 9, 2014 at 5:19 am</a>		</div>
+
+		<p>Re ROT13: &quot;Leetkey&quot; addon for Firefox.</p>
+<p>I&#39;m confused by this:</p>
+<p>&nbsp;movq xmm1, y &nbsp; &nbsp; &nbsp; &nbsp; // xmm1 = { 0, 0, C, D } = { *, *, C, D }</p>
+<p>&nbsp;&#8230;</p>
+<p>&nbsp;punpckldq xmm1, xmm1 // xmm1 = { C, C, D, D } = { *, C, *, D }</p>
+<p>&nbsp;pshufd xmm2, xmm1, _MM_SHUFFLE(2, 0, 3, 1)</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; // xmm2 = { D, D, C, C } = { *, D, *, C }</p>
+<p>Specifically, why is the unpack necessary? Can&#39;t you just shuffle {0,0,C,D} to {0,D,0,C} directly? (I honestly don&#39;t know &#8211; I&#39;ve never played with SSE at all.)</p>
+<div class="post">[<em>Yes, I could&#39;ve done that, but I also need <code>xmm1 = { *, C, *, D }</code> for the <code>pmuludq xmm1, xmm0</code> that follows. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165833">
+				<div id="div-comment-1165833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1165833">
+			December 9, 2014 at 6:47 pm</a>		</div>
+
+		<p>&quot;M-x rot13-region</p>
+<p>M-x all-hail-emacs&quot;</p>
+<p>Sure, but then I&#39;d have to use Emacs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166133">
+				<div id="div-comment-1166133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1166133">
+			December 10, 2014 at 11:55 pm</a>		</div>
+
+		<p>@Brian_EE</p>
+<p>Not only can you do it with a 32&#215;32 hardware multiplier peripheral, but you can also do it by recursively simulating each 32&#215;32 multiply with 16&#215;16 multiplies! (Is your mind blown yet?)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1166143">
+				<div id="div-comment-1166143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward (again)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1166143">
+			December 10, 2014 at 11:57 pm</a>		</div>
+
+		<p>@Brian_EE</p>
+<p>Also, you would store a 128-bit number with something like:</p>
+<p>struct int128 {long long low, high;};</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1166173">
+				<div id="div-comment-1166173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1166173">
+			December 11, 2014 at 5:35 am</a>		</div>
+
+		<p>Anonymous Coward (again): You probably want the low 64 bits to be unsigned:</p>
+<p>struct int128 {unsigned long long low; long long high;};</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman odd alt thread-odd thread-alt depth-1" id="comment-1166403">
+				<div id="div-comment-1166403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453#comment-1166403">
+			December 12, 2014 at 7:13 am</a>		</div>
+
+		<p>@Anonymous Coward: Yes, I know that I could use a struct to build my own data type for 128 bits. But then I also have to create all my own operators (such as addition etc) to manipulate it. The compiler tops out at 64 bits for compiler-generated operations. There is still the &quot;what would I use this for&quot; aspect in the low-power MCU world.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

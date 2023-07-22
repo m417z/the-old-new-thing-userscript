@@ -1,0 +1,439 @@
+<html>
+<head>
+<title>What happens to lost timer messages if I don't process them fast enough?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What happens to lost timer messages if I don&#8217;t process them fast enough?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 28, 2015 / year-entry #202</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Some time ago, I noted that if your WM_TIMER handler takes longer than the timer period, your queue will not fill up with WM_TIMER messages. The WM_TIMER message is generated on demand, and if your handler doesn't check for messages, then there is no demand for timer messages. But what happens when your thread finally...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Some time ago,
+I noted that
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/12/04/10577881.aspx">
+if your <code>WM_<wbr>TIMER</code> handler takes longer than the
+timer period, your queue will not fill up with
+<code>WM_<wbr>TIMER</code> messages</a>.
+The
+<code>WM_<wbr>TIMER</code> message is generated on demand,
+and if your handler doesn't check for messages,
+then there is no demand for timer messages.
+But what happens when your thread finally starts processing messages
+again?
+What happens to the timers that elapsed while you were busy?
+Do they accumulate?
+</p>
+<p>
+Here's a sketch of how timers work.
+(Note that the timers under discussion here are the timers set
+by the <code>Set&shy;Timer</code> function.)
+</p>
+<p>
+When a timer is created, it is initially <i>not ready</i>.
+</p>
+<p>
+Every <var>n</var> milliseconds (where <var>n</var> is the period
+of the timer),
+the timer is marked <i>ready</i>.
+This is done regardless of the state of the UI thread.
+Note that <i>ready</i> is a flag, not a counter.
+If the timer is already ready, then it stays ready;
+there is no such thing as "double ready".
+The <code>QS_<wbr>TIMER</code> flag is set on the queue state,
+indicating that there is now a pending timer for the thread.
+This in turn may cause a function like
+<code>Get&shy;Message</code> or
+<code>Msg&shy;Wait&shy;For&shy;Multiple&shy;Objects</code>
+to wake up.
+</p>
+<p>
+When the appropriate conditions are met
+(<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/12/19/10249000.aspx"
+>as discussed earlier</a>),
+the window manager checks whether there are any timers for the thread
+that are marked <i>ready</i>.
+If so, then the corresponding <code>WM_<wbr>TIMER</code> message
+is generated and the <i>ready</i> flag is cleared.
+</p>
+<p>
+Let's illustrate this with our
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/07/23/54576.aspx">
+scratch program</a>.
+Make the following changes:
+</p>
+<pre>
+#include &lt;strsafe.h&gt;
+
+DWORD g_tmStart;
+
+void SquirtTime()
+{
+ TCHAR sz[256];
+ StringCchPrintf(sz, 256, "%d\r\n", GetTickCount() - g_tmStart);
+ OutputDebugString(sz);
+}
+</pre>
+<p>
+This adds a function that prints the number of milliseconds which have
+elapsed since <code>g_tmStart</code>.
+Note that we use simple subtraction and rely on unsigned arithmetic
+to handle timer rollover issues.
+</p>
+<pre>
+void CALLBACK OnTimer(HWND hwnd, UINT, UINT_PTR, DWORD)
+{
+ SquirtTime();
+}
+</pre>
+<p>
+Our timer tick handler merely prints the elapsed time to the debugger.
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ <font COLOR=blue>g_tmStart = GetTickCount();
+ SetTimer(hwnd, 1, 500, OnTimer);
+ Sleep(1750);</font>
+ return TRUE;
+}
+</pre>
+<p>
+Finally, we create a 500ms timer on our window,
+but we also intentionally stall the thread for 1750ms.
+</p>
+<p>
+Can you predict the output of this program?
+</p>
+<p>
+Here's what I got when I ran the program:</p>
+<pre>
+1797
+2000
+2500
+3000
+3500
+4000
+4500
+...
+</pre>
+<p>
+Let's see if we can explain it.
+</p>
+<p>
+Since the timer is set to fire at 500ms intervals,
+every 500ms, the timer gets marked ready.
+</p>
+<ul>
+<li>At <var>T</var> = 500ms, the timer is marked ready.
+<li>At <var>T</var> = 1000ms, the timer is marked ready.
+    This is redundant, since the timer is already ready.</p>
+<li>At <var>T</var> = 1500ms, the timer is marked ready.
+    Again, this is redundant.</p>
+<li>At <var>T</var> = 1750ms, the program finally wakes up
+    from its <code>Sleep</code> and eventually gets around
+    to processing messages.</p>
+<li>Hey look, there is a ready timer, so we generate a
+    <code>WM_<wbr>TIMER</code> message and clear the <i>ready</i>
+    flag.</p>
+<li>At <var>T</var> = 1797ms, the timer message is processed.
+<li>The program returns to its message loop, where there are no
+    further messages to process, so it sits and waits.</p>
+<li>At <var>T</var> = 2000ms, the timer is marked ready.
+    This causes the <code>Get&shy;Message</code> to wake up
+    generate a
+    <code>WM_<wbr>TIMER</code> message and clear the <i>ready</i>
+    flag.</p>
+<li>At <var>T</var> = 2000ms, the timer message is processed.
+<li>At <var>T</var> = 2500ms, the timer is marked ready.
+    This causes the <code>Get&shy;Message</code> to wake up
+    generate a
+    <code>WM_<wbr>TIMER</code> message and clear the <i>ready</i>
+    flag.</p>
+<li>At <var>T</var> = 2500ms, the timer message is processed.
+<li>And so on, with a new timer message every 500ms
+    that is processed immediately.
+</ul>
+<p>
+Observe that
+when the program begins processing messages at <var>T</var> = 1750ms,
+it receives only one timer message right away,
+even though three timer periods have elapsed.
+</p>
+<p>
+I guess another way of looking at this is to think of your timer
+as setting a frame rate.
+If your thread is busy when it's time to render the next frame,
+then the next frame is late.
+And if your thread is really busy, it may drop frames entirely.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1201521">
+				<div id="div-comment-1201521" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201521">
+			September 28, 2015 at 7:13 am</a>		</div>
+
+		<p>I would personally point out that the answer is in the question. Lost messages are lost. Of course, technically they didn&#39;t exist in the first place&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1201511">
+				<div id="div-comment-1201511" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kevin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201511">
+			September 28, 2015 at 7:14 am</a>		</div>
+
+		<p>So, in short, a timer is like an event, rather than a semaphore.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1201501">
+				<div id="div-comment-1201501" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrew</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201501">
+			September 28, 2015 at 7:19 am</a>		</div>
+
+		<p>Raymond, thanks! &nbsp;I&#39;ve had this question in my head, in vague form, since I started working with timers in Windows Forms over 10 years ago.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1201481">
+				<div id="div-comment-1201481" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201481">
+			September 28, 2015 at 8:59 am</a>		</div>
+
+		<p>And how things works when there are two timers?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle even thread-even depth-1" id="comment-1201471">
+				<div id="div-comment-1201471" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201471">
+			September 28, 2015 at 9:17 am</a>		</div>
+
+		<p>@EduardoS: What would you expect to happen? &nbsp;Each timer owns its own ready state, and once a registered timer is ready, the thread gets notified with an event. &nbsp;The mechanisms are the same, you just have multiple ready states that get checked by the window manager.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1201461">
+				<div id="div-comment-1201461" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201461">
+			September 28, 2015 at 9:21 am</a>		</div>
+
+		<p>@EsduardoS: I believe that there is plenty of context in the article above to answer your question. It would appear that each timer has a corresponding flag, so given that, the rest should fall out pretty readily&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1201451">
+				<div id="div-comment-1201451" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201451">
+			September 28, 2015 at 9:52 am</a>		</div>
+
+		<p>I think one thing that really tells what is meant to happen is if you look at the timer callback function. The final parameter is basically the result of a call to GetTickCount.</p>
+<p>So what this says to me is that timer events are not really guaranteed to be reliable, and if you really need to be sure, you should work on the difference in time between the current timer event and the previous.</p>
+<p>Another thing that I&#39;m sure is obvious, but if I don&#39;t address it, someone will focus on it is the function that you use to get the time from the system. Yes the WinAPI itself uses GetTickCount, but the callback in Windows is old. If you do use a timer, you should use one that can last as long as you need and is as precise as you need.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1201431">
+				<div id="div-comment-1201431" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201431">
+			September 28, 2015 at 3:03 pm</a>		</div>
+
+		<p>&quot;It would appear that each timer has a corresponding flag, so given that, the rest should fall out pretty readily&#8230;&quot;</p>
+<p>And it would only take about 5 more lines of code to test that theory, as well, code that should be obvious from what was already provided.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1201421">
+				<div id="div-comment-1201421" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">meh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201421">
+			September 28, 2015 at 4:37 pm</a>		</div>
+
+		<p>@Darran Rowe. Also obvious is if you need heaps accurate timing then maybe you need to look at basing your whole thing on some other mechanism than WM_TIMER.</p>
+<p>@EduardoS. I think it depends on the inverse square of the distance between the timers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1201391">
+				<div id="div-comment-1201391" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roel Schroeven</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201391">
+			September 29, 2015 at 3:12 am</a>		</div>
+
+		<p>Do you really get such nice rounded timings? I&#39;ve never seen that in practice. Using your program, I get this output:</p>
+<p>1763</p>
+<p>2059</p>
+<p>2559</p>
+<p>3073</p>
+<p>3573</p>
+<p>4087</p>
+<p>4587</p>
+<p>5101</p>
+<p>5601</p>
+<p>&#8230;</p>
+<p>That confirms what I&#39;ve always noticed in practice: the delta between triggers is often larger than the specified interval. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1201361">
+				<div id="div-comment-1201361" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sven2</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201361">
+			September 29, 2015 at 7:31 am</a>		</div>
+
+		<p>I also wonder why the first timer fires at 1797 in the example. That&#39;s 47 milliseconds to set up the timer, sleep, wake up and process the timer message. Seems like a lot of time for a simple task to me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1201341">
+				<div id="div-comment-1201341" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201341">
+			September 29, 2015 at 7:46 am</a>		</div>
+
+		<p>@everybody</p>
+<p>What I asked was, let&#39;s say you have set up two timers, every one second, for example, but the message processing takes more than one second, let&#39;s say, 2 seconds, so, the flags of both timers are checked, one get&#39;s issued, but processin takes too long and the flag is checked again, in the next GetMessage wich timer message will be dispatched?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1201281">
+				<div id="div-comment-1201281" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150928-00/?p=91501#comment-1201281">
+			September 29, 2015 at 11:32 am</a>		</div>
+
+		<p>@EduardoS:</p>
+<p>That should be implementation defined. IMO, the most likely ordering is that it will dispatch the timer messages in order of them being first triggered, but I don&#39;t remember enough of the documentation to comment on if this is true or guaranteed.</p>
+<p>The important thing to remember though is that if there are multiple timers active, all of the timers will eventually trigger.</p>
+<p>@Roel Schroeven, Sven2:</p>
+<p>The output I get is similar to Raymond&#39;s.</p>
+<p>1781</p>
+<p>2000</p>
+<p>2500</p>
+<p>3000</p>
+<p>3500</p>
+<p>4000</p>
+<p>4500</p>
+<p>&#8230;.</p>
+<p>Remember there are some important things with getting these times. First, the initial wait time is there because the thread is set to sleep for 1750, but it is set to sleep right at the end of WM_CREATE. There are some really heavy messages that it has to process before it gets to the timer ones. For example, it seems like the relative priority is that the WM_PAINT message gets processed before WM_TIMER. So is it hard to believe that drawing the non-client area, and then the client area may take time? There are a few more things to remember, how the paint message is non trivial regardless, you have to clear the invalidated region at the very least, and also how many other messages are in the queue after WM_CREATE? When you take that into account, it is not that surprising that the initial time is not 1750.</p>
+<p>Second, my development system is an Intel system that is quad core + hyper threading. The system is also not busy while running the application. So in the cases where the WM_TIMER occur, the thread wakes, is guaranteed to run immediately, and gets the call to GetTickCount done quickly. If you are doing this while your system is busy then it isn&#39;t that surprising that you will get some extra time when the timer is handled.</p>
+<p>@Raymond:</p>
+<p>StringCchPrintf(sz, 256, &quot;%drn&quot;, GetTickCount() &#8211; g_tmStart);</p>
+<p>I do that quite often myself, you are being good using TCHAR, and then a literal comes along and you forget to wrap it with the TEXT macro. I can&#39;t remember how many compiler errors I have gotten from that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

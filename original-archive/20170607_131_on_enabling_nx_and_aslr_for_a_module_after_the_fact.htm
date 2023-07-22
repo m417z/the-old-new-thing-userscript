@@ -1,0 +1,478 @@
+<html>
+<head>
+<title>On enabling NX and ASLR for a module after the fact</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>On enabling NX and ASLR for a module after the fact</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 7, 2017 / year-entry #132</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">You can flip the bit, but you can't regenerate relocation information.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer wanted to enable NX (also known as
+Data Execution Prevention, or DEP)
+and ASLR for some executables and DLLs.
+There are two ways of doing this:
+</p>
+<ul>
+<li>Enable the options at link time by passing the
+    linker command line options
+    <code>/NX&shy;COMPAT</code> and
+    <code>/DYNAMIC&shy;BASE</code>,
+    and for good measure
+    <code>/HIGH&shy;ENTROPYVA</code>.
+</li>
+<li>
+    Build the modules the usual way,
+    and then use the <code>EDITBIN</code>
+    program with those same command line options
+    to enable the features on the files in question.
+</li>
+</ul>
+<p>
+For reasons the customer didn't provide (but which I can guess),&sup1;
+there are a handful of files that they cannot relink,
+so they are forced to use the <code>EDITBIN</code> approach
+for those files.
+</p>
+<p>
+What the customer found
+was that both the linker and
+the <code>EDITBIN</code> approaches
+seemed to be fine with <code>/NX&shy;COMPAT</code>.
+But the story was different with
+the <code>/DYNAMIC&shy;BASE</code> flag.
+</p>
+<p>
+Specifically, the linker approach was creating a larger file
+due to a new
+<code>.reloc</code> section.
+The file produced by the <code>EDITBIN</code> approach didn't
+have a <code>.reloc</code> section,
+and dumping the header reports
+<b>Relocations stripped</b>.
+Furthermore, when running <code>EDITBIN</code>, it generated the
+ominous warning message,
+"Warning LNK4259: '/DYNAMIC&shy;BASE' is not compatible
+with '/FIXED'; image may not run."
+It appears that linking with the <code>/DYNAMIC&shy;BASE</code> flag
+implicitly sets <code>/FIXED:NO</code>,
+but the <code>EDITBIN</code> command doesn't apply the same behavior,
+and it doesn't support the <code>/FIXED:NO</code> command line option.
+</p>
+<p>
+The customer had the following questions:
+</p>
+<ul>
+<li>
+Are the linker approach and the
+the <code>EDITBIN</code> approach for enabling
+<code>/NX&shy;COMPAT</code> equivalent?
+</li>
+</ul>
+<p>
+Yes, enabling NX via the linker <code>/NX&shy;COMPAT</code> flag
+is equivalent to enabling it with <code>EDITBIN</code>.
+In both cases, they set the
+<code>IMAGE_</code><code>DLL&shy;CHARACTERISTICS_</code><code>NX_</code><code>COMPAT</code>
+bit in the
+<code>IMAGE_</code><code>OPTIONAL_</code><code>HEADER</code>'s
+<code>Dll&shy;Characteristics</code>.
+</p>
+<ul>
+<li>
+Are the linker approach and the
+the <code>EDITBIN</code> approach for enabling
+<code>/DYNAMIC&shy;BASE</code> equivalent?
+</li>
+</ul>
+<p>
+The answer depends on what color glasses you're wearing.
+If you're wearing
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20110512-00/?p=10683">
+kernel-colored glasses</a>,
+then yes, the two approaches are the same because both set the
+<code>IMAGE_</code><code>DLL&shy;CHARACTERISTICS_</code><code>DYNAMIC_</code><code>BASE</code>
+bit in the
+<code>IMAGE_</code><code>OPTIONAL_</code><code>HEADER</code>'s
+<code>Dll&shy;Characteristics</code>.
+But in reality, they are not the same,
+because of the behavior noted above with respect to relocations.
+If you ask the linker for <code>/DYNAMIC&shy;BASE</code>,
+it will default to <code>/FIXED:NO</code>
+because
+<code>/DYNAMIC&shy;BASE</code> means
+"My base address can be moved around",
+which is the opposite of
+<code>/FIXED</code>, which means
+"My base address cannot change."
+</p>
+<p>
+If you say <code>/FIXED</code>,
+then the linker does not generate "relocations",
+which are the bits of information that describe what adjustments need
+to be made to your DLL in order to make it happy at its new location.
+Trying to turn on
+<code>/DYNAMIC&shy;BASE</code> with
+<code>EDITBIN</code>
+on a binary that is <code>/FIXED</code>
+doesn't work because <code>EDITBIN</code> doesn't know
+how to regenerate the <code>.reloc</code> section.
+</p>
+<p>
+If you want to enable <code>/DYNAMIC&shy;BASE</code>,
+then you cannot link with <code>/FIXED</code>.
+</p>
+<ul>
+<li>
+Are there any adverse consequences of mixing ASLR-enabled DLLs
+and non-ASLR-enabled DLLs in the same process?
+</li>
+</ul>
+<p>
+There are no consequences beyond those already stated on the tin.
+The ASLR-enabled binaries will be subject to ASLR,
+and the non-ASLR-enabled binaries will not.
+You can mix and match freely within a process.
+Just be aware that the non-ASLR-enabled binaries will not be
+randomly relocated, which means that those binaries
+will not benefit from the security protections provided by ASLR.
+</p>
+<ul>
+<li>
+Are there any adverse consequences of mixing NX-enabled DLLs
+and non-NX-enabled DLLs in the same process?
+</li>
+</ul>
+<p>
+The NX setting is process-wide,
+and the process takes its NX state from the <code>/NX&shy;ENABLED</code>
+state of the executable,
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20110824-00/?p=9823">
+not from any DLLs</a>.
+It's yet another one of the module flags that
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20140502-00/?p=1093">
+are meaningless for DLLs</a>.
+So mix it up in the DLLs all you want.
+Nobody will care,
+because the flag is ignored for DLLs anyway.
+</p>
+<ul>
+<li>
+Are there any adverse consequences of mixing EXEs and DLLs
+which use different approaches for enabling NX and/or ASLR?
+For example,
+is there an unexpected interaction between an EXE which enabled
+ASLR with <code>EDITBIN</code> and a DLL that enabled ASLR
+with a linker switch?
+How can I tell whether an EXE or DLL has had its NX or ASLR bit set
+via the linker as opposed to the <code>EDITBIN</code> program?
+</li>
+</ul>
+<p>
+There is no way to tell how the NX or ASLR attributes were enabled.
+Using the linker or <code>EDITBIN</code> both lead to the same binary.
+There's nothing that records who set the bit.
+As a result, it doesn't matter how you enabled NX and ASLR.
+The system behaves the same regardless of how you enabled them.
+</p>
+<p>
+<b>Bonus chatter</b>:
+There is
+<a HREF="https://msdn.microsoft.com/en-us/library/bb430720.aspx">
+some text on MSDN</a>
+(which got copied into
+<a HREF="https://technet.microsoft.com/en-us/library/security/dn848375.aspx">
+a glossary on TechNet</a>)
+which says
+</p>
+<blockquote CLASS="q"><p>
+For a component to support ASLR,
+all components that it loads must also support ASLR.
+For example, if A.exe consumes B.dll and C.dll, all three must support ASLR.
+</p>
+</blockquote>
+<p>
+Nobody is quite sure how that text got into the documentation,
+since it's not true.
+One of the original authors of that article surmises that
+perhaps what they were trying to say was
+"In order for a process to take full advantage of ASLR,
+the executable and all DLLs must support ASLR,"
+but somehow the message got garbled during editing.
+</p>
+<p>
+Given what we already know about
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20160413-00/?p=93301">
+how the loader shares pages in the face of ASLR</a>,
+having a DLL be subject to ASLR in some processes but not others
+would create extra work for the loader,
+because it now has to be able to keep up to two copies of every
+DLL in memory: A randomly-located version for ASLR,
+and a non-relocated version for non-ASLR.
+It's extra work for no real benefit,
+so I can understand why they don't do it.
+</p>
+<p>
+&sup1;
+I can think of a few reasons why the customer cannot relink all
+of the files.
+One possibility is that they don't have the source code any more.
+Another is that they have the source code, but they don't have
+the build tools any more.
+(For example, it may be built with a very old compiler that doesn't
+work any more.)
+Or they have the source code, and they have the tools,
+but they simply don't want to take the risk that relinking the file
+might result in an unexpected change to the program.
+(For example, if it was linked with an older version of the linker,
+and they have since upgraded to a newer version.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1298965">
+				<div id="div-comment-1298965" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian_EE</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1298965">
+			June 7, 2017 at 7:54 am</a>		</div>
+
+		<p>Isn&#8217;t another reason that perhaps they are 3rd party DLLs?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1298975">
+				<div id="div-comment-1298975" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">morlamweb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1298975">
+			June 7, 2017 at 8:05 am</a>		</div>
+
+		<p>Raymond mentioned that as the first possibility: the customer doesn&#8217;t have the source code for the binaries.  They may have had it at one point until it got archived and they lost, the tape, or they&#8217;re 3rd part binaries and they never had the source in the first place.  It&#8217;s a meaningless distinction.  Either way, the customer doesn&#8217;t have the source.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-gregm even depth-3" id="comment-1299455">
+				<div id="div-comment-1299455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299455">
+			June 10, 2017 at 1:58 pm</a>		</div>
+
+		<p>&#8220;Raymond mentioned that as the first possibility&#8221;</p>
+<p>Sort of, but not really.  &#8220;One possibility is that they don&#8217;t have the source code any more.&#8221;  implies that they had the source code at one point and that they built it.  If this had stopped before &#8220;any more&#8221; then I would agree that it would completely cover 3rd party DLLs.  I had the exact same thought, and it fits right in at the beginning of the progression:</p>
+<p>&#8211; They never had the source code.<br />
+&#8211; They don&#8217;t have the source code any more.<br />
+&#8211; They don&#8217;t have the build tools any more.<br />
+&#8211; They don&#8217;t want to take the risk.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1298985">
+				<div id="div-comment-1298985" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1298985">
+			June 7, 2017 at 9:25 am</a>		</div>
+
+		<p>&#8220;Nobody is quite sure how that text got into the documentation, since it&#8217;s not true.&#8221;</p>
+<p>1) Am I currently protected by ASLR?     &#8211;     &gt;&gt;Yes<br />
+2) Load Component A.exe (/DYNAMIC­BASE)<br />
+3) Component A requires Component B.dll (/FIXED) so it loads<br />
+4) Am I still protected by ASLR?            &#8211;       &gt;&gt;Not so much</p>
+<p>So does Component A &#8220;support ASLR&#8221;? &#8211;  I think you could be kind to the authors and say &#8220;no&#8221;.<br />
+That is, &#8220;support&#8221; could be read as &#8220;operate within the security mechanism and not break or weaken it&#8221;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1299055">
+				<div id="div-comment-1299055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">philiplu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299055">
+			June 7, 2017 at 2:47 pm</a>		</div>
+
+		<p>I&#8217;m pretty sure that was the original meaning of the documentation &#8211; if any DLL in a process isn&#8217;t protected by ASLR, it&#8217;s much easier to take advantage of the fixed addresses to escalate a buffer overrun anywhere into remote code execution.  In fact, I think I might be partly responsible for that text &#8211; I remember discussing this with folks over in the Windows team back when I was working on the Visual C++ runtime components of the various security mechanisms, in 2005 or so.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-3 parent" id="comment-1299065">
+				<div id="div-comment-1299065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299065">
+			June 7, 2017 at 3:02 pm</a>		</div>
+
+		<p>Unfortunately, some customers interpreted the wording to mean &#8220;If B.DLL or C.DLL is /FIXED, then the /DYNAMICBASE attribute of A.EXE is ignored and it will not be subjected to ASLR.&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1299075">
+				<div id="div-comment-1299075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299075">
+			June 7, 2017 at 5:21 pm</a>		</div>
+
+		<p>I&#8217;m surprised that /DYNAMICBASE does anything with /FIXED set in the header. (OK I know that&#8217;s really !(relocations stripped) but that&#8217;s not the point.) It just seems like the kernel would conclude that it can&#8217;t relocate it and it got its base address anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1299045">
+				<div id="div-comment-1299045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.silverbacknetworks.tech' rel='external nofollow' class='url'>Joshua Bowman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299045">
+			June 7, 2017 at 2:01 pm</a>		</div>
+
+		<p>It is left as an exercise to the reader to create a tool that can fixup the locations and create a .reloc section.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1299066">
+				<div id="div-comment-1299066" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299066">
+			June 7, 2017 at 3:11 pm</a>		</div>
+
+		<p>The author of editbin should be able to paste the linker source into the code base.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1299185">
+				<div id="div-comment-1299185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan Wilson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299185">
+			June 8, 2017 at 1:55 pm</a>		</div>
+
+		<p>I recently wrote some code that needed to do exactly that (parts bits of code and data in the exe file and generate a bunch of relocations) and I can tell you its not possible to fully automate the process, you need to know in advance whether bits of data in the exe file are addresses or just plain data.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1299635">
+				<div id="div-comment-1299635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.silverbacknetworks.tech' rel='external nofollow' class='url'>Joshua Bowman</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299635">
+			June 13, 2017 at 12:21 am</a>		</div>
+
+		<p>Naturally; even IDA, hallowed be its name, still gets code vs data wrong occasionally when no obfuscation at all is being done, let alone when it is. Anything one of us mortals makes is bound to be worse.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1" id="comment-1299085">
+				<div id="div-comment-1299085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170607-00/?p=96295#comment-1299085">
+			June 7, 2017 at 6:52 pm</a>		</div>
+
+		<p>On the other hand, since Delphi always include a .reloc section regardless of whether it&#8217;s EXE or DLL, using EDITBIN to alter &#8220;/DYNAMIC­BASE&#8221; flag for these binaries will work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

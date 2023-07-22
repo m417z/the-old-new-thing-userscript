@@ -1,0 +1,353 @@
+<html>
+<head>
+<title>Even if you have a lock, you can borrow some lock-free techniques</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Even if you have a lock, you can borrow some lock-free techniques</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 22, 2011 / year-entry #100</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Even if you prefer to use a lock (after all, they are much easier to program), you can borrow some lock-free techniques. For example, consider this: CRITICAL_SECTION g_cs; GORILLADATA g_data; void PokeGorilla(double intensity) { EnterCriticalSection(&g_cs); DeformGorilla(intensity, &g_data); Reticulate(&g_data.spline); int stress = CalculateTension(&g_data.spline); if (stress < 25) g_data.mood = RELAXED; else if (stress < 50) g_data.mood...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Even if you prefer to use a lock
+(after all, they are much easier to program),
+you can borrow some lock-free techniques.
+For example, consider this:
+</p>
+<pre>
+CRITICAL_SECTION g_cs;
+GORILLADATA g_data;
+
+void PokeGorilla(double intensity)
+{
+  EnterCriticalSection(&amp;g_cs);
+  DeformGorilla(intensity, &amp;g_data);
+  Reticulate(&amp;g_data.spline);
+  int stress = CalculateTension(&amp;g_data.spline);
+  if (stress &lt; 25)      g_data.mood = RELAXED;
+  else if (stress &lt; 50) g_data.mood = ANNOYED;
+  else                  g_data.mood = ANGRY;
+  DeleteObject(g_data.hbmGorilla);
+  g_data.hbmGorilla = RenderGorilla(&amp;g_data);
+  LeaveCriticalSection(&amp;g_cs);
+}
+</pre>
+<p>
+There are some concerns here.
+First of all, there's the lock hierarchy issue:
+If reticulating a spline takes the geometry lock,
+that may violate our lock hierarchy.
+</p>
+<p>
+If the lock <code>g_cs</code> is a hot lock,
+you may be concerned that all this gorilla stuff will
+hold the lock for too long.
+Maybe rendering a gorilla is a slow and complicated
+operation because it's hard to get the fur just right.
+</p>
+<p>
+These issues become less onerous if you switch to a lock-free
+algorithm, but that's an awful lot of work, and it's hard to
+get right.
+But maybe you can do just 20% of the work to get 80% of the benefit.
+</p>
+<p>
+<pre>
+void PokeGorilla(double intensity)
+{
+  <font COLOR=blue>// Capture
+  EnterCriticalSection(&amp;g_cs);
+  GORILLADATA data = g_data; // typo fixed
+  LeaveCriticalSection(&amp;g_cs);
+
+  // Recalculate based on captured data</font>
+  DeformGorilla(intensity, &amp;data);
+  Reticulate(&amp;data.spline);
+  int stress = CalculateTension(&amp;data.spline);
+  if (stress &lt; 25)      data.mood = RELAXED;
+  else if (stress &lt; 50) data.mood = ANNOYED;
+  else                  data.mood = ANGRY;
+  data.hbmGorilla = RenderGorilla(&amp;data);
+
+  <font COLOR=blue>// Commit
+  EnterCriticalSection(&amp;g_cs);
+  HBITMAP hbmToDelete = g_data.hbmGorilla;
+  g_data = data;
+  LeaveCriticalSection(&amp;g_cs);</font>
+  DeleteObject(hbmToDelete);
+}
+</pre>
+<p>
+Here, we use the capture/try/commit model.
+We capture the state of the gorilla into a local variable,
+then perform our update based on that captured state.
+The spline reticulation takes place without any locks held,
+which avoids introducing a lock hierarchy violation.
+And rendering the gorilla is done without any locks held,
+which avoids introducing a choke point on the lock.
+After the calculations are done, we then re-enter the lock
+and commit the changes.
+</p>
+<p>
+This pattern uses a last-writer-wins model.
+If another thread pokes the gorilla while we are still
+calculating the previous gorilla state, we will overwrite
+that gorilla state when we complete.
+For some scenarios, that's acceptable.
+But maybe the gorilla's emotional state needs to be an accumulation
+of all the times he's ben poked.
+We want to detect that somebody has poked the gorilla while we
+were busy calculating so that we can incorporate that new information
+into the final result.
+</p>
+<p>
+To do that, we introduce
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/12/10152296.aspx">
+a change counter</a>.
+</p>
+<pre>
+<font COLOR=blue>LONG g_lCounter;</font>
+
+void PokeGorilla(double intensity)
+{
+  <font COLOR=blue>BOOL fSuccess;
+
+  do {</font>
+    // Capture
+    EnterCriticalSection(&amp;g_cs);
+    GORILLADATA data = g_data; // typo fixed
+    <font COLOR=blue>LONG lCounter = g_lCounter;</font>
+    LeaveCriticalSection(&amp;g_cs);
+
+    // Recalculate based on captured data
+    DeformGorilla(intensity, &amp;data);
+    Reticulate(&amp;data.spline);
+    int stress = CalculateTension(&amp;data.spline);
+    if (stress &lt; 25)      data.mood = RELAXED;
+    else if (stress &lt; 50) data.mood = ANNOYED;
+    else                  data.mood = ANGRY;
+    data.hbmGorilla = RenderGorilla(&amp;data);
+
+    // Commit
+    EnterCriticalSection(&amp;g_cs);
+    HBITMAP hbmToDelete;
+    <font COLOR=blue>if (lCounter == g_lCounter)
+    {</font>
+      hbmToDelete = g_data.hbmGorilla;
+      g_data = data;
+      <font COLOR=blue>g_lCounter++;
+      fSuccess = TRUE;
+    } else {
+      hbmToDelete = data.hbmGorilla;
+      fSuccess = FALSE;
+    }</font>
+    LeaveCriticalSection(&amp;g_cs);
+    DeleteObject(hbmToDelete);
+  <font COLOR=blue>} while (!fSuccess);</font>
+}
+</pre>
+<p>
+In addition to the regular gorilla data,
+we also associate a change counter that is incremented
+each time somebody pokes the gorilla.
+In real life, you might want to make the change counter
+part of the <code>GORILLA&shy;DATA</code> structure.
+(Actually, in real life, you probably shouldn't poke a gorilla.)
+In a lock-free algorithm, we would
+<code>Interlocked&shy;Compare&shy;Exchange&shy;Release</code>
+the lock counter to see if the lock counter changed
+(and if not, to update it with the new lock counter).
+But since a <code>GORILLA&shy;DATA</code> structure
+cannot be updated atomically,
+we have to use our critical section to perform the
+comparison-and-update.
+</p>
+<p>
+Even though we used a lock, we still follow the lock-free pattern.
+If the gorilla has been poked while we were busy processing our own poke,
+then we throw away the results of our computations and start over,
+so that our poke can be accumulated with the previous pokes.
+</p>
+<p>
+<b>Exercise</b>:
+What constraints must be applied to the
+<code>GORILLADATA</code> structure for this technique to work?
+</p></p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-908413">
+				<div id="div-comment-908413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bdcrazy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908413">
+			April 22, 2011 at 7:23 am</a>		</div>
+
+		<p>Thanks for a good laugh early on a friday. &nbsp;Reticulating splines was an interesting math problem back in the days of playing sim city. &nbsp;I haven&#39;t done much serious programming in a while, but this series has been enlightening, thanks for that as well.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-908423">
+				<div id="div-comment-908423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908423">
+			April 22, 2011 at 7:30 am</a>		</div>
+
+		<p>You&#39;re poking the gorilla with double intensity. PETA may get involved. Even single intensity is normally not recommended.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-908433">
+				<div id="div-comment-908433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908433">
+			April 22, 2011 at 7:30 am</a>		</div>
+
+		<p>It&#39;s probably to trivial to mention, but I hope I understood that when you introduce local GORILLADATA it should look like:</p>
+<p> &nbsp;GORILLADATA data = g_data;</p>
+<div class="post">[<i>Fixed, thanks. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-908443">
+				<div id="div-comment-908443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimMaster</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908443">
+			April 22, 2011 at 8:30 am</a>		</div>
+
+		<p>@bdcrazy Thought of the same thing! reticulating splinies is stuck in my head now!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-908453">
+				<div id="div-comment-908453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908453">
+			April 22, 2011 at 8:59 am</a>		</div>
+
+		<blockquote><p>
+  What constraints must be applied to the GORILLADATA structure for this technique to work?
+</p></blockquote>
+<p>No pointers comes to mind, otherwise your local copy would still point to the same memory address and any concurrent updates would likely stomp all over each other. &nbsp;In general the local copy needs to be completely isolated from the original g_data, no shared data or global states.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-908463">
+				<div id="div-comment-908463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">groosalugg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908463">
+			April 22, 2011 at 9:22 am</a>		</div>
+
+		<p>GORILLADATA must be POD or have a &#39;simple&#39; copy-constructor (doesn&#39;t take improper locks / modify the original object).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-908483">
+				<div id="div-comment-908483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nick</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908483">
+			April 22, 2011 at 12:20 pm</a>		</div>
+
+		<p>Rendering, reticulating, and deforming gorillas?</p>
+<p>Is this code from the secret upcoming port of <em>Gorillas</em> from BASIC to Xbox? :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-908493">
+				<div id="div-comment-908493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110422-00/?p=10853#comment-908493">
+			April 22, 2011 at 5:12 pm</a>		</div>
+
+		<p>By a strange coincidence, Poke Gorilla Double Intensity is the name of the new Old Spice body wash.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

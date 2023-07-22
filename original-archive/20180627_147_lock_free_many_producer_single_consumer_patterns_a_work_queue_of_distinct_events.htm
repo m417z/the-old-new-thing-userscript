@@ -1,0 +1,257 @@
+<html>
+<head>
+<title>Lock free many-producer/single-consumer patterns: A work queue of distinct events, order not important, follow-up question</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock free many-producer/single-consumer patterns: A work queue of distinct events, order not important, follow-up question</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 27, 2018 / year-entry #147</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">We try to minimize spurious wake-ups, but eliminating them is probably not worth the effort.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When I discussed the
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20161124-00/?p=94775">
+work queue of distinct events, order not important</a>,
+commenter JDG noted that
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20161124-00/?p=94775#comment-1275065">
+there's a sequence of events that can result in a spurious wake-up</a>.
+"Is this spurious wake just a necessary evil to keep the algorithm simple?
+It looks harmless;
+the way the consumer function is written looks threadsafe to me."
+</p>
+<p>
+Spurious wakes tend to come with the territory of lock-free algorithms.
+Sure, you can work really hard to remove all the tiny little race
+conditions that can lead to spurious wakes,
+but that usually makes your algorithm significantly more complicated
+without much real benefit.
+</p>
+<p>
+Of course, one way to get rid of spurious wakes is to make your
+algorithm intentionally inefficient,
+but that's probably not what you're after either.
+In the linked example, you can get rid of spurious wakes by
+removing the loop from <code>Consume&shy;Work</code>.
+Instead of draining the pool of available work, the consumer
+drains only one item.
+You then make the <code>Request&shy;Work</code> function always
+wake the consumer using something that has an internal counter,
+like a semaphore.
+Congratulations, you now have no spurious wakes.
+But you replaced it with a design that calls
+<code>Wake&shy;Consumer</code> far, far more often than the original
+code,
+so it's a net performance loss.
+</p>
+<p>
+In the example I gave, the race window is open when the consumer
+has dequeued the last work item and is the process of retiring it.
+During that time, the next queued work item will generate a wake.
+I guess you could get into a persistent spurious wake case if the
+producer queues items at the same rate that the consumer is retiring them,
+so that the race window is open for most of the loop.
+</p>
+<p>
+I guess
+you could fix this by having another flag that says
+"I'm busy retiring work items."
+</p>
+<pre>
+SLIST_HEADER WorkQueue;
+LONG busy = 0;
+
+void RequestWork(WorkItem* work)
+{
+ if (InterlockedPushEntrySList(&amp;WorkQueue, work)
+                                               == nullptr) {
+  if (!InterlockedCompareExchange(&amp;busy, -1, -1)) {
+   // You provide the WakeConsumer() function.
+   WakeConsumer();
+  }
+ }
+}
+
+// You call this function when the consumer receives the
+// signal raised by WakeConsumer().
+void ConsumeWork()
+{
+ InterlockedExchange(&amp;busy, 1);
+
+ PSLIST_ENTRY entry;
+ while ((entry = InterlockedPopEntrySList(&amp;WorkQueue))
+                                               != nullptr) {
+back_into_the_loop:
+  ProcessWorkItem(static_cast&lt;WorkItem*&gt;(entry));
+  delete entry;
+ }
+
+ InterlockedExchange(&amp;busy, 0);
+
+ // Final race condition: Maybe we were too aggressive
+ // in suppressing spurious wakes.
+ entry = InterlockedPopEntrySList(&amp;WorkQueue);
+ if (entry) {
+  InterlockedExchange(&amp;busy, 1);
+  goto back_into_the_loop;
+ }
+}
+</pre>
+<p>
+Maybe there's a more elegant way of phrasing this,
+but I think it illustrates that the work to remove the last
+vestiges of spurious wakes can result in an algorithm that is
+harder to read.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1349155">
+				<div id="div-comment-1349155" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105#comment-1349155">
+			June 27, 2018 at 7:58 am</a>		</div>
+
+		<p>Having algorithms that are easy to read and comprehend is an important point, one that is often overlooked when you are in the heat of code-designing and code-writing.  I have gone back into my old code, on occasion, and found a hard-to-follow algorithm.  when algorithms are hard to understand, then fixes or enhancements are probably more likely to be incorrect.</p>
+<p>And woe to those who try to tell me that comments in code are not important, or that &#8220;the code IS the comments&#8221;.  Bah to that!  Well-crafted comments explain WHY the code is doing what it&#8217;s doing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fjeldse odd alt thread-odd thread-alt depth-1 parent" id="comment-1349165">
+				<div id="div-comment-1349165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Erik+F' rel='external nofollow' class='url'>Erik F</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105#comment-1349165">
+			June 27, 2018 at 12:01 pm</a>		</div>
+
+		<p>Isn&#8217;t a busy flag just a lock with another name?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1349185">
+				<div id="div-comment-1349185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105#comment-1349185">
+			June 27, 2018 at 1:35 pm</a>		</div>
+
+		<p>No, because this busy flag doesn&#8217;t cause anybody to block. This busy flag is to optimize our spurious wakes. How about if I had called it <code>alreadyWorking</code>?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1349515">
+				<div id="div-comment-1349515" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105#comment-1349515">
+			June 29, 2018 at 8:42 am</a>		</div>
+
+		<p>Every time I see &#8220;order is, or is not, important&#8221;, I think about something a programmer friend told me &#8212; that painting a house blue and then painting it red is not the same as painting it red and then painting it blue.  On the other hand, adding flour and then sugar to a bowl, and mixing, has (usually) the same result as adding sugar and then flour, and mixing.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1349585">
+				<div id="div-comment-1349585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Aged .Net Guy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105#comment-1349585">
+			June 30, 2018 at 12:55 pm</a>		</div>
+
+		<p>Then again, in many producer consumer interactions there&#8217;s a significant difference between &#8220;order not strictly required&#8221;, and &#8220;LIFO is <i>always</i> acceptable&#8221;.  e.g. Most of us can tolerate the reality at the grocery store that with several independent lines and cashiers, we probably won&#8217;t finish our transaction in strict FIFO versus our arrival time at the checkstand cluster.  But it&#8217;ll be close to that for squishy values of &#8220;close&#8221;.  But imagine applying LIFO to a time when the crowd is growing and the cashiers can&#8217;t keep up.  That would be Not Good.</p>
+<p>I suppose my punch line is that a LIFO consumer solution meets the letter of the law for &#8220;order not important&#8221;, but oft times not the spirit.  IOW for many practical producer / consumer patterns, there&#8217;s an implicit notion that the ordering won&#8217;t get too far out of whack vs FIFO. With a design using LIFO consumption, there&#8217;s no upper limit to the wait time of the pathological case despite total system throughput goals still being met.  I bet that&#8217;d usually get logged as a bug during perf testing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1350325">
+				<div id="div-comment-1350325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dennis</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180627-00/?p=99105#comment-1350325">
+			July 5, 2018 at 7:23 am</a>		</div>
+
+		<p>As far as I can tell, the proposed code does not remove the window; it only shortens it to after the InterlockedExchange(&amp;busy, 0);</p>
+<p>(I suppose that the &#8220;this&#8221; in &#8220;you could fix this&#8221; refers to &#8220;race window is open for most of the loop&#8221;, not spurious wakes in general.)</p>
+<p>It should be possible to completely eliminate spurious wakes by turning busy into a counter, but perhaps it would be simpler to use the InterlockedFlushSList from the FIFO version. (You can skip reversing the list since order doesn&#8217;t matter.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

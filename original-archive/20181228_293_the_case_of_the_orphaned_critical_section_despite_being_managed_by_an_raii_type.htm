@@ -1,0 +1,431 @@
+<html>
+<head>
+<title>The case of the orphaned critical section despite being managed by an RAII type</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The case of the orphaned critical section despite being managed by an RAII type</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 28, 2018 / year-entry #293</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Rolling up the debugging sleeves.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Some time ago,
+I was enlisted to help debug an elusive deadlock.
+Studying a sampling of process memory dumps led
+to the conclusion that a critical section had been orphaned.
+Sometimes, the thread that owned the critical section had
+already exited,
+but sometimes the thread was still running,
+but it was running code completely unrelated to the critical section.
+It was as if the code that acquired the critical section had
+simply forgotten to release it before returning.
+</p>
+<p>
+The thing is,
+all attempts to acquire the critical section were managed
+by an RAII type,
+so there should be no way that the critical section could have
+been forgotten.
+And yet it was.
+</p>
+<p>
+When would the destructor for an RAII object by bypassed?
+One possibility is that somebody did an
+<code>Exit&shy;Thread</code>
+or (horrors)
+<code>Terminate&shy;Thread</code>.
+But this doesn't match the evidence,
+because as noted above,
+in some of the crash dumps,
+the critical section owner is still alive and running,
+but unaware that it owns the critical section.
+</p>
+<p>
+On all platforms other than x86,
+exception unwind information is kept in
+tables in a rarely-used portion of the image,
+so that we don't waste memory on exception unwind information
+until an exception actually occurs:
+When an exception occurs, the system pages in the unwind tables
+and does a table lookup to see which unwind handler should run.
+But on x86, the exception unwind state is maintained manually in the code.
+This is a bad thing for x86 performance,
+but a good thing for getting inside the head of the compiler.
+</p>
+<blockquote CLASS=m><p>
+Bonus reading:
+<a HREF="https://github.com/CppCon/CppCon2018/blob/master/Presentations/unwinding_the_stack_exploring_how_cpp_exceptions_work_on_windows/unwinding_the_stack_exploring_how_cpp_exceptions_work_on_windows__james_mcnellis__cppcon_2018.pdf">
+Unwinding the Stack: Exploring How C++ Exceptions Work on Windows</a>.<br>
+&mdash;
+<a HREF="https://cppcon2018.sched.com/event/FnLD/unwinding-the-stack-exploring-how-c-exceptions-work-on-windows">
+James McNellis</a>, CppCon 2018
+</p>
+</blockquote>
+<p>
+The unwind checkpoint is a 32-bit value,
+usually stored at <code>[ebp-4]</code>.
+The compiler uses it to keep track of what needs to get unwound
+if an exception occurs.
+If the compiler can deduce that
+no exception can occur between two checkpoints,
+then it can optimize out the first checkpoint.
+</p>
+<p>
+There are four functions that enter the critical section in question.
+The code that does so looks like this:</p>
+<pre>
+{
+  auto guard = SystemChangeListenerCS.Lock();
+  ... some code ...
+} // guard destructor releases the lock
+</pre>
+<p>
+Finding the exact point where the guards are created is made easier with
+the assistance of the <code>#</code> debugger command,
+which means "Disassemble until you see this string in the disassembly."
+</p>
+<p>
+<pre>
+0:000&gt; #SystemChangeListenerCS SystemChangeListenerThreadProc
+SystemChangeListenerThreadProc+0x7c:
+1003319c mov     ecx,offset SystemChangeListenerCS (100b861c)
+0:000&gt;
+</pre>
+<p>
+Okay, so the debugger found a line of assembly that
+mentions <code>System&shy;Change&shy;Listener&shy;CS</code>.
+Let's look to see whether there is an unwind checkpoint after
+the lock is taken.
+</p>
+<pre>
+0:000&gt; u 1003319c
+ChangeMonitorThreadProc+0x7c:
+1003319c mov     ecx,offset contoso!SystemChangeListenerCS (100b861c)
+100331a1 push    eax
+100331a2 call    Microsoft::WRL::Wrappers::CriticalSection::Lock (1002a863)
+100331a7 mov     byte ptr [ebp-4],5
+</pre>
+<p>
+We see that immediately after acquiring the lock,
+the code updates <code>[ebp-4]</code> to remember
+that it needs to destruct the lock guard
+in case an exception occurs.
+</p>
+<p>
+<b>Exercise</b>:
+I said that the unwind state is recorded in a 32-bit value
+stored at <code>[ebp-4]</code>,
+but the code here updates only a byte.
+Why only a byte?
+</p>
+<p>
+The lock is acquired again later in that same function,
+so we'll search some more.
+If you leave off the second parameter to the <code>#</code> command,
+it continues searching where the previous search left off.
+</p>
+<pre>
+0:000&gt; #SystemChangeListenerCS
+SystemChangeListenerThreadProc+0x487:
+100335a7 mov     ecx,offset contoso!SystemChangeListenerCS (100b861c)
+0:000&gt; u 100335a7
+contoso!SystemChangeListenerThreadProc+0x487:
+100335a7 mov     ecx,offset contoso!SystemChangeListenerCS (100b861c)
+100335ac push    eax
+100335ad call    Microsoft::WRL::Wrappers::CriticalSection::Lock (1002a863)
+100335b2 mov     byte ptr [ebp-4],0Dh
+</pre>
+<p>
+Okay, so this lock guard is also marked for unwinding.
+</p>
+<p>
+The next function that uses the critical section
+is <code>Reset&shy;Widgets</code>.
+</p>
+<pre>
+0:000&gt; #SystemChangeListenerCS ResetWidgets
+ResetWidgets+0x133:
+10033fcc mov     ecx,offset SystemChangeListenerCS (100b861c)
+0:000&gt; u 10033fcc l4
+ResetWidgets+0x133:
+10033fcc mov     ecx,offset SystemChangeListenerCS (100b861c)
+10033fd1 push    eax
+10033fd2 call    Microsoft::WRL::Wrappers::CriticalSection::Lock (1002a863)
+10033fd7 call    Microsoft::WRL::ComPtr&lt;IStream&gt;::Reset (10039932)
+10033fdc call    Microsoft::WRL::ComPtr&lt;Widget&gt;::Reset (10039142)
+10033fe1 cmp     dword ptr [ebp-4Ch],0
+10033fe5 je      ResetWidgets+0x157 (10033ff0)
+10033fe7 push    dword ptr [ebp-4Ch]
+</pre>
+<p>
+Hm, this function doesn't create an unwind checkpoint after
+taking the lock.
+This means that the compiler believes that no exception can occur
+between the point the guard is created and the next thing that
+would require updating the unwind checkpoint
+(in our case, that would be the point the lock is destructed).
+</p>
+<p>
+We repeat this analysis with the other two functions.
+One of them creates an unwind checkpoint; the other doesn't.
+</p>
+<p>
+Why does the compiler believe that no exceptions can occur
+in the guarded block?
+Well, inside the block it calls
+<a HREF="https://docs.microsoft.com/en-us/cpp/windows/comptr-class?view=vs-2017#reset">
+<code>ComPtr::</code><code>Reset</code></a>
+twice,
+and it does some other stuff.
+The <code>Reset</code> method is declared like this:
+</p>
+<pre>
+template&lt;typename T&gt;
+class ComPtr {
+unsigned long Reset() { return InternalRelease(); }
+unsigned long InternalRelease() throw() { ... }
+...
+};
+</pre>
+<p>
+Observe that
+<a HREF="https://docs.microsoft.com/en-us/cpp/windows/comptr-class?view=vs-2017#internalrelease">
+the <code>Internal&shy;Release</code> method</a>
+uses the deprecated <code>throw()</code> specifier,
+which says that the method never throws an exception.
+The compiler then inferred that the <code>Reset</code> method
+also never throws an exception, since it does nothing that could
+result in an exception.
+</p>
+<p>
+This code was compiled before the Microsoft C++ compiler
+added the <code>/std:C++17</code> switch,
+so it uses
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180928-00/?p=99855">
+the old rules for the <code>throw()</code> specifier</a>,
+which for the Microsoft C++ compiler boils down to
+"I'm trusting you never to throw an exception."
+</p>
+<p>
+My theory is that the <code>Reset</code> actually did throw
+an exception.
+Since the compiler didn't create an unwind checkpoint,
+the lock guard did not get unwound.
+The exception was caught higher up the stack,
+so the process didn't crash.
+</p>
+<p>
+Digging into the two objects wrapped inside the <code>ComPtr</code>
+revealed that the first one was a <code>Widget&shy;Monitor</code>
+object.
+</p>
+<p>
+<b>Exercise</b>:
+The first was really an <code>IWidget&shy;Monitor</code> interface,
+so why did it disassemble as
+<code>ComPtr&lt;IStream&gt;</code>?
+</p>
+<p>
+The <code>Widget&shy;Monitor</code>'s destructor went like this:
+</p>
+<pre>
+WidgetMonitor::~WidgetMonitor()
+{
+ Uninitialize();
+}
+
+void WidgetMonitor::Uninitialize()
+{
+ blah blah;
+ ThrowIfFailed(m_monitor.Deactivate());
+ blah blah;
+ ThrowIfFailed(m_monitor.Disconnect());
+ blah blah;
+}
+</pre>
+<p>
+Now you see the problem.
+If the <code>Uninitialize</code> method throws an exception,
+the exception will propagate out of the destructor.
+(This code is so old that it predates C++11's rule
+that destructors are <code>noexcept</code>
+by default where possible.)
+And then it will propagate out of
+<code>ComPtr::</code><code>Internal&shy;Release</code>,
+and then out of <code>ComPtr::</code><code>Reset</code>,
+and then out of <code>Reset&shy;Widgets</code>.
+And unwinding out of <code>Reset&shy;Widgets</code>
+will not run the lock guard's destructor because the compiler
+assumed that no exception could be thrown,
+thanks to the <code>throw()</code> specifier on the
+<code>ComPtr::</code><code>Internal&shy;Release</code> method.
+</p>
+<p>
+As is often the case, it's usually a lot easier to find something
+once you know what you're looking for.
+The team dug into its telemetry to see that, yes indeed,
+the systems that encountered the problem had also thrown an
+exception from
+<code>Widget&shy;Monitor::</code><code>Uninitialize</code>,
+thus confirming the theory.
+</p>
+<p>
+Now they could work on fixing the problem:
+Fix the destructor so it doesn't throw any exceptions.
+In this specific case,
+the exception was thrown because they were deactivating
+an object that hadn't been fully activated.
+Since
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20080107-00/?p=23913">
+cleanup functions cannot fail</a>,
+the best you can do is to
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20140807-00/?p=313">
+just soldier on and clean up as much as you can</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20181228-00/?p=100585#respond" style="display:none;">Cancel reply</a></small></h3><p class="must-log-in">You must be <a href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">logged in</a> to post a comment.</p>	</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-matteo even thread-even depth-1" id="comment-1374735">
+				<div id="div-comment-1374735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585#comment-1374735">
+			December 28, 2018 at 2:43 pm</a>		</div>
+
+		<p>I have a long standing bug that really looks like this, let&#8217;s hope it&#8217;s something similar!</p>
+
+		<div class="reply"><a rel="nofollow" class="comment-reply-login" href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">Log in to Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ibookstein odd alt thread-odd thread-alt depth-1" id="comment-1374745">
+				<div id="div-comment-1374745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DoomMuffins' rel='external nofollow' class='url'>DoomMuffins</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585#comment-1374745">
+			December 29, 2018 at 12:31 am</a>		</div>
+
+		<p>Exercise #1: I&#8217;m guessing the state provably has top 3 bytes all zero at that point, so it&#8217;s a viable code density optimization.<br />
+Exercise #2: COMDAT folding merged the two instantiations of this templated function.</p>
+
+		<div class="reply"><a rel="nofollow" class="comment-reply-login" href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">Log in to Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-akraus1 even thread-even depth-1" id="comment-1374765">
+				<div id="div-comment-1374765" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alois' rel='external nofollow' class='url'>Alois</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585#comment-1374765">
+			December 30, 2018 at 3:31 pm</a>		</div>
+
+		<p>I think Exercise 2 is solved by DoomMuffins already.<br />
+But Exercise 1 is different. The numbers put into [ebp-4] look like indicies to the guard clauses. The other 3 bytes are probably only there to check in the exception handler if a stack corruption did occur. If the other 3 bytes are non zero then the application should terminate hard without any exception unwinding to prevent reliability and security issues.</p>
+
+		<div class="reply"><a rel="nofollow" class="comment-reply-login" href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">Log in to Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-billy-oneal odd alt thread-odd thread-alt depth-1" id="comment-1374825">
+				<div id="div-comment-1374825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Billy.Oneal' rel='external nofollow' class='url'>Billy.Oneal</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585#comment-1374825">
+			December 31, 2018 at 5:09 pm</a>		</div>
+
+		<p>&gt; Fix the destructor so it doesn&#8217;t throw any exceptions.</p>
+<p>Note that if this code wasn&#8217;t compiled in a nonstandard mode, they wouldn&#8217;t be able to throw exceptions, since destructors are noexcept by default in standard C++. I think lots of Windows though compiles with /Zc:implicitNoexcept- though.</p>
+
+		<div class="reply"><a rel="nofollow" class="comment-reply-login" href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">Log in to Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk even thread-even depth-1" id="comment-1374985">
+				<div id="div-comment-1374985" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585#comment-1374985">
+			January 2, 2019 at 9:41 am</a>		</div>
+
+		<p>The article already says &#8220;(This code is so old that it predates C++11&#8217;s rule that destructors are noexcept by default where possible.)&#8221;</p>
+
+		<div class="reply"><a rel="nofollow" class="comment-reply-login" href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">Log in to Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-knapek-mar odd alt thread-odd thread-alt depth-1" id="comment-1375085">
+				<div id="div-comment-1375085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Marek+Kn%C3%A1pek' rel='external nofollow' class='url'>Marek Knápek</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181228-00/?p=100585#comment-1375085">
+			January 3, 2019 at 10:09 am</a>		</div>
+
+		<p>I had similar problem. AFX_MAINTAIN_STATE2 RAII-style-class failed to revert change of global variable inside COM interface function. That function was introduced by two weird macros (one for header file one for cpp, STDMETHOD and STDMETHODIMP) which added something like __declspec(nothrow) and extern &#8220;C&#8221; attributes to it. There was also try-catch-all block around all code inside the function. Yet still, there was a rare exception thrown and destructor of the RAII object was not called.</p>
+
+		<div class="reply"><a rel="nofollow" class="comment-reply-login" href="https://blogs.msdn.microsoft.com/oldnewthing/wp-login.php?redirect_to=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20181228-00%2F%3Fp%3D100585">Log in to Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,584 @@
+<html>
+<head>
+<title>If you want to receive a message that is broadcast to top-level windows, you need a top-level window</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>If you want to receive a message that is broadcast to top-level windows, you need a top-level window</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 1, 2016 / year-entry #1</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Stands to reason.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer wanted to suppress autorun from a wizard page.
+They started with
+<a HREF="http://msdn.microsoft.com/en-us/library/bb776825.aspx">
+this page on MSDN</a>
+but found that their wizard page did not receive the
+<code>Query&shy;Cancel&shy;Auto&shy;Play</code> message.
+</p>
+<pre>
+default: 
+  if (g_uQueryCancelAutoPlay == 0) { 
+    g_uQueryCancelAutoPlay = 
+      RegisterWindowMessage(TEXT("QueryCancelAutoPlay"));
+  } 
+  if (uMsg &amp;&amp; uMsg == g_uQueryCancelAutoPlay) { 
+    SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, TRUE);          
+    return TRUE;    
+  }
+  break;
+</pre>
+<p>
+The customer reported that
+their dialog procedure never received the
+<code>Query&shy;Cancel&shy;Auto&shy;Play</code> message.
+They even called
+<code>Change&shy;Window&shy;Message&shy;Filter&shy;Ex</code>
+to explicitly allow the <code>g_uQuery&shy;Cancel&shy;Auto&shy;Play</code>
+message to be received,
+but that didn't help.
+</p>
+<p>
+The original code had other issues which distracted me from the
+actual problem.
+The source of the problem is hidden 
+in their opening statement:
+They are trying to receive this message
+<i>in a wizard</i>,
+which means that this dialog procedure does not correspond to a top-level
+window.
+It is a child dialog inside the wizard.
+</p>
+<p>
+Since broadcast messages go only to top-level windows,
+you need to have a top-level window that can receive the message.
+Creating your own top-level window will not work in this case,
+because
+<code>Query&shy;Cancel&shy;Auto&shy;Play</code> is sent only
+to the foreground window.
+Therefore, you will have to
+subclass your existing top-level window so you can
+snoop in on the messages.
+You can find the top-level window by calling
+<code>Get&shy;Ancestor(hwnd, GA_ROOT)</code>,
+and you can use
+<code>Set&shy;Window&shy;Subclass</code>
+to intercept the messages.
+</p>
+<p>
+You need to be careful about this,
+because you don't want to reject autoplay unconditionally.
+You should reject autoplay only when your page
+is the active page.
+It would be bad if the "Please insert the DVD" page suppressed
+autorun even before the user reached that page,
+or after the used moved beyond that page all the way to
+"Congratulations. Everything is ready to go."
+</p>
+<p>
+Therefore, you need to listen for the
+<code>PSN_SET&shy;ACTIVE</code> and
+<code>PSN_KILL&shy;ACTIVE</code> notifications.
+When your page becomes active, you subclass the root window;
+when it is no longer active, you remove the subclass.
+Alternatively, you can set and clear a flag,
+and have the subclass function check the flag to see whether
+it should respond to the message or let it go through.
+</p>
+<p>
+Okay, let's do it.
+First, let's have a three-page wizard that doesn't try to do anything
+fancy with autoplay.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;commctrl.h&gt;
+
+HINSTANCE g_hinst;
+
+// For demonstration purposes only. In real life, of course,
+// you would check if the correct DVD is inserted.
+
+bool IsCorrectDVD()
+{
+  SYSTEMTIME st;
+  GetSystemTime(&amp;st);
+  return st.wMinute % 2 == 0;
+}
+
+INT_PTR CALLBACK WelcomeDlgProc(
+    HWND hdlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  switch (message) {
+  case WM_NOTIFY:
+    {
+      LPNMHDR pnmh = (LPNMHDR)lParam;
+      switch (pnmh-&gt;code) {
+      case PSN_SETACTIVE:
+        PropSheet_SetWizButtons(pnmh-&gt;hwndFrom, PSWIZB_NEXT);
+        return TRUE;
+      }
+    }
+    break;
+  }
+  return FALSE;
+}
+
+INT_PTR CALLBACK InsertDlgProc(
+    HWND hdlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  switch (message) {
+  case WM_NOTIFY:
+    {
+      LPNMHDR pnmh = (LPNMHDR)lParam;
+      switch (pnmh-&gt;code) {
+      case PSN_SETACTIVE:
+        PropSheet_SetWizButtons(pnmh-&gt;hwndFrom, PSWIZB_BACK | PSWIZB_NEXT);
+        return TRUE;
+      case PSN_WIZNEXT:
+        if (!IsCorrectDVD()) {
+           MessageBox(hdlg, TEXT("Please insert the correct DVD."),
+                      TEXT("Error"), MB_OK);
+           SetWindowLongPtr(hdlg, DWLP_MSGRESULT, -1);
+           return TRUE;
+        }
+        break;
+      }
+    }
+    break;
+  }
+  return FALSE;
+}
+
+INT_PTR CALLBACK FinishedDlgProc(
+    HWND hdlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  switch (message) {
+  case WM_NOTIFY:
+    {
+      LPNMHDR pnmh = (LPNMHDR)lParam;
+      switch (pnmh-&gt;code) {
+      case PSN_SETACTIVE:
+        PropSheet_SetWizButtons(pnmh-&gt;hwndFrom, PSWIZB_FINISH);
+        return TRUE;
+      }
+    }
+    break;
+  }
+  return FALSE;
+}
+
+HPROPSHEETPAGE CreateWizardPage(PCTSTR dialogTemplate, DLGPROC dlgProc)
+{
+  PROPSHEETPAGE psp = { sizeof(psp) };
+  psp.hInstance = g_hinst;
+  psp.lParam = 0;
+  psp.dwFlags = PSP_DEFAULT;
+  psp.pszTemplate = dialogTemplate;
+  psp.pfnDlgProc = dlgProc;
+  return CreatePropertySheetPage(&amp;psp);
+}
+
+int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
+                   LPSTR lpCmdLine, int nShowCmd)
+{
+  HPROPSHEETPAGE pages[3] = {
+    CreateWizardPage(MAKEINTRESOURCE(1), WelcomeDlgProc),
+    CreateWizardPage(MAKEINTRESOURCE(2), InsertDlgProc),
+    CreateWizardPage(MAKEINTRESOURCE(3), FinishedDlgProc),
+  };
+
+  PROPSHEETHEADER psh = { sizeof(psh) };
+  psh.hInstance = hinst;
+  psh.dwFlags = PSH_WIZARD;
+  psh.pszCaption = TEXT("Awesome Wizard");
+  psh.phpage = pages;
+  psh.nPages = 3;
+  PropertySheet(&amp;psh);
+  return 0;
+}
+
+// scratch.rc
+#include &lt;windows.h&gt;
+#include &lt;commctrl.h&gt;
+
+1 DIALOGEX 0, 0, WIZ_CXDLG, WIZ_CYDLG
+STYLE DS_SHELLFONT | WS_CHILD
+FONT 8, "MS Shell Dlg 2"
+BEGIN
+    LTEXT "Welcome.", -1, 0, 8, 216, 38
+END
+
+2 DIALOGEX 0, 0, WIZ_CXDLG, WIZ_CYDLG
+STYLE DS_SHELLFONT | WS_CHILD
+FONT 8, "MS Shell Dlg 2"
+BEGIN
+    LTEXT "Insert DVD.", -1, 0, 8, 216, 38
+END
+
+3 DIALOGEX 0, 0, WIZ_CXDLG, WIZ_CYDLG
+STYLE DS_SHELLFONT | WS_CHILD
+FONT 8, "MS Shell Dlg 2"
+BEGIN
+    LTEXT "Finished.", -1, 0, 8, 216, 38
+END
+</pre>
+<p>
+So far, so boring.
+The Welcome page enables the Next button;
+the Insert page has both Back and Next buttons;
+the Finished page has a Finish button.
+If the user clicks Next on the Insert page,
+but the correct DVD is not inserted,
+then display an error message and stay on the page.
+</p>
+<p>
+Okay, now the problem:
+If the user inserts the DVD when instructed,
+it will autoplay,
+so let's suppress autoplay while the Insert page is displayed.
+</p>
+<pre>
+<font COLOR="blue">LRESULT CALLBACK MainWindowSubclassProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR uIdSubclass,
+    DWORD_PTR dwRefData)
+{
+  static UINT wmQueryCancelAutoPlay;
+
+  if (wmQueryCancelAutoPlay == 0) {
+    wmQueryCancelAutoPlay =
+      RegisterWindowMessage(TEXT("QueryCancelAutoPlay"));
+  }
+
+  if (message &amp;&amp; message == wmQueryCancelAutoPlay) {
+    HWND hwndPropSheet = (HWND)dwRefData;
+    PropSheet_PressButton(hwndPropSheet, PSBTN_NEXT);
+    return TRUE;
+  }
+  return DefSubclassProc(hwnd, message, wParam, lParam);
+}</font>
+
+INT_PTR CALLBACK InsertDlgProc(
+    HWND hdlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  <font COLOR="blue">HWND hwndRoot;</font>
+  switch (message) {
+  case WM_NOTIFY:
+    {
+      LPNMHDR pnmh = (LPNMHDR)lParam;
+      switch (pnmh-&gt;code) {
+      case PSN_SETACTIVE:
+        PropSheet_SetWizButtons(pnmh-&gt;hwndFrom, PSWIZB_BACK | PSWIZB_NEXT);
+        <font COLOR="blue">hwndRoot = GetAncestor(hdlg, GA_ROOT);
+        SetWindowSubclass(hwndRoot, MainWindowSubclassProc, 0, (DWORD_PTR)pnmh-&gt;hwndFrom);
+        SetWindowLongPtr(hdlg, DWLP_USER, (LPARAM)hwndRoot);</font>
+        return TRUE;
+      case PSN_WIZNEXT:
+        if (!IsCorrectDVD()) {
+           MessageBox(hdlg, TEXT("Please insert the correct DVD."),
+                      TEXT("Error"), MB_OK);
+           SetWindowLongPtr(hdlg, DWLP_MSGRESULT, -1);
+           return TRUE;
+        }
+        break;
+      <font COLOR="blue">case PSN_KILLACTIVE:
+        hwndRoot = (HWND)SetWindowLongPtr(hdlg, DWLP_USER, 0);
+        RemoveWindowSubclass(hwndRoot, MainWindowSubclassProc, 0);</font>
+        break;
+      }
+    }
+    break;
+  }
+  return FALSE;
+}
+</pre>
+<p>
+Our subclass procedure receives the property sheet window
+as its reference data.
+It checks whether the message is
+<code>Query&shy;Cancel&shy;Auto&shy;Play</code>.
+If so, then it presses the Next button in the property
+sheet and returns <code>TRUE</code> to cancel the autoplay.
+</p>
+<p>
+<b>Exercise</b>: I thought you returned a value from a dialog
+procedure by using <code>Set&shy;Window&shy;Long&shy;Ptr</code>
+with <code>DWLP_MSG&shy;RESULT</code>,
+but here, we're just returning <code>TRUE</code> directly.
+What's going on?
+</p>
+<p>
+The dialog procedure for the page installs the subclass when
+the page is activated,
+and it removes the subclass when the page is deactivated.
+The window to be subclassed is the root window for the wizard.
+We save that in our <code>DWLP_USER</code> so we know which
+window to unsubclass when we lose activation.
+Note also that we pass the property sheet as the reference
+data for <code>Set&shy;Window&shy;Subclass</code>,
+so that the subclass procedure has the correct window handle
+for the <code>Prop&shy;Sheet_Press&shy;Button</code> macro.
+</p>
+<p>
+By the way,
+as a courtesy, the property sheet manager forwards the following
+messages to all pages:
+</p>
+<ul>
+<li><code>WM_DISPLAY&shy;CHANGE</code>
+<li><code>WM_SETTINGS&shy;CHANGE</code>
+<li><code>WM_SYS&shy;COLOR&shy;CHANGE</code>
+</ul>
+<p>
+And it forwards the following messages to the active page:
+</p>
+<ul>
+<li><code>WM_ACTIVATE&shy;APP</code>
+<li><code>WM_ACTIVATE</code>
+<li><code>WM_DEVICE&shy;CHANGE</code>
+<li><code>WM_ENABLE</code>
+<li><code>WM_END&shy;SESSION</code>
+<li><code>WM_PALETTE&shy;CHANGED</code> (but only if the
+    <code>wParam</code> is not the property sheet itself,
+    to
+    <a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/dd145214(v=vs.85).aspx">
+    avoid an infinite palette realization loop</a>)</p>
+<li><code>WM_QUERY&shy;END&shy;SESSION</code>
+<li><code>WM_QUERY&shy;NEW&shy;PALETTE</code>
+</ul>
+<p>
+But for other messages
+(like <code>Query&shy;Cancel&shy;Auto&shy;Play</code>),
+you're on your own.
+</p>
+<p>
+Armed with this knowledge, you can
+answer this question,
+which as it happens,
+arrived eight months later
+from the same customer!
+</p>
+<blockquote CLASS="q"><p>
+We have a scenario where we need some pages of a wizard
+to know that a
+<code>WM_POWER&shy;BROADCAST</code> message has arrived.
+What is the best way to pass this message to the wizard pages?
+Also, how would we ensure that this message only gets forwarded
+to the page that is currently active?
+</p>
+</blockquote>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1220651">
+				<div id="div-comment-1220651" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220651">
+			January 1, 2016 at 7:13 am</a>		</div>
+
+		<p>To be fair, usually you do want to suppress the autorun during the entire wizard. The idea behind a wizard is that the user is doing things in a known order.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1220661">
+				<div id="div-comment-1220661" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220661">
+			January 1, 2016 at 10:27 am</a>		</div>
+
+		<p>See paragraph &#8220;You need to be careful about this, because you don’t want to reject autoplay unconditionally.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1220701">
+				<div id="div-comment-1220701" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220701">
+			January 3, 2016 at 2:28 am</a>		</div>
+
+		<p>I would go as far as to suggest that you would only want to suppress the autorun not only when your wizard is on the right page but also when it is in the foreground.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-3" id="comment-1220712">
+				<div id="div-comment-1220712" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220712">
+			January 3, 2016 at 11:35 pm</a>		</div>
+
+		<p>That second part is already covered: The QueryCancelAutoPlay message is sent only to the foreground window.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mohamedsalah123 even thread-odd thread-alt depth-1 parent" id="comment-1220751">
+				<div id="div-comment-1220751" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/mmediouni' rel='external nofollow' class='url'>mmediouni</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220751">
+			January 4, 2016 at 9:26 am</a>		</div>
+
+		<p>Why in NT&#8217;s history, GUI management wasn&#8217;t its own subsystem with its own API, and the Win32 GUI API layered on the top of it?<br />
+Most of other Win32 APIs are translation layers to the Native API.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1220771">
+				<div id="div-comment-1220771" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220771">
+			January 4, 2016 at 10:36 am</a>		</div>
+
+		<p>Originally the GUI was a separate subsystem, but the performance was bad, so it got moved into the kernel.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mohamedsalah123 even depth-3 parent" id="comment-1220781">
+				<div id="div-comment-1220781" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/mmediouni' rel='external nofollow' class='url'>mmediouni</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220781">
+			January 4, 2016 at 11:08 am</a>		</div>
+
+		<p>yeah, but why was the Win32 GDI API chosen for the GUI, even in NT 3.1?(NT is supposed to have multiple subsystems, which may have not compatible ways to display graphics, a translator on the top on Win32 is not ideal)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4 parent" id="comment-1220783">
+				<div id="div-comment-1220783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220783">
+			January 4, 2016 at 11:25 am</a>		</div>
+
+		<p>The GUI for Windows NT was originally OS/2 PM. You can read your computing history for more details.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-yuhong-bao even depth-5" id="comment-1220812">
+				<div id="div-comment-1220812" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220812">
+			January 4, 2016 at 6:43 pm</a>		</div>
+
+		<p>I think OP was asking for a completely subsystem generic GUI API.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mohamedsalah123 odd alt depth-5" id="comment-1220884">
+				<div id="div-comment-1220884" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/mmediouni' rel='external nofollow' class='url'>mmediouni</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160101-00/?p=92761#comment-1220884">
+			January 5, 2016 at 10:18 am</a>		</div>
+
+		<p>Yuhong Bao: yeah, I see no need for the GUI (and its API) to be tied with a particular subsystem</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,686 @@
+<html>
+<head>
+<title>Reading a contract from the other side: SHSetInstanceExplorer and SHGetInstanceExplorer</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Reading a contract from the other side: SHSetInstanceExplorer and SHGetInstanceExplorer</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 28, 2008 / year-entry #181</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>27</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Shell extensions that create worker threads need to call the SHGetInstanceExplorer function so that Explorer will not exit while the worker thread is still running. When your worker thread finishes, you release the IUnknown that you obtained to tell the host program, "Okay, I'm done now, thanks for waiting." You can read this contract from...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Shell extensions that create worker threads need to call the
+<code>SHGetInstanceExplorer</code> function
+so that Explorer will not exit while the worker thread is still running.
+When your worker thread finishes, you release the <code>IUnknown</code>
+that you obtained to tell the host program,
+"Okay, I'm done now, thanks for waiting."
+</p>
+<p>
+You can read this contract from the other side.
+Instead of thinking of yourself as the shell extension running
+inside a host program,
+think of yourself as the host program that has a shell extension
+running inside of it.
+Consider
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/11/26/270710.aspx">
+a simple program</a>
+that displays the properties of a file,
+or at least tries to:
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;shellapi.h&gt;
+#include &lt;tchar.h&gt;
+
+int __cdecl _tmain(int argc, TCHAR **argv)
+{
+  SHELLEXECUTEINFO sei = { sizeof(sei) };
+  sei.fMask = SEE_MASK_FLAG_DDEWAIT | SEE_MASK_INVOKEIDLIST;
+  sei.nShow = SW_SHOWNORMAL;
+  sei.lpVerb = TEXT("properties");
+  sei.lpFile = TEXT("C:\\Windows\\Explorer.exe");
+  ShellExecuteEx(&amp;sei);
+  return 0;
+}
+</pre>
+<p>
+Oh dear!
+When you run this program, nothing happens.
+Well, actually, something did happen, but the program exited
+too fast for you to see it.
+To slow things down, add the line
+</p>
+<pre>
+  MessageBox(NULL, TEXT("Waiting"), TEXT("Title"), MB_OK);
+</pre>
+<p>
+right before the <code>return 0</code>.
+Run the program again, and this time the properties dialog
+appears, as well as the message box.
+Aha, the problem is that our program is exiting while the property
+sheet is still active.
+(Now delete that call to <code>MessageBox</code> before something
+stupid happens.)
+</p>
+<p>
+The question now is how to know when the property sheet is
+finished so we can exit.
+That's where <code>SHSetInstanceExplorer</code> comes in.
+The name "Explorer" in the function name is really a placeholder
+for "the host program";
+it just happens to be called "Explorer" because the function
+was written from the point of view of the shell extension,
+and the host program is nearly always Explorer.exe.
+</p>
+<p>
+In this case, however, we are the host program, not Explorer.
+The <code>SHSetInstanceExplorer</code> lets you register a
+free-threaded <code>IUnknown</code> that shell extensions can
+obtain by calling <code>SHGetInstanceExplorer</code>.
+Following COM reference counting conventions,
+the <code>SHGetInstanceExplorer</code>
+performs an <code>AddRef()</code> on the <code>IUnknown</code>
+that it returns;
+the shell extension's worker thread
+performs the corresponding <code>Release()</code>
+when it is finished.
+</p>
+<p>
+All that is required of the <code>IUnknown</code> that you
+pass to <code>SHSetInstanceExplorer</code> is that it be
+free-threaded; in other words, that it support being called
+from multiple threads.
+This means managing the "process reference count"
+with interlocked functions rather than boring <code>++</code>
+and <code>--</code> operators.
+Of course, in practice, you also need to tell your main program
+"Okay, all the shell extensions are finished; you can exit now"
+when the reference count drops to zero.
+</p>
+<p>
+There are many ways to accomplish this task.
+Here's one that I threw together just now.
+I didn't think too hard about this class;
+I'm not positioning this as the best way of implementing it,
+or even as a particularly good one.
+The purpose of this article is to show the <i>principle</i> behind
+process references.
+Once you understand that,
+you are free to go ahead and solve the problem your own way.
+But here's <i>a</i> way.
+</p>
+<pre>
+#include &lt;shlobj.h&gt;
+
+class ProcessReference : public IUnknown {
+public:
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv)
+  {
+    if (riid == IID_IUnknown) {
+      *ppv = static_cast&lt;IUnknown*&gt;(this);
+      AddRef();
+      return S_OK;
+    }
+   *ppv = NULL; return E_NOINTERFACE;
+  }
+
+  STDMETHODIMP_(ULONG) AddRef()
+    { return InterlockedIncrement(&amp;m_cRef); }
+
+  STDMETHODIMP_(ULONG) Release()
+  {
+    LONG lRef = InterlockedDecrement(&amp;m_cRef);
+    if (lRef == 0) PostThreadMessage(m_dwThread, WM_NULL, 0, 0);
+    return lRef;
+  }
+
+  ProcessReference()
+    : m_cRef(1), m_dwThread(GetCurrentThreadId())
+    { SHSetInstanceExplorer(this); }
+
+  ~ProcessReference()
+  {
+    SHSetInstanceExplorer(NULL);
+    Release();
+
+    MSG msg;
+    while (m_cRef &amp;&amp; GetMessage(&amp;msg, NULL, 0, 0)) {
+      TranslateMessage(&amp;msg);
+      DispatchMessage(&amp;msg);
+    }
+  }
+
+private:
+  LONG m_cRef;
+  DWORD m_dwThread;
+};
+</pre>
+<p>
+The idea behind this class is that the main thread (and only
+the main thread) creates it on the stack.
+When constructed, the object registers itself as the
+"process <code>IUnknown</code>";
+any shell extensions that call <code>SHGetInstanceExplorer</code>
+will get a pointer to this object.
+When the object is destructed, it unregisters itself as the process
+reference (to avoid dangling references) and
+waits for the reference count
+to drop to zero.
+Notice that the <code>Release</code> method posts a dummy thread
+message so that the "waiting for the reference count to go to zero"
+message loop will wake up.
+</p>
+<p>
+In a sense, this is backwards from the way normal COM objects work,
+which operate under the principle of "When the reference count drops to
+zero, the object is destructed."
+We turn it around and code it up as
+"when the object is destructed, it waits for the reference count
+to drop to zero."
+If you wanted to do it the more traditional COM way,
+you could have the main thread go into a wait loop and have
+the object's destructor signal the main thread.
+I did it this way because it makes using the class very convenient.
+</p>
+<p>
+Now that we have a process reference object, it's a simple matter
+of adding it to our main thread:
+</p>
+<pre>
+int __cdecl _tmain(int argc, TCHAR **argv)
+{
+  <font COLOR=blue>ProcessReference ref;</font>
+  ...
+</pre>
+<p>
+With this modification, the program displays the property sheet
+and patiently waits for the property sheet to be dismissed
+before it exits.
+</p>
+<p>
+<b>Exercise</b>: Explain how the object behaves if we initialized
+the reference count to zero and deleted the call to <code>Release</code>
+in the destructor.
+</p>
+<p>
+<b>Bonus reading</b>:
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/05/21/136701.aspx">
+Do you know when your destructors run? Part 2</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (27)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-633643">
+				<div id="div-comment-633643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">meh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633643">
+			May 28, 2008 at 11:02 am</a>		</div>
+
+		<p>Wow. This will come in handy. Many thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-633663">
+				<div id="div-comment-633663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633663">
+			May 28, 2008 at 12:25 pm</a>		</div>
+
+		<p>As a bonus, if you do this then all the property dialogs opened from common dialogs will hang around when the user &quot;exits&quot; your program.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-633673">
+				<div id="div-comment-633673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mathieu Garstecki</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633673">
+			May 28, 2008 at 12:44 pm</a>		</div>
+
+		<p>Shouldn&#8217;t the m_cRef member be declared as volatile ? Without it, the variable &nbsp;might be put in a register when the loop starts, and not be reloaded, isn&#8217;t it ? Am I missing something here ?</p>
+<div class=post>[<i>That would be a violation of the &#8220;as-if&#8221; rule, because GetMessage might change m_cRef. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-633743">
+				<div id="div-comment-633743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexandre Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633743">
+			May 28, 2008 at 4:24 pm</a>		</div>
+
+		<p>BryanK:</p>
+<p>All platforms that run Windows guarantee cache coherency between processors. Also, any function that can cause thread switch (such as GetMessage) acts implicitly as memory barrier.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-633773">
+				<div id="div-comment-633773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.tungware.com' rel='external nofollow' class='url'>Henry Skoglund</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633773">
+			May 28, 2008 at 7:00 pm</a>		</div>
+
+		<p>The question was what would happen if we set the refcount to 0 and omitted the Release() call:</p>
+<p>(While I haven&#8217;t actually tried to run the code) it seems to me the ProcessReference object would behave perfectly fine as long as the client/shell extension remembers to call the SHGetInstanceExplorer function. If not it would hang in the message loop in the destructor (because Relase() will never be called).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-633793">
+				<div id="div-comment-633793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633793">
+			May 28, 2008 at 7:30 pm</a>		</div>
+
+		<p>&quot;(Now delete that call to MessageBox before something stupid happens.)&quot;</p>
+<p>What do you mean?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-633813">
+				<div id="div-comment-633813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633813">
+			May 28, 2008 at 7:37 pm</a>		</div>
+
+		<p>From MSDN:</p>
+<p>&quot;Note &nbsp;This function is available through Windows XP Service Pack 2 (SP2) and Windows Server 2003. It might be altered or unavailable in subsequent versions of Windows.&quot;</p>
+<p>Should this be removed?</p>
+<p>Clue if you are wondering why that was added: It was added for the same reason another Shell function was misspelled, which is out of scope of this blog entry.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-633683">
+				<div id="div-comment-633683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633683">
+			May 28, 2008 at 1:08 pm</a>		</div>
+
+		<p>&quot;volatile&quot; doesn&#8217;t fix concurrency issues. &nbsp;It only informs the compiler; it does *not* inform the CPU.</p>
+<p>If you&#8217;re running on SMP, and you put &quot;volatile&quot; there, then whichever CPU runs this code will load whichever line into its cache when the loop starts. &nbsp;(Well, actually, before that &#8212; speculative execution is fun!) &nbsp;Then, it may not update that line when another thread (running on a different CPU) updates the variable. &nbsp;(It depends on the CPU&#8217;s memory model.) &nbsp;This is why e.g. the Linux kernel doesn&#8217;t use &quot;volatile&quot; as a memory barrier: it&#8217;s not one.</p>
+<p>To make it completely safe, you have to do some kind of interlocked operation when you&#8217;re writing *and* when you&#8217;re reading m_cRef. &nbsp;(Maybe not on x86, of course. &nbsp;But this is C (well, C++), not x86 assembly.) &nbsp;The proper way to do this is something like:</p>
+<p>while(InterlockedCompareExchange(&amp;m_cRef, 0L, 0L) &amp;&amp; GetMessage(&#8230;)) { &#8230; }</p>
+<p>(Suitably modified for pointer-sized integers, if needed, of course.)</p>
+<p>The &quot;exchange&quot; doesn&#8217;t actually modify the variable, but the &quot;read&quot; part of the exchange is still atomic with respect to other interlocked operations.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-633843">
+				<div id="div-comment-633843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Todd Greer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633843">
+			May 29, 2008 at 12:47 am</a>		</div>
+
+		<p>There is some documentation on MSDN that says that &quot;As of VS 2005, volatile now implements aquire/release semantics&quot;. However, I have heard reports that this is not true, at least for x64 builds. I haven&#8217;t verified any of this myself. Whether it is appropriate to rely on compiler-specific behavior is of course very context-dependent. It doesn&#8217;t make sense in my context.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cornedbee odd alt thread-odd thread-alt depth-1" id="comment-633883">
+				<div id="div-comment-633883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CornedBee</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633883">
+			May 29, 2008 at 3:07 am</a>		</div>
+
+		<blockquote><p>
+  it seems to me the ProcessReference object would behave perfectly fine as long as the client/shell extension remembers to call the SHGetInstanceExplorer function. If not it would hang in the message loop in the destructor (because Relase() will never be called).
+</p></blockquote>
+<p>The example program was too simple. What if the program only shows the properties dialog under certain circumstances? When it doesn&#8217;t, no one will ever call Release() even without a buggy extension.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-633913">
+				<div id="div-comment-633913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633913">
+			May 29, 2008 at 3:53 am</a>		</div>
+
+		<p>@CornedBee</p>
+<p>I&#8217;m not getting your answer to Raymond&#8217;s &quot;exercise question&quot;. Even if release() was never called because the object hasn&#8217;t been used in the code &#8211; why would the destructor block? If m_cRef was initialized to 0, the first condition of the while-statement would prevent GetMessage() from being called in the first place &#8211; wouldn&#8217;t it?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-633923">
+				<div id="div-comment-633923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gwyn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633923">
+			May 29, 2008 at 4:54 am</a>		</div>
+
+		<p>Hi Michael B,</p>
+<p>after the call to Release() in the destructor, what will the value of m_cRef be?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-633963">
+				<div id="div-comment-633963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633963">
+			May 29, 2008 at 8:10 am</a>		</div>
+
+		<p>Raymond wrote:</p>
+<blockquote><p>
+  [That would be a violation of the &quot;as-if&quot; rule, because GetMessage might change m_cRef. -Raymond]
+</p></blockquote>
+<p>For all I know, GetMessage might start by performing some kind of atomic read with a fast bail-out, which might get inlined by whole-program optimization when statically linking to whatever provides GetMessage. The compiler might decide to not reload m_cRef in that case if it can prove it&#8217;s not changed.</p>
+<p>Or perhaps GetMessage doesn&#8217;t necessarily provide a memory barrier for m_cRef, meaning that an incorrect value might be read from the current CPU&#8217;s cache despite having been modified by another CPU.</p>
+<p>Not that I&#8217;m saying that I understand Win32 development enough to know whether the above is valid in this case (perhaps GetMessage is always dynamically-linked, and the semantics of the above loop guarantee that there&#8217;ll be a memory barrier before m_cRef is read?). But you seem to be saying that &quot;because it&#8217;s a call to an external function, the compiler can&#8217;t tell whether it modifies m_cRef&quot;, which is not necessarily true.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-633983">
+				<div id="div-comment-633983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Medinoc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-633983">
+			May 29, 2008 at 9:47 am</a>		</div>
+
+		<p>Just to confirm I got it straight: ShellExecuteEx() with &quot;properties&quot; displays the file&#8217;s property sheet in the calling process, only in a new thread?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kjkhyperion even thread-even depth-1" id="comment-634073">
+				<div id="div-comment-634073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634073">
+			May 29, 2008 at 12:08 pm</a>		</div>
+
+		<p>BryanK: <em>never</em> believe anything Torvalds says. It&#8217;s a GCC issue &#8211; in Visual Studio 2003 and later, accessing a &quot;volatile&quot; implies a barrier; in 2005 and later, barriers apply across the call stack, too. It&#8217;s all documented</p>
+<p>The core issue is that C and C++ don&#8217;t have a standard memory model, but Herb Sutter and others are working on it, specifically based on the assumptions Windows makes: &lt;<a rel="nofollow" target="_new" href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2007/n2197.pdf&gt;" rel="nofollow"></a><a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2007/n2197.pdf&#038;gt" rel="nofollow">http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2007/n2197.pdf&#038;gt</a>;. C++0x will include a memory model specification, too</p>
+<p>Technically, multi-threaded C/C++ applications &quot;never worked&quot;, because there was no real reason they should work, it wasn&#8217;t like anyone had given it any thought. This doesn&#8217;t mean in practice multi-threading never worked, period</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-634003">
+				<div id="div-comment-634003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634003">
+			May 29, 2008 at 10:19 am</a>		</div>
+
+		<p>Gwyn: The call to Release() in the destructor would also be removed. &nbsp;I don&#8217;t know what the issue would be with initializing the ref-count to zero, other than &quot;COM objects&#8217; ref-counts can&#8217;t be zero&quot;. &nbsp;Maybe it&#8217;s as simple as that? &nbsp;Not sure.</p>
+<p>Alexandre Grigoriev:</p>
+<p>&gt; All platforms that run Windows guarantee cache coherency between processors.</p>
+<p>Sure, today that may be true (IA64?). &nbsp;Will it always be true? &nbsp;Will Windows ever run on a system whose processors are separated by a network, and therefore can&#8217;t do cache coherency protocols quickly enough?</p>
+<p>Besides, &quot;volatile&quot; in general is almost always a bad idea (because it&#8217;s basically just a superstition). &nbsp;See e.g. <a rel="nofollow" target="_new" href="http://lkml.org/lkml/2007/8/17/187" rel="nofollow">http://lkml.org/lkml/2007/8/17/187</a> (note that the discussion there was *exactly* this type of setup: atomic_read() with a barrier, versus atomic_read with just a volatile keyword).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-634223">
+				<div id="div-comment-634223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634223">
+			May 29, 2008 at 7:18 pm</a>		</div>
+
+		<p>Dang&#8230; Henry posted a good answer to Raymond&#8217;s exercise before I got around to it.</p>
+<p>Here&#8217;s what Raymond had to say about initializing with a refcount of 1 vs. a refcount of 0 before:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2005/09/29/475298.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2005/09/29/475298.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-634183">
+				<div id="div-comment-634183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.tungware.com' rel='external nofollow' class='url'>Henry Skoglund</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634183">
+			May 29, 2008 at 5:47 pm</a>		</div>
+
+		<p>To Michael B:</p>
+<p>you&#8217;re right, after I posted my comment yesterday I also saw that indeed the destructor will not block, because of the check for m_cRef being 0.</p>
+<p>But about that exercise: there might still be another problem hiding in the code, which can be triggered because of the free-threaded requirement on the object.</p>
+<p>Assume that one thread (#1) owns the ProcessReference object, and another thread (#2) uses it. </p>
+<p>Consider the case when the 2nd thread is executing in Release(), specifically this line:</p>
+<p>if (lRef == 0) PostThreadMessage(m_dwThread, WM_NULL, 0, 0);</p>
+<p>If that thread is rescheduled/switched out right after (lRef == 0) but *before* calling PostThreadMessage(), and the 1st thread is the next one running, and it calls the ProcessReference&#8217;s destructor at that point, then the 1st thread would prematurely exit the destructor (because it would never run the message loop).</p>
+<p>So the answer to Raymond&#8217;s exercise might be, that without the destructor having its own call to Release() (and setting the refcount to 0), a free-threaded environment could raise problems. With a Release() call in the destructor I think those dangers are more or less eliminated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-634443">
+				<div id="div-comment-634443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Denisenko Mikhail</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634443">
+			May 30, 2008 at 10:48 am</a>		</div>
+
+		<p>If refCount initialized to 0 then every time refCount will go to 0 message will be posted to thread queue. In destructor only 1 message will be consumed. Problems: unexpected messages in message queue &#8211; not good, or there is possible queue overflow, possible? still not good :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-634553">
+				<div id="div-comment-634553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634553">
+			May 30, 2008 at 2:04 pm</a>		</div>
+
+		<p>mikeb: Ah, I bet that&#8217;s it. &nbsp;Accessing member variables after the object has been destroyed (because the destructor has finished, and so the memory that was allocated on the stack is gone, since main has exited and the C runtime is now running) is definitely bad. &nbsp;:-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-634393">
+				<div id="div-comment-634393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634393">
+			May 30, 2008 at 8:27 am</a>		</div>
+
+		<p>&gt; _never_ believe anything Torvalds says.</p>
+<p>That right there is an ad-hominem fallacy. &nbsp;Who says it is irrelevant: if there&#8217;s something wrong with the argument, feel free to point it out. &nbsp;;-)</p>
+<p>&gt; It&#8217;s a GCC issue</p>
+<p>No, it&#8217;s a C standards issue (as you point out later). &nbsp;There is *no* real standard for what to do when volatile is present (on a multi-CPU machine: but on a single-CPU machine, it&#8217;s irrelevant), so various compiler writers are free to do almost *anything*. &nbsp;That includes adding a barrier (as VS2005 and later have done with a memory barrier, and VS2003 has done with a compiler barrier), turning off basically all their optimizations (as GCC seems to do), or anything else.</p>
+<p>The fact that &lt;insert favorite compiler here&gt; takes &quot;volatile&quot; to mean &quot;add a bunch of barriers all over&quot; doesn&#8217;t mean you should post code that depends on that behavior; not every Windows developer uses VS. &nbsp;(There are some that use mingw, and &#8212; at a guess &#8212; many more that use compilers from other companies.) &nbsp;There are even fewer Windows developers that use VS2005 or later (some people still use VC++6, or perhaps even older versions). &nbsp;So J. Random Developer coming to this blog in six months and using Some Other C++ Compiler reads &quot;insert volatile to fix it!&quot;, and does, and gets completely wrong code out.</p>
+<p>Using &quot;volatile&quot; as a magic wand, to be used to make every lock-free multi-threaded algorithm correct, is still WRONG. &nbsp;It may work properly with *some* compilers, but it isn&#8217;t forced to mean anything to the processor, so SMP machines will still get the lock-free algorithm wrong.</p>
+<p>A memory model spec will help future C compilers, yes &#8212; but it doesn&#8217;t do a whole lot of good at the moment. &nbsp;;-)</p>
+<p>Also, regarding GetMessage being a barrier: You need a (read) barrier *before* reading m_cRef, not after reading it. &nbsp;(Just like you need a write barrier *after* writing to it.) &nbsp;Of course, GetMessage is called before the *next* read (in the loop), so it might be OK for all except the first access; I haven&#8217;t thought it through very far.</p>
+<p>Henry: I&#8217;m not sure whether that&#8217;s an issue, since the destructor does still exit. &nbsp;Yes, it exits early, but I don&#8217;t *think* that matters.</p>
+<p>Although, hang on, it might: When the second thread resumes, it will still post a WM_NULL message to the &quot;main&quot; thread, which won&#8217;t get consumed by the destructor. &nbsp;Depending on what happens after the destructor finishes, this may be bad &#8212; if that thread goes into another GetMessage loop, then it will be bad, since it&#8217;ll pick up a message that nobody should have sent.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-634603">
+				<div id="div-comment-634603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://codewiz51.blogspot.com' rel='external nofollow' class='url'>Old Coder</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634603">
+			May 30, 2008 at 5:34 pm</a>		</div>
+
+		<p>Well, if you forget and leave out InterlockedDecrement in the release method, your program falls over pretty quickly.</p>
+<p>File this mistake under I should have used cut and paste&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-634483">
+				<div id="div-comment-634483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634483">
+			May 30, 2008 at 12:13 pm</a>		</div>
+
+		<p>&gt;&gt; Henry: I&#8217;m not sure whether that&#8217;s an issue, since the destructor does still exit. &nbsp;Yes, it exits early, but I don&#8217;t *think* that matters.</p>
+<p>Although, hang on, it might: When the second thread resumes, it will still post a WM_NULL message to the &quot;main&quot; thread, which won&#8217;t get consumed by the destructor. &nbsp;Depending on what happens after the destructor finishes, this may be bad &#8212; if that thread goes into another GetMessage loop, then it will be bad, since it&#8217;ll pick up a message that nobody should have sent. &lt;&lt;</p>
+<p>At least one race condition exists regardless of the behavior of message queues or what PostThreadMessage() might do internally. &nbsp;The m_dwThread member of ProcessReference can be accessed in the Release() method after the dtor finishes if the m_cRef counter is initialized to 0 instead of 1.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-634683">
+				<div id="div-comment-634683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">yme</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634683">
+			May 30, 2008 at 9:36 pm</a>		</div>
+
+		<p>How does initializing the reference count to 1 prevent the worker thread from accessing m_dwThread in Release() after the destructor is done? &nbsp;It seems to me that once the destructor executes Release(), things are the same as if the reference count had been initialized to 0.</p>
+<p>That is: the reference count is 1; the worker thread starts running Release(), which decrements it to 0; the main thread continues running the destructor, which completes; the worker thread continues running Release(), which tries to access m_dwThread.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-634793">
+				<div id="div-comment-634793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634793">
+			May 31, 2008 at 2:28 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; It seems to me that once the destructor executes Release(), things are the same as if the reference count had been initialized to 0. &lt;&lt;
+</p></blockquote>
+<p>The difference is that before the Release() is called in the dtor the ProcessReference has called SHSetInstanceExplorer(NULL) while the refcount is non-zero so nothing else can obtain a new reference. &nbsp;Of course, this means that the implementations of SHSetInstanceExplorer() and SHGetInstanceExplorer() need to have some synchronization, but that&#8217;s an internal implementation detail that one should be able to assume is taken care of (otherwise the API is unsafe no matter what you do as a client).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-634853">
+				<div id="div-comment-634853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">yme</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634853">
+			June 1, 2008 at 7:15 am</a>		</div>
+
+		<p>I don&#8217;t follow.</p>
+<p>If the reference count starts at 1 and the destructor calls Release(), then at the beginning of the destructor&#8217;s while() loop, there may be any number of outstanding references to the object, and the reference count equals that number, as it should. &nbsp;And the same holds if the reference count starts at 0 and the destructor omits the call to Release().</p>
+<p>Why does it matter what the reference count was when the references were given out?</p>
+<p>For an object that deletes itself whenever its reference count changes from 1 to 0, I understand that the reference count should never be 0 when anyone holds a reference, because they may call AddRef() and then Release(), expecting things to return to the way they were, but instead the object will disappear. &nbsp;But here, strictly, the reference count needs to be accurate only when the destructor starts its while() loop, because before that, the object will stay around regardless of its reference count.</p>
+<p>I hope I don&#8217;t sound too nitpicky. &nbsp;Undoubtedly, it&#8217;s a good idea to keep the reference count accurate all the time, just for consistency: if the implementation of SHSetInstanceExplorer() and SHGetInstanceExplorer() has a reference to the object, we may as well record that fact in the reference count. &nbsp;But Raymond did ask as an exercise how the object would behave if we didn&#8217;t, and so far, I don&#8217;t see how it would behave differently. &nbsp;(Of course, maybe that&#8217;s the right answer. &nbsp;I don&#8217;t know.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-634913">
+				<div id="div-comment-634913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080528-00/?p=22163#comment-634913">
+			June 2, 2008 at 9:05 am</a>		</div>
+
+		<p>is this API similar to what you can get with SHCreateThreadRef/SHSetThreadRef ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,348 @@
+<html>
+<head>
+<title>How can I reserve a range of address space and create nonzero memory on demand when the program reads or writes a page in the range, even when multithreading?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I reserve a range of address space and create nonzero memory on demand when the program reads or writes a page in the range, even when multithreading?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 26, 2018 / year-entry #23</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>7</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Some memory mapping magic.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Last time,
+we described
+how you can become the page access manager for a range of pages,
+but it
+<!-- backref; How can I reserve a range of address space and create nonzero memory on demand when the program reads or writes a page in the range? -->
+required that all the accesses came from one thread at a time</a>
+because you don't want another thread to be able to access the memory
+while it is still
+being prepared.
+That requirement exists because we are preparing the pages in place,
+and once you unprotect the page so you can prepare the page,
+another thread can sneak in and see the pages before they're ready.
+</p>
+<p>
+Let's see what we can do to get this to work in the multithreading case, too.
+</p>
+<p>
+Unfortunately, I don't see a version of <code>Virtual&shy;Alloc</code>
+that lets you say,
+"Please take this page of memory I already have and map it into
+that location over there."
+You can do it if you're willing to use AWE,
+but that requires permission to allocate physical memory,
+and you lose the ability to write-protect pages
+(which makes detecting dirty pages harder),
+and it works only on natively 32-bit versions of Windows.
+</p>
+<p>
+So we'll have to use a different trick:
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20031007-00/?p=42263">
+mapping the same block of memory into two locations</a>.
+We'll take the trick a step further
+and map the same memory twice,
+but with different permissions.
+</p>
+<p>
+First, create a shared memory block with
+<code>Create&shy;File&shy;Mapping</code>,
+specifying a page protection of <code>PAGE_</code><code>READ&shy;WRITE</code>.
+This gives you read/write access to the underlying memory.
+</p>
+<p>
+Next,
+map the shared memory block with <code>Map&shy;View&shy;Of&shy;File</code>,
+specifying a file mapping access of
+<code>FILE_</code><code>MAP_</code><code>WRITE</code>,
+since we will eventually want to give the client write access
+(just not at first).
+This is the memory region that will be used to hold client-visible memory.
+Right now, it's filled with zeroes, but we'll fix that soon.
+</p>
+<p>
+Use <code>Virtual&shy;Protect</code> to
+change the page protection to
+<code>PAGE_</code><code>NO&shy;ACCESS</code> for all the pages.
+This removes access to all the pages.
+The client-visible memory is now ready.
+</p>
+<p>
+When an access violation
+occurs and you want to swizzle some memory and map it in,
+here's what you do:
+</p>
+<p>
+Use the faulting address to figure out which page of data
+needs to be swizzled and mapped in.
+</p>
+<p>
+Use some sort of synchronization to make sure only one thread
+is doing the swizzling for this page.
+If you discover that the
+page has already been swizzled,
+then you are done
+because the other thread already did the work for you.
+</p>
+<p>
+Otherwise, you are the first thread to handle the access violation.
+Find the corresponding page in your file mapping and
+use <code>Map&shy;View&shy;Of&shy;File</code> with a
+file mapping access of <code>FILE_</code><code>MAP_</code><code>WRITE</code>.
+This creates a second view of the page in which
+the client just took an access violation.
+</p>
+<p>
+Use this second view to create the data
+that you eventually want to make visible to the client.
+Note that we have two views to the same data:
+A no-access view that the client knows about and
+a read-write view that only you know about.
+</p>
+<p>
+When you're happy with the page of data,
+you can unmap the second view since you don't need it any more.
+</p>
+<p>
+Use <code>Virtual&shy;Protect</code> to
+change the page protection of the client-visible page to
+<code>PAGE_</code><code>READ&shy;ONLY</code>.
+Do this only for the one page that you prepared.
+This "opens up" that page in the view,
+converting it from <code>PAGE_</code><code>NO&shy;ACCESS</code>
+to
+<code>PAGE_</code><code>READ&shy;ONLY</code>.
+</p>
+<p>
+Similarly, when you encounter a write access violation on
+a page in the client-visible view,
+you mark the page as dirty and upgrade the page to
+<code>PAGE_</code><code>READ&shy;WRITE</code>.
+When the client closes the database,
+you unswizzle the dirty pages and write them back out.
+(If you want to be super-clever, you could also unswizzle the pages
+and write them out even before the client closes the database.
+Remember to make the pages read-only,
+so that you can detect when the client dirties the pages again.)
+</p>
+<p>
+Notice that the client-visible file mapping now contains a mix
+of no-access pages,
+read-only pages,
+and read-write pages.
+</p>
+<p>
+There are some obvious optimizations you can perform here.
+</p>
+<p>
+First of all, you don't have to create a single file mapping
+for everything.
+Creating the file mapping will take a commit charge for the
+entire size of the mapping, even if you end up not using all of it.
+Instead, you can start with a small file mapping
+(say, one
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">megabyte</a>),
+and when you use up all those pages,
+you create a new file mapping to hold the next megabyte.
+This creates extra bookkeeping for your page management code,
+but you won't have more than a megabyte of
+"extra" memory committed.
+</p>
+<p>
+Another optimization is to
+cache the views that you use to prepare the swizzled pages.
+At one extreme, you could just map them in as read-write and
+just leave them mapped indefinitely.
+Or you could keep the few most recent views around,
+hoping for data locality.
+</p>
+<p>
+Anyway, that's the sketch of how you can have a process-wide
+block of user-mode-managed addresses where you control what
+happens the first time the client reads from or writes to that page.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (7)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20180126-00/?p=97905#respond" style="display:none;">Cancel reply</a></small></h3>			<form action="https://blogs.msdn.microsoft.com/oldnewthing/wp-comments-post.php" method="post" id="commentform" class="comment-form">
+				<p class="comment-form-comment"><textarea id="comment" name="comment" cols="45" rows="4" aria-required="true"></textarea></p><p class="comment-form-author"><label for="author">Name <span class="required">*</span></label> <input id="author" name="author" type="text" value="" size="30" maxlength="245" aria-required='true' required='required' /></p>
+<p class="comment-form-email"><label for="email">Email <span class="required">*</span></label> <input id="email" name="email" type="text" value="" size="30" maxlength="100" aria-describedby="email-notes" aria-required='true' required='required' /></p>
+<p class="comment-form-url"><label for="url">Website</label> <input id="url" name="url" type="text" value="" size="30" maxlength="200" /></p>
+<p class="form-submit"><input name="submit" type="submit" id="submit" class="submit btn btn-default" value="Post Comment" /> <input type='hidden' name='comment_post_ID' value='97905' id='comment_post_ID' />
+<input type='hidden' name='comment_parent' id='comment_parent' value='0' />
+</p><p style="display: none;"><input type="hidden" id="akismet_comment_nonce" name="akismet_comment_nonce" value="331e3ea49f" /></p><p style="display: none;"><input type="hidden" id="ak_js" name="ak_js" value="11"/></p>			</form>
+			</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1322825">
+				<div id="div-comment-1322825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marvy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1322825">
+			January 27, 2018 at 7:01 pm</a>		</div>
+
+		<p>I&#8217;ve long wondered something about mapping the same memory at two different addresses.  If you program in assembly, then it makes perfect sense.  If you program in some high-level language, then maybe it also makes sense, depending on the language spec.  But what if you program in C?  Consider:</p>
+<p>void f(int* x, int* y) {<br />
+if(x==y) return;<br />
+*x = 4;<br />
+*y = 8;<br />
+assert(*x == 4); // can this check be optimized out??<br />
+}</p>
+<p>The pointers are not const, so we are allowed to write to them.<br />
+There are no threading games going on.<br />
+They are not volatile, so presumably anything we wrote we can read back unchanged.<br />
+But if x and y are two mappings of the same memory, this fails.<br />
+Does this mean that to be fully standards compliant, we should declare them volatile, or is there some subtlety at work here?</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905&#038;replytocom=1322825#respond' onclick='return addComment.moveForm( "div-comment-1322825", "1322825", "respond", "97905" )' aria-label='Reply to Marvy'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong odd alt depth-2 parent" id="comment-1322855">
+				<div id="div-comment-1322855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1322855">
+			January 28, 2018 at 8:37 pm</a>		</div>
+
+		<p>The use of mapped address is like the use of &#8220;pointer to pointer&#8221; in C.</p>
+<p>In this case, it&#8217;s &#8220;You have two pointers. One points to the memory address directly, the other points to some memory location that contains address to the memory address referenced by the first pointer&#8221;.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905&#038;replytocom=1322855#respond' onclick='return addComment.moveForm( "div-comment-1322855", "1322855", "respond", "97905" )' aria-label='Reply to cheong00'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1323145">
+				<div id="div-comment-1323145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Trapp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1323145">
+			January 30, 2018 at 9:09 am</a>		</div>
+
+		<p>Yes but the question here was what the compiler&#8217;s view on this would be, right?<br />
+I guess it won&#8217;t optimize this away because as soon as you dereference a pointer, the compiler can never know what&#8217;s the value you get, even if you accessed the same pointer one line above. Even when you application is single-threaded, *another process* may have changed the memory in the meantime (in case of shared memory), or maybe you accessed some hardware I/O which is done through memory access (there are even cases in which a &#8220;write&#8221; is actually a call to kind of a &#8220;function implemented by hardware&#8221; and the &#8220;read&#8221; will give you something entirely different). So I would assume that this check can in never be optimized out.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905&#038;replytocom=1323145#respond' onclick='return addComment.moveForm( "div-comment-1323145", "1323145", "respond", "97905" )' aria-label='Reply to David Trapp'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1323725">
+				<div id="div-comment-1323725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JDG</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1323725">
+			February 2, 2018 at 12:36 pm</a>		</div>
+
+		<p>C and C++ have something called the Strict Aliasing Rule. It states that no two parameters to the same function that are pointers to different fundamental types may alias. Implied by this wording is that if they *are* of the same fundamental type, then they *might* alias, which rules out certain optimizations. In some variants, such as C99 with its &#8220;restrict&#8221; keyword, you can actually tell the compiler, &#8220;Even though there are other pointer parameters of the same type, I promise they won&#8217;t alias, go ahead and optimize!&#8221;</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905&#038;replytocom=1323725#respond' onclick='return addComment.moveForm( "div-comment-1323725", "1323725", "respond", "97905" )' aria-label='Reply to JDG'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1323795">
+				<div id="div-comment-1323795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marvy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1323795">
+			February 3, 2018 at 11:06 am</a>		</div>
+
+		<p>But here, we explicitly check that x and y are not equal, so the compiler &#8220;knows&#8221; they don&#8217;t alias.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1322846">
+				<div id="div-comment-1322846" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://blog.excastle.com/' rel='external nofollow' class='url'>Joe White</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1322846">
+			January 28, 2018 at 5:37 pm</a>		</div>
+
+		<p>Huh. It wouldn&#8217;t have occurred to me that you could change the VirtualProtect settings on a block of memory that came from MapViewOfFile. I would&#8217;ve expected that MapViewOfFile &#8220;owns&#8221; that memory. Changing its protection feels like visiting someone&#8217;s house and replacing their curtains.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905&#038;replytocom=1322846#respond' onclick='return addComment.moveForm( "div-comment-1322846", "1322846", "respond", "97905" )' aria-label='Reply to Joe White'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1323385">
+				<div id="div-comment-1323385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905#comment-1323385">
+			February 1, 2018 at 7:17 am</a>		</div>
+
+		<p>The missing version of VirtualAlloc would be quite useful for expanding sparse matrices, without having to copy them to the new location. Ran out of column indices? VirtualAlloc a new larger block of memory, and reuse the existing memory block for the known data.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180126-00/?p=97905&#038;replytocom=1323385#respond' onclick='return addComment.moveForm( "div-comment-1323385", "1323385", "respond", "97905" )' aria-label='Reply to SI'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

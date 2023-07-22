@@ -1,0 +1,491 @@
+<html>
+<head>
+<title>When I intentionally create a stack overflow with SendMessage, why do I sometimes not get a stack overflow?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>When I intentionally create a stack overflow with <CODE>SendMessage</CODE>, why do I sometimes not get a stack overflow?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 20, 2018 / year-entry #142</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It depends on what overflows first.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Take our
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20030723-00/?p=43073">
+scratch program</a>
+and make these changes:
+</p>
+<pre>
+LRESULT CALLBACK
+WndProc(HWND hwnd, UINT uiMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uiMsg) {
+    ...
+    <font COLOR="blue">case WM_APP: return SendMessage(hwnd, WM_APP, 0, 0) + 1;</font>
+    }
+
+    return DefWindowProc(hwnd, uiMsg, wParam, lParam);
+}
+
+int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
+                   LPSTR lpCmdLine, int nShowCmd)
+{
+    ...
+        ShowWindow(hwnd, nShowCmd);
+
+        <font COLOR="blue">SendMessage(hwnd, WM_APP, 0, 0);
+        MessageBox(hwnd, TEXT("Will this appear?"), TEXT("Hey"), MB_OK);</font>
+
+        while (GetMessage(&amp;msg, NULL, 0, 0)) {
+            ...
+        }
+
+        ...
+}
+</pre>
+<p>
+This program enters infinite recursion upon receipt of the
+<code>WM_</code><code>APP</code> message by sending itself
+another copy of the same message.
+We add one to the returned value
+to make sure there's no tail call elimination.
+</p>
+<p>
+After the program creates the window, it starts the death spiral
+by sending the first <code>WM_</code><code>APP</code> message.
+And then after the deadly message, it displays a message.
+</p>
+<p>
+The question: What happens?
+Do you see the message?
+</p>
+<p>
+When you run the program, you might see the message, or you might crash.
+It depends on which resource runs out first:
+The user-mode stack or the kernel-mode stack.
+</p>
+<p>
+Sending a message consumes some stack in user-mode,
+because you're calling the <code>Send&shy;Message</code>
+function, and that does some work in user mode before
+calling into kernel mode to do the actual message sending.
+</p>
+<p>
+Upon entry into kernel mode, some more stack is consumed
+to do the kernel-mode processing,
+like looking up which thread should be chosen to handle the message
+and dispatching any active window hooks.
+In this case, the destination window belongs to the same thread,
+so the kernel simulates a call into user mode and transitions
+back to user mode at a function whose job it is to call the
+window procedure.
+</p>
+<p>
+Now we're back in user mode, and the helper function calls the window
+procedure,
+which allocates a stack frame, detects that the message is
+<code>WM_</code><code>APP</code>, and calls
+<code>Send&shy;Message</code>,
+and the process repeats.
+</p>
+<p>
+When does this end?
+</p>
+<p>
+On entry to kernel mode,
+the kernel checks how much kernel-mode stack is still available,
+and if there isn't enough to send a message,
+then the kernel says,
+"Whoa, I'm not going to be able to do this
+<code>Send&shy;Message</code> thing,
+so I'm going to fail the call."
+The kernel-mode portion of
+the <code>Send&shy;Message</code> function returns zero,
+and that causes
+<code>Send&shy;Message</code> to return zero
+instead of sending the message.
+</p>
+<p>
+On the other hand,
+there is no such preflight check in user mode.
+User mode just keeps running until it runs out of stack,
+at which point a
+<a HREF="https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugging-a-stack-overflow">
+<code>STATUS_</code><code>STACK_</code><code>OVERFLOW</code> exception</a>
+is raised.
+Assuming nobody handles this exception,
+the program crashes.
+</p>
+<p>
+It comes down to a race to see which limited resource runs out first.
+If the kernel-mode stack runs out first, then one of the
+<code>Send&shy;Message</code> calls will return zero without
+actually sending the message,
+at which point the entire call stack unwinds,
+and then execution resumes at the call to
+<code>Message&shy;Box</code>.
+On the other hand, if the user-mode stack runs out first,
+then you get a stack overflow exception.
+</p>
+<p>
+Your program has some control over how much user-mode stack is
+consumed at each recursion,
+because some of that stack usage comes from your own window procedure.
+So if you keep your window procedure's stack usage low,
+then you're more likely to run out of kernel mode stack first.
+</p>
+<p>
+But wait, there's still another wrinkle that introduces
+a level of unpredictability to the calculations.
+We'll dig deeper next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-ranta even thread-even depth-1 parent" id="comment-1347995">
+				<div id="div-comment-1347995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ranta' rel='external nofollow' class='url'>ranta</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1347995">
+			June 20, 2018 at 9:41 am</a>		</div>
+
+		<p>That sounds dangerous. I expected the kernel-mode portion to release all of the kernel stack for the duration of the user-mode callback, and if it needs to preserve some information across the callback, then allocate a handle for that information and put the handle on the user-mode stack.</p>
+<p>What if the application recurses until SendMessage notices there is not enough kernel stack available and returns 0, and then the application starts trying other system calls? I imagine the system-call dispatcher must always check the kernel stack limits, not only for SendMessage. However, it might be difficult to know in advance how much kernel stack will be needed, especially for I/O that can go through many filter device objects. So, Windows presumably has a conservative estimate for that. What is a good way for a driver developer to test whether his or her driver can tolerate such a depleted kernel stack?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1348015">
+				<div id="div-comment-1348015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://geelaw.blog/' rel='external nofollow' class='url'>Gee Law</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348015">
+			June 20, 2018 at 10:44 am</a>		</div>
+
+		<p>For your first paragraph, if the kernel put the handle on the user-mode stack, user-mode application could leak the handle, or even worse, trick the kernel into later de-allocating another resource by overwriting it, which would almost surely result a user-mode initiated BSoD, a security hole.</p>
+<p>For the second paragraph, I wouldn&#8217;t be surprised if every (good) driver checks the stack limit before actually anything. Otherwise, user-mode initiated BSoD.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kadu_cortez even depth-2" id="comment-1348025">
+				<div id="div-comment-1348025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kc0rtez' rel='external nofollow' class='url'>kc0rtez</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348025">
+			June 20, 2018 at 10:57 am</a>		</div>
+
+		<p>ranta, doesn&#8217;t even make sense trying to &#8220;tolerate&#8221; a depleted kernel stack, if things get to this point you have much bigger issues to deal with.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-koldude odd alt depth-2" id="comment-1348035">
+				<div id="div-comment-1348035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348035">
+			June 20, 2018 at 10:58 am</a>		</div>
+
+		<p>Reasonably speaking if you&#8217;re in a situation where you&#8217;ve run out of kernel stack you&#8217;re doing something VERY VERY wrong as almost all the patterns in windows programming encourage an asynchronous style that keeps thread stacks usually fairly small. <code>SendMessage</code> is one of the few places that at least I would assume <em>currently</em> this sort of thing is possible. But AFAIK <code>SendMessage</code> only guarantees the message will be delivered and will return a value, not that it will happen synchronously or even for that matter on the same stack. While I don&#8217;t see this changing for performance reasons it is conceivable that this could be re-implemented in a way that is not subject to this sort of abuse. That said deeply nested <code>SendMessage</code> should probably be avoided anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1348075">
+				<div id="div-comment-1348075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348075">
+			June 20, 2018 at 1:26 pm</a>		</div>
+
+		<p>I think you&#8217;re suggesting copying the stack into some other location and then resetting the stack pointer. Which means that if you have live pointers into the stack, those pointers are now wild! You would have to leave the old stack where it is and allocate a new one for the next recursion. But allocating a new stack for each kernel transition gets kind of expensive.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1348085">
+				<div id="div-comment-1348085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348085">
+			June 20, 2018 at 1:51 pm</a>		</div>
+
+		<p>Plan 9 had in interesting property in this regard. Pointers on the stack could not be shared with other threads because all threads used the same addresses for the stack.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3 parent" id="comment-1348095">
+				<div id="div-comment-1348095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348095">
+			June 20, 2018 at 2:44 pm</a>		</div>
+
+		<p>I would expect something more like the way Unix signals are handled: the kernel saves the relevant information in the user-mode stack, pushes a special return address into it, updates the return address to point to the signal handler, and _returns from the kernel_ (that is, all the kernel stack is deallocated), which resumes userspace at the signal handler. When the signal handler returns, the special return address points to a thunk which calls the sigreturn() system call. Now back to the kernel (with a fresh stack), it copies and validates whatever is needed from the user-mode stack, restores the user-mode state, and returns.</p>
+<p>With this kind of mechanism, the user-mode stack is the only one which can have unbounded growth. This allows the kernel to use some tiny stacks (on Linux, used to be a bit less than 4K, was later bumped to 8K or 16K due to the rising complexity of driver code).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4 parent" id="comment-1348135">
+				<div id="div-comment-1348135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348135">
+			June 20, 2018 at 8:01 pm</a>		</div>
+
+		<p>In Unix, signals always occur as the kernel was exiting to user mode &#8211; there was nothing kernel mode was going to do after the signal anyway. In Windows, on the other hand, the kernel can inject a call into user mode, and then <i>act on the return value</i>, which means resuming the continuation from the stack. For example, the kernel injects a call to the hook procedure, and then when the hook procedure returns, the kernel uses the return value to decide whether to call the next hook procedure. And then after the hook is dispatched, the kernel then continues what it was doing before it called the hook procedure. How would you do this using the unix signal model?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5 parent" id="comment-1348185">
+				<div id="div-comment-1348185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348185">
+			June 21, 2018 at 11:21 am</a>		</div>
+
+		<p>It depends on which form of uglyness you prefer. return -EINTR where the continuation is written to a buffer provided by the userpsace caller would work. Let&#8217;s see, do I prefer kernel calls building up on the stack when the kernel has to call back into usermode or do I prefer continuation buffers that need to be able to grow and other kinds of overhead.</p>
+<p>MS didn&#8217;t quite finish their work in x64 Windows and exceptions can&#8217;t cross through the kernel mode callbacks anymore. This is a pill in C# Winforms where sometimes throw ex; disappears rather than reaching its catch and there&#8217;s no documentation on which callbacks have this property. I guess it finally got too ugly for them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-5" id="comment-1348205">
+				<div id="div-comment-1348205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348205">
+			June 21, 2018 at 3:01 pm</a>		</div>
+
+		<p>It&#8217;s not really a choice because if you want kernel mode to call into user mode and act on the result, the EINTR model won&#8217;t work. The Unix way is basically &#8220;Kernel mode never calls into user mode. Instead, it abandons the current operation (EINTR) and <i>returns</i> to user mode, possibly with an altered user-mode continuation.&#8221; If you are ever tempted to call from kernel mode into user mode, you are told &#8220;We don&#8217;t do that here. You should move all your code into user mode if that&#8217;s so important to you.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1348005">
+				<div id="div-comment-1348005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348005">
+			June 20, 2018 at 10:06 am</a>		</div>
+
+		<p>&#8220;When I intentionally create a stack overflow&#8221; &#8211; please tell me this wasn&#8217;t some customer that thought intentionally creating a stack overflow was the right way to accomplish their goal&#8230;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1348045">
+				<div id="div-comment-1348045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348045">
+			June 20, 2018 at 12:49 pm</a>		</div>
+
+		<p>More likely, a customer had a failing program (more complicated than the one that Raymond shows), that failed in two different ways depending on the weather or the phase of the moon.  They asked &#8220;hey, what&#8217;s going on &#8211; we know why we&#8217;re failing, but we&#8217;re surprised to see two different results&#8221;.  Then Raymond boiled down the customer&#8217;s sample to fit well with his &#8220;scratch program&#8221; sample code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1348055">
+				<div id="div-comment-1348055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Beldantazar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348055">
+			June 20, 2018 at 1:20 pm</a>		</div>
+
+		<p>Well, the goal could be to deliberately induce a problem as part of testing some other code to make sure it can handle it gracefully, but that seems like it might be giving people who would try this too much credit.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1348105">
+				<div id="div-comment-1348105" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JAS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348105">
+			June 20, 2018 at 3:11 pm</a>		</div>
+
+		<p>The mother of all stack overflows can be had with C# async functions, just move the entire call chain to the multi-GB heap. I secretly wonder if anyone ever had to solve a problem this way.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1348175">
+				<div id="div-comment-1348175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348175">
+			June 21, 2018 at 10:59 am</a>		</div>
+
+		<p>That&#8217;s the standard solution to transform a recursive function into an iterative one and avoid troubles with the stack: Allocate a list on the heap and every call adds a new level to it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1348645">
+				<div id="div-comment-1348645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348645">
+			June 23, 2018 at 10:49 am</a>		</div>
+
+		<p>I think, if I had that problem (and planned to have it), I&#8217;d prefer using tail recursion to converting to an iterative loop.  I might even use a trampoline function, in environments where tail recursion isn&#8217;t available.  Either way (hoisting the stack to heap, or simply running a recursion that doesn&#8217;t in any meaningful way recurse, ie reduce the working set) you&#8217;re probably doing something distasteful and wrong.</p>
+<p>It&#8217;s not so much &#8220;if only I could recurse 257 times, instead of just 256.&#8221;  It&#8217;s more &#8220;Hey, recursing tens of millions of times is <b>fun</b>!&#8221;</p>
+<p>And yes, it&#8217;s all fun and games &#8230; until somebody loses an eye.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kirbyfcf2 even thread-even depth-1 parent" id="comment-1348115">
+				<div id="div-comment-1348115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Kirby+FC' rel='external nofollow' class='url'>Kirby FC</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348115">
+			June 20, 2018 at 4:40 pm</a>		</div>
+
+		<p>stackoverflow.com was intentionally created September 15, 2008</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command odd alt depth-2" id="comment-1348145">
+				<div id="div-comment-1348145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348145">
+			June 20, 2018 at 11:31 pm</a>		</div>
+
+		<p>Yeah. And we are yet to see which resource it will expend faster: Existing users&#8217; tolerance for harassment or market demand.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1348525">
+				<div id="div-comment-1348525" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tihiy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348525">
+			June 22, 2018 at 2:04 pm</a>		</div>
+
+		<p>I wonder why SendMessage is not optimized to call window function directly without jumping to kernel. Windows 95 was.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1348655">
+				<div id="div-comment-1348655" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180620-00/?p=99055#comment-1348655">
+			June 23, 2018 at 1:39 pm</a>		</div>
+
+		<p>The point of the article is pointing that it <u>is</u> optimized in the case where are no hooks or other funny things.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

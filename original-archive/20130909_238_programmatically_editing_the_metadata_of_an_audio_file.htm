@@ -1,0 +1,475 @@
+<html>
+<head>
+<title>Programmatically editing the metadata of an audio file</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Programmatically editing the metadata of an audio file</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 9, 2013 / year-entry #239</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today's Little Program edits the metadata of an audio file, ostensibly to correct a spelling error, but really just to show how it's done. Today's smart pointer class library is... (rolls dice)... CComPtr! We open with two helper functions which encapsulate the patterns Get property from property store Call IProperty≠Store::Get≠Value Convert PROPVARIANT into desired final...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today's Little Program edits the metadata of an audio file,
+ostensibly to correct a spelling error,
+but really just to show how it's done.
+</p>
+<p>
+Today's smart pointer class library is... (rolls dice)... CComPtr!
+</p>
+<p>
+We open with two helper functions which encapsulate the patterns
+</p>
+<ul>
+<li>Get property from property store
+<ol>
+<li>Call <code>IProperty&shy;Store::<wbr>Get&shy;Value</code>
+<li>Convert <code>PROPVARIANT</code> into desired final type
+<li>Destroy the <code>PROPVARIANT</code>
+    </ol>
+<li>Set property in property store
+<ol>
+<li>Create a <code>PROPVARIANT</code>
+<li>Call <code>IProperty&shy;Store::<wbr>Set&shy;Value</code>
+<li>Destroy the <code>PROPVARIANT</code>
+    </ol>
+</ul>
+<pre>
+#define STRICT
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;shlobj.h&gt;
+#include &lt;propkey.h&gt;
+#include &lt;propvarutil.h&gt;
+#include &lt;atlbase.h&gt;
+#include &lt;atlalloc.h&gt;
+
+template&lt;typename TLambda&gt;
+HRESULT GetPropertyAsLambda(IPropertyStore *pps, REFPROPERTYKEY key,
+                             TLambda lambda)
+{
+  PROPVARIANT pvar;
+  HRESULT hr = pps-&gt;GetValue(key, &amp;pvar);
+  if (SUCCEEDED(hr)) {
+    hr = lambda(pvar);
+    PropVariantClear(&amp;pvar);
+  }
+  return hr;
+}
+
+template&lt;typename TLambda&gt;
+HRESULT SetPropertyAsLambda(IPropertyStore *pps, REFPROPERTYKEY key,
+                            TLambda lambda)
+{
+  PROPVARIANT pvar;
+  HRESULT hr = lambda(&amp;pvar);
+  if (SUCCEEDED(hr)) {
+    hr = pps-&gt;SetValue(key, pvar);
+    PropVariantClear(&amp;pvar);
+  }
+  return hr;
+}
+</pre>
+<p>
+Both functions use a lambda to do the type-specific work.
+</p>
+<p>
+Here are some functions that will use the helpers:
+</p>
+<pre>
+HRESULT GetPropertyAsString(
+    IPropertyStore *pps, REFPROPERTYKEY key, PWSTR *ppszValue)
+{
+  *ppszValue = nullptr;
+  return GetPropertyAsLambda(pps, key, [=](REFPROPVARIANT pvar) {
+    return PropVariantToStringAlloc(pvar, ppszValue);
+  });
+}
+
+HRESULT SetPropertyAsString(
+    IPropertyStore *pps, REFPROPERTYKEY key, PCWSTR pszValue)
+{
+  return SetPropertyAsLambda(pps, key, [=](PROPVARIANT *ppvar) {
+    return InitPropVariantFromString(pszValue, ppvar);
+  });
+}
+
+HRESULT GetPropertyAsStringVector(
+    IPropertyStore *pps, REFPROPERTYKEY key,
+    PWSTR **pprgsz, ULONG *pcElem)
+{
+  *pprgsz = nullptr;
+  *pcElem = 0;
+  return GetPropertyAsLambda(pps, key, [=](REFPROPVARIANT pvar) {
+    return PropVariantToStringVectorAlloc(pvar, pprgsz, pcElem);
+  });
+}
+
+HRESULT SetPropertyAsStringVector(
+    IPropertyStore *pps, REFPROPERTYKEY key,
+    PCWSTR *prgsz, ULONG cElems)
+{
+  return SetPropertyAsLambda(pps, key, [=](PROPVARIANT *ppvar) {
+    return InitPropVariantFromStringVector(prgsz, cElems, ppvar);
+  });
+}
+</pre>
+<p>
+The <code>Prop&shy;Variant&shy;To&shy;String&shy;Vector&shy;Alloc</code>
+function returns an array of pointers to memory allocated via
+<code>Co&shy;Task&shy;Mem&shy;Alloc</code>,
+and the array itself was also allocated by the same function.
+Here's a helper function to free the memory and the array:
+</p>
+<pre>
+template&lt;typename T&gt;
+void CoTaskMemFreeArray(T **prgElem, ULONG cElem)
+{
+    for (ULONG i = 0; i &lt; cElem; i++) {
+        CoTaskMemFree(prgElem[i]);
+    }
+    CoTaskMemFree(prgElem);
+}
+</pre>
+<p>
+Okay, we're ready to write our main program.
+Remember, Little Programs do little to no error checking.
+In a real program, you would check that your function calls succeeded.
+</p>
+<pre>
+int __cdecl wmain(int argc, wchar_t **argv)
+{
+  <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/05/20/135841.aspx">CCoInitialize</a> init;
+  CComPtr&lt;IPropertyStore&gt; spps;
+  SHGetPropertyStoreFromParsingName(argv[1], nullptr,
+    GPS_READWRITE, IID_PPV_ARGS(&amp;spps));
+
+  // Get the existing composers
+  PWSTR *rgpszComposers;
+  ULONG cComposers;
+  GetPropertyAsStringVector(spps, <a HREF="http://msdn.microsoft.com/en-us/library/windows/desktop/bb787298(v=vs.85).aspx">PKEY_Music_Composer</a>,
+    &amp;rgpszComposers, &amp;cComposers);
+
+  // Look for "Dvorak, Antonin" and add diacritics
+  for (ULONG ulPos = 0; ulPos &lt; cComposers; ulPos++) {
+    if (wcscmp(rgpszComposers[ulPos], L"Dvorak, Antonin") == 0) {
+      // Swap in the new name
+      PWSTR pszOld = rgpszComposers[ulPos];
+      rgpszComposers[ulPos] = L"Dvo\x0159\x00E1k, Anton\x00EDn";
+      // Write out the new list of composers
+      SetPropertyAsStringVector(spps, PKEY_Music_Composer, (PCWSTR *)rgpszComposers, cComposers);
+      // Swap it back so we can free it
+      rgpszComposers[ulPos] = pszOld;
+      // Add a little graffiti just because
+      SetPropertyAsString(spps, PKEY_Comment, L"Kilroy was here");
+      spps-&gt;Commit();
+      break;
+    }
+  }
+  CoTaskMemFreeArray(rgpszComposers, cComposers);
+  
+  return 0;
+}
+</pre>
+<p>
+Okay, what just happened here?
+</p>
+<p>
+First, we took the file whose name was passed on the command
+line (fully-qualified path, please)
+and obtained its property store.
+</p>
+<p>
+Next, we queried the property store for the
+<code>System.&shy;Music.&shy;Composer</code> property.
+This property is typed as a multiple-valued string,
+so we read and write the value in the form of a string vector.
+You could also read and write it as a single string:
+The
+<a HREF="http://msdn.microsoft.com/en-us/library/windows/desktop/bb776560(v=vs.85).aspx">
+<code>Prop&shy;Variant&shy;To&shy;String&shy;Alloc</code></a>
+function represents string arrays by joining the strings together,
+separating them with <code>"; "</code> (semicolon and space).
+However, we access it as an array because that makes it easier
+to insert and remove individual entries.
+</p>
+<p>
+Once we get the list of composers, we look for one that says
+<code>"Dvorak, Antonin"</code>.
+If we find it, then we change that entry to
+<code>"Dvo&#x159;&#xe1;k, Anton&#xed;n"</code>
+and write out the new vector.
+</p>
+<p>
+And then just to show that I know how to write out a string
+property too,
+I'll put some graffiti in the Comment field.
+</p>
+<p>
+Commit the changes and break the loop now that we found what
+we're looking for.
+(This assumes that the song was not a collaboration between
+Anton&#xed;n Dvo&#x159;&#xe1;k and himself!)
+</p>
+<p>
+So there you have it,
+a little program that modifies metadata.
+Obviously, this program is not particularly useful by itself,
+but it illustrates what you need to do to do something more
+useful in general.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1076563">
+				<div id="div-comment-1076563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076563">
+			September 9, 2013 at 7:27 am</a>		</div>
+
+		<p>You can use the wonderful new feature of Visual C, and save your source file as Unicode, so you don&#39;t have to enter non-ASCII characters by their hex codes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1076583">
+				<div id="div-comment-1076583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076583">
+			September 9, 2013 at 8:50 am</a>		</div>
+
+		<p>alegr1: and then it stops displaying properly on some terminals, doesn&#39;t round trip through some command-line programs and mail clients, and makes it awkward to reason about the memory contents. Better to pull the strings out into a separate file if you want to edit them that way.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1076593">
+				<div id="div-comment-1076593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JDP </cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076593">
+			September 9, 2013 at 9:43 am</a>		</div>
+
+		<p>is that a for-if loop I spy, Raymond? :o) </p>
+<p>I know, little program, example purposes only &#8212; but once you explained that as an anti-pattern, it was like a switch being flipped in my head, and I wind up doing my best to make any for-ifs that I find more sensible.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1076613">
+				<div id="div-comment-1076613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">me</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076613">
+			September 9, 2013 at 9:49 am</a>		</div>
+
+		<p>hopefully that doesnt have the nasty side effect with txxx tags that has been in there since 2009&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-1076623">
+				<div id="div-comment-1076623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076623">
+			September 9, 2013 at 9:49 am</a>		</div>
+
+		<p>The for-if antipattern looks like this:</p>
+<p>for (i = some range of values) {</p>
+<p>____ if (i == some specific value) { do something with i }</p>
+<p>}</p>
+<p>This can be replaced with the more performant</p>
+<p>do something with (the specific value)</p>
+<p>That is not the case in this example. What we have here is:</p>
+<p>for (i = some range of values) {</p>
+<p>____ if (array[i] == some specific value) { do something with i }</p>
+<p>}</p>
+<p>There is no way to replace this with a single statement. If we were guaranteed that the &quot;composers&quot; array were sorted we could do a binary search instead of a linear search, but no such guarantee exists.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1076653">
+				<div id="div-comment-1076653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jodi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076653">
+			September 9, 2013 at 2:23 pm</a>		</div>
+
+		<p>I think he meant not seeing the general usefulness of it due to unsupported formats that are commonly used.</p>
+<p>Then again he might have confused it with the metadata stored in alternative streams or with metadata locked in to individual user accounts. Dealing with COM, metadata can mean a lot of things. Like sending your boss that photoshopped picture of him that you made. Lovely bugs and office installed. I&#39;ve run windows 7 for years I never knew it supported flac. I just tested it. I&#39;m surprised. Must be something I installed, surely. It do still however not support mkv or ogg. As for me I did go nutsy, windows media player, ugh, unusable and slow! After that episode I installed an open source player.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1076633">
+				<div id="div-comment-1076633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter M</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076633">
+			September 9, 2013 at 12:14 pm</a>		</div>
+
+		<p>// Swap in the new name</p>
+<p>PWSTR pszOld = rgpszComposers[ulPos];</p>
+<p>rgpszComposers[ulPos] = L&quot;Dvox0159x00E1k, Antonx00EDn&quot;;</p>
+<p>&#8230;</p>
+<p>// Swap it back so we can free it</p>
+<p>rgpszComposers[ulPos] = pszOld;</p>
+<p>Swapping pointers to allocated memory make me nervous.</p>
+<p>Swapping a pointer with static string when talking to com makes me worried</p>
+<p>rgpszComposers[ulPos] = L&quot;Dvox0159x00E1k, Antonx00EDn&quot;;</p>
+<p>&quot;but it illustrates what you need to do to do something more useful in general.&quot;</p>
+<p>No, I&#39;m not seeing it. An example would have been nice.</p>
+<p>I only see problems: Since when can windows read flac and mkv metadata? Can it even read ogg?</p>
+<p>Windows version of &quot;metadata&quot;, *cough* time wasting lock-in *cough* is not compatible when you move the files to another computer eg Linux or even sometimes another windows machine.</p>
+<div class="post">[<em>This was a quick and dirty app, so it cuts a lot of corners, such as editing the array in place. I&#39;m not sure what you mean by &quot;I&#39;m not seeing it.&quot; I showed how you can read and modify the Composers property of an audio file. What&#39;s not to see? (Windows stores it in the ID3 field of the mp3 file. Isn&#39;t that widely recognized? And if you want to write a flac or mkv property provider, go nutsy.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1076673">
+				<div id="div-comment-1076673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/arcangelpip_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>arcangelpip@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076673">
+			September 9, 2013 at 7:28 pm</a>		</div>
+
+		<p>@Jodi:</p>
+<p>The formats are third party, so Windows doesn&#39;t support them out of the box.</p>
+<p>There is, however, nothing stopping third party developers from providing the same level of integration to these formats that the likes of MP3 and WMA have.</p>
+<p>For Direct Show, LAV Filters provides splitters and filters for a lot of out of box formats like flac/mkv/ogg and more. This doesn&#39;t add general support for the tags that these formats use though. As Raymond said, someone needs to write a property provider for these formats, and that is just something that people haven&#39;t done.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1076683">
+				<div id="div-comment-1076683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076683">
+			September 10, 2013 at 6:49 am</a>		</div>
+
+		<p>How appropriate that the Classical Music Library Free Download of the Week for this week (or week-like period) is Dvo≈ô√°k&#39;s Symphony No. 9.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1076763">
+				<div id="div-comment-1076763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1076763">
+			September 10, 2013 at 10:22 am</a>		</div>
+
+		<p>&gt; &quot;but it illustrates what you need to do to do something more useful in general.&quot;</p>
+<p>&gt; No, I&#39;m not seeing it. An example would have been nice.</p>
+<p>As an example of a practical use of this technique, here&#39;s a tool I use to groom the audio metadata in my collection (mostly to set the album title on content which spans multiple CDs.)</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/matthew_van_eerde/archive/2013/09/10/shellproperty-exe-set-read-string-properties-on-a-file-from-the-command-line.aspx">blogs.msdn.com/&#8230;/shellproperty-exe-set-read-string-properties-on-a-file-from-the-command-line.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1077023">
+				<div id="div-comment-1077023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NitpickersParadise</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1077023">
+			September 11, 2013 at 9:24 am</a>		</div>
+
+		<p>ITT: People complaining that relatively obscure* formats are not supported out of the box by Windows. Oh the humanity! How will I ever properly tag my APE files now?</p>
+<p>*In sheer numbers MP3 will be here today, here tomorrow, here forever. The wise-man however always archives with FLAC then transcodes to the flavor of the week, but how many people are that forward thinking?</p>
+<p>The solution, as usual is to look the the wide world of third party utilities that are what makes the Windows Ecosystem the Goliath it has been for years in the desktop world. Personally I enjoy Mp3Tag.de which supports *some* of these obscure formats.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1077863">
+				<div id="div-comment-1077863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bulletmagnet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130909-00/?p=3293#comment-1077863">
+			September 16, 2013 at 4:17 am</a>		</div>
+
+		<p>Did you actually roll dice, or did you use <a rel="nofollow" target="_new" href="http://xkcd.com/221/">http://xkcd.com/221/</a> ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

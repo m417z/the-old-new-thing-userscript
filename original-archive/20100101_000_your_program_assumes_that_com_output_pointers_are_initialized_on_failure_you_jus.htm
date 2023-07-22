@@ -1,0 +1,476 @@
+<html>
+<head>
+<title>Your program assumes that COM output pointers are initialized on failure; you just don't realize it yet</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Your program assumes that COM output pointers are initialized on failure; you just don&#8217;t realize it yet</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 1, 2010 / year-entry #1</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">We saw last time that the COM rules for output pointers are that they must be initialized on return from a function, even if the function fails. The COM marshaller relies on this behavior, but then again, so do you; you just don't realize it yet. If you use a smart pointer library (be it...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+We saw last time that the COM rules for output pointers are that
+they must be initialized on return from a function,
+even if the function fails.
+The COM marshaller relies on this behavior,
+but then again, so do you; you just don't realize it yet.
+</p>
+<p>
+If you use a smart pointer library (be it ATL
+or boost or whatever), you are still relying on output
+pointers being <code>NULL</code> when not valid,
+regardless of whether or not the call succeeded.
+Let's look at this line of code from
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/10/07/9904040.aspx">
+that article about <code>IUnknown::QueryInterface</code></a>:
+</p>
+<pre>
+CComQIPtr&lt;ISomeInterface&gt; spsi(punkObj);
+...
+// spsi object goes out of scope
+</pre>
+<p>
+If the <code>IUnknown::QueryInterface</code> method puts a
+non-<code>NULL</code> value in <code>spsi</code> on failure,
+then when <code>spsi</code> is destructed, it's going
+to call <code>IUnknown::Release</code> on itself,
+and something bad happens.
+If you're lucky, you will crash because the thing lying around in
+<code>spsi</code> was a garbage pointer.
+But if you're not lucky, the thing lying around in <code>spsi</code>
+might be a pointer to a COM object:
+</p>
+<pre>
+<i>// wrong!
+HRESULT CObject::QueryInterface(REFIID riid, void **ppvObj)
+{
+  *ppvObj = this; // assume success since it almost always succeeds
+  if (riid == IID_IUnknown || riid == IID_IOtherInterface) {
+    AddRef();
+    return S_OK;
+  }
+  // forgot to set *ppvObj = NULL
+  return E_NOINTERFACE;
+}</i>
+</pre>
+<p>
+Notice that this code optimistically sets the output pointer to
+itself, but if the interface is not supported, it changes its mind
+and returns <code>E_NOINTERFACE</code> <i>without setting the
+output pointer to <code>NULL</code></i>.
+Now you have an elusive reference counting bug,
+because the destruction of <code>spsi</code> will call
+<code>CObject::Release</code>,
+which will manifest itself by <code>CObject</code> object
+being destroyed prematurely because you just over-released the object.
+If you're lucky, that'll happen relative soon;
+if you're not lucky, it won't manifest itself for another half hour.
+</p>
+<p>
+Okay, sure, maybe this is too obvious a mistake for
+<code>CObject::QueryInterface</code>, but any method that
+has an output parameter can suffer from this error,
+and in those cases it might not be quite so obvious:
+</p>
+<pre>
+<i>// wrong!
+HRESULT CreateSurface(const SURFACEDESC *psd,
+                      ISurface **ppsf)
+{
+ *ppsf = new(nothrow) CSurface();
+ if (!*ppsf) return E_OUTOFMEMORY;
+ HRESULT hr = (*ppsf)->Initialize(psd);
+ if (SUCCEEDED(hr)) return S_OK;
+ (*ppsf)-&gt;Release(); // throw it away
+ // forgot to set *ppsf = NULL
+ return hr;
+}</i>
+</pre>
+<p>
+This imaginary function
+takes a surface description and tries to create a surface
+that matches it.
+It does this by first creating a blank surface,
+and then initializing the surface.
+If that succeeds, then we succeed;
+otherwise, we clean up the incomplete surface and fail.
+</p>
+<p>
+Except that we forgot to set <code>*ppsf = NULL</code>
+in our failure path.
+If initialization fails, then we destroy the surface,
+and the pointer returned to the caller points to the
+surface that we abandoned.
+But the caller shouldn't be looking at that pointer because
+the function failed, right?
+</p>
+<p>
+Well, unless the caller called you like this:
+</p>
+<pre>
+CComPtr&lt;ISurface&gt; spsf;
+if (SUCCEEDED(CreateSurface(psd, &amp;spsf))) {
+ ...
+}
+</pre>
+<p>
+If the surface fails to initialize, then <code>spsf</code>
+contains a pointer to a surface that has already been deleted.
+When the <code>spsf</code> is destructed, it's going to call
+<code>ISurface::Release</code> on some point that is no longer
+valid, and bad things are going to happen.
+This can get particularly insidious when <code>spsf</code> is
+not a simple local variable but rather a member of
+class which itself doesn't get destroyed for a long time.
+The bad pointer sits in <code>m_spsf</code> like a time bomb.
+</p>
+<p>
+Although all the examples I gave here involve COM interface pointers,
+the rule applies to all output parameters.
+</p>
+<pre>
+CComBSTR bs;
+if (SUCCEEDED(GetName(&amp;bs)) { ... }
+
+// -or-
+
+CComVariant var;
+if (SUCCEEDED(GetName(&amp;var)) { ... }
+</pre>
+<p>
+In the first case, the the <code>GetName</code> method had
+better not leave garbage in the output <code>BSTR</code> on failure,
+because the <code>CComBSTR</code>
+is going to <code>SysFreeString</code> in its destructor.
+Similarly in the second case with <code>CComVariant</code>
+and <code>VariantClear</code>.
+</p>
+<p>
+So remember, if your function doesn't want to return a value
+in an output pointer, you still have to return something in it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-matteo even thread-even depth-1" id="comment-799423">
+				<div id="div-comment-799423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799423">
+			January 1, 2010 at 8:15 am</a>		</div>
+
+		<p>[&#8230;you are still relying on output pointers *begin* NULL when not valid&#8230;]</p>
+<p>Typo for &#8220;being&#8221;?</p>
+<div class=post>[<i>Fixed, thanks. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-799443">
+				<div id="div-comment-799443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Logan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799443">
+			January 1, 2010 at 9:57 am</a>		</div>
+
+		<p>This is part of the reason I loathe the operator&amp; overload on those smart pointers. The ship, as they say, has sailed but I really wish we were forced to write</p>
+<p>CComPtr&lt;IFoo&gt; smartptr;</p>
+<p>void *dumbptr;</p>
+<p>if( S_OK == thing-&gt;QueryInterface(IID_IFoo, &amp;dumbptr) ) smartptr.Attach( (IFoo*)dumbptr );</p>
+<p>or similar.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-799483">
+				<div id="div-comment-799483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Buchan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799483">
+			January 1, 2010 at 3:04 pm</a>		</div>
+
+		<p>Com smart pointers&#8217; operator&amp; will clear themselves for this exact reason, so you have to explicitly initialize the output to a bad value, rather than fail to initialize it to a good value, which is far more common.</p>
+<p>Ahh yes. The CreateFoo function, how I loath writing you. I would now write it creating dependencies before the object so the ctor can be nothrow:</p>
+<p>HRESULT CreateFoo(FooParams params, IFoo** outFoo) {</p>
+<p> &nbsp; &nbsp;CFoo::InitParams initParams;</p>
+<p> &nbsp; &nbsp;HRESULT hr = initParams.Initialize(params);</p>
+<p> &nbsp; &nbsp;CFoo* foo = nullptr;</p>
+<p> &nbsp; &nbsp;if (SUCCEEDED(hr))</p>
+<p> &nbsp; &nbsp; &nbsp; &nbsp;if (!(foo = new (nothrow) CFoo(params, initParams)))</p>
+<p> &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;hr = E_OUTOFMEMORY;</p>
+<p> &nbsp; &nbsp;*outFoo = foo;</p>
+<p> &nbsp; &nbsp;return hr;</p>
+<p>}</p>
+<p>Now there is only one return point and outFoo is obviously always initialized, although it does mean a bit more futzing around with moving the dependencies from InitParams in a nothrow fashion: mostly &quot;_bar.attach(initParams.bar.detach());&quot;, or &quot;_bar = move(initParams.bar);&quot; now with C++0x.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-799503">
+				<div id="div-comment-799503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://zeuxcg.blogspot.com/' rel='external nofollow' class='url'>Arseny Kapoulkine</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799503">
+			January 1, 2010 at 4:12 pm</a>		</div>
+
+		<p>The problem in CComQIPtr manifests only because CComQIPtr relies on correct implementation of QueryInterface, i.e. it could support inaccurate implementations by checking the return code and setting pointer to NULL on failure; of course the second example is valid regardless.</p>
+<div class=post>[<i>The problem is not specific to CComQIPtr, it was just an example that involved the least amount of typing. The problem is common to all &#8220;smart pointer&#8221; types which release on destruction.</p>
+<p>CCompPtr&lt;ISomeInterface&gt; spsi;<br />if (SUCCEEDED(punkObj-&gt;QueryInterface(IID_ISomeInterface, (void**)&amp;spsi)) { &#8230; }</p>
+<p>When spsi is destructed, it will attempt to release the inner pointer even if the QI failed and set the inner pointer to a non-NULL value. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-799613">
+				<div id="div-comment-799613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://K.Hagan@thermoteknix.com' rel='external nofollow' class='url'>Ken Hagan</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799613">
+			January 2, 2010 at 6:35 am</a>		</div>
+
+		<p>&nbsp;if(S_OK == thing-&gt;QueryInterface(IID_IFoo, &amp;dumbptr))</p>
+<p>&nbsp; smartptr.Attach( (IFoo*)dumbptr );</p>
+<p>There&#8217;s nothing to stop you doing that, if you like typing, but since we have to do it &quot;Raymond&#8217;s way&quot; if we want to marshal properly and since his way is less typing, and since the run-time overhead is the same, I just don&#8217;t see the advantage myself.</p>
+<p>Then there are cases where a function returns two reference counted objects, but fails after setting just one of them. Your idiom starts to look messy.</p>
+<p>Smart pointers are garbage collection done right. In addition to the syntactic invisibility of traditional GC, they are deterministic and extensible. If your language is powerful enough to let you create smart pointers, you don&#8217;t need GC. The presence of GC in the language is therefore a pretty big clue that it is lacking in some way.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm odd alt thread-odd thread-alt depth-1" id="comment-799623">
+				<div id="div-comment-799623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799623">
+			January 2, 2010 at 6:51 am</a>		</div>
+
+		<p>&#8220;We saw last time that the COM rules for output pointers are that they must be initialized on return from a function, even if the function fails. The COM marshaller relies on this behavior, but then again, so do you; you just don&#8217;t realize it yet.&#8221;</p>
+<p>Since the out parameters must be initialized to something valid before the function is called for marshalling to work properly, would it bs sufficient to say that the COM rules for output pointers are that they must not be set to something invalid on failure?</p>
+<div class=post>[<i>Even terser: They must not be set to something invalid <u>ever</u>. Note of course that if you don&#8217;t set it to NULL on failure, then your caller had better know that he&#8217;s on the hook for freeing it even on failure. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-799653">
+				<div id="div-comment-799653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799653">
+			January 2, 2010 at 12:51 pm</a>		</div>
+
+		<p>Gecko&#8217;s XPCOM layer doesn&#8217;t allow you to return values on failure (although writing 0 to output pointers is silently tolerated). This means that it can for instance have its smart QI helpers clear themselves if the QI fails. However its equivalent to the &amp; operator does not support inout arguments (I don&#8217;t know whether CComPtr does or not.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm odd alt thread-odd thread-alt depth-1" id="comment-799663">
+				<div id="div-comment-799663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799663">
+			January 2, 2010 at 5:41 pm</a>		</div>
+
+		<p>[Even terser: They must not be set to something invalid ever. Note of course that if you don&#8217;t set it to NULL on failure, then your caller had better know that he&#8217;s on the hook for freeing it even on failure. -Raymond]</p>
+<p>I was thinking along the lines of not even touching it on failure, that is not setting it to anything at all except on success.</p>
+<div class=post>[<i>On failure, you must set it to NULL. If you don&#8217;t touch it, then it contains uninitialized garbage on exit. (We&#8217;re talking about [out] parameters, which are uninitialiized on entry, as opposed to [in][out] parameters.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-799643">
+				<div id="div-comment-799643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Logan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799643">
+			January 2, 2010 at 11:51 am</a>		</div>
+
+		<p>@Ken</p>
+<p>The advantage is to avoid having a sneaky and surprising overload of operator&amp;, especially since COM (by necessity) throws void* (and void**) around so much. I&#8217;m certainly not going to write it the long way, since there is really no good reason to (except maybe paranoia), while that overload exists, and at this point it is idiomatic so it would be confusing not to do it that way. That said, it strikes me as an extremenly brittle and heavy handed way to go about making using the smart pointer &quot;look the same&quot; as using a dumb pointer. A less verbose option could be</p>
+<p>if(SUCCEEDED(smartptr.QIAttach( thing )) { &#8230; }</p>
+<p>No surprising overload, heck it can be safer than a regular (or even a templated QI) because you can&#8217;t mix up the GUID and the type.</p>
+<p>Yes, this doesn&#8217;t solve the problem of functions tthat return multiple interfaces or even functions that aren&#8217;t QueryInterface.</p>
+<p>Maybe I should just go write a COM smart pointer library and quit complaining about the non-obviousness of operator&amp; overloads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-799703">
+				<div id="div-comment-799703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799703">
+			January 3, 2010 at 1:57 pm</a>		</div>
+
+		<p>No, I&#8217;m gonna say that our program that uses CComPtr assumes the pointer is left unchanged when QueryInterface fails. &nbsp;</p>
+<p>The smart pointer&#8217;s NULL value is set in its constructor, of course. QueryInterface setting to NULL on failure is not necessary. &nbsp;</p>
+<p>I&#8217;ll give you that our code assumes that the code assumes that &nbsp;garbage isn&#8217;t put in the pointer on failure. &nbsp;But it doesn&#8217;t assume that NULL is put there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm even thread-even depth-1" id="comment-799733">
+				<div id="div-comment-799733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799733">
+			January 3, 2010 at 8:26 pm</a>		</div>
+
+		<p>[On failure, you must set it to NULL. If you don&#8217;t touch it, then it contains uninitialized garbage on exit. (We&#8217;re talking about [out] parameters, which are uninitialiized on entry, as opposed to [in][out] parameters.) -Raymond]</p>
+<p>Ah, thanks, I was misremembering a quote from the previous article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-799743">
+				<div id="div-comment-799743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799743">
+			January 3, 2010 at 8:35 pm</a>		</div>
+
+		<p>ulric:</p>
+<p>See Raymond&#8217;s response to GregM. &nbsp;We are talking about [out] parameters. &nbsp;The current value of the pointer inside of CComPtr is meaningless when passed into QueryInterface. &nbsp;In fact, if it already has a pointer to a valid object, then a reference will be leaked when QueryInterface sets the output value.</p>
+<p>Also, even if you are passing in an initialized CComPtr, that doesn&#8217;t mean that that pointer is what is passed into the QueryInterface in question. &nbsp;If the interface has been marshaled, I&#8217;m nearly positive that the QI call has to get thunked over to the proper apartment (if required) in order to be executed. &nbsp;Thus even if the initial NULL in CComPtr could be considered redundant, the QI implementation must be correct as per the standard in order for the results to be properly thunked back to the caller.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-799873">
+				<div id="div-comment-799873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799873">
+			January 4, 2010 at 9:42 am</a>		</div>
+
+		<p>Ken: Smart pointers are just reference counting done for you (in most cases). That&#8217;s kind of the default method of garbage collection for old languages like VB and Perl that were never intended to be multi-threaded.</p>
+<p>Once you need to support multiple threads, the overhead starts to get pretty high. And if you need to be safe in the face of signals, exceptions, and threads, good luck getting portability or performance.</p>
+<p>Furthermore, &quot;smart&quot; pointers start to look pretty dumb once you have cycles in your object graph. Of course you can manually fix them, but there goes your syntactic invisibility.</p>
+<p>There&#8217;s a reason new languages use traditional GC instead of ref counting.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-799943">
+				<div id="div-comment-799943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799943">
+			January 4, 2010 at 11:27 am</a>		</div>
+
+		<p>In all the examples, the problem is that the function sets the output parameter to something on failure. &nbsp;You don&#8217;t have to set the pointer to NULL if you didn&#8217;t put something there optimistically. CComQiPtr already sets it&#8217;s pointer to NULL before calling QI. &nbsp; </p>
+<div class=post>[<i>But what about callers who don&#8217;t use CComQIPtr and rely on output pointers being NULL on failure? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-799993">
+				<div id="div-comment-799993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-799993">
+			January 4, 2010 at 1:29 pm</a>		</div>
+
+		<p>nope, with smart pointers, by virtue of them being C++ objects with constructors and destructors, we don&#8217;t assume that the function will set the pointer on failure. We just assumes that the pointer will be untouched, i.e. remain null. (it had to be null, otherwise it would leak) </p>
+<p>It doesn&#8217;t matter that the parameter is defined as &#8220;[out]&#8221; &nbsp;the spirit of the code is you left it alone. </p>
+<div class=post>[<i>That&#8217;s great about the &#8220;spirit of the code&#8221;, but the rules of COM is that all [out] parameters must be definitely initialized. You may not assume that they will be preinitialized to NULL on entry. Because <a href="http://blogs.msdn.com/oldnewthing/archive/2004/03/26/96777.aspx" rel="nofollow">they might not be</a>. There&#8217;s no rule of COM that says &#8220;All QueryInterface calls must be made with smart pointers.&#8221; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-801493">
+				<div id="div-comment-801493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://K.Hagan@thermoteknix.com' rel='external nofollow' class='url'>Ken Hagan</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100101-00/?p=15443#comment-801493">
+			January 7, 2010 at 2:28 pm</a>		</div>
+
+		<p>&quot;Once you need to support multiple threads, the overhead starts to get pretty high. And if you need to be safe in the face of signals, exceptions, and threads, good luck getting portability or performance.&quot;</p>
+<p>Nope, you&#8217;ve lost me there. The overhead with multiple threads is merely in using atomic increment or decrement, and unless you are really *hammering* the object from more than one thread you&#8217;ll struggle to measure it in even the most contrived benchmark. (Of course, unless these threads are all in the sane apartment, it isn&#8217;t possible to hammer anything because each thread will only see its proxy.)</p>
+<p>Signals are non-portable, outside of the rather narrow world of strict Posix. ISO C basically says &quot;you can&#8217;t portably do anything with a signal or in a signal handler&quot;. So yeah, I&#8217;ll struggle to get portability there. Good luck with allocating, freeing, modifying or even safely reading GC-ed objects in that signal handler, by the way.</p>
+<p>Exceptions have zero overhead unless they are thrown, in which case unwinding objects takes the same time as it would during a garbage collection pass, and finding those objects takes considerably less time since the compiler knows exactly where they are.</p>
+<p>&quot;There&#8217;s a reason new languages use traditional GC instead of ref counting.&quot;</p>
+<p>Yes. Their designers didn&#8217;t understand the above points, so didn&#8217;t give the programmer the tools to build proper smart pointer classes. That makes them deficient in my book.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

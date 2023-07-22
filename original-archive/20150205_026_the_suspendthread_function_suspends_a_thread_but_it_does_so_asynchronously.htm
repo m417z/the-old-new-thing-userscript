@@ -1,0 +1,502 @@
+<html>
+<head>
+<title>The SuspendThread function suspends a thread, but it does so asynchronously</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The SuspendThread function suspends a thread, but it does so asynchronously</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 5, 2015 / year-entry #27</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>22</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Prologue: Why you should never suspend a thread. Okay, so a colleague decided to ignore that advice because he was running some experiments with thread safety and interlocked operations, and suspending a thread was a convenient way to open up race windows. While running these experiments, he observed some strange behavior. LONG lValue; DWORD CALLBACK...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<b>Prologue</b>:
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/12/09/55988.aspx">
+Why you should never suspend a thread</a>.
+</p>
+<p>
+Okay, so a colleague decided to ignore that advice because he was running
+some experiments with thread safety and interlocked operations,
+and suspending a thread was a convenient way to open up race windows.
+</p>
+<p>
+While running these experiments, he observed some strange behavior.
+</p>
+<pre>
+LONG lValue;
+
+DWORD CALLBACK IncrementerThread(void *)
+{
+ while (1) {
+  InterlockedIncrement(&amp;lValue);
+ }
+ return 0;
+}
+
+// This is just a test app, so we will abort() if anything
+// happens we don't like.
+
+int __cdecl main(int, char **)
+{
+ DWORD id;
+ HANDLE thread = CreateThread(NULL, 0, IncrementerThread, NULL, 0, &amp;id);
+ if (thread == NULL) abort();
+
+ while (1) {
+  if (SuspendThread(thread) == (DWORD)-1) abort();
+
+  if (InterlockedOr(&amp;lValue, 0) != InterlockedOr(&amp;lValue, 0)) {
+   printf("Huh? The variable lValue was modified by a suspended thread?\n");
+  }
+
+  ResumeThread(thread);
+ }
+ return 0;
+}
+</pre>
+<p>
+The strange thing is that the "Huh?" message was being printed.
+How can a suspended thread modify a variable?
+Is there some way that
+<code>Interlocked&shy;Increment</code>
+can start incrementing a variable,
+then get suspended,
+and somehow finish the increment later?
+</p>
+<p>
+The answer is simpler than that.
+The <code>Suspend&shy;Thread</code> function tells the scheduler
+to suspend the thread but does not wait for an acknowledgment
+from the scheduler that the suspension has actually occurred.
+This is sort of alluded to in
+<a HREF="http://msdn.microsoft.com/library/ms686345">
+the documentation for
+<code>Suspend&shy;Thread</code></a>
+which says
+</p>
+<blockquote CLASS=q><p>
+This function is primarily designed for use by debuggers.
+It is not intended to be used for thread synchronization
+</p>
+</blockquote>
+<p>
+You are not supposed to use
+<code>Suspend&shy;Thread</code> to synchronize two threads
+because there is no actual synchronization guarantee.
+What is happening is that the <code>Suspend&shy;Thread</code>
+signals the scheduler to suspend the thread and returns
+immediately.
+If the scheduler is
+<a HREF="https://channel9.msdn.com/shows/Going+Deep/Arun-Kishan-Farewell-to-the-Windows-Kernel-Dispatcher-Lock/">
+busy doing something else</a>,
+it may not be able to handle the suspend request immediately,
+so the thread being suspended gets to run on borrowed time
+until the scheduler gets around to processing the suspend request,
+at which point it actually gets suspended.
+</p>
+<p>
+If you want to make sure the thread really is suspended,
+you need to perform a synchronous operation that is dependent
+on the fact that the thread is suspended.
+This forces the suspend request to be processed since it
+is a prerequisite for your operation,
+and since your operation is synchronous,
+you know that by the time it returns,
+the suspend has definitely occurred.
+</p>
+<p>
+The traditional way of doing this is to call
+<code>Get&shy;Thread&shy;Context</code>,
+since this requires the kernel to read from the context
+of the suspended thread,
+which has as a prerequisite that the context be saved in the
+first place,
+which has as a prerequisite that the thread be suspended.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (22)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1174563">
+				<div id="div-comment-1174563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174563">
+			February 5, 2015 at 7:57 am</a>		</div>
+
+		<p>Until the last paragraph I wondered how the CLR team would ever be able to make the GC work with an asynchronous SuspendThread. They need to know that a particular thread is stopped and then even change its CONTEXT.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174583">
+				<div id="div-comment-1174583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sven2</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174583">
+			February 5, 2015 at 9:59 am</a>		</div>
+
+		<p>Ian: Couldn&#39;t you implement that as a simple queue of events? You just create the event and wait for it. Events are always set by the respective previous owner of the FIFO CS. Management of the event list would have to be in a regular Critical Section of course.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174593">
+				<div id="div-comment-1174593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174593">
+			February 5, 2015 at 11:01 am</a>		</div>
+
+		<p>@Ian: The reason you didn&#39;t see it happen in practice was probably because the thread was suspending itself, and some implementation detail in the scheduler made it act synchronously on the request if the thread making the request was the same as the target.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-hankhein odd alt thread-odd thread-alt depth-1" id="comment-1174603">
+				<div id="div-comment-1174603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Henri+Hein' rel='external nofollow' class='url'>Henri Hein</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174603">
+			February 5, 2015 at 11:02 am</a>		</div>
+
+		<p>I see the advantage to Ian&#39;s approach. &nbsp;To use events, you would need one for each thread. &nbsp;Saving the event objects can be substantial if there are a lot of workers. &nbsp;What I don&#39;t like about it is that I would then have to restart each thread in order to stop that queue (say, during program exit or some kind of app-wide reset).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174613">
+				<div id="div-comment-1174613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174613">
+			February 5, 2015 at 11:08 am</a>		</div>
+
+		<p>Thinking on how it could have been implemented: SuspendThread sets a &quot;please suspend yourself&quot; flag on the target and fires an inter-processor interrupt to the core which is running the thread. When returning from any system call or interrupt, the &quot;please suspend yourself&quot; flag is checked, and if it&#39;s set, it jumps into the scheduler instead of returning.</p>
+<p>If that&#39;s how it&#39;s implemented, calling SuspendThread on yourself will always find the flag set on return from the SuspendThread system call, and so jump into the scheduler instead of returning. Call SuspendThread on a thread running on a different core, and the thread can still run for a while before that core receives the inter-processor interrupt and returns from it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174623">
+				<div id="div-comment-1174623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">documentation issue</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174623">
+			February 5, 2015 at 12:06 pm</a>		</div>
+
+		<p>Seems like the MSDN documentation should just be explicit upfront about the suspension happening asynchronously. As is written there is little to suggest the asynchronicity:</p>
+<p> &nbsp; &nbsp;Remarks</p>
+<p> &nbsp; &nbsp;If the function succeeds, execution of the specified thread is suspended and the thread&#39;s suspend count is incremented</p>
+<p>The comment on &quot;not intended to be used for thread synchronization&quot; doesn&#39;t really help in this regard, as it is immediately followed up by an explanation of the deadlock situation, aka &quot;Why you should never suspend a thread&quot;. &nbsp;So it reads more like a prolog to the deadlock situation rather than the side effect happening asynchronously.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1174653">
+				<div id="div-comment-1174653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174653">
+			February 5, 2015 at 3:53 pm</a>		</div>
+
+		<p>@Ian:</p>
+<p>A few problems with that approach:</p>
+<p>1. If you insert a thread context structure to a list, it needs to have a critical section to protect it. That critical section doesn&#39;t have a guarantee of FIFO ordering, so you lose order here.</p>
+<p>2. You have to call SuspendThread on yourself while outside any critical section. And the owner will call ReleaseThread. But the problem here that because of a race condition these calls may get reversed, and then the thread will remain suspended (ResumeThread on a running thread has no effect).</p>
+<p>A simple auto-reset event has a soft FIFO order behavior. Most of the time the ordering will be honored. If you&#39;re not running asynchronous I/O, the possibility of falling out of order will be even lower.</p>
+<p>And there is no concept or guarantee of ordering on a multi-processor system, anyway. Two threads may arrive to the EnterMyCriticalSection call in some order, but there is no guarantee that they will arrive to the locking instruction in the same order.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174663">
+				<div id="div-comment-1174663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zach</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174663">
+			February 5, 2015 at 4:25 pm</a>		</div>
+
+		<p>Since we&#39;re on the subject of SuspendThread, I would be very curious to know why when writing a debugger, it is not enough for a thread to be stopped via WaitForDebugEvent in order to call GetThreadContext. &nbsp;In other words, WaitForDebugEvent() returns and says some thread N received an event. &nbsp;If you call GetThreadContext() on a handle for N, the results are indeterminate. &nbsp;You still must first call SuspendThread().</p>
+<p>This is confusing, because if you look at the documentation for ContinueDebugEvent, it says this:</p>
+<p>&quot;After the ContinueDebugEvent function succeeds, the specified thread continues&quot;.</p>
+<p>This suggests that the thread is suspended. &nbsp;Furthermore, on the MSDN page titled &quot;Writing the Debugger&#39;s Main Loop&quot; (<a rel="nofollow" target="_new" href="https://msdn.microsoft.com/en-us/library/windows/desktop/ms681675(v=vs.85).aspx">msdn.microsoft.com/&#8230;/ms681675(v=vs.85).aspx</a>) it says this:</p>
+<p>&quot;When the debugging event occurs, the system suspends all threads in the process being debugged and notifies the debugger of the event.&quot;</p>
+<p>But my own testing suggests that GetThreadContext() is still not safe to call until you&#39;ve called SuspendThread. &nbsp;So something else is at play here.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174573">
+				<div id="div-comment-1174573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174573">
+			February 5, 2015 at 8:44 am</a>		</div>
+
+		<p>A while ago I wrote what I think is one valid use of SuspendThread() outside a debugger. (Yes, I&#39;m a special snowflake :-)). I needed a strict FIFO critical section (and yes, I know about the convoy problem) and I implemented it by having the thread wanting to enter the critical section call SuspendThread() *on itself*. When the current owner of the critical section leaves, it calls ResumeThread() on the waiting thread at the front of the queue. There were a couple of added complications to avoid problems with a thread being pre-empted between asking to enter the critical section and actually calling SuspendThread(). But the crucial point is that a thread only suspends itself, so you know it isn&#39;t holding a lock.</p>
+<p>However, I&#39;m now wondering if it&#39;s possible for a thread to exit from SuspendThread(hSelf) immediately and then be suspended a few instructions later. I&#39;ve never seen this happen in practise.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174693">
+				<div id="div-comment-1174693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">12BitSlab</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174693">
+			February 6, 2015 at 5:06 am</a>		</div>
+
+		<p>@ JM &#8212; SuspendThread() was supported in .Net through version 1.1. &nbsp;It was deprecated in 2.0.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174713">
+				<div id="div-comment-1174713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174713">
+			February 6, 2015 at 7:06 am</a>		</div>
+
+		<p>Ian&#39;s implementation sounds like a ticking time bomb. FIFO means &quot;a queue.&quot; Ian, I&#39;m quite sure you didn&#39;t need &quot;a strict FIFO critical section&quot; as such but something to be processed in a certain way for something to be done. So you probably needed a queue, and that is independent of your decision to use &quot;SuspendThread&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174743">
+				<div id="div-comment-1174743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174743">
+			February 6, 2015 at 7:25 am</a>		</div>
+
+		<p>@acq Every man and his dog will tell you &quot;you don&#39;t want to do that&quot; when he doesn&#39;t have a better way to do &quot;that&quot;.</p>
+<p>Essentially what you seem to be saying is that I don&#39;t want to use threads plus a critical section to protect the resource; instead I should put the work in a queue and process it serially (so the resource doesn&#39;t need protecting). It&#39;s a fair point, but there are reasons why I can&#39;t do that in this particular case. But if I was starting again from scratch that is indeed how I would do it. Mucking about with thread scheduling is a mug&#39;s game.</p>
+<p>As to whether it is a ticking time bomb, it all depends on whether SuspendThread(hSelf) is indeed asynchronous or not&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174763">
+				<div id="div-comment-1174763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174763">
+			February 6, 2015 at 8:02 am</a>		</div>
+
+		<p>12BitSlab: don&#39;t you mean Thread.Suspend()? That&#39;s not related to how managed thread suspension can be made to work for purposes of GC (which is internal to the CLR). Thread.Suspend() is obsolete for the same reason SuspendThread() is a bad idea, but my point was that the CLR doesn&#39;t need SuspendThread() (or its managed equivalent) as long as it&#39;s willing to compromise on when it can do garbage collection (which seems a reasonable price to pay).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174773">
+				<div id="div-comment-1174773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">12BitSlab</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174773">
+			February 6, 2015 at 8:04 am</a>		</div>
+
+		<p>@ JM &#8212; Yes, you are correct. &nbsp;Sometimes I switch too often between managed and non-managed code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-iboyd even thread-even depth-1" id="comment-1174803">
+				<div id="div-comment-1174803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/IanBoyd' rel='external nofollow' class='url'>IanBoyd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174803">
+			February 6, 2015 at 8:46 am</a>		</div>
+
+		<p>I recently upgraded our development tools. In the intervening years they had deprecated their </p>
+<p> &nbsp; &nbsp;Thread.Suspend();</p>
+<p>and </p>
+<p> &nbsp; &nbsp;Thread.Resume();</p>
+<p>Saying that they are only meant to be used for debugging purposes, and not as a general mechanism to suspend and resume threads.</p>
+<p>They replaced the methods with only:</p>
+<p> &nbsp; &nbsp;Thread.Start();</p>
+<p>which is used to start a thread that was start with CREATE_SUSPENDED.</p>
+<p>Which has caused some changes to no longer depend on the ability to Suspend a thread.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174673">
+				<div id="div-comment-1174673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174673">
+			February 6, 2015 at 1:00 am</a>		</div>
+
+		<p>@mark: I haven&#39;t consulted the CLR source for this, but they wouldn&#39;t *need* SuspendThread() to make this work in the managed world, because, well, it&#39;s managed. That is to say, if a thread is running managed code, they can use whatever mechanism they like for cooperative suspension (an APC sounds like a good fit), and if it&#39;s running unmanaged code, they leave it alone (or rather, defer the suspend until we&#39;ve returned to the managed world).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174683">
+				<div id="div-comment-1174683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174683">
+			February 6, 2015 at 1:14 am</a>		</div>
+
+		<p>@alegr1 (2) was the complication I mentioned. ResumeThread() returns 0 if the thread is not yet suspended, so we have to spin (SwitchToThread/YieldProcessor) until ResumeThread() returns 1 to handle the race.</p>
+<p>I overstated the strict FIFO requirement though, and thanks for pointing out that my solution isn&#39;t 100% strict. I&#39;m much more concerned that under conditions of high load a thread shouldn&#39;t be repeatedly starved by a &#39;convoy&#39; coming through. It&#39;s more important that *every* thread gets to run at roughly equal time intervals than that the overall throughput is maximised. On a multiprocessor system I guess it&#39;s very unlikely to be an issue anyway, but this code usually runs on single processor systems.</p>
+<p>@Cesar Very interesting, but unfortunately it&#39;s all conjecture. I&#39;d love to know what the real answer is.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174823">
+				<div id="div-comment-1174823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Duke of New York</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174823">
+			February 6, 2015 at 11:33 am</a>		</div>
+
+		<p>&quot;Don&#39;t suspend threads&quot;</p>
+<p>&quot;Why&quot;</p>
+<p>&quot;Because it would be bad&quot;</p>
+<p>&quot;Define bad&quot;</p>
+<p>&quot;Try to imagine all execution as you know it stopping instantaneously and your synchronization contracts exploding at the speed of light.</p>
+<p>&quot;OK, right. That&#39;s bad&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1174933">
+				<div id="div-comment-1174933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174933">
+			February 7, 2015 at 11:18 am</a>		</div>
+
+		<p>@Mark: I can&#39;t speak for the CLR, but I do know how Java HotSpot does it (usually): At certain well defined points in the code (before returning from functions, backedges on loops,..) there&#39;s code that reads from a specific page in memory. When the JVM wants to stop all threads it removes the read rights from the given page in memory. </p>
+<p>This causes all threads to sooner or later fault, which causes the fault handler to be executed which is where the JVM takes over control. </p>
+<p>This has apparently a lower overhead than reading a flag and then jumping to some code, although the later is/was done by the AArch64 JVM.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1174943">
+				<div id="div-comment-1174943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1174943">
+			February 7, 2015 at 12:31 pm</a>		</div>
+
+		<p>@JM: It&#39;s not even a compromise really. If you want to do a GC you have to know for every thread exactly where object pointers are (on the stack, in registers,..) &#8211; if you had to store that information for every single assembly instruction this would be incredibly large or you&#39;d have to recompute it somehow from fixed points. While theoretically doable it just complicates everything for no good reason. </p>
+<p>In Java you also have the problem of native code working with Java objects (so no GC while any thread doing native code). In .NET I guess unsafe code segments (pointers) might be similarly problematic.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1175013">
+				<div id="div-comment-1175013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1175013">
+			February 9, 2015 at 9:16 am</a>		</div>
+
+		<p>@Ian: Could this be a case for Fibers because you need to decide yourself which thread runs next?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1175173">
+				<div id="div-comment-1175173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150205-00/?p=44743#comment-1175173">
+			February 10, 2015 at 2:27 pm</a>		</div>
+
+		<p>@voo: For .NET if you&#39;re going to manipulate a managed object from native code, it is necessary to pin it from managed code first. This adds a reference (yes a true counted reference) and the GC knows to not even so much as move an object with reference &gt; 0.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

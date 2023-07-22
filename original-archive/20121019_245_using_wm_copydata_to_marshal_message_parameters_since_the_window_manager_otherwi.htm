@@ -1,0 +1,495 @@
+<html>
+<head>
+<title>Using WM_COPYDATA to marshal message parameters since the window manager otherwise doesn't know how</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using WM_COPYDATA to marshal message parameters since the window manager otherwise doesn&#8217;t know how</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 19, 2012 / year-entry #246</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Miral asks for the recommended way of passing messages across processes if they require custom marshaling. There is no one recommended way of doing the custom marshaling, although some are hackier than others. Probably the most architecturally beautiful way of doing it is to use a mechanism that does perform automatic marshaling, like COM and...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Miral asks for
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/09/10/4849069.aspx#4858169">
+the recommended way of passing messages across processes
+if they require custom marshaling</a>.
+</p>
+<p>
+There is no one recommended way of doing the custom marshaling,
+although some are hackier than others.
+</p>
+<p>
+Probably the most <i>architecturally beautiful</i> way of doing
+it is to use a mechanism that <i>does</i> perform automatic
+marshaling,
+like COM and MIDL.
+Okay, it's not actually automatic, but it does allow you just
+give MIDL your structures and some information about
+<a HREF="http://blogs.msdn.com/b/larryosterman/archive/2010/05/26/what-does-size-is-mean-in-an-idl-file.aspx">
+how they should be interpreted</a>,
+and the MIDL compiler autogenerates the marshaler.
+You can then pass the data back and forth by simply
+invoking COM methods and letting COM do the work.
+</p>
+<p>
+<i>Architecturally beautiful</i> often turns into
+<i>forcing me to learn more than I really wanted to learn</i>,
+so here's a more self-contained approach:
+Take advantage of the
+<code>WM_<wbr>COPY&shy;DATA</code> message.
+This is sort of the poor-man's marshaler.
+All it knows how to marshal is a blob of bytes.
+It's your responsibility to take what you want to marshal
+and serialize it into a blob of bytes.
+<code>WM_<wbr>COPY&shy;DATA</code> will get the bytes to the other side,
+and then the recipient needs to deserialize the blob of bytes
+back into your data.
+But at least <code>WM_<wbr>COPY&shy;DATA</code> does the tricky bit
+of getting the bytes from one side to the other.
+</p>
+<p>
+Let's start with our
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/07/23/54576.aspx">
+scratch program</a>
+and have it transfer data to another copy of itself.
+Make the following changes:
+</p>
+<pre>
+<font COLOR=blue>#include &lt;strsafe.h&gt;
+
+HWND g_hwndOther;
+
+#define CDSCODE_WINDOWPOS 42 // lpData -&gt; WINDOWPOS
+
+void OnWindowPosChanged(HWND hwnd, LPWINDOWPOS pwp)
+{
+ if (g_hwndOther) {
+  COPYDATASTRUCT cds;
+  cds.dwData = CDSCODE_WINDOWPOS;
+  cds.cbData = sizeof(WINDOWPOS);
+  cds.lpData = pwp;
+  SendMessage(g_hwndOther, WM_COPYDATA,
+           reinterpret_cast&lt;WPARAM&gt;(hwnd),
+           reinterpret_cast&lt;LPARAM&gt;(&amp;cds));
+ }
+ FORWARD_WM_WINDOWPOSCHANGED(hwnd, pwp, DefWindowProc);
+}
+
+void OnCopyData(HWND hwnd, HWND hwndFrom, PCOPYDATASTRUCT pcds)
+{
+ switch (pcds-&gt;dwData) {
+ case CDSCODE_WINDOWPOS:
+  if (pcds-&gt;cbData == sizeof(WINDOWPOS)) {
+   LPWINDOWPOS pwp = static_cast&lt;LPWINDOWPOS&gt;(pcds-&gt;lpData);
+   TCHAR szMessage[256];
+   StringCchPrintf(szMessage, 256,
+    TEXT("From window %p: x=%d, y=%d, cx=%d, cy=%d, flags=%s %s"),
+    hwndFrom, pwp-&gt;x, pwp-&gt;y, pwp-&gt;cx, pwp-&gt;cy,
+    (pwp-&gt;flags &amp; SWP_NOMOVE) ? TEXT("nomove") : TEXT("move"),
+    (pwp-&gt;flags &amp; SWP_NOSIZE) ? TEXT("nosize") : TEXT("size"));
+   SetWindowText(hwnd, szMessage);
+  }
+  break;
+ }
+}</font>
+
+// WndProc
+
+<font COLOR=blue>    HANDLE_MSG(hwnd, WM_WINDOWPOSCHANGED, OnWindowPosChanged);
+    HANDLE_MSG(hwnd, WM_COPYDATA, OnCopyData);</font>
+
+// WinMain
+    <font COLOR=blue>// If there is another window called "Scratch", then it becomes
+    // our recipient.
+    g_hwndOther = FindWindow(TEXT("Scratch"), TEXT("Scratch"));</font>
+
+    hwnd = CreateWindow(
+        "Scratch",                      /* Class Name */
+        <font COLOR=blue>g_hwndOther ? TEXT("Sender") : TEXT("Scratch"),</font>
+        WS_OVERLAPPEDWINDOW,            /* Style */
+        CW_USEDEFAULT, CW_USEDEFAULT,   /* Position */
+        CW_USEDEFAULT, CW_USEDEFAULT,   /* Size */
+        NULL,                           /* Parent */
+        NULL,                           /* No menu */
+        hinst,                          /* Instance */
+        0);                             /* No special parameters */
+
+</pre>
+<p>
+Just to make it easier to tell the two windows apart,
+I call the one sending the message "Sender".
+(Note that my method for finding the other window is
+pretty rudimentary, because that's not the point of
+the example.)
+</p>
+<p>
+Whenever the sender window receives a
+<code>WM_<wbr>WINDOW&shy;POS&shy;CHANGED</code> message,
+it sends a copy of the <code>WINDOW&shy;POS</code> structure
+to the recipient, which then displays it in its own title bar.
+Things to observe:
+</p>
+<ul>
+<li>The value you put into <code>dwData</code> can be anything
+    you like. It's just another <code>DWORD</code> of data.
+    Traditionally, it's used like a "message number",
+    used to communicate what type of data is being sent.
+    In our case, we choose 42 to mean "The <code>lpData</code> points to
+    a <code>WINDOW&shy;POS</code> structure."</p>
+<li>The <code>cbData</code> is the number of bytes you want
+    to send, and <code>lpData</code> points to the buffer.
+    In our case, the number of bytes is always the same,
+    but variable-sized data is also fine.</p>
+<li>The <code>lpData</code> can point anywhere,
+    as long as the memory is valid for the lifetime of the
+    <code>Send&shy;Message</code> call.
+    In this case, I just point it at the data given to me
+    by the window manager.
+    Of course, if you allocated memory to put into
+    <code>lpData</code>, then the responsibility for freeing
+    it also belongs to you.</p>
+<li>For safety's sake, I validate that when I get a
+    <code>CDS&shy;CODE_<wbr>WINDOW&shy;POS</code> request,
+    the associated data really is the size of a <code>WINDOW&shy;POS</code>
+    structure.
+    This helps protect against a rogue caller who tries to crash
+    the application by sending a
+    <code>CDS&shy;CODE_<wbr>WINDOW&shy;POS</code>
+    with a size less than <code>sizeof(WINDOW&shy;POS)</code>, thereby
+    triggering a buffer overflow.
+    (Exercise: Under what other conditions can the size
+    be incorrect?
+    How would you fix that?)</p>
+<li>The <code>WM_<wbr>COPY&shy;DATA</code> copies data in only one direction.
+    It does not provide a way to pass information back to the sender.
+    (Exercise: How would you pass information back?)</p>
+<li>The <code>hwndFrom</code> parameter is a courtesy
+    parameter, like <code>dwData</code>.
+    There is currently no attempt to verify that the window
+    really is that of the sender.
+    (In practice, all that could really be verified is that the
+    window belongs to the thread that is doing the sending,
+    but right now, not even that level of validation is performed.)
+</ul>
+<p>
+The <code>WM_<wbr>COPY&shy;DATA</code> message is suitable for
+small-to-medium-sized amounts of memory.
+Though if the amount of memory is so small that it fits
+into a <code>WPARAM</code> and <code>LPARAM</code>,
+then even <code>WM_<wbr>COPY&shy;DATA</code> is overkill.
+</p>
+<p>
+If you're going to be passing large chunks of memory,
+then you may want to consider
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/12/11/56043.aspx">
+using a shared memory handle instead</a>.
+The shared memory handle also has the benefit of being shared,
+which means that the recipient can modify the shared memory block,
+and the sender can see the changes.
+(Yes,
+this is one answer to the second exercise,
+but see if you can find another answer that tays within the spirit
+of the exercise.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1016983">
+				<div id="div-comment-1016983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Justin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1016983">
+			October 19, 2012 at 7:19 am</a>		</div>
+
+		<p>The size of WINDOWPOS would be incorrect if one process was 32-bit and the other was 64-bit. &nbsp;I would this this by sending a different structure that only contained the x, y, cx, cy and flags fields.</p>
+<p>If I wanted to pass information back then I&#39;d probably send another window message back to the first window (which you know from the wParam of the WM_COPYDATA message), although you would have to use a PostMessage instead of SendMessage to avoid deadlocks.</p>
+<div class="post">[<i>No deadlock here, because a thread can process inbound sent messages while waiting for an outgoing sent message to complete. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1016993">
+				<div id="div-comment-1016993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1016993">
+			October 19, 2012 at 7:24 am</a>		</div>
+
+		<p>You can of course send a WM_COPYDATA back to the &quot;client&quot; if you need to return data but if you need to send a lot of these messages it might be better to use SHAllocShared or some other shared memory map implementation&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017003">
+				<div id="div-comment-1017003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017003">
+			October 19, 2012 at 7:54 am</a>		</div>
+
+		<p>&quot;No deadlock here, because a thread can process inbound sent messages while waiting for an outgoing sent message to complete. -Raymond&quot;</p>
+<p>I don&#39;t get it. &nbsp;If both threads/processes are using SendMessage to call each other, wouldn&#39;t they be in a state of deadlock?</p>
+<p>1. &nbsp;Process A calls SendMessage to send to Process B, and waits for process B&#39;s window procedure to return.</p>
+<p>2. &nbsp;Process B&#39;s window procedure is now called, and calls SendMessage to send to process A. &nbsp;Now process B waits for process A to process that message.</p>
+<p>3. &nbsp;Process A will never process message sent by process B because it&#39;s still waiting for B&#39;s window procedure to return.</p>
+<p>There are other message functions that seem much more appropriate in this situation.</p>
+<div class="post">[<i>In step 3, process A is woken up &quot;because a thread can process inbound sent messages while waiting for an outgoing sent message to complete.&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017033">
+				<div id="div-comment-1017033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">meh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017033">
+			October 19, 2012 at 8:29 am</a>		</div>
+
+		<p>@JamesJohnston <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2004/06/08/150929.aspx" rel="nofollow">blogs.msdn.com/&#8230;/150929.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017043">
+				<div id="div-comment-1017043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AsmGuru62</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017043">
+			October 19, 2012 at 9:28 am</a>		</div>
+
+		<p>WM_COPYDATA is also fast.</p>
+<p>I was writing a logger process and was surprised that it would log thousands of log string</p>
+<p>per second &#8212; each send with WM_COPYDATA from another process.</p>
+<p>Impressive!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017053">
+				<div id="div-comment-1017053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017053">
+			October 19, 2012 at 9:43 am</a>		</div>
+
+		<p>@AsmGuru62: Yeah, copying a contiguous block of data from one memory location to another is very fast, especially if you know what CPU you&#39;re using and you can use that to tune the code to use the SIMD registers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017073">
+				<div id="div-comment-1017073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017073">
+			October 19, 2012 at 10:17 am</a>		</div>
+
+		<p>Does anybody know when WM_COPYDATA was created? Obviously it had to exist for Win32 to work (because different windows could have different address spaces), but it&#39;s not clear that there was a use for it in 16-bit Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017093">
+				<div id="div-comment-1017093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken Hagan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017093">
+			October 19, 2012 at 12:46 pm</a>		</div>
+
+		<p>@Gabe: I remember noticing it in the pre-release docs for Win32 and I remember thinking it was new. As you say, Win16 doesn&#39;t need it and Win32 almost certainly does.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017023">
+				<div id="div-comment-1017023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017023">
+			October 19, 2012 at 8:10 am</a>		</div>
+
+		<p>Well that&#39;s a lot cleaner than XxxxProcessmemory. And it handles 32/64 bit correctly if your structs are defined sanely* (system structs often aren&#39;t).</p>
+<p>*local definition is suitable for use in binary file formats.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017103">
+				<div id="div-comment-1017103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017103">
+			October 20, 2012 at 3:30 am</a>		</div>
+
+		<p>@Gabe: Of course, there&#39;s nothing to stop you from sending a 0x004A message in 16-bit Windows and passing an hWnd in wParam and a COPYDATASTRUCT in lParam ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017123">
+				<div id="div-comment-1017123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017123">
+			October 20, 2012 at 9:49 pm</a>		</div>
+
+		<p>Hooray for WM_COPYDATA, I use it since..forever and never failed me. I disagree Ray, is not &quot;poor-man&#39;s marshaler&quot; but is the smart man&#39;s marshaler, KISS!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017143">
+				<div id="div-comment-1017143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017143">
+			October 21, 2012 at 12:44 pm</a>		</div>
+
+		<p>I must concur with Danny, especially considering how dangerous COM is to your tech support resources due to loading broken DLLs into your process (not MS DLLs).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017153">
+				<div id="div-comment-1017153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/virtual8086_4000_gmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>virtual8086@gmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017153">
+			October 21, 2012 at 1:08 pm</a>		</div>
+
+		<p>I&#39;ve been recently working on a project, where we needed to pass/share information between/with application instances running within different terminal sessions. The only way we finally found was to use UDP-sockets: the data amount was small enough not to exceed UDP packet size.</p>
+<p>Is this method OK? Is there anything more suitable?</p>
+<p>The whole task was the following: all application instances share a single list of items; if UserA in terminal session A adds/deletes an item to/from the list, UserB in terminal session B should see the changes as soon as possible.</p>
+<p>Thank you.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017163">
+				<div id="div-comment-1017163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017163">
+			October 21, 2012 at 5:48 pm</a>		</div>
+
+		<p>@Virtual8086: See global named pipes. But yeah, I&#39;ve found the UDP datagrams to localhost to be far more reliable to get working. Named pipes seems to have some odd resource allocation glitches that appear to be residue of an older era.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017183">
+				<div id="div-comment-1017183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/virtual8086_4000_gmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>virtual8086@gmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017183">
+			October 21, 2012 at 10:13 pm</a>		</div>
+
+		<p>@Joshua: pipes were also not suitable, because we had to send data to multiple application instances (3 and more) while pipes are somewhat like TCP-sockets allowing only 2 sides to be connected.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1017193">
+				<div id="div-comment-1017193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017193">
+			October 22, 2012 at 3:29 am</a>		</div>
+
+		<p>@Gabe I checked out an old copy of Visual C++ 1.5 and it didn&#39;t seem to know about WM_COPYDATA, but it turns out that by comparison I also have a 16-year-old copy of the Platform SDK .HLP (!) file which did know about WM_COPYDATA and claims that Win32s supports it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1017653">
+				<div id="div-comment-1017653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121019-00/?p=6293#comment-1017653">
+			October 24, 2012 at 7:28 am</a>		</div>
+
+		<p>OK&#8230; now I just learned about some re-entrancy implications that I hadn&#39;t really thought about before! &nbsp;Ouch.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

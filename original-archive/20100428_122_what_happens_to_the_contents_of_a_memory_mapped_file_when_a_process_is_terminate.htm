@@ -1,0 +1,255 @@
+<html>
+<head>
+<title>What happens to the contents of a memory-mapped file when a process is terminated abnormally?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What happens to the contents of a memory-mapped file when a process is terminated abnormally?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 28, 2010 / year-entry #123</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Bart wonders what happens to the dirty contents of a memory-mapped file when an application is terminated abnormally. From the kernel's point of view, there isn't much difference between a normal and an abnormal termination. In fact, the last thing that Exit­Process does is Terminate­Process(Get­Current­Process(), Exit­Code), so in a very real sense the two operations...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Bart wonders <a href="http://blogs.msdn.com/oldnewthing/pages/407234.aspx#1165882"> what happens to the dirty contents of a memory-mapped file when an application is terminated abnormally</a>.</p>
+<p> From the kernel's point of view, there isn't much difference between a normal and an abnormal termination. In fact, the last thing that <code>Exit&shy;Process</code> does is <code>Terminate&shy;Process(Get&shy;Current&shy;Process(), Exit&shy;Code)</code>, so in a very real sense the two operations are identical from the kernel's point of view. The only difference is that in a controlled termination, DLLs get their <code>DLL_<wbr>PROCESS_<wbr>DETACH</wbr></wbr></code> notifications, whereas in an abnormal termination, they don't. But given that the advice for DLLs is to do as little as possible during process termination (including suppressing normal cleanup), the difference even there is negligible. </p>
+<p> Therefore, the real question is <i>What happens to the dirty contents of a memory-mapped file when an application exits without closing the handle?</i> </p>
+<p> If a process exits without closing all its handles, the kernel will close them on the process's behalf. Now, in theory, the kernel could change its behavior depending on why a handle is closed&mdash;skipping some steps if the handle is being closed as part of cleanup and performing additional ones if it came from an explicit <code>Close&shy;Handle</code> call. So it's theoretically possible that the unwritten memory-mapped data may be treated differently. (Although it does violate the principle of <a href="http://blogs.msdn.com/oldnewthing/archive/2009/02/16/9425124.aspx"> not keeping track of information you don't need</a>. But as we've seen, <a href="http://blogs.msdn.com/oldnewthing/archive/2010/03/22/9982671.aspx"> sometimes you have to violate a principle</a>.) </p>
+<p> But there's also the guarantee that multiple memory-mapped views of the same local file are <i>coherent</i>; that is, that <a href="http://blogs.msdn.com/oldnewthing/archive/2003/10/07/55194.aspx"> changes made to one view are immediately reflected in other views</a>. Therefore, if there were another view of that memory-mapped file which you neglected to close manually, any changes you had made to that view would still be visible in other views, so the contents were not lost. It's not like the kernel is going to fire up its time machine and say, "Okay, those writes to the memory-mapped file which this terminated application made, I'm going to go back and undo them even though I had already shown them to other applications." </p>
+<p> In other words, in the case where the memory-mapped view is to a local file, and there happens to be another view on the file, then the changes are not discarded, since they are being kept alive by that other view. </p>
+<p> Therefore, if the kernel were to discard unflushed changes to the memory-mapped view, it would have to have not one but two special-cases. One for the "this handle is being closed implicitly due to an application exiting without closing all its handles" case and another for the "this handle being closed implicitly due to an application exiting without closing all its handles when the total number of active views is less than two." </p>
+<p> I don't know what the final answer is, but if the behavior were any different from the process closing the handle explicitly, it would require two special-case behaviors in the kernel. I personally consider this unlikely. Certainly if I were writing an operating system, I wouldn't bother writing these two special cases. </p>
+<p> If you think like the memory manager, then you come to the same conclusion from a different direction. If you think about the lifetime of a committed page, there are a small set of operations each page type needs to perform. </p>
+<ul>
+<li><i>Page in</i>: Produce the contents of the page. </li>
+<li><i>Make dirty</i>: The page has been written to for the first time. </li>
+<li><i>Page out dirty</i>: The page is about to be removed from memory.     The application has written to the page since it was paged in. </li>
+<li><i>Page out clean</i>: The page is about to be removed from memory.     The application has not written to the page since it was paged in. </li>
+<li><i>Decommit dirty</i>: The page is about to be removed from memory,     and it was written to since it was paged in. </li>
+<li><i>Decommit clean</i>: The page is about to be removed from memory,     and it was not written to since it was paged in. </li>
+</ul>
+<p> The different types of committed pages implement these operations in different ways. Because, after all, that's what makes them different. </p>
+<ul>
+<li>Zero-initialized memory     
+<ul>
+<li><i>Page in</i>: Fill the page with zeroes.     </li>
+<li><i>Make dirty</i>: Locate a free page in the swap file,     assign it to this page,      set type to "allocated memory".     </li>
+<li><i>Page out dirty</i>: (never happens)     </li>
+<li><i>Page out clean</i>: Do nothing.     </li>
+<li><i>Decommit dirty</i>: (never happens)     </li>
+<li><i>Decommit clean</i>: Do nothing.     </li>
+</ul>
+</li>
+<li>Allocated memory     
+<ul>
+<li><i>Page in</i>: Read page contents from swap file.     </li>
+<li><i>Make dirty</i>: Do nothing.     </li>
+<li><i>Page out dirty</i>: Write page contents to swap file.     </li>
+<li><i>Page out clean</i>: Do nothing.     </li>
+<li><i>Decommit dirty</i>: Free the page from the swap file.     </li>
+<li><i>Decommit clean</i>: Free the page from the swap file.     </li>
+</ul>
+</li>
+<li>Memory-mapped file     
+<ul>
+<li><i>Page in</i>: Read page contents from file.     </li>
+<li><i>Make dirty</i>: Do nothing.     </li>
+<li><i>Page out dirty</i>: Write page contents to file.     </li>
+<li><i>Page out clean</i>: Do nothing.     </li>
+<li><i>Decommit dirty</i>: Write page contents to file.     </li>
+<li><i>Decommit clean</i>: Do nothing.     </li>
+</ul>
+</li>
+</ul>
+<p> There are other types of pages (such as <i>copy-on-write pages</i>, the <i>null page</i>, and <i>physical pages</i>, but they aren't relevant here.) </p>
+<p> Note that these operations apply to the pages and not to the address space. <a href="http://blogs.msdn.com/oldnewthing/archive/2004/08/10/211890.aspx"> Memory can be committed without being visible in the address space</a>, and a single page can be visible in multiple address spaces at once, or even <a href="http://blogs.msdn.com/oldnewthing/archive/2003/10/07/55194.aspx"> multiple times within the same address space</a>! The reason two views onto the same local file are coherent is that they are merely two manifestations of the same underlying committed page. The part of the memory manager that manages committed memory doesn't know where in the address space (if anywhere) the memory is going to be mapped, nor does it know why the requested operation is taking place (beyond the circumstances implied by the operation itself). </p>
+<p> When a memory-mapped file page is decommitted, the appropriate <i>Decommit function</i> is called, and if the page is dirty, then the contents are flushed to the underlying file. It doesn't know why the decommit happened, so it can't perform any special shortcuts depending on the circumstances that led to the decommit. </p>
+<p> Consider a memory-mapped file with two views. One view closes normally. The page is still committed (the second view is still using it), so no <i>Decommit</i> happens yet. Then the process which was using the second view terminates abnormally. The <i>Decommit</i> must still be treated as a normal (not abnormal) decommit, because the first process did terminate normally, and therefore is under the not unreasonable expectation that its changes will make it into the file. In order to protect against discarding changes which earlier (now-closed) views had made, an extra bit would have to be carried for each committed page that says, "This page contains data that we promised to write back to the file (because somebody wrote to it and then closed the view normally)." You would set this flag on every page in a view when you close the view normally, or if you close the view due to abnormal process termination if there are other still-running processes that are using the view (because the changes are visible to them), and you would clear this flag after each <i>Page out</i> operation. Then you could add another type of decommit, <i>Decommit leaked</i>, which is used when a page that contains no changes from properly-closed views is decommitted because the last remaining reference to it was from a process that terminated abnormally. </p>
+<p> You could do all this work in your memory manager, but why bother? It's additional bookkeeping just to <a href="http://blogs.msdn.com/oldnewthing/archive/2007/07/19/3945339.aspx"> optimize the case where somebody is doing something wrong</a>. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-829133">
+				<div id="div-comment-829133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexandre Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829133">
+			April 28, 2010 at 8:55 am</a>		</div>
+
+		<p>Since we&#8217;re talking about memory-mapped files, let me warn you about one special case. It&#8217;s when you create a temporary file to back your memory, and it is DELETE_ON_CLOSE file.</p>
+<p>Some programmers close the original file handle after they passed it to CreateFileMapping. In theory, the file mapping object keeps a reference to the file object, so the file is not supposed to go away. But if the file is created with DELETE_ON_CLOSE, it gets deleted on CloseHandle (IRP_MJ_CLEANUP), not on file object destruction.</p>
+<p>In this case, the file mapping won&#8217;t be able to flush the dirty pages. They will actually be silently discarded, and will be all zero after page-in.</p>
+<p>This problem was reportedly fixed around Vista timeframe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829143">
+				<div id="div-comment-829143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829143">
+			April 28, 2010 at 3:38 pm</a>		</div>
+
+		<blockquote><p>
+  changes made to one view are immediately reflected in other views
+</p></blockquote>
+<p>&lt;a href=&quot;<a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Cache_coherence&quot;&gt;I" rel="nofollow">http://en.wikipedia.org/wiki/Cache_coherence&quot;&gt;I</a> don&#8217;t think this is possible on a multiprocessor system.&lt;/a&gt;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829163">
+				<div id="div-comment-829163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexandre Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829163">
+			April 28, 2010 at 4:12 pm</a>		</div>
+
+		<p>@Anonymous:</p>
+<p>IA32/x86-64 multiprocessor have implicit cache coherence protocol between processors. When the data left the write buffer (by virtues of a write barrier) and got to cache, it is immediately visible to all other processors.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829193">
+				<div id="div-comment-829193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ismael</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829193">
+			April 29, 2010 at 5:09 am</a>		</div>
+
+		<p>@Anonymous, Alexandre Grigoriev:</p>
+<p>Both views are correct, for differing definitions of &quot;immediately&quot;; immediately after the write instruction retires, immediately before the next instruction executes, or immediately after the write is sent to L2 cache I guess.</p>
+<p>It&#8217;s possible to mess this stuff up, which is why we have e.g interlocked instructions and special lock-free IPC protocols that guarantee a certain internally-consistent memory semantic, provided all the participating processes implement it correctly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829223">
+				<div id="div-comment-829223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">volatile</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829223">
+			April 29, 2010 at 7:53 am</a>		</div>
+
+		<p>Objects has to be declared as &quot;volatile&quot; to be sure to be synced immediately.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829233">
+				<div id="div-comment-829233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dylan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829233">
+			April 29, 2010 at 8:19 am</a>		</div>
+
+		<p>@volatile</p>
+<p>On some level you could say that, but volatile is rarely the correct answer.</p>
+<p><a rel="nofollow" target="_new" href="http://www.kernel.org/doc/Documentation/volatile-considered-harmful.txt" rel="nofollow">http://www.kernel.org/doc/Documentation/volatile-considered-harmful.txt</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829253">
+				<div id="div-comment-829253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexandre Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829253">
+			April 29, 2010 at 8:54 am</a>		</div>
+
+		<p>@ismael, volatile:</p>
+<p>Standard defines &#8216;volatile&#8217; as memory whose contents can be changed by means outside of C/C++ &quot;virtual machine&quot; control. Most proper example of this are memory-mapped device registers.</p>
+<p>But the standard doesn&#8217;t define any multiprocessing, or memory ordering.</p>
+<p>Microsoft-specific implementation of volatile access in the latest compilers adds read barrier after reading a volatile, and write barrier before writing a volatile.</p>
+<p>A written data is visible as soon as it gets to L1 cache. It may not be visible if it&#8217;s in the write buffer. A serializing instruction makes sure all posted writes are committed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829723">
+				<div id="div-comment-829723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100428-00/?p=14223#comment-829723">
+			May 3, 2010 at 6:46 am</a>		</div>
+
+		<p>@Dylan</p>
+<p>The compiler/linker/environment/IDE/whatever/&#8230; could replace the volatile language construct with those accessor functions to I/O hardware. Instead of reinventing the wheel, existing keywords could be reused and made to work as developers expect them to work.</p>
+<p>@ismael</p>
+<p>The standard doesn&#8217;t prevent the compiler from implementing a volatile keyword which syncs between threads/processes/&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,579 @@
+<html>
+<head>
+<title>Excursions in composition: Adding rewind support to a sequential stream</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Excursions in composition: Adding rewind support to a sequential stream</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 23, 2007 / year-entry #103</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Here's a problem "inspired by actual events": I have a sequential stream that is the response to a request I sent to a web site. The format of the stream is rather messy; it comes with a variable-length header that describes what type of data is being returned. I want to read that header and...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Here's a problem "inspired by actual events":
+</p>
+<blockquote CLASS=q>
+<p>
+I have a sequential stream
+that is the response to a request I sent to a web site.
+The format of the stream is rather messy; it comes with a
+variable-length header that describes what type of data is being returned.
+I want to read that header and then
+hand the stream to an appropriate handler.
+But the handlers expect to be given the stream in its entirety,
+including the bytes that I have already read.
+Since this is a sequential stream,
+I can't change the seek position.
+How can I "unread" the data and give the handlers what they want?
+</p>
+<p>
+Right now, I'm just closing the stream I get and issuing a second request.
+I give that second stream to the handler that I determined by
+parsing the first stream.
+Of course, this makes the rather unsafe assumption that
+the server will send the same data stream back the
+second time, and I'm issuing twice as many
+requests as I really need.
+</p>
+<p>
+I tried reading the entire stream into memory and creating
+a new stream on that, but the data stream can be very big,
+and I feel bad allocating all that memory just so I can
+"unread" a few dozen bytes.
+</p>
+</blockquote>
+<p>
+All the customer wants here is to be able to "unread" some bytes
+from a stream.
+This is a perfect job for our
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/03/22/1927891.aspx">
+composite sequential stream</a>.
+The first stream consists of the bytes we want to push back,
+and the second stream is the rest of the stream.
+Here's an explanation in pictures.
+The pink stream is the original stream returned from the web site,
+and the green stream remembers the bytes we want to push back.
+</p>
+<p>
+Initial state:
+</p>
+<table BORDER=0>
+<tr>
+<td STYLE="border: solid .75pt black; background: lightgreen"
+    >&nbsp;</td>
+<td STYLE="border: solid .75pt black; background: pink"
+    >ABCDEFGHIJK...</td>
+</tr>
+</table>
+<p>
+After reading a few bytes:
+</p>
+<table BORDER=0>
+<tr>
+<td STYLE="border: solid .75pt black; background: lightgreen"
+    >&nbsp;ABCD</td>
+<td STYLE="border: solid .75pt black; background: pink"
+    >EFGHIJK...</td>
+</tr>
+</table>
+<p>
+After reading a few more bytes:
+</p>
+<table BORDER=0>
+<tr>
+<td STYLE="border: solid .75pt black; background: lightgreen"
+    >&nbsp;ABCDEFG</td>
+<td STYLE="border: solid .75pt black; background: pink"
+    >HIJK...</td>
+</tr>
+</table>
+<p>
+Finally, we have determined the handler, but the handler expects
+to start reading from the "A", so we will take these two streams
+and concatenate them so they look like
+one stream again:
+</p>
+<table BORDER=0 STYLE="border: solid .75pt black; background: lightblue">
+<tr>
+<td STYLE="border: solid .75pt black; background: lightgreen"
+    >&nbsp;ABCDEFG</td>
+<td STYLE="border: solid .75pt black; background: pink"
+    >HIJK...</td>
+</tr>
+</table>
+<p>
+Okay, let's do it.
+All we have to worry about is filling the green stream
+with the bytes that we read out of the pink stream;
+we're going to use
+<code>CConcatStream</code> to do the composition at the end.
+</p>
+<pre>
+class CRewindStream : public CROSequentialStreamBase
+{
+public:
+ CRewindStream(ISequentialStream *pstm);
+ ISequentialStream *Rewind();
+
+ // *** ISequentialStream ***
+ STDMETHODIMP Read(void *pv, ULONG cb, ULONG *pcbRead);
+
+protected:
+ ~CRewindStream();
+
+ bool m_fRewound;
+ IStream *m_pstm1;
+ ISequentialStream *m_pstm2;
+};
+
+CRewindStream::CRewindStream(ISequentialStream *pstm)
+ : m_fRewound(false), m_pstm2(pstm)
+{
+ CreateStreamOnHGlobal(NULL, TRUE, &amp;m_pstm1);
+ m_pstm2-&gt;AddRef();
+}
+
+CRewindStream::~CRewindStream()
+{
+ if (m_pstm1) m_pstm1-&gt;Release();
+ m_pstm2-&gt;Release();
+}
+
+HRESULT CRewindStream::Read(void *pv, ULONG cb, ULONG *pcbRead)
+{
+ ULONG cbRead = 0;
+ HRESULT hr;
+ if (m_fRewound) {
+  hr = E_FAIL;
+ } else if (!m_pstm1) {
+  hr = E_OUTOFMEMORY;
+ } else {
+  hr = m_pstm2-&gt;Read(pv, cb, &amp;cbRead);
+  if (SUCCEEDED(hr)) {
+   hr = m_pstm1-&gt;Write(pv, cbRead, NULL);
+  }
+ }
+ if (pcbRead) *pcbRead = cbRead;
+ return hr;
+}
+
+ISequentialStream *CRewindStream::Rewind()
+{
+ if (!m_pstm1 || m_fRewound) return NULL;
+
+ m_fRewound = true;
+ const LARGE_INTEGER li0 = { 0, 0 };
+ m_pstm1-&gt;Seek(li0, STREAM_SEEK_SET, NULL);
+ return new CConcatStream(m_pstm1, m_pstm2);
+}
+</pre>
+<p>
+Our <code>RewindStream</code> takes a sequential stream
+and creates a memory stream via <code>CreateStreamOnHGlobal</code>
+to remember the parts that we read so we can stick them back
+when it's time to rewind.
+</p>
+<p>
+When reading from the stream, we read from the sequential stream
+and append the result to the memory stream before returning it.
+In this manner, each byte read from the head of the pink stream
+gets appended to the end of the green stream.
+</p>
+<p>
+When it's time to rewind, we seek the memory stream back to the
+beginning and create a concatenated stream out of the memory
+stream and the unread portion of the sequential stream.
+</p>
+<p>
+Here's a simple program that illustrates our new rewindable sequential
+stream:
+</p>
+<pre>
+int __cdecl _tmain(int argc, TCHAR **argv)
+{
+ CoInitialize(NULL);
+ IStream *pstmFile;
+ if (SUCCEEDED(SHCreateStreamOnFile(argv[1], STGM_READ,
+                                    &amp;pstmFile))) {
+  CRewindStream *pstmRewind = new CRewindStream(pstmFile);
+  if (pstmRewind) {
+   char ch;
+   ULONG cb;
+   while (SUCCEEDED(pstmRewind-&gt;Read(&amp;ch, 1, &amp;cb)) &amp;&amp; cb) {
+    printf("Header: '%c'\n", ch);
+    if (ch == ' ') {
+     ISequentialStream *pstmRewound = pstmRewind-&gt;Rewind();
+     if (pstmRewound) {
+      PrintStream(pstmRewound);
+      pstmRewound-&gt;Release();
+     }
+     break;
+    }
+   }
+   pstmRewind-&gt;Release();
+  }
+  pstmFile-&gt;Release();
+ }
+ CoUninitialize();
+ return 0;
+}
+</pre>
+<p>
+For illustration purposes, let's assume that the header
+ends when we find a space.
+We create a stream on the file whose name is passed on the
+command line and put it inside a <code>CRewindStream</code>.
+We then read from that stream a byte at a time until we
+find that space.
+(To prove that we're really rewinding, we also print
+each byte from the header as we encounter it.)
+Once we find the space, we ask the <code>CRewindStream</code>
+to create a new stream that represents the original stream
+rewound back to the beginning.
+We pass that stream to the <code>PrintStream</code> helper
+function from last time, to prove that the resulting stream
+really is the entire file contents starting from the beginning.
+</p>
+<p>
+Notice that we consumed only as much memory as necessary to
+remember the parts of the stream that needed to be replayed.
+Even if the file were a megabyte in size, we only need to remember
+the bytes that we read up until we decided that we were finished
+reading the header.
+</p>
+<p>
+Now, this isn't the most beautiful implementation of a rewindable
+stream, but it was convenient for expository purposes.
+I leave you to make as many prettifications as meet your aesthetic
+requirements.
+</p>
+<p>
+Exercise: Discuss what would be needed in order to support
+rewinding more than once and the performance consequences thereof.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-484943">
+				<div id="div-comment-484943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-484943">
+			March 23, 2007 at 11:11 am</a>		</div>
+
+		<p>Oops, I need to proofread better. &nbsp;In the second paragraph, last sentence:</p>
+<p>s/local variable/member variable/</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-484993">
+				<div id="div-comment-484993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JP</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-484993">
+			March 23, 2007 at 11:31 am</a>		</div>
+
+		<p>BryanK, the problem there would be once your &quot;content handler&quot; starts processing the whole multi-megabyte stream, you&#8217;re still Writing that onto your memory stream, so you would need another function to flag that we&#8217;re done Rewinding.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-485063">
+				<div id="div-comment-485063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Angstrom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485063">
+			March 23, 2007 at 12:52 pm</a>		</div>
+
+		<p>Isn&#8217;t this the sort of thing you&#8217;re supposed to use the Content-Type header for?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-485183">
+				<div id="div-comment-485183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485183">
+			March 23, 2007 at 2:00 pm</a>		</div>
+
+		<p>@Angstrom:</p>
+<p>Without wanting to put words in Raymond&#8217;s mouth, his blog entries are often of a particular scope and (even when inspired by actual events, as in this case) intended to be pedagogical.</p>
+<p>In other words, he&#8217;s generally showing you either a feature you might not know about, and/or how to use that feature correctly.</p>
+<p>In other words, your Content-Type question is tangentially relevant at best. &nbsp;Imagine this same article, but it&#8217;s not about a stream coming from a website/http, but from somewhere else.</p>
+<p>(I&#8217;m not having a go, just pointing out the facts :-))</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-485193">
+				<div id="div-comment-485193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">manuelg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485193">
+			March 23, 2007 at 2:22 pm</a>		</div>
+
+		<p>Implemented this in Python recently, posted in the Python Cookbook</p>
+<p><a rel="nofollow" target="_new" href="http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/502304" rel="nofollow">http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/502304</a></p>
+<p>I needed to &quot;pushback&quot; onto the &quot;stream&quot;, and also test if the stream is empty, without side-effects (i.e. without eating a character of the stream during the test).</p>
+<p>Python is slow, but you can squeeze some efficiency back from Python with minimal pain, because Python accepts an &quot;iterator&quot; (Python&#8217;s name for a stream) in most places where Python accepts a list. &nbsp;If Python sees a &quot;next&quot; method, it is happy, you don&#8217;t have to do any &quot;Java-esque&quot; Object Oriented interface push-ups.</p>
+<p>Implementation follows:</p>
+<p>&#8216;class pushback_wrapper(object):</p>
+<p>&#8216; &nbsp; &nbsp;</p>
+<p>&#8216; &nbsp; &nbsp;def <strong>init</strong>(self, it):</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;self.it = it</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;self.pushed_back = []</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;</p>
+<p>&#8216; &nbsp; &nbsp;def <strong>iter</strong>(self):</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;return self</p>
+<p>&#8216; &nbsp; &nbsp;</p>
+<p>&#8216; &nbsp; &nbsp;def <strong>nonzero</strong>(self):</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;if self.pushed_back:</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;return True</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;try:</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;self.pushed_back.insert(0, self.it.next())</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;except StopIteration:</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;return False</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;else:</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;return True</p>
+<p>&#8216; &nbsp; &nbsp;</p>
+<p>&#8216; &nbsp; &nbsp;def next(self):</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;try:</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;return self.pushed_back.pop()</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;except IndexError:</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;return self.it.next()</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;</p>
+<p>&#8216; &nbsp; &nbsp;def pushback(self, item):</p>
+<p>&#8216; &nbsp; &nbsp; &nbsp; &nbsp;self.pushed_back.append(item)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-485303">
+				<div id="div-comment-485303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">scott</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485303">
+			March 23, 2007 at 3:57 pm</a>		</div>
+
+		<p>Is this problem &quot;inspired by&quot; Internet Explorer? &nbsp;I feel like I&#8217;ve been on the server side of &quot;closing the stream I get and issuing a second request&quot;, having to deal with the effects of that &quot;solution&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-485333">
+				<div id="div-comment-485333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ac</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485333">
+			March 23, 2007 at 5:31 pm</a>		</div>
+
+		<p>OT, but I loved the hanselminutes interview</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-484923">
+				<div id="div-comment-484923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-484923">
+			March 23, 2007 at 11:07 am</a>		</div>
+
+		<p>Haven&#8217;t thought about this much, but I&#8217;d guess that the easiest way to rewind more than once is to make a new CRewindStream whose constructor is passed the result of the Rewind call on the original CRewindStream. &nbsp;Of course this ends up creating a new stream every time you need to rewind a stream, and I&#8217;m sure there are more efficient ways to do it. &nbsp;But it might be workable, depending on the specific requirements.</p>
+<p>Actually, it&#8217;d probably be better to have Rewind affect the current stream instead of returning a new stream, if you have to rewind more than once. &nbsp;Make the CRewindStream read from m_pstm2 when it&#8217;s first created, but have a member boolean that you can set to make it read from m_pstm1 instead. &nbsp;Then, in the Rewind call, set that local variable and do a Seek to the beginning of m_pstm1 (so reads come from the start of it, not the end).</p>
+<p>Read would have to check this member boolean, and read from the correct sub-stream. &nbsp;Read would also have to swap from m_pstm1 forward to m_pstm2 if it gets to the end of m_pstm1 (just like the concatenation stream from yesterday did), and in that case it&#8217;d also have to reset the member variable. &nbsp;Finally, the interface would of course change; you&#8217;d set up a stream, Read() from it N times, then call Rewind() and Read() again (N more times). &nbsp;And then of course you can Rewind() again, and Read() again N *more* times. &nbsp;Etc., etc.</p>
+<p>This has the advantage of not re-duplicating the header data if there are multiple Rewind calls (e.g. a stream that rewinds four times won&#8217;t store four copies of the first few bytes, where my first design would have, since the memory-streams weren&#8217;t shared). &nbsp;But it&#8217;s more complicated, too; it&#8217;s a merging of the concatenation stream from yesterday and the rewindable stream from today.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-485083">
+				<div id="div-comment-485083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485083">
+			March 23, 2007 at 1:01 pm</a>		</div>
+
+		<p>Dang, you&#8217;re right. &nbsp;You&#8217;d end up with two copies of the entire stream, which is likely to be more memory than N copies of the first M bytes (for my first solution: N rewinds and M bytes read on average on each of them). &nbsp;Plus reads would take twice as long. &nbsp;Hmm&#8230; &nbsp;I&#8217;m not sure how to fix that short of adding the new function to flag the end of rewinding, as you say.</p>
+<p>I know &#8212; you could read everything out of the ISequentialStream and write it into a memory stream, Release the ISequentialStream, and use the memory stream instead! &nbsp;Then it&#8217;s Seek()able, and therefore can be rewound, and you only have one copy of the data! &nbsp;:-P</p>
+<p>(Yes, yes, I know &#8212; the ISequentialStream&#8217;s contents may not all be in memory at once. &nbsp;E.g., network-type streams would pull data from a socket as it&#8217;s requested.)</p>
+<p>I think C++ will let you create another overloaded CRewindStream constructor whose parameter is a concatenation stream (instead of the ISequentialStream interface), right? &nbsp;If so, you could make that constructor, and expose some of the internals of the concatenation stream to the rewind stream. &nbsp;Then the rewind stream could use those internals to store each byte read from the final underlying stream only once, when its constructor gets a concatenation stream. &nbsp;(Of course this requires only one non-concatenated stream to begin with; if your first stream is a concatenated one whose first sub-stream doesn&#8217;t have the exposed buffer, then it will break pretty horribly.)</p>
+<p>And this is an even more-complicated solution than the one above that stores stuff twice (exposing class internals to that extent is Really Bad). &nbsp;Probably the only way that will work reliably and not copy the entire stream is to create a manual tree of CRewindStream wrappers.</p>
+<p>Actually, that&#8217;s not as bad as I thought at first &#8212; you&#8217;ll only have one previous memory stream hanging around, not all of them. &nbsp;The reason is, the first Rewind() should be followed by a Release() on the CRewindStream that Rewind was called on (since it shouldn&#8217;t be used again), which will release m_pstm1 and m_pstm2. &nbsp;The stream returned from Rewind will still have a reference, so they won&#8217;t go away. &nbsp;But after you call Rewind again, you&#8217;ll Release the second CRewindStream, which will Release the concatenation stream, and the memory stream from the first CRewindStream *will* go away at that point.</p>
+<p>You could even make the concatenation stream release its first stream once it Reads to the end of it (since the base streams are sequential, the stream interface is useless after you read to its end), which could release the memory stream even earlier, depending on the usage.</p>
+<p>Unless I&#8217;m forgetting something else. &nbsp;;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-485483">
+				<div id="div-comment-485483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://jasonhaley.com/blog/archive/2007/03/24/138308.aspx' rel='external nofollow' class='url'>Jason Haley</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485483">
+			March 24, 2007 at 10:42 am</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-485493">
+				<div id="div-comment-485493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">meh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485493">
+			March 24, 2007 at 1:07 pm</a>		</div>
+
+		<p>Yes, the interview was very nice.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-485893">
+				<div id="div-comment-485893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.levicki.net/' rel='external nofollow' class='url'>Igor</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-485893">
+			March 26, 2007 at 9:35 pm</a>		</div>
+
+		<p>Someone here is doing what they shouldn&#8217;t most likely due to the poor design so this exercise is pretty pointless.</p>
+<p>Handler shouldn&#8217;t need the information which has already been consumed in order to determine the handler.</p>
+<p>Parser shouldn&#8217;t consume information which is vital to the handler.</p>
+<p>Either way, it is completely broken.</p>
+<div class="post">[<i>Then I guess the HTML META tag is completely broken. So too are the various image file formats. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-486663">
+				<div id="div-comment-486663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-486663">
+			March 28, 2007 at 11:34 am</a>		</div>
+
+		<p>HTML META tag &#8212; yeah, I&#8217;d say that is pretty broken. &nbsp;But then, I&#8217;d say that a lot of HTML is pretty broken, too. &nbsp;;-)</p>
+<p>The META tag is the only way to override broken web server configurations that don&#8217;t specify a character set or don&#8217;t specify the correct content-type; the proper fix is to use a web server that does specify the proper character set or content-type for your files. &nbsp;(And for shared hosting, that would be a web server that allows these values to be changed per-file, e.g. by using another control file per-host, or separate settings per-host that can be changed by the people being hosted.)</p>
+<p>Image file formats: ideally, you&#8217;d be able to use the content type (or some other out-of-band method) to decide on your handler, but if the image is sitting on a local disk, you don&#8217;t have a content type available (on most FSes, anyway). &nbsp;Without that, you&#8217;re right, something like this is needed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-486893">
+				<div id="div-comment-486893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.levicki.net/' rel='external nofollow' class='url'>Igor</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-486893">
+			March 28, 2007 at 7:58 pm</a>		</div>
+
+		<p>Raymond said: </p>
+<p>&#8220;Then I guess the HTML META tag is completely broken. So too are the various image file formats.&#8221;</p>
+<p>There, you said it and I agree. They are broken and this is a fix but from the wrong side. Like trying to plug the pipe with your finger instead of closing the valve.</p>
+<p>That is why most software suck &#8212; because it is built as an ugly hack around a broken or completely flawed specifications.</p>
+<div class=post>[<i>You can solve the problem your way (refusing to write this code and demanding instead that the HTML and image format specifications be fixed); I&#8217;ll solve it my way. We&#8217;ll see who&#8217;s finished first. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-486903">
+				<div id="div-comment-486903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.levicki.net/' rel='external nofollow' class='url'>Igor</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070323-00/?p=27523#comment-486903">
+			March 28, 2007 at 8:05 pm</a>		</div>
+
+		<p>BryanK:</p>
+<p>You see, this is the heart of the problem:</p>
+<p>You either:</p>
+<ol>
+<li>Pass the image completely to the handler and let it determine if it can handle it</li>
+</ol>
+<p>or:</p>
+<ol>
+<li>Determine correct image type and pass the rest to the handler which does not waste time performing the same checks again but instead just decodes it</li>
+</ol>
+<p>What Raymond has done here is a workaround for two pieces of code (a parser and a handler) which were never meant to work together. How can you tell that? Because one part of their work is overlapping. What we end up is a waste of resources in the name of &quot;reusable&quot; code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

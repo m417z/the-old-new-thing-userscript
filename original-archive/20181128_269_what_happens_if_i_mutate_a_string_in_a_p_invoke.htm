@@ -1,0 +1,523 @@
+<html>
+<head>
+<title>What happens if I mutate a string in a p/invoke?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What happens if I mutate a string in a p/invoke?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 28, 2018 / year-entry #269</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It seems to work, for specific meanings of "seems".</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When it comes time to p/invoke to a Win32 function that writes to
+a string buffer,
+everybody uses a <code>StringBuilder</code> class
+to receive the string.
+</p>
+<p>
+But could we just use a <code>string</code>?
+I mean, we can still allocate a buffer for the
+<code>string</code> and then ask Win32 to fill
+the buffer.
+</p>
+<pre>
+// Code in italics is wrong
+<i>[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+extern public static int GetKeyboardLayoutName(string buffer);
+
+var buffer = new String('\0', 9);
+GetKeyboardLayoutName(buffer);</i>
+</pre>
+<p>
+I mean, sure C# strings are immutable, but that just
+means that you can't mutate them from within the C# language.
+The runtime will allocate some memory for the string,
+and that memory will be writable in practice,
+so the <code>Get&shy;Keyboard&shy;Layout&shy;Name</code>
+function will be able to write to it,
+and bingo, the results are in the string!
+What could possibly go wrong?
+</p>
+<p>
+What could possibly go wrong is that you're violating
+the rules of the language, namely that strings are immutable.
+</p>
+<p>
+Passing a <code>string</code>
+via platform invoke means that the runtime
+will pass a null terminated C-style string
+that it expects to be read from.
+If the native function ends up writing to it,
+then what happens next is unpredictable.
+</p>
+<p>
+For example, the platform invoke code is not
+required to pass a pointer to the internal string buffer.
+It might copy the string contents to a temporary buffer
+and pass a pointer to that temporary buffer.
+If the native function modifies that buffer,
+the runtime won't try to copy the results back to the
+original string buffer,
+because the runtime doesn't expect the native function
+to modify the buffer at all.
+</p>
+<p>
+In fact, there is a case where this temporary buffer
+is guaranteed to exist: when the function
+being called takes an ANSI string.
+Because the raw internal string buffer is in
+the wrong format, namely Unicode (UTF-16LE),
+so the CLR needs to create a temporary ANSI version
+of the string.
+</p>
+<p>
+Even if you manage to cajole the runtime into passing
+a pointer to the raw string buffer,
+the runtime doesn't expect the string to change,
+and if the native function doesn't fill the entire buffer,
+the runtime won't notice.
+You'll have a string with extra junk in it.
+</p>
+<p>
+And the fact that you're mutating what is supposed to
+be immutable is going to cause its own problems:
+</p>
+<pre>
+using System;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+
+// Code in italics is wrong
+class Program
+{
+  <i>[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  extern public static int GetKeyboardLayoutName(string buffer);</i>
+
+  public static void Main()
+  {
+    var hash = new Dictionary&lt;string, int&gt;();
+    string buffer = new string('\0', 10);
+    hash[buffer] = 2;
+    <i>GetKeyboardLayoutName(buffer);</i>
+
+    string buffer2 = new string('\0', 10);
+    Console.WriteLine(hash[buffer2]);
+  }
+}
+</pre>
+<p>
+Strings are immutable, and therefore they can safely
+be used as keys in dictionaries.
+But in the above example,
+we are mutating the string that is being used as a key,
+which messes up the dictionary.
+Not only did the item's key change,
+but nobody can find the new key because
+its hash code is different,
+so it's in the wrong bucket in the dictionary.
+</p>
+<p>
+Basically, you created a dictionary that violates the
+dictionary invariants.
+</p>
+<p>
+Another case where mutating a string violates the rules
+of C# can be found
+<a HREF="https://referencesource.microsoft.com/#mscorlib/system/string.cs,8711fff131bc4d0e">
+in the reference source for the
+<code>String.CompareOrdinalHelper</code> method</a>.
+The method compares two characters at a time,
+and once it finds a difference,
+it looks to see which character of the pair is the one
+that caused the strings to be different.
+This assumes that strings are immutable.
+</p>
+<p>
+But if you mutate the internal buffer from another thread,
+it's possible that the first loop finds a pair of characters
+which don't match,
+but when it goes to see which of the pair it is,
+the contents of the buffer changed, and now the characters
+match after all.
+Assertion failure.
+Function returns incorrect result.
+</p>
+<p>
+If you are passing a string buffer that native code will
+write to,
+use a <code>String&shy;Builder</code>.
+That's what it's for.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-jimfoye2 even thread-even depth-1" id="comment-1371725">
+				<div id="div-comment-1371725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mitosis1000' rel='external nofollow' class='url'>Mitosis1000</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371725">
+			November 28, 2018 at 8:46 am</a>		</div>
+
+		<p>How about Microsoft add more APIs to the .NET UI frameworks? My WPF code is littered with p/invoke calls. Even for someone (as yours truly) who used to do C++/Win32 programming, it&#8217;s annoying at times. Yeah, the website is out there with the examples&#8230;it&#8217;s still annoying I can&#8217;t restore my WPF window without dropping down to this stuff.</p>
+<p>Yes, I&#8217;m whining, and on the wrong blog, to boot.</p>
+<p>Otherwise, great post, thanks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-sebastiaandammann odd alt thread-odd thread-alt depth-1" id="comment-1371735">
+				<div id="div-comment-1371735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Sebazzz' rel='external nofollow' class='url'>Sebazzz</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371735">
+			November 28, 2018 at 10:05 am</a>		</div>
+
+		<p>What about passing in an char array or a pointer to a stackalloced char array. Does this have advantages?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-nickblatter even thread-even depth-1 parent" id="comment-1371745">
+				<div id="div-comment-1371745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/_Nicholas' rel='external nofollow' class='url'>_Nicholas</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371745">
+			November 28, 2018 at 1:27 pm</a>		</div>
+
+		<p>&gt; sure C# strings are immutable, but that just means that you can&#8217;t mutate them from within the C# language.</p>
+<p>As far as I know, you actually *can* if you&#8217;re willing to use `unsafe` (which may be obvious, since with unsafe most bets are off):</p>
+<p>string a = &#8220;foo&#8221;;<br />
+string b = &#8220;foo&#8221;;</p>
+<p>Console.WriteLine(a); // foo<br />
+Console.WriteLine(b); // foo<br />
+Console.WriteLine(object.ReferenceEquals(a, b)); // true</p>
+<p>unsafe { fixed(char* c = a) { *c = &#8216;b&#8217;; } }</p>
+<p>Console.WriteLine(a); // boo<br />
+Console.WriteLine(b); // boo<br />
+Console.WriteLine(object.ReferenceEquals(a, b)); // true</p>
+<p>This shows we&#8217;re actually modifying the interned string buffer and not somehow creating a copy.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-nickblatter odd alt depth-2 parent" id="comment-1371755">
+				<div id="div-comment-1371755" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/_Nicholas' rel='external nofollow' class='url'>_Nicholas</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371755">
+			November 28, 2018 at 1:28 pm</a>		</div>
+
+		<p>Well that&#8217;s gross.  I don&#8217;t know where my newlines went.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-msn even depth-3" id="comment-1371775">
+				<div id="div-comment-1371775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/poizan42' rel='external nofollow' class='url'>poizan42</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371775">
+			November 28, 2018 at 1:59 pm</a>		</div>
+
+		<p>The blog software has a longstanding bug where the formatting is broken when viewing your own comments. It looks fine for everyone else &#8211; just try logging out or viewing it in an incognito window.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-geelaw odd alt depth-2" id="comment-1371865">
+				<div id="div-comment-1371865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Gee+Law' rel='external nofollow' class='url'>Gee Law</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371865">
+			November 28, 2018 at 3:30 pm</a>		</div>
+
+		<p>You coincidentally can mutate a <code>System.String</code> and get away with it. But ECMA-334 5th edition (the latest ECMA C#) explicitly undefines the behavior of such code. See the example at the end of section 28.7.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn even depth-2" id="comment-1372235">
+				<div id="div-comment-1372235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1372235">
+			December 4, 2018 at 2:16 am</a>		</div>
+
+		<p>I have once used <b>unsafe</b> to pass some data from HTTP stream directly to a C# structure. This worked perfect in unit tests, and in integration tests. But, luckily, the server team had some load tests configured, before deploying the feature to production. The crashes happened unpredictibly, and there was no hint that copy of the network buffer was involved.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-msn odd alt thread-odd thread-alt depth-1 parent" id="comment-1371785">
+				<div id="div-comment-1371785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/poizan42' rel='external nofollow' class='url'>poizan42</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371785">
+			November 28, 2018 at 2:03 pm</a>		</div>
+
+		<p>So I have been thinking about this before and have been wondering what the performance impacts would be of calling VirtualProtect before and after allocating a string to keep the page read-only most of the time (would ofc. also require that the GC be changed to keep strings together in their own pages).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-akraus1 even depth-2 parent" id="comment-1371795">
+				<div id="div-comment-1371795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alois' rel='external nofollow' class='url'>Alois</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371795">
+			November 28, 2018 at 2:09 pm</a>		</div>
+
+		<p>@poizan42: That would be wasteful because you could place only one string into one page. If you would add a second string to that page you would need to unprotect it for a short amount of time which would defeat the purpose of VirtualProtect again. The costs of soft faulting pages into a process working set are not so small as I would like it. See <a href="https://aloiskraus.wordpress.com/2017/11/12/bringing-the-hardware-and-windows-to-its-limits/" rel="nofollow">https://aloiskraus.wordpress.com/2017/11/12/bringing-the-hardware-and-windows-to-its-limits/</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-msn odd alt depth-3" id="comment-1371895">
+				<div id="div-comment-1371895" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/poizan42' rel='external nofollow' class='url'>poizan42</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371895">
+			November 29, 2018 at 1:42 am</a>		</div>
+
+		<p>Yes there would indeed be a small window for another thread to mutate strings in the page. But if the goal is to rat out bugs then that doesn&#8217;t matter so much.</p>
+<p>The real price would depend on how often strings are allocated. It could also just be used while debugging (there are already several places where the runtime has additional checks when debugging which aren&#8217;t cheap performance wise).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1371805">
+				<div id="div-comment-1371805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371805">
+			November 28, 2018 at 2:37 pm</a>		</div>
+
+		(The content was deleted per user request)
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fowlthe2nd odd alt thread-odd thread-alt depth-1" id="comment-1371815">
+				<div id="div-comment-1371815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/fowl' rel='external nofollow' class='url'>fowl</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371815">
+			November 28, 2018 at 2:38 pm</a>		</div>
+
+		<p>If you modify a string, you&#8217;re going to have a particularly bad time once <a href="https://github.com/dotnet/coreclr/issues/14208" rel="nofollow">string de-duplication</a> is implemented.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-phlipping even thread-even depth-1 parent" id="comment-1371855">
+				<div id="div-comment-1371855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/mrphlip' rel='external nofollow' class='url'>mrphlip</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371855">
+			November 28, 2018 at 3:23 pm</a>		</div>
+
+		<p>Poking at the internals to modify allegedly-immutable objects is good traditional fun in any language&#8230;<br />
+<code>Python 2.7.15rc1 (default, Apr 15 2018, 21:51:34)<br />
+&gt;&gt;&gt; import ctypes<br />
+&gt;&gt;&gt; class PyIntObject(ctypes.Structure):<br />
+...     _fields_ = [("ob_refcnt", ctypes.c_long),<br />
+...                 ("ob_type", ctypes.c_void_p),<br />
+...                 ("ob_ival", ctypes.c_long)]<br />
+...<br />
+&gt;&gt;&gt; fourobj = PyIntObject.from_address(id(4))<br />
+&gt;&gt;&gt; fourobj.ob_ival<br />
+4<br />
+&gt;&gt;&gt; fourobj.ob_ival = 5<br />
+&gt;&gt;&gt; 4<br />
+5<br />
+&gt;&gt;&gt; 2 + 2<br />
+5<br />
+&gt;&gt;&gt; 5 - 1<br />
+5<br />
+&gt;&gt;&gt; (2 + 2) + 1<br />
+6<br />
+&gt;&gt;&gt; 5 - 1 - 1 - 1<br />
+5<br />
+&gt;&gt;&gt; 2 * 2 * 2<br />
+10</code></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-parkrrrr odd alt depth-2" id="comment-1372095">
+				<div id="div-comment-1372095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/RP+%28MSFT%29' rel='external nofollow' class='url'>RP (MSFT)</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1372095">
+			December 3, 2018 at 8:37 am</a>		</div>
+
+		<p>This just reinforces my belief that Python is the latest incarnation of FORTRAN.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-odd thread-alt depth-1 parent" id="comment-1371875">
+				<div id="div-comment-1371875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371875">
+			November 28, 2018 at 5:49 pm</a>		</div>
+
+		<p>Btw, shouldn&#8217;t the declaration be like this?<br />
+extern public static int GetKeyboardLayoutName(out string buffer);</p>
+<p>I think you need out/ref to receive the content correctly.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-aadsso-1live-com00034001d01cd865 odd alt depth-2 parent" id="comment-1371905">
+				<div id="div-comment-1371905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Neil+Rashbrook+%28Copy+1%29' rel='external nofollow' class='url'>Neil Rashbrook (Copy 1)</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371905">
+			November 29, 2018 at 3:41 am</a>		</div>
+
+		<p>Isn&#8217;t that addressed via the comment:</p>
+<p>// Code in italics is wrong</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong even depth-3 parent" id="comment-1371955">
+				<div id="div-comment-1371955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1371955">
+			November 29, 2018 at 5:26 pm</a>		</div>
+
+		<p>It&#8217;s wrong in different sense.</p>
+<p>Since &#8220;string&#8221; is a type passed &#8220;by value&#8221; be default, the &#8220;buffer&#8221; would always be a string with 9 null characters.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-geelaw odd alt depth-4 parent" id="comment-1372065">
+				<div id="div-comment-1372065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Gee+Law' rel='external nofollow' class='url'>Gee Law</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1372065">
+			December 1, 2018 at 1:55 pm</a>		</div>
+
+		<p>Passing a <code>string</code> passes the reference (pointer) to the string by value. The native function receives a pointer to the beginning of the string. CLR thinks it wants a <code>char const *</code>, while the code actually treats it as <code>char *</code> and modify the content, which means modifying the <code>string</code> object. The reference variable <code>buffer</code> does not change &#8212; it still points to the original object, which is now modified.</p>
+<p>In C parlance, this means: <code>void funny(char const *buf) { *(char*)buf = 'a'; }</code> and <code>char b[] = "hello"; char const *p = b; funny(p); std::puts(p);</code>.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong even depth-5" id="comment-1372085">
+				<div id="div-comment-1372085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181128-00/?p=100345#comment-1372085">
+			December 3, 2018 at 1:31 am</a>		</div>
+
+		<p>Humm&#8230; I think &#8220;reference&#8221; to C# string is just a key to interned string table. Since it&#8217;s immutable the CLR provides no way to change the string value it points to, and it&#8217;s not pointer as if it were in C/C++. That&#8217;s why we need to use StringBuilder if we just need to modify a single character in string.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

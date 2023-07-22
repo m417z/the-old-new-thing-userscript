@@ -1,0 +1,387 @@
+<html>
+<head>
+<title>What is the underlying object behind a COM interface pointer?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What is the underlying object behind a COM interface pointer?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 24, 2007 / year-entry #142</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">When you're debugging, you might have a pointer to a COM interface and want to know what the underlying object is. Now, sometimes this trick won't work because the interface pointer actually points to a stub or proxy, but in the case where no marshalling is involved, it works great. (This technique also works for...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When you're debugging,
+you might have a pointer to a COM interface and want to know
+what the underlying object is.
+Now, sometimes this trick won't work because the interface pointer
+actually points to a stub or proxy,
+but in the case where no marshalling is involved, it works great.
+(This technique also works for many C++ compilers for
+any object that has virtual methods and therefore a vtable.)
+</p>
+<p>
+Recall that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/02/05/68017.aspx">
+the layout of a COM object</a> requires that the
+pointer to a COM interface point to the object's vtable,
+and it's the vtable that is the key.
+</p>
+<pre>
+0:000&gt; dv
+            pstm = 0x000c7568
+0:000&gt; dt psf
+Local var @ 0x7cc2c Type IStream*
+0x000c7568
+   +0x000 __VFN_table : 0x1c9c8e84
+</pre>
+<p>
+Okay, so far all we know is that our <code>IStream&nbsp;*</code>
+lives at <code>0x000c7568</code> and its vtable is
+<code>0x1c9c8e84</code>.
+Whose stream implementation is it?
+</p>
+<pre>
+0:000&gt; ln 0x1c9c8e84
+(1c9c8e84)   ABC!CAlphaStream::`vftable'
+</pre>
+<p>
+Aha, it's a <code>CAlphaStream</code> from <code>ABC.DLL</code>.
+Let's take a look at it:
+</p>
+<pre>
+0:000&gt; dt ABC!CAlphaStream 0x000c7568
+   +0x000 __VFN_table : 0x1c9c8e84 <font COLOR=blue>// our vtable</font>
+   +0x004 m_cRef           : 480022128
+   +0x008 lpVtbl           : 0x1c9d2d30
+   +0x00c lpVtbl           : 0x00000014
+   +0x010 m_pszName        : 0x000c7844 "??????????"
+   +0x014 m_dwFlags        : 0x3b8
+   +0x018 m_pBuffer        : 0x00000005
+   +0x01c m_cbBuffer       : 705235565
+   +0x020 m_cbPos          : 2031674
+</pre>
+<p>
+"Hey, how did you get the debugger to dump <code>m_pszName</code>
+as a string?"
+If you issue the <code>.enable_unicode 1</code> command,
+then the debugger will treat pointers to <code>unsigned short</code>
+as if they were pointers to Unicode strings.
+(By default, only pointers to <code>wchar_t</code> are treated
+as pointers to Unicode strings.)
+</p>
+<p>
+Okay, back to the structure dump.
+It doesn't look right at all.
+The reference count is some absurd value,
+the vtable at offset <code>0x00c</code> is a bogus pointer,
+the name in <code>m_pszName</code> is garbage,
+pretty much every field aside from the initial vtable and
+the vtable at offset <code>0x008</code> is blatantly wrong.
+</p>
+<p>
+What happened?
+Well, clearly we were given a "<code>q</code>" pointer;
+i.e., a pointer to one of the vtables other than the first one.
+We have to adjust the pointer so it points to the start of the
+object instead of the middle.
+</p>
+<p>
+How do we do this adjustment?
+There's the methodical way and the quick-and-dirty way.
+</p>
+<p>
+The methodical way is to use the
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/02/06/68695.aspx">
+adjustor thunks</a>
+to tell you how much the pointer needs to be adjusted
+in order to move from a secondary vtable to the primary one.
+(This assumes that the primary <code>IUnknown</code> implementation
+is the first base class.
+This is not guaranteed to be the case but it usually is.)
+</p>
+<pre>
+0:000&gt; dps 1c9c8e84 l1
+1c9c8e84  1c9eb08e ABC![thunk]:CAlphaStream::QueryInterface`adjustor{8}'
+</pre>
+<p>
+Aha, this adjustors adjust by eight bytes, so we just need to subtract
+eight from our pointer to get the object's starting address.
+</p>
+<pre>
+0:000&gt; dt ABC!CAlphaStream 0x000c7560<font COLOR=blue>-8</font>
+   +0x000 __VFN_table : 0x1c9c8ee8
+   +0x004 m_cRef           : 2
+   +0x008 lpVtbl           : 0x1c9c8e84
+   +0x00c lpVtbl           : 0x1c9c8e70
+   +0x010 m_pszName        : 0x1c9d2d30 "Scramble"
+   +0x014 m_dwFlags        : 0x14
+   +0x018 m_pBuffer        : 0x000c7844
+   +0x01c m_cbBuffer       : 952
+   +0x020 m_cbPos          : 5
+</pre>
+<p>
+Ah, that looks much nicer.
+Notice that the reference count is a more reasonable value of two,
+the name pointer looks good,
+the buffer size and position appear to be much more realistic.
+</p>
+<p>
+Now, I don't bother with the whole adjustor thunk thing.
+Instead I rely on the principle of
+"<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/04/23/2215961.aspx"
+>Assume it's mostly correct</a>":
+Assume that the object is not corrupted and just adjust the pointer by
+eye until the fields line up.
+Let's take another look at the original (bad) dump:
+</p>
+<pre>
+0:000&gt; dt ABC!CAlphaStream 0x000c7568
+   +0x000 __VFN_table : 0x1c9c8e84
+   +0x004 m_cRef           : 480022128
+   +0x008 lpVtbl           : 0x1c9d2d30
+   +0x00c lpVtbl           : 0x00000014
+   +0x010 m_pszName        : 0x000c7844 "??????????"
+   +0x014 m_dwFlags        : 0x3b8
+   +0x018 m_pBuffer        : 0x00000005
+   +0x01c m_cbBuffer       : 705235565
+   +0x020 m_cbPos          : 2031674
+</pre>
+<p>
+This obviously doesn't smell right, but what do we have to do
+to get things to line up?
+Well, we know that the vtable we have must go into one of the
+other two vtable slots, either the one at offset <code>0x008</code>
+or the one at offset <code>0x00c</code>.
+If we moved it to offset <code>0x00c</code>,
+then that would move the <code>0x00000014</code> currently at
+offset <code>0x00c</code> down twelve bytes, placing it at
+offset <code>0x018</code>, right at <code>m_pBuffer</code>.
+But obviously <code>0x00000014</code> is not a valid buffer
+pointer, so <code>0x00c</code> can't be the correct adjustment.
+On the other hand, if we put our vtable at offset <code>0x008</code>,
+then that would move <code>0x000c7844</code> into the
+<code>m_pBuffer</code> position, which is not too unreasonable.
+Therefore, I would guess that the adjustor is eight,
+yielding the same structure dump that we got by dumping the
+vtable to see the adjustor.
+</p>
+<p>
+In real life, I tend to pay attention to the vtables, the
+reference count,
+and any string members because it's usually pretty easy to see
+whether you got them right.
+(Vtables reside in code.
+Reference counts tend to be small integers.
+Strings are, well, strings.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-496313">
+				<div id="div-comment-496313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496313">
+			April 24, 2007 at 11:54 am</a>		</div>
+
+		<p>Wow, thanks for elucidating this stuff! &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-496413">
+				<div id="div-comment-496413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496413">
+			April 24, 2007 at 1:05 pm</a>		</div>
+
+		<p>Great stuff &#8211; this has been Ctrl-C/Ctrl-V&#8217;ed right into my debugging notes file.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-496593">
+				<div id="div-comment-496593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Metathunk</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496593">
+			April 24, 2007 at 9:12 pm</a>		</div>
+
+		<blockquote><p>
+  0x000c7568</p>
+<p>  we just need to subtract eight</p>
+<p>  0x000c7560-8</p>
+<p>  This obviously doesn&#8217;t smell right
+</p></blockquote>
+<p>Metanitpicker&#8217;s corner: &nbsp;Only a bug hunter would care.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-496603">
+				<div id="div-comment-496603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://hallvards.blogspot.com/2004/07/hack-7-interface-to-object-in-delphi.html' rel='external nofollow' class='url'>Hallvard Vassbotn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496603">
+			April 25, 2007 at 3:27 am</a>		</div>
+
+		<p>I do something similar at runtime in Delphi:</p>
+<p><a rel="nofollow" target="_new" href="http://hallvards.blogspot.com/2004/07/hack-7-interface-to-object-in-delphi.html" rel="nofollow">http://hallvards.blogspot.com/2004/07/hack-7-interface-to-object-in-delphi.html</a></p>
+<p>Delphi interfaces are COM compatible, so basically it is the same technique. I guess it is easier to call this function from the debugger than to muck about by hand ;).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-496623">
+				<div id="div-comment-496623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MadQ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496623">
+			April 25, 2007 at 5:18 am</a>		</div>
+
+		<p>What a coincidence you should be talking about COM interface pointers and vtables. I recently wrote a shell extension that adds a custom clipboard format to the shell&#8217;s IDataObject by allocating some global memory, and (after doing something useful with the memory) calling IDataObject::SetData. The shell eventually frees the memory by calling IUnknown::Release on the pUnkForRelease member of the STGMEDIUM I passed into IDataObject::SetData. </p>
+<p>Nitpicker&#8217;s corner: when the shell extension&#8217;s reference count decrements zero, it calls OleFlushClipboard if necessary, which pretty much forces the shell to actually the free memory that was allocated. No memory leak here.</p>
+<div class="post">[<i>Huh? If you still have a reference in the pUnkForRelease then your reference count can&#8217;t be zero. -Raymond</i>]</div>
+<p>Anyway&#8230; earlier today a thought occurred to me: &#8220;suppose I had a .NET object that handed out an STGMEDIUM, and I had to free it immediately when the consumer releases it, not whenever the next garbage collection occurs. Can that be done in the CLR?&#8221; As it turns out, the answer is yes, but it&#8217;s not trivial. I wouldn&#8217;t recommend actually doing this in a real-world situation.</p>
+<p>The problem is that the CLR doesn&#8217;t notify the underlying managed object when the last reference to the COM-callable wrapper is released. The CCW simply removes the strong reference to the managed object, making eligible for garbage collection (barring any other references to it.) Some mechanism akin to ATL&#8217;s FinalRelease method would have been nice, but alas, there&#8217;s no such thing in managed world. Nor does the CCW call the managed object&#8217;s IDisposable.Dispose method (should it exist,) which strikes me as an appropriate thing to do, but which might lead to unexpected behavior.</p>
+<p>To get back on topic, the solution is to do some magic pointer-swizzling on the vtable of the managed object&#8217;s CCW. The CCW is a perfectly ordinary COM object, with a perfectly ordinary vtable. Since all COM objects inherit from IUnknown, the third entry in the vtable always points to the CCW&#8217;s Release method. </p>
+<p>The trick is to create a delegate for that pointer using Marshal.GetDelegateForFunctionPointer. COM uses the stdcall calling convention, always passing a pointer to the COM object as the first argument on the stack, so the delegate&#8217;s signature can be &#8220;int SwizzledRelease(IntPtr pUnknown)&#8221; as long the method is static. </p>
+<p>Marshal.ReadIntPtr(pUnknown) returns the address of the vtable, and Marshal.ReadIntPtr(pVtable, 2 * IntPtr.Size) returns the pointer to the CCW&#8217;s Release method. Calling Marshal.GetDelegateForFunctionPointer with that pointer will create a delegate that calls the CCW&#8217;s original Release method. An unmanaged pointer to a delegate of the SwizzledRelease method can be obtained by using Marshal.GetFunctionPointerForDelegate. Finally, the CCW’s vtable is modified by calling Marshal.WriteIntPtr(pVTable, 2 * IntPtr.Size, pSwizzledRelease). This concludes the pointer swizzling.</p>
+<p>Now the SwizzledRelease method will be called whenever a COM consumer calls IUnknown::Release on the managed object. All that remains is for the SwizzledRelease method to call through the delegate of the CCW’s original Release method and eventually to return the result from it. In the meantime, the managed object can be obtained using Marshal.GetObjectForIUnknown. Et voila, if the reference count returned from the CCW’s original Release method is zero, the memory specified by the STGMEDIUM can now be released right on cue.</p>
+<p>This was a fun little exercise in messing with COM vtables. I think for my next experiment I’ll try to bypass the CCW entirely by creating a vtable on the fly. This should actually be much safer to do, since I’ll own the entire thing, and won’t be messing with someone else’s memory.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-496773">
+				<div id="div-comment-496773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MadQ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496773">
+			April 25, 2007 at 2:21 pm</a>		</div>
+
+		<p>&gt;[Huh? If you still have a reference in the pUnkForRelease then your reference count can&#8217;t be zero. -Raymond]</p>
+<p>Oh, I create a separate object, whose sole purpose is to free the memory on its final Release. It&#8217;s this object&#8217;s IUnknown pointer I specify in the pUnkForRelease. </p>
+<p>Actually, I found it necessary to do it this way. It appears that the shell tries to unload itself pretty damn quick when a file open/save dialog is dismissed in an application. The extension&#8217;s DllCanUnloadNow is never called and the IShelExtInit&#8217;s Release is only called once, regardless of how many references are still held. </p>
+<div class=post>[<i>That separate object increments your DLL object count, so it can&#8217;t be zero. And that aggressive unload isn&#8217;t coming from the shell; <a href="http://blogs.msdn.com/oldnewthing/archive/2004/06/28/167800.aspx#167919" rel="nofollow">it&#8217;s coming from CoUninitialize</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-496803">
+				<div id="div-comment-496803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496803">
+			April 25, 2007 at 4:41 pm</a>		</div>
+
+		<p>&quot;Metanitpicker&#8217;s corner: &nbsp;Only a bug hunter would care.&quot;</p>
+<p>A rather pointless statement since this post &lt;i&gt;started&lt;/i&gt; with the phrase &quot;When you&#8217;re debugging.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-496843">
+				<div id="div-comment-496843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Metadebugger</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-496843">
+			April 25, 2007 at 9:07 pm</a>		</div>
+
+		<blockquote><p>
+  A rather pointless statement since this post</p>
+<p>  &lt;i&gt;started&lt;/i&gt; with the phrase &quot;When you&#8217;re</p>
+<p>  debugging.&quot;
+</p></blockquote>
+<p>Well sure, when I&#8217;m debugging I make mistakes too, and I have to debug my debugging mistakes. &nbsp;If I thunk twice about subtracting 8 then I&#8217;d discover how pointless that dt statement was. &nbsp;I&#8217;d have to go back and subtract 8 just once instead of twice. &nbsp;Some call this kind of observation &quot;nitpicking&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-junfeng even thread-even depth-1" id="comment-497283">
+				<div id="div-comment-497283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Junfeng+Zhang' rel='external nofollow' class='url'>Junfeng Zhang</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070424-00/?p=27143#comment-497283">
+			April 27, 2007 at 12:29 am</a>		</div>
+
+		<p>We reserved one DWORD dwSig for every class. </p>
+<p>When you dump the adjacent memory you will know exactly which class it is. </p>
+<div class="post">[<i>This works great as long as you don&#8217;t interoperate with components written by other people (e.g., you never call CoCreateInstance). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

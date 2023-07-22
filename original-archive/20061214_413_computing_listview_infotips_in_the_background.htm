@@ -1,0 +1,662 @@
+<html>
+<head>
+<title>Computing listview infotips in the background</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Computing listview infotips in the background</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 14, 2006 / year-entry #414</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">When the listview control asks you for an infotip, it sends you then LVN_GETINFOTIP notification, and when you return, the result is displayed as the infotip. But what if computing the infotip takes a long time? You don't want to stall the UI thread on a long operation, after all. This is where LVM_SETINFOTIP comes...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When the listview control asks you for an infotip, it sends you
+then <code>LVN_GETINFOTIP</code> notification, and when you return,
+the result is displayed as the infotip.
+But what if computing the infotip takes a long time?
+You don't want to stall the UI thread on a long operation,
+after all.
+This is where <code>LVM_SETINFOTIP</code> comes in.
+</p>
+<p>
+If you want to say, "Um, I'm not ready with that infotip yet,"
+you do two things:
+First, you return a blank infotip to the listview in response
+to <code>LVN_GETINFOTIP</code>;
+this tells the listview not to display anything.
+Then, when you have the infotip, you send the
+<code>LVM_SETINFOTIP</code> message to say,
+"Oh, here's that infotip you asked for.
+If you were still wondering."
+If the user is still hovering over the item that the infotip was
+requested for, the infotip will be displayed.
+Otherwise, the infotip will be thrown away (since the user doesn't
+want to see it any more).
+</p>
+<p>
+Here's a quick and dirty (and not very good) implementation of
+this algorithm, just to illustrate the point.
+Start with the program from last time and make the following
+changes:
+</p>
+<pre>
+// add to top of file
+<font COLOR=blue>#define UNICODE
+#define _UNICODE</font>
+
+<font COLOR=blue>class BackgroundInfoTip {
+public:
+ BackgroundInfoTip() { ZeroMemory(&amp;m_sit, sizeof(m_sit)); }
+ BOOL Start(HWND hwnd, NMLVGETINFOTIP *pit)
+ {
+  m_hwnd = hwnd;
+  m_sit.cbSize = sizeof(m_sit);
+  m_sit.dwFlags = 0;
+  m_sit.iItem = pit-&gt;iItem;
+  m_sit.iSubItem = pit-&gt;iSubItem;
+  if ((pit-&gt;dwFlags &amp; LVGIT_UNFOLDED) ||
+     (m_pszPrefix = StrDup(pit-&gt;pszText)) != NULL) {
+   return QueueUserWorkItem(s_Work, this, WT_EXECUTELONGFUNCTION);
+  }
+  return FALSE;
+ }
+ ~BackgroundInfoTip() {
+  LocalFree(m_pszPrefix);
+  CoTaskMemFree(m_sit.pszText);
+ }
+ static DWORD CALLBACK s_Work(void *lpParameter);
+ void Work();
+ HWND m_hwnd;
+ LVSETINFOTIP m_sit;
+ LPTSTR m_pszPrefix;
+};
+
+void BackgroundInfoTip::Work()
+{
+ Sleep(3000); // artificial delay
+ TCHAR szInfotip[INFOTIPSIZE];
+ if (m_pszPrefix) {
+  StringCchCopy(szInfotip, INFOTIPSIZE, m_pszPrefix);
+  StringCchCat(szInfotip, INFOTIPSIZE, TEXT("\r\n"));
+ } else {
+  szInfotip[0] = TEXT('\0');
+ }
+ StringCchCat(szInfotip, INFOTIPSIZE, TEXT("Here is an infotip"));
+ if (SUCCEEDED(SHStrDup(szInfotip, &amp;m_sit.pszText)) &amp;&amp;
+     PostMessage(m_hwnd, WM_APP, 0, (LPARAM)this)) {
+  // ownership transferred to main window
+ } else {
+  delete this;
+ }
+}
+
+DWORD BackgroundInfoTip::s_Work(void *lpParameter)
+{
+ BackgroundInfoTip *self = 
+    reinterpret_cast&lt;BackgroundInfoTip*&gt;(lpParameter);
+ self-&gt;Work();
+ return 0;
+}</font>
+
+void OnGetInfoTip(HWND hwnd, NMLVGETINFOTIP *pit)
+{
+ if (!pit-&gt;cchTextMax) return;
+ <font COLOR=blue>// note: uses no-throwing "new"
+ BackgroundInfoTip *pbit = new BackgroundInfoTip();
+ if (pbit &amp;&amp; pbit-&gt;Start(hwnd, pit)) {
+  pit-&gt;pszText[0] = TEXT('\0'); // no tip yet
+ } else {
+  delete pbit;
+ }</font>
+}
+
+<font COLOR=blue>void FinishInfoTip(BackgroundInfoTip *pbit)
+{
+ SendMessage(g_hwndChild, LVM_SETINFOTIP, 0, (LPARAM)&amp;pbit-&gt;m_sit);
+ delete pbit;
+}
+
+    case WM_APP: FinishInfoTip((BackgroundInfoTip *)lParam); return 0;</font>
+</pre>
+<p>
+We start by defining
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/02/12/71851.aspx">
+<code>UNICODE</code> and <code>_UNICODE</code></a>
+because we're using the Windows&nbsp;XP common controls (version&nbsp;6),
+and that version of the common controls supports only Unicode.
+(Version&nbsp;5 of the common controls doesn't support the
+<code>LVM_SETINFOTIP</code> message.)
+</p>
+<p>
+Next, let's skip ahead to the <code>OnGetInfoTip</code> function.
+When we are asked to produce an infotip, we create an instance of
+our helper class and get it started.
+Once we're convinced that the infotip computation is under way,
+we return a blank infotip to the listview to tell it,
+"Don't display anything yet."
+</p>
+<p>
+The helper class <code>BackgroundInfoTip</code>
+starts by capturing the parameters of the
+<code>NMLVGETINFOTIP</code>.
+Again, we pay close attention to the <code>LVGIT_UNFOLDED</code>
+flag:
+If it is not set, then we save the text currently in the infotip
+so we can prepend it to the infotip text.
+We then toss the item onto the thread pool and wait for the
+work item to fire.
+</p>
+<p>
+As before, our infotip computation is artificially simple:
+It's just a hard-coded string.
+In real life you presumably would actually sit down and
+compute something.
+I stuck in a <code>Sleep(3000)</code> to create an artificial
+delay in order to simulate this "computation time".
+Once we have our answer,
+remembering to
+prefix the original infotip text if the item was folded,
+we save it in the <code>LVSETINFOTIP</code>
+structure and post a message back to our main thread to say,
+"Okay, the infotip is ready."
+</p>
+<p>
+On receipt of the <code>WM_APP</code> message
+(in a proper program, it would have a more meaningful name
+like <code>WM_INFOTIPREADY</code>), we tell the listview
+that we have our infotip, in case it was still interested.
+And since this completes the background infotip calculation,
+we can delete the helper object.
+</p>
+<p>
+This is not very good code because it fails to handle some
+obvious cases:
+If the user moves to a new listview item, the listview will
+ask for a new infotip.
+Our code doesn't attempt to cancel the previous background infotip;
+as a result, if the user waves the mouse over the listview,
+we may end up with a large number of background infotip computations,
+all but one of which will be discarded.
+Even worse, all the discarded ones will be ahead of the
+important one in the work item queue:
+You're spending all your time doing something whose result
+is going to be thrown away, and not executing
+the work item whose result is actually useful.
+</p>
+<p>
+The code also doesn't handle the case where the window is
+closed while the background work items are still running.
+Closing the window should cancel the work items or at least
+tell them that they don't have a main window to talk to any more.
+</p>
+<p>
+Adding code to handle all these edge cases would have distracted
+from the point of this article, so I leave you to make this code
+more solid as an exercise.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-benkaras even thread-even depth-1" id="comment-453173">
+				<div id="div-comment-453173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">benkaras</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453173">
+			December 14, 2006 at 1:27 pm</a>		</div>
+
+		<p>&quot;The code also doesn&#8217;t handle the case where the window is closed while the background work items are still running. Closing the window should cancel the work items or at least tell them that they don&#8217;t have a main window to talk to any more.&quot;</p>
+<p>I am guessing that you&#8217;ve also left it as an exersize to fix the memory leak when this occurs. &nbsp;If the window is destroyed, the WM_APP message is never handled and BackgroundInfoTip gets leaked.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453183">
+				<div id="div-comment-453183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453183">
+			December 14, 2006 at 1:27 pm</a>		</div>
+
+		<p>&#8220;We start by defining UNICODE and _UNICODE because we&#8217;re using the Windows XP common controls (version 6), and that version of the common controls supports only Unicode. (Version 5 of the common controls doesn&#8217;t support the LVM_SETINFOTIP message.)&#8221;</p>
+<p>Um.. where is this documented, just out of interest? (the Unicode statement, anyway).</p>
+<p>The docs say LVM_SETINFOTIP is only available in version 6, but nothing that I&#8217;ve seen about version 6 only supporting Unicode in general.</p>
+<div class=post>[<i>It should be documented in MSDN but I wouldn&#8217;t be surprised if nobody remember to add it. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453193">
+				<div id="div-comment-453193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kiwiblue</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453193">
+			December 14, 2006 at 2:57 pm</a>		</div>
+
+		<p>&quot;Um.. where is this documented, just out of interest? (the Unicode statement, anyway).&quot;</p>
+<p>Here?</p>
+<p><a rel="nofollow" target="_new" href="http://msdn2.microsoft.com/en-us/library/ms649780.aspx#requirements" rel="nofollow">http://msdn2.microsoft.com/en-us/library/ms649780.aspx#requirements</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453223">
+				<div id="div-comment-453223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">A</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453223">
+			December 14, 2006 at 5:06 pm</a>		</div>
+
+		<p>I guess what Raymond meant to say is &#8220;the new LVM_SETINFOTIP message is only available in a Unicode version&#8221;. COMCTL32 v6, in general, does support ANSI.</p>
+<div class="post">[<i>None of the new stuff will support ANSI, and even some old stuff doesn&#8217;t work. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453273">
+				<div id="div-comment-453273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sergio</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453273">
+			December 15, 2006 at 5:32 am</a>		</div>
+
+		<p>That&#8217;s why it&#8217;s so cool to read Raymond&#8217;s blog (and also why I prefer more technical subjects). By following this small article and thread, I&#8217;ve learnt:</p>
+<p>1) About some special features in common controls</p>
+<p>2) Much more important: that to use Win XP comctl I have to make my program UNICODE (and no, on the link posted by kiwiblue it&#8217;s not written, they just say &quot;ComCtl32.dll, version 6, requires a system for Unicode&quot; which has some other meaning (I don&#8217;t know which system they refer, but I&#8217;d expect to mean &quot;operating system&quot;).</p>
+<p>3) About the existence of &quot;std::nothrow&quot;</p>
+<p>Question: is () in Raymond&#8217;s &quot;new BackgroundInfoTip();&quot; and error (I think new A and new A() are different things) or is it some special syntax connected with the fact that it&#8217;s &quot;non throwing new&quot;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453253">
+				<div id="div-comment-453253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453253">
+			December 14, 2006 at 10:44 pm</a>		</div>
+
+		<p>I&#8217;ve noticed that you and Larry Osterman often (always?) use a non-throwing variant of the new operator.</p>
+<p>In order to prevent confusion, you may want to consider using the std::nothrow_t parameter:</p>
+<p>=================</p>
+<p> &nbsp;SomeType *p = new(std::nothrow) SomeType;</p>
+<p>=================</p>
+<p>This would avoid having to comment that fact:</p>
+<p>=================</p>
+<p> &nbsp;// note: uses no-throwing &#8220;new&#8221;</p>
+<p> &nbsp;BackgroundInfoTip *pbit = new BackgroundInfoTip();</p>
+<p>=================</p>
+<p>Using std::nothrow avoids relying on the not always obvious use of a special .obj linked into the program, a _set_new_handler function, or a standard-breaking operator new function override.</p>
+<div class="post">[<i>Sorry, I always forget that this option exists. It&#8217;s just not part of my everyday vocabulary. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453293">
+				<div id="div-comment-453293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kiwiblue</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453293">
+			December 15, 2006 at 10:32 am</a>		</div>
+
+		<p>Sergio: even if the &quot;system for Unicode&quot; is ambiguous, the next paragraph is a dead giveaway:</p>
+<p>[quote]</p>
+<p>You should not subclass the updated common controls with an ANSI window procedure.</p>
+<p>[/quote]</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453313">
+				<div id="div-comment-453313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bmm6o</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453313">
+			December 15, 2006 at 11:50 am</a>		</div>
+
+		<p>Sergio: &quot;I think new A and new A() are different things&quot;</p>
+<p>They are the same. &nbsp;I prefer the &quot;new A()&quot; variant. &nbsp;You may be thinking of stack allocation, in which there is a huge difference between &quot;A a;&quot; and &quot;A a();&quot; (use the first, the second is a function declaration).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453333">
+				<div id="div-comment-453333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">A</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453333">
+			December 15, 2006 at 12:12 pm</a>		</div>
+
+		<p>&#8220;Much more important: that to use Win XP comctl I have to make my program UNICODE&#8221;</p>
+<p>Seriously people, just because Raymond said it doesn&#8217;t make it true. Granted, there might be some rare exceptions, but in five years of linking numerous ANSI-based applications against COMCTL32 v6, I&#8217;ve never encountered a single compatibility issue that wasn&#8217;t due to a bug in my own code.</p>
+<p>In fact, entire frameworks &#8212; like Borland&#8217;s Visual Component Library &#8212; are built around the assumption that COMCTL32 v6 supports ANSI.</p>
+<div class=post>[<i>You&#8217;re lucky that your ANSI program never used the EM_GETHANDLE message. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453353">
+				<div id="div-comment-453353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Philip Taylor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453353">
+			December 15, 2006 at 1:15 pm</a>		</div>
+
+		<p>&quot;I think new A and new A() are different things&quot;</p>
+<p>My limited understanding of the C++ standard is that it says: If A is a non-POD class type (i.e. it doesn&#8217;t act like a plain C struct), then &quot;new A&quot; default-initialises it. Otherwise A is a POD type, and &quot;new A&quot; gives an indeterminate value (e.g. whatever happened to be in that memory before you allocated it). In both cases, &quot;new A()&quot; default-initialises it (which means calling the default constructor for non-POD types, and zero-initialising for POD types).</p>
+<p>So if you did have a POD type &#8216;T&#8217;, then &quot;new T&quot; would leave its contents indeterminate, while &quot;new T()&quot; would zero-initialise it instead.</p>
+<p>In this case, BackgroundInfoTip is non-POD (since it has a constructor and destructor), so there&#8217;s no difference. In both versions it calls the default constructor. Since that constructor has an empty member initialisation list, it causes any non-POD members to be default-initialised (but there aren&#8217;t any here), and any POD members (which is all it has) will not be initialised so they&#8217;ll be random values. If the constructor was &quot;BackgroundInfoTip() : m_sit() {}&quot; instead then it should zero-initialise the m_sit member since that&#8217;s a POD type.</p>
+<p>For example, assuming the formatting works alright here:</p>
+<p>struct A { int m; }; // POD</p>
+<p>struct B { ~B(); int m; }; // non-POD</p>
+<p>struct C { C() : m() {}; ~C(); int m; }; // non-POD, default-initialising m</p>
+<p>int main() {</p>
+<p>&nbsp;std::cout</p>
+<p>&nbsp; &nbsp;&lt;&lt; (new A &nbsp;)-&gt;m &lt;&lt; &quot; &quot;</p>
+<p>&nbsp; &nbsp;&lt;&lt; (new A())-&gt;m &lt;&lt; &quot; &quot;</p>
+<p>&nbsp; &nbsp;&lt;&lt; (new B &nbsp;)-&gt;m &lt;&lt; &quot; &quot;</p>
+<p>&nbsp; &nbsp;&lt;&lt; (new B())-&gt;m &lt;&lt; &quot; &quot;</p>
+<p>&nbsp; &nbsp;&lt;&lt; (new C &nbsp;)-&gt;m &lt;&lt; &quot; &quot;</p>
+<p>&nbsp; &nbsp;&lt;&lt; (new C())-&gt;m &lt;&lt; &quot;n&quot;;</p>
+<p>}</p>
+<p>MSVC8 outputs &quot;? 0 ? ? 0 0&quot; (where &#8216;?&#8217; is some random value). ICC9 outputs &quot;? 0 ? 0 0 0&quot;. GCC3.4 outputs &quot;0 0 0 0 0 0&quot;. So the difference does matter in some cases. (But please point out any mistakes I&#8217;ve made!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453363">
+				<div id="div-comment-453363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Boyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453363">
+			December 15, 2006 at 1:49 pm</a>		</div>
+
+		<p>&#8220;Adding code to handle all these edge cases would have distracted from the point of this article, so I leave you to make this code more solid as an exercise.&#8221;</p>
+<p>i was hoping i would finally get to see a decent way to cancel queued user work items, wait on all cancelled work items to finally return, all the while not getting stuck waiting for queued work items to return.</p>
+<p>If concurrency is the wave of the future, operating systems or compilers are going to have to do it all; it&#8217;s a nightmare to manage yourself.</p>
+<div class=post>[<i>My rule is one topic per posting. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453373">
+				<div id="div-comment-453373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453373">
+			December 15, 2006 at 2:46 pm</a>		</div>
+
+		<p>The rules are kind of tricky:</p>
+<ul>
+<li>There are 3 types of initializations: zero, default, and value.</li>
+<li>
+<p>new T calls the default-initializer.</p>
+</li>
+<li>
+<p>new T() calls the value-initializer.</p>
+</li>
+<li>
+<p>The compiler generated default ctor for B looks like B::B() {}. B::m remains uninitialized here because it&#8217;s a POD.</p>
+</li>
+<li>
+<p>new A doesn&#8217;t do anything since it&#8217;s a POD.</p>
+</li>
+<li>
+<p>new A() value-initializes A which zero-initializes all fields since it&#8217;s a POD.</p>
+</li>
+<li>
+<p>new B default-initializes B which calls the compiler generated default ctor that leaves B::m uninitialized.</p>
+</li>
+<li>
+<p>new B() value-initializes B which zero-initializes all fields since its default ctor is compiler generated as opposed to user-defined.</p>
+</li>
+<li>
+<p>new C default-initializes C, which calls the default ctor.</p>
+</li>
+<li>
+<p>new C() value-initializes C, which calls the default ctor.</p>
+</li>
+</ul>
+<p>MSVC8&#8217;s output is incorrect. GCC looks like it&#8217;s allocating memory from a zeroed out chunk, so that&#8217;s not really helpful. ICC9&#8217;s is the only minimally correct behavior you should depend on (if you ignore the fact that it&#8217;s undefined to read from an uninitialized value).</p>
+<p>I&#8217;m glad Raymond realized std::nothrow exists but I hope he finally realizes to use static_cast when converting pointers to and from void* even though I&#8217;ve said this like 5 times now.</p>
+<p>And thankfully the definition of POD is being loosened up in C++0x (this shouldn&#8217;t affect the above) so you can add ctors (except the special ones) to a POD-struct and still have it remain a POD-struct:</p>
+<p><a rel="nofollow" target="_new" href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2006/n2102.html" rel="nofollow">http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2006/n2102.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453393">
+				<div id="div-comment-453393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">steveg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453393">
+			December 15, 2006 at 6:18 pm</a>		</div>
+
+		<p>&lt;advertisement&gt;re discussion on c++ new: i did 10 years of c++ and am now much happier in the world of c# &#8212; i spend more time solving problems, less time fighting obscure c++ rules &#8212; YMMV.&lt;/advertisement&gt;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453403">
+				<div id="div-comment-453403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453403">
+			December 15, 2006 at 7:46 pm</a>		</div>
+
+		<p>Hmm&#8230; I cannot find any reference in the C++ Standard to &quot;value initialization&quot; (I&#8217;m looking at ISO/IEC 14882:1998(E)). &nbsp;However, in section 5.3.4 (New), it says that, &quot;An object whose initializer is an empty set of parentheses, i.e., (), shall be default-initialized.&quot;</p>
+<p>So it seems to me that &quot;new B&quot; and &quot;new B()&quot; should result in the same behavior (ie., that the default constructor for B is called, so B::m is not initialized). &nbsp;</p>
+<p>So all of the &quot;new&quot; expressions above, except for &quot;new A&quot; result in default initialization. &nbsp;For a POD type, like A, that results in being zero-initialized.</p>
+<p>new A &nbsp; &#8211; indeterminate value</p>
+<p>new A() &#8211; zero-initialize</p>
+<p>new B &nbsp; &#8211; default construct (B::m is uninitialized)</p>
+<p>new B() &#8211; default construct (B::m is uninitialized)</p>
+<p>new C &nbsp; &#8211; default construct</p>
+<p>new C() &#8211; default construct</p>
+<p>The behavior of MSVC 8 seems to follow these rules.</p>
+<p>I agree with steveg that this kind of obscure crap is a major problem with C++.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-453413">
+				<div id="div-comment-453413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453413">
+			December 15, 2006 at 7:52 pm</a>		</div>
+
+		<blockquote><p>
+  in five years of linking numerous ANSI-based applications against COMCTL32 v6
+</p></blockquote>
+<p>Why on earth are you still writing ANSI application in 2006?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453433">
+				<div id="div-comment-453433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453433">
+			December 15, 2006 at 10:20 pm</a>		</div>
+
+		<p>value-initialization was added to TC1, the 2003 revision of the C++ standard. MSVC8 is conformant only if it claims to follow the 1998 standard.</p>
+<p>And for completeness, lets add another example:</p>
+<p>struct D { D() {}; int m; };</p>
+<p>new D; // D::m uninitialized</p>
+<p>new D(); // D::m uninitialized</p>
+<p>static D d; // D::m is zero-initialized in during static initialization</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453473">
+				<div id="div-comment-453473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">That one Ian guy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453473">
+			December 16, 2006 at 4:13 am</a>		</div>
+
+		<p>Great pedantic comments here. &nbsp;What the heck does documenting throw/nothrow have to do with listview tooltips?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-453483">
+				<div id="div-comment-453483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ghjk</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453483">
+			December 16, 2006 at 11:47 am</a>		</div>
+
+		<p>Dean: Maybe because he&#8217;s in scientific computing? Most of the libraries I work with on a daily basis speak only ANSI strings, and I mean char*, not even std::string. The conversion overhead is such that it&#8217;s just not worth building things to use Unicode until all these libraries get fixed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-453683">
+				<div id="div-comment-453683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-453683">
+			December 17, 2006 at 10:37 pm</a>		</div>
+
+		<p>Thursday, December 14, 2006 10:44 PM by mikeb</p>
+<blockquote><p>
+  I&#8217;ve noticed that you and Larry Osterman</p>
+<p>  often (always?) use a non-throwing variant of</p>
+<p>  the new operator.
+</p></blockquote>
+<p>Yeah, he uses the old new. &nbsp;(So do I, except for buffers that grow to meet demand where I might use malloc and realloc.)</p>
+<p>Friday, December 15, 2006 7:52 PM by Dean Harding</p>
+<blockquote><p>
+  &gt; in five years of linking numerous ANSI-based</p>
+<p>  &gt; applications against COMCTL32 v6
+</p></blockquote>
+<p>></p>
+<blockquote><p>
+  Why on earth are you still writing ANSI</p>
+<p>  application in 2006?
+</p></blockquote>
+<p>You mean 2001, because you quoted A saying A has been linking it for 5 years. &nbsp;A few theoretically possible reasons might be: &nbsp;(1) Windows ME still existed in 2001; (2) Machines with 32MB of RAM still run Windows 98 in 2006; (3) Applications which were written in 1999 might still get Windows XP look and feel added to their UI; (4) Some applications which were written for Unix might still get ported to Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-454343">
+				<div id="div-comment-454343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">old skol</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-454343">
+			December 19, 2006 at 9:23 am</a>		</div>
+
+		<blockquote><p>
+  Why on earth are you still writing ANSI application in 2006?
+</p></blockquote>
+<p>Why on earth are people still writing C++ applications in 2006?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-455693">
+				<div id="div-comment-455693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061214-02/?p=28713#comment-455693">
+			December 21, 2006 at 10:37 pm</a>		</div>
+
+		<p>Tuesday, December 19, 2006 9:23 AM by old skol</p>
+<blockquote><p>
+  Why on earth are people still writing C++</p>
+<p>  applications in 2006?
+</p></blockquote>
+<p>Here&#8217;s one answer:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2006/12/18/1317290.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2006/12/18/1317290.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

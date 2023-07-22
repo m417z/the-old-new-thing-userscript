@@ -1,0 +1,482 @@
+<html>
+<head>
+<title>The PowerPC 600 series, part 14: Code walkthrough</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The PowerPC 600 series, part 14: Code walkthrough</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 23, 2018 / year-entry #192</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Putting the theory into practice.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today we're going to take a relatively small function and watch
+what the compiler did with it.
+The function is this guy from the C runtime library,
+although I've
+simplified it a bit to avoid some distractions.
+</p>
+<pre>
+extern FILE _iob[];
+
+int fclose(FILE *stream)
+{
+    int result = EOF;
+
+    if (stream-&gt;_flag &amp; _IOSTRG) {
+        stream-&gt;_flag = 0;
+    } else {
+        int index = stream - _iob;
+        _lock_str(index);
+        result = _fclose_lk(stream);
+        _unlock_str(index);
+    }
+
+    return result;
+}
+</pre>
+<p>
+Here's the corresponding disassembly:
+</p>
+<pre>
+; int fclose(FILE *stream)
+; {
+    mflr    r0              ; move return address to r0
+    stw     r29,-0xC(r1)    ; save non-volatile register
+    stw     r30,-8(r1)      ; save non-volatile register
+    stw     r31,-4(r1)      ; save non-volatile register
+    stw     r0,-0x10(r1)    ; save return address
+    stwu    r1,-0x50(r1)    ; create stack frame and link
+</pre>
+<p>
+On entry, the parameters to a function are passed in <var>r3</var>
+through <var>r10</var>.
+This function has only one parameter, so it goes in <var>r3</var>.
+</p>
+<p>
+The return address is passed in <var>lr</var>,
+but the <var>lr</var> register cannot be stored directly into memory.
+We need to transfer it through a general-purpose register.
+The Microsoft compiler uses <var>r0</var> for this purpose
+(and doesn't use <var>r0</var> for any other purpose as far as I can tell.)
+</p>
+<p>
+The next step is to save the non-volatile registers that the function
+uses, so that they can be restored at function exit.
+Then we save the return address on the stack, and finally create
+the stack frame and link it to the previous stack frame.
+</p>
+<p>
+We created an 80-byte stack frame.
+The 24 bytes closest to the top of the stack form the system-reserved
+area; the next 32 bytes are the home spaces for the eight register parameters.
+We don't call any functions with more than eight parameters,
+so we don't need any space for the outbound parameters beyond eight.
+Our usable local variables therefore start at offset 56.
+On the other hand, we stored the return address at offset
+80 &minus; 16 = 64,
+and the nonvolatile registers at offsets 68 thorough 76,
+which means that our local variables live at offsets 56 through 64.
+(It turns out that we won't use any of them!
+But we had to allocate them anyway, in order to keep the stack
+aligned on a 16-byte boundary.)
+</p>
+<p>
+Okay, with the prologue out of the way, we can start doing
+real work.
+</p>
+<pre>
+;   if (stream-&gt;_flag ...
+    mr      r31,r3          ; r31 = stream
+    lwz     r3,0xC(r31)     ; r3 = stream-&gt;_flag
+</pre>
+<p>
+We are going to test a bit in the <code>stream-&gt;_flag</code>
+member, so we need to load that up.
+Meanwhile, we save the stream parameter in the <var>r31</var> register.
+</p>
+<pre>
+;   int result = EOF;
+    li      r30,-1          ; r30 = -1
+    li      r4,0            ; r4 = 0 (handy zero value)
+</pre>
+<p>
+Interleaved with the evaluation of the condition we insert
+the initialization of the <code>result</code> local variable,
+and we set <var>r4</var> to zero because zero is a handy value to have.
+</p>
+<pre>
+;   if (stream-&gt;_flag &amp; _IOSTRG) {
+    rlwinm. r3,r3,0,25,25   ; r3 = r3 &amp; 0x40 (_IOSTRG)
+    beq     notstring       ; if bit not set, then go to "else" branch
+</pre>
+<p>
+We use the all-purpose <code>rlwinm</code> instruction here.
+We shift by zero positions, but specify a mask of (25,25).
+On the PowerPC, bits are numbered starting from the most significant
+bit, so position 25 has value <code>1 &lt;&lt; (31-25) = 0x40</code>.
+Therefore, this instruction is functionally equivalent to
+</p>
+<pre>
+    andi.   r3,r3,0x40      ; r3 = r3 &amp; 0x40 (_IOSTRG)
+</pre>
+<p>
+Since the <code>rlwinm</code> opcode is followed by a period,
+it sets flags in <var>cr0</var> based on the result.
+We test these flags in the subsequent <code>beq</code>
+and jump if the bit is not set.
+Recall that if you don't specify a condition register for <code>beq</code>,
+it defaults to <var>cr0</var>.
+</p>
+<p>
+Otherwise, we fall through:
+</p>
+<pre>
+;       stream-&gt;_flag = 0;
+    stw     r4,0xC(r31)     ; stream-&gt;_flag = 0
+    b       done            ; end of "true" branch
+</pre>
+<p>
+We preloaded zero into the <var>r4</var> register, so we can
+use a <code>stw</code> to store that zero into the 
+<code>stream-&gt;_flags</code>.
+That's the end of the <code>true</code> branch
+of the <code>if</code> statement,
+so we jump to the function exit code.
+</p>
+<pre>
+    } else {
+notstring:
+;       int index = stream - _iob;
+    lwz     r3,-0x7F3C(r2)  ; r3 = &amp;_iob
+    subfc   r3,r3,r31       ; calculate raw pointer offset
+    srawi   r29,r3,5        ; divide by 32 to get the index (saved in r29)
+</pre>
+<p>
+First, we need to calculate the address of the <code>_iob</code>
+global address.
+The addresses of global variables are kept in the table of contents.
+The displacement in memory access instructions is a signed 16-bit value,
+so the table of contents register usually points
+32<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">KB</a>
+past the start of the actual table of contents,
+so that the code can use both positive and negative offsets to access
+a 64KB block of data.
+And since most programs don't have more than 8192 global variables,
+the offsets you see will almost always be negative.
+</p>
+<p>
+After we get the address of the <code>_iob</code> global variable,
+we subtract the raw pointers to get the byte difference,
+and then we divide by <code>sizeof(FILE)</code> to get the index.
+We're lucky that the size of a <code>FILE</code> is a power of 2,
+so a shift instruction can be used instead of a full division.
+</p>
+<pre>
+;       _lock_str(index);
+    mr      r3,r29          ; first function parameter is "index"
+    bl      _lock_str       ; call _lock_str
+    nop                     ; don't need to restore toc
+</pre>
+<p>
+Now that we've calculated the index, set it up as the argument
+for the <code>_lock_str</code> function and call it.
+At the time the compiler generated the code, it was not sure
+whether <code>_lock_str</code> was a function in the same module
+or was a na&iuml;vely-imported function, so it left a <code>nop</code>
+after the <code>bl</code>.
+If the function turned out
+to be a na&iuml;vely-imported function,
+the linker would have changed the <code>nop</code> to
+<code>lwz r2, 4(sp)</code> in order to restore the
+table of contents.
+</p>
+<pre>
+;       result = _fclose_lk(stream);
+    mr     r3,r31           ; load parameter for _fclose_lk
+    bl     _fclose_lk
+    mr     r30,r3           ; save return value in "result"
+</pre>
+<p>
+The next thing to do is to call <code>_fclose_lk</code>,
+so we put the <code>stream</code> parameter in <var>r3</var>,
+copying it from <var>r31</var> which is where we saved it at
+the start of the function.
+This time, the compiler knows that <code>_fclose_lk</code>
+is in the same module,
+presumably because it was in the same translation unit,
+so it doesn't need to leave a <code>nop</code> after the <code>bl</code>.
+</p>
+<pre>
+;       _unlock_str(index);
+    mr     r3,r29           ; load parameter for _unlock_str
+    bl     _unlock_str
+    nop                     ; don't need to restore toc
+</pre>
+<p>
+After the <code>_fclose_lk</code>, we call <code>_unlock_str</code>,
+and this time the compiler didn't know whether
+<code>_unlock_str</code> was in the same module or not,
+so it leaves a precautionary <code>nop</code> after the <code>bl</code>.
+</p>
+<pre>
+;  }
+done:
+    mr     r3,r30           ; set return value
+
+    lwz    r0,0x40(r1)      ; recover return address
+    lwz    r29,0x44(r1)     ; restore non-volatile register
+    lwz    r30,0x48(r1)     ; restore non-volatile register
+    lwz    r31,0x4C(r1)     ; restore non-volatile register
+    mtlr   r0               ; move return address to lr so we can jump to it
+    addi   r1,r1,0x50       ; clean the stack
+    blr                     ; return to caller
+</pre>
+<p>
+We set the return value to the <code>result</code>,
+and then we enter the epilogue.
+In the epilogue, we load the return address into <var>r0</var>,
+and then restore the non-volatile registers.
+We load the return address first so that the <code>mtlr</code>
+is less likely to stall waiting for the answer to come back from memory.
+</p>
+<p>
+One thing you may notice is that the non-volatile registers are
+saved with negative offsets (into the red zone) but restored
+from positive offsets (from the local frame).
+This makes it harder to match up the two, but you can generally assume
+that the compiler knows how to do math and didn't mess that up.
+</p>
+<p>
+The more significant consequence of this is that it's harder
+to manually unwind the stack
+in order to see what was in the registers of the caller.
+You can disassemble at the start of the function to see where
+the registers were saved, but they are saved at negative offsets,
+which you then need to mentally add to the size of the stack frame
+expressed in the <code>stwu</code> instruction at the end of the
+prologue.
+To get the positive offsets,
+you need to disassemble at the end of the function, which is
+harder to find since you just keep disassembling forward until
+you find that you've started disassembling another function.
+And even that trick doesn't work if the module has undergone
+profile-guided optimization, which can make the code for
+a function discontiguous.
+</p>
+<p>
+Anyway,
+after restoring the non-volatile registers,
+we move the return address into the <var>lr</var> register,
+pop the stack frame,
+and return.
+(The Windows NT software conventions require that the
+return instruction be encoded exactly as <code>blr</code> and not
+one of its functional equivalents.)
+</p>
+<p>
+This concludes our very quick tour of the PowerPC 600 series of processors.
+Like the MIPS R4000,
+I never had to do any significant work with PowerPC,
+so I probably won't be able to answer interesting questions.
+The focus was on learning enough to be able to read valid
+compiler output,
+with a few extra notes on the architecture to call out
+what makes it different.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1357115">
+				<div id="div-comment-1357115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357115">
+			August 23, 2018 at 9:21 am</a>		</div>
+
+		<p>You put a lot of work into these blog posts.  Much appreciated!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1357125">
+				<div id="div-comment-1357125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">florian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357125">
+			August 23, 2018 at 1:04 pm</a>		</div>
+
+		<p>I can only agree with that.</p>
+<p>For me as a hobbyist, the series about processor architectures are not always easy to digest. But I often wait for the last post, and print out everything, so it&#8217;s easier to keep the definitions from the early posts besides the code from the more complex posts. Then I read it on a hot and lazy summer holiday afternoon (some of the series were published in midsummer) with an iced coffee, before or after taking a swim in the cool river. Your articles add a lot of pleasure to these already good days!</p>
+<p>(And also did your book, of course. I wished it would never end.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aadsso-1live-com000340019af3cc36 even thread-odd thread-alt depth-1 parent" id="comment-1357135">
+				<div id="div-comment-1357135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Richard+T+Russell' rel='external nofollow' class='url'>Richard T Russell</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357135">
+			August 23, 2018 at 2:15 pm</a>		</div>
+
+		<p>&#8220;in order to keep the stack aligned on a 16-byte boundary.&#8221;</p>
+<p>Didn&#8217;t we establish the other day that the stack alignment requirement is 8 bytes, not 16?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1357145">
+				<div id="div-comment-1357145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357145">
+			August 23, 2018 at 2:45 pm</a>		</div>
+
+		<p>I think the alignment requirement really is 16. The red zone doesn&#8217;t need to fill the entire frame.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1357165">
+				<div id="div-comment-1357165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vas Crabb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357165">
+			August 23, 2018 at 9:38 pm</a>		</div>
+
+		<p>The alignment requirement is 16 bytes on AIX, MacOS, OSX and Linux as well.  They all have the same requirement that the stack pointer be updated and linked atomically, and the same distance between saved R1 and R3 parameter home space.  The red zone size doesn&#8217;t have to be a valid stack frame size.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1357195">
+				<div id="div-comment-1357195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">djhayman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357195">
+			August 24, 2018 at 1:23 am</a>		</div>
+
+		<p>Out of interest, how similar were the various architecture ABIs between Windows NT and Windows CE? Both have supported X86, ARM, MIPS, and PowerPC at various times. Was the PowerPC ABI for NT the same as the PowerPC ABI for CE?</p>
+<p>NT has also supported X86-64, Alpha, and Itanium, while CE has also supported SuperH. Were NT or CE ever ported (but perhaps not publicly released) to any other architectures?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1357205">
+				<div id="div-comment-1357205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vas Crabb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357205">
+			August 24, 2018 at 7:05 am</a>		</div>
+
+		<p>There was a short-lived WinNT port for InterPro workstations using the Fairchild/InterGraph CLIPPER C400 CPU.  I think the bulk of the porting was done by InterGraph.  Was there ever a SPARC version?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1357295">
+				<div id="div-comment-1357295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357295">
+			August 24, 2018 at 1:31 pm</a>		</div>
+
+		<p>*insert Frodo &#8216;is over. is finally over&#8217; meme</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1357745">
+				<div id="div-comment-1357745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Al Go</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180823-00/?p=99555#comment-1357745">
+			August 27, 2018 at 1:52 pm</a>		</div>
+
+		<p>“rlwinm. r3,r3,0,25,25   ; r3 = r3 &amp; 0x40”<br />
+That instruction takes some time to get used to.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

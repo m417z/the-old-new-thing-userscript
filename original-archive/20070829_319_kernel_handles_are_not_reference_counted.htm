@@ -1,0 +1,505 @@
+<html>
+<head>
+<title>Kernel handles are not reference-counted</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Kernel handles are not reference-counted</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 29, 2007 / year-entry #320</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Here's a question that floated past some time ago: In my code, I have multiple objects that want to talk to the same handle (via DeviceIoControl). Each time I create an object, I use DuplicateHandle to increment the reference count on the handle. That way, when each object calls CloseHandle, only the last one actually...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Here's a question that floated past some time ago:
+</p>
+<blockquote CLASS=q><p>
+In my code, I have multiple objects that want to talk to the
+same handle (via <code>DeviceIoControl</code>).
+Each time I create an object, I use <code>DuplicateHandle</code>
+to increment the reference count on the handle.
+That way, when each object calls <code>CloseHandle</code>,
+only the last one actually closes the handle.
+However, when I run the code, I find as soon as the first object
+calls <code>CloseHandle</code>, the handle is no longer valid
+and nobody else can use it.
+What flags do I need to pass to <code>CreateFile</code> to get
+this to work?
+</p>
+</blockquote>
+<p>
+In other words, the code went something like this:
+</p>
+<pre>
+<i>// h is the handle that we want to share with a new CFred object
+
+CFred *MakeFred(HANDLE h)
+{
+ // "Duplicate the handle to bump the reference count"
+ // This code is wrong - see discussion
+ // All error checking removed for expository purposes
+ HANDLE hDup;
+ DuplicateHandle(GetCurrentProcess(), h,
+                 GetCurrentProcess(), &amp;hDup,
+                 0, FALSE, DUPLICATE_SAME_ACCESS);
+ return new CFred(h);
+}</i>
+</pre>
+<p>
+Kernel handles aren't reference-counted.
+When you call <code>CloseHandle</code>,
+that closes the handle, end of story.
+</p>
+<p>
+From the original problem statement, we know that
+the <code>CFred</code> object closes the handle when it
+is destroyed.
+Just for argument's sake, let's say that the caller goes
+something like this:
+</p>
+<pre>
+CFred *pfred1 = MakeFred(h);
+CFred *pfred2 = MakeFred(h);
+delete pfred1;
+delete pfred2;
+</pre>
+<p>
+What actually happens when you run this fragment?
+</p>
+<p>
+The first time we call <code>MakeFred</code> we take
+the original handle <code>h</code> and duplicate it,
+but we give the original handle to the <code>CFred</code>
+constructor and leak the <code>hDup</code>!
+The original poster assumed that duplicating a handle merely 
+incremented the handle's imaginary reference count,
+so that <code>h == hDup</code>.
+(Which would also have made the original poster wonder why
+we even bother having a <code>lpTargetHandle</code> parameter
+in the first place.)
+</p>
+<p>
+When <code>pfred1</code> is deleted, it closes its handle,
+which is <code>h</code>.
+This closes the <code>h</code> handle and renders it invalid
+and available to be recycled for another <code>CreateFile</code>
+or other operation that creates a handle.
+</p>
+<p>
+When <code>pfred2</code> is deleted, it also closes its handle,
+which is still <code>h</code>.
+This is now closing an already-close handle,
+which is an error.
+If we had bothered calling a method on <code>pfred2</code> that
+used the handle, it would have gotten failures from those operations
+as well, since the handle is no longer valid.
+(Well, if we're lucky, we would have gotten a failure.
+If we were unlucky, the handle would have been recycled and
+we ended up performing a <code>DeviceIoControl</code> on somebody
+else's handle!)
+</p>
+<p>
+Meanwhile, the calling code's copy of <code>h</code> is also bad,
+since <code>pfred1</code> closed it when it was deleted.
+</p>
+<p>
+What we really want to do here is duplicate the handle
+and pass the <strong>duplicate</strong> to each object.
+The <code>DuplicateHandle</code> function creates a new
+handle that refers to the same object as the original handle.
+That new handle can be closed without affecting the original handle.
+</p>
+<pre>
+// h is the handle that we want to share with a new CFred object
+
+CFred *MakeFred(HANDLE h)
+{
+ // Create another handle that refers to the same object as "h"
+ // All error checking removed for expository purposes
+ HANDLE hDup;
+ DuplicateHandle(GetCurrentProcess(), h,
+                 GetCurrentProcess(), &amp;hDup,
+                 0, FALSE, DUPLICATE_SAME_ACCESS);
+ return new CFred(<font COLOR=blue>hDup</font>);
+}
+</pre>
+<p>
+The fix is one word, highlighted in blue.
+We give the duplicated handle to the <code>CFred</code> object.
+That way, it gets its own handle which it is free to close
+any time it wants, and it won't affect anybody else's handle.
+</p>
+<p>
+You can think of <code>DuplicateHandle</code> as a sort of
+<code>AddRef</code> for kernel objects.
+Each time you duplicate a handle, the reference count on the
+kernel object goes up by one, and you gain a new reference
+(the new handle).
+Each time you close a handle, the reference count on the kernel
+object drops by one.
+</p>
+<p>
+In summary, a handle is not a reference-counted object.
+When you close a handle, it's gone.
+When you duplicate a handle, you gain a new obligation to
+close the duplicate, in addition to the existing obligation
+to close the original handle.
+The duplicate handle refers to the same object as the original handle,
+and it is the underlying object that is reference-counted.
+(Note that kernel objects can have reference from things
+that aren't handles.
+For example, an executing thread maintains a reference to the underlying
+thread object.
+Closing the last handle to a thread will not destroy the thread object
+because the thread keeps a reference to itself as long as it's running.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-544333">
+				<div id="div-comment-544333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Medinoc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544333">
+			August 29, 2007 at 11:26 am</a>		</div>
+
+		<p>I love the DuplicateHandle() function since the very first time I managed to make an &quot;big&quot; Interprocess Communication work (excluding sockets).</p>
+<p>It also helped me learn that a file object has only one file pointer, regardless of the number of handles. In fact, I can&#8217;t really think of any good reason to call DuplicateHandle() on a file handle. But I did know a dirty trick on duplicated console input buffer handles&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-544353">
+				<div id="div-comment-544353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dgr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544353">
+			August 29, 2007 at 11:52 am</a>		</div>
+
+		<p>so many people get it wrong. even ones who understand pointers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544403">
+				<div id="div-comment-544403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Maks Verver</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544403">
+			August 29, 2007 at 2:55 pm</a>		</div>
+
+		<p>@CornedBee: the handle is not just a reference to the kernel object, but also a token that signifies that a process has access to the object and is allowed to decrease the internal reference count. The kernel must be able to enforce that such a token is genuine, to make sure the internal books remain balanced.</p>
+<p>Suppose a handle was just a pointer to a kernel object that has a single reference count. Then processes would be able to delete references they didn&#8217;t create (maybe that would do for Windows 3.11, but not in any secure system) and you wouldn&#8217;t be able to remove outstanding references on process exit.</p>
+<p>So, you&#8217;ll have to do some per-process bookkeeping, which means that you&#8217;ll effectively have multiple handles to the same kernel object anyway (because handles differ between processes). &nbsp;As Raymond points out, POSIX file descriptors work in the same way and that is not surprising since the scenario is similar: different processes (which must be isolated) share access to a single object.</p>
+<p>Given that you have to keep track of references, it&#8217;s easier to keep track of simple ones than having a two-level scheme of reference counting per process, and per kernel object. Ofcourse, if you want to have only one kernel reference and do per-process reference counting too (which is arguably somewhat more space-efficient) you can implement that in user mode just fine. (But don&#8217;t bother unless you&#8217;re creating hundreds of thousand handles.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-544413">
+				<div id="div-comment-544413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sohail</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544413">
+			August 29, 2007 at 3:05 pm</a>		</div>
+
+		<p>Or you could use a funny thing called a reference counted pointer! std::tr1::shared_ptr</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544433">
+				<div id="div-comment-544433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://mailto:bozo99@gmail.com' rel='external nofollow' class='url'>Ed Massey</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544433">
+			August 29, 2007 at 4:55 pm</a>		</div>
+
+		<p>The fact is, this stuff is not really that well documented. &nbsp;In an effort to abstract the internals of the system (taken to the extreme), many of the nuiances are left inadequately explained, leading to many hours of developer frustration.</p>
+<p>Even a simple picture paints a thousand words, so here&#8217;s the data structures from the Windows kernel (from WinDbg 6.6 running under Windows XP). &nbsp;Each (executive) process in the kernel is represented by the EPROCESS structure. &nbsp;The ObjectTable field points to a HANDLE_TABLE structure that maintains the per-process handle table. &nbsp;Each entry in this table is represented by the HANDLE_TABLE_ENTRY structure, whose Object field points to the object, and indirect, the OBJECT_HEADER, which contains the actual reference (and handle) counts. &nbsp;The Body field is the first byte of the type-specific object body&#8230;</p>
+<p>0:000&gt; dt _EPROCESS</p>
+<p>&#8212;snip&#8212;</p>
+<p>&nbsp; +0x0c4 ObjectTable &nbsp; &nbsp; &nbsp;: Ptr32 _HANDLE_TABLE</p>
+<p>&#8212;snip&#8212;</p>
+<p>0:004&gt; dt _HANDLE_TABLE</p>
+<p>&nbsp; +0x000 TableCode &nbsp; &nbsp; &nbsp; &nbsp;: Uint4B</p>
+<p>&nbsp; +0x004 QuotaProcess &nbsp; &nbsp; : Ptr32 _EPROCESS</p>
+<p>&nbsp; +0x008 UniqueProcessId &nbsp;: Ptr32 Void</p>
+<p>&nbsp; +0x00c HandleTableLock &nbsp;: [4] _EX_PUSH_LOCK</p>
+<p>&nbsp; +0x01c HandleTableList &nbsp;: _LIST_ENTRY</p>
+<p>&nbsp; +0x024 HandleContentionEvent : _EX_PUSH_LOCK</p>
+<p>&nbsp; +0x028 DebugInfo &nbsp; &nbsp; &nbsp; &nbsp;: Ptr32 _HANDLE_TRACE_DEBUG_INFO</p>
+<p>&nbsp; +0x02c ExtraInfoPages &nbsp; : Int4B</p>
+<p>&nbsp; +0x030 FirstFree &nbsp; &nbsp; &nbsp; &nbsp;: Uint4B</p>
+<p>&nbsp; +0x034 LastFree &nbsp; &nbsp; &nbsp; &nbsp; : Uint4B</p>
+<p>&nbsp; +0x038 NextHandleNeedingPool : Uint4B</p>
+<p>&nbsp; +0x03c HandleCount &nbsp; &nbsp; &nbsp;: Int4B</p>
+<p>&nbsp; +0x040 Flags &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;: Uint4B</p>
+<p>&nbsp; +0x040 StrictFIFO &nbsp; &nbsp; &nbsp; : Pos 0, 1 Bit</p>
+<p>0:004&gt; dt _HANDLE_TABLE_ENTRY</p>
+<p>&nbsp; +0x000 Object &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; : Ptr32 Void</p>
+<p>&nbsp; +0x000 ObAttributes &nbsp; &nbsp; : Uint4B</p>
+<p>&nbsp; +0x000 InfoTable &nbsp; &nbsp; &nbsp; &nbsp;: Ptr32 _HANDLE_TABLE_ENTRY_INFO</p>
+<p>&nbsp; +0x000 Value &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;: Uint4B</p>
+<p>&nbsp; +0x004 GrantedAccess &nbsp; &nbsp;: Uint4B</p>
+<p>&nbsp; +0x004 GrantedAccessIndex : Uint2B</p>
+<p>&nbsp; +0x006 CreatorBackTraceIndex : Uint2B</p>
+<p>&nbsp; +0x004 NextFreeTableEntry : Int4B</p>
+<p>0:004&gt; dt _HANDLE_TABLE_ENTRY_INFO</p>
+<p>&nbsp; +0x000 AuditMask &nbsp; &nbsp; &nbsp; &nbsp;: Uint4B</p>
+<p>0:004&gt; dt _OBJECT_HEADER</p>
+<p>&nbsp; +0x000 PointerCount &nbsp; &nbsp; : Int4B</p>
+<p>&nbsp; +0x004 HandleCount &nbsp; &nbsp; &nbsp;: Int4B</p>
+<p>&nbsp; +0x004 NextToFree &nbsp; &nbsp; &nbsp; : Ptr32 Void</p>
+<p>&nbsp; +0x008 Type &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; : Ptr32 _OBJECT_TYPE</p>
+<p>&nbsp; +0x00c NameInfoOffset &nbsp; : UChar</p>
+<p>&nbsp; +0x00d HandleInfoOffset : UChar</p>
+<p>&nbsp; +0x00e QuotaInfoOffset &nbsp;: UChar</p>
+<p>&nbsp; +0x00f Flags &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;: UChar</p>
+<p>&nbsp; +0x010 ObjectCreateInfo : Ptr32 _OBJECT_CREATE_INFORMATION</p>
+<p>&nbsp; +0x010 QuotaBlockCharged : Ptr32 Void</p>
+<p>&nbsp; +0x014 SecurityDescriptor : Ptr32 Void</p>
+<p>&nbsp; +0x018 Body &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; : _QUAD</p>
+<p>Hope that clears things up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cornedbee odd alt thread-odd thread-alt depth-1" id="comment-544383">
+				<div id="div-comment-544383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CornedBee</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544383">
+			August 29, 2007 at 1:37 pm</a>		</div>
+
+		<p>So let me get this straight.</p>
+<p>There are kernel objects.</p>
+<p>There are handles to kernel objects. When all handles to an object have been closed, the kernel object is destroyed.</p>
+<p>With DuplicateHandle, you can create a new handle to a given kernel object. The new handle has a different value, but references the same object.</p>
+<p>Hmm &#8230;</p>
+<p>It seems to me like this would be more complicated to implement than really doing it the way this guy thought it worked: by having all handles to the same object be the same, and just incrementing/decrementing reference counts. Any specific reason it wasn&#8217;t done this way?</p>
+<p>Offhand, I can only come up with one: defense against multiple calls of CloseHandle on the same handle invalidating other handles. Given that several processes would share the same handle values (after all, what&#8217;s the point of simplifying the system when you still need the complicated version for some use cases), that&#8217;s probably a very valid reason.</p>
+<p>dgr: That&#8217;s hardly surprising. After all, the pointers themselves aren&#8217;t reference-counted, it can only be the underlying memory that is. The problem here is that handles do *not* behave like simple, reference-counted pointers to kernel objects.</p>
+<p>OK, came up with another reason: there is handle-specific information to be stored, like open mode.</p>
+<div class=post>[<i>You&#8217;ll have to ask the unix folks. They had dup(2) decades ago. (Good luck sharing objects across processes if the handle number must be globally unique.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544443">
+				<div id="div-comment-544443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.netmerchant.com.au/' rel='external nofollow' class='url'>Luke Amery</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544443">
+			August 29, 2007 at 8:57 pm</a>		</div>
+
+		<p>I hope this isn&#8217;t offtopic&#8230;</p>
+<p>I have always wondered about the accounting associated with DuplicateHandle when creating handles for other processes.</p>
+<p>For example, two processes A and B. B is just an unwitting process standing around minding it&#8217;s own business. Process A is nasty and wants Process B to either go away or at least look extremely bad.</p>
+<p>Process A starts Duplicating handles with Process B as the target process. Process B never knows about these handles as there is never any IPC between A and B.</p>
+<p>Unix solves this problem by limiting handle duplication to an IPC mechanism (the kernel can then know each process is in agreement and any failure can be cleanly dealt with &#8211; either the IPC op worked or it didn&#8217;t).</p>
+<p>Just wondering what other people think&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-544453">
+				<div id="div-comment-544453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Steward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544453">
+			August 29, 2007 at 9:34 pm</a>		</div>
+
+		<p>Luke: to duplicate a handle into Process B, you need a handle to Process B with PROCESS_DUP_HANDLE access. &nbsp;Which, as <a rel="nofollow" target="_new" href="http://msdn2.microsoft.com/ms684880.aspx" rel="nofollow">http://msdn2.microsoft.com/ms684880.aspx</a> notes, allows you to just as easily duplicate (HANDLE)-1, and do what you like with the target process.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544463">
+				<div id="div-comment-544463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">HS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544463">
+			August 29, 2007 at 10:58 pm</a>		</div>
+
+		<blockquote><p>
+  You&#8217;ll have to ask the unix folks. They had dup(2) decades ago.
+</p></blockquote>
+<p>Those who do not understand unix, are doomed to reinvent it. Poorly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-544543">
+				<div id="div-comment-544543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nksingh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544543">
+			August 30, 2007 at 1:54 am</a>		</div>
+
+		<p>@HS</p>
+<p>And those who do understand UNIX long for something better.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544563">
+				<div id="div-comment-544563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jules</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544563">
+			August 30, 2007 at 6:42 am</a>		</div>
+
+		<p>Perhaps a more interesting question is why, when something is working, people tend to assume it&#8217;s because they&#8217;ve not include the correct magic incantation of flags in their system calls.</p>
+<p>It&#8217;s a perplexing question, actually. &nbsp;A quick scan of the CreateFile documentation shows that there isn&#8217;t a FILE_ALLOW_CLOSE_ORIGINAL_HANDLE_INSTEAD_OF_DUPLICATE that could plausibly fix this problem, so why didn&#8217;t the poster realise this wasn&#8217;t the problem?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-544573">
+				<div id="div-comment-544573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jules</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544573">
+			August 30, 2007 at 6:43 am</a>		</div>
+
+		<p>nksingh&gt; Time for Plan 9, then? ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544613">
+				<div id="div-comment-544613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pdohara@smallwarz.org</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544613">
+			August 30, 2007 at 9:36 am</a>		</div>
+
+		<p>Jules wrote:</p>
+<p>&quot;Perhaps a more interesting question is why, when something is working, people tend to assume it&#8217;s because they&#8217;ve not include the correct magic incantation of flags in their system calls.&quot;</p>
+<p>Perhaps because so many attributes are not documented and must be discovered :-).</p>
+<p>Pat O</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-544583">
+				<div id="div-comment-544583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544583">
+			August 30, 2007 at 8:18 am</a>		</div>
+
+		<p>Sohail: &nbsp;&quot;a reference counted pointer! std::tr1::shared_ptr&quot;</p>
+<p>So you&#8217;re OK with requiring user programs to be written in C++? &nbsp;And you&#8217;re OK with forcing all programs to use a specific C++ standard library (that includes the ref-counted pointer), and if they use some other C++ standard library, they&#8217;d be incompatible with the kernel?</p>
+<p>And, after all that, you&#8217;re happy having the library do all the same work that the kernel does right now *anyway*, to give you the *sole* benefit of having this particular situation work?</p>
+<p>If so, that&#8217;s fine. &nbsp;But that seems like a massively, massively over-engineered solution to a nonexistant problem to me. &nbsp;Just realize that objects have refcounts instead of handles, and each additional reference can have a different handle value. &nbsp;Now it&#8217;s obvious that the lpTargetHandle parameter&#8217;s out value could be different, and poof, the problem disappears.</p>
+<p>(Granted, I don&#8217;t know whether it&#8217;s documented that objects have refcounts instead of handles. &nbsp;But I must have picked it up *somewhere*.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-544593">
+				<div id="div-comment-544593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jules</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-544593">
+			August 30, 2007 at 8:24 am</a>		</div>
+
+		<p>&quot;Granted, I don&#8217;t know whether it&#8217;s documented that objects have refcounts instead of handles. &nbsp;But I must have picked it up *somewhere*.&quot;</p>
+<p>It&#8217;s made pretty clear by the documentation on CloseHandle:</p>
+<p>&quot;CloseHandle invalidates the specified object handle, decrements the object&#8217;s handle count, and performs object retention checks. After the last handle to an object is closed, the object is removed from the system.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-590973">
+				<div id="div-comment-590973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2008/01/17/7137438.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070829-00/?p=25363#comment-590973">
+			January 17, 2008 at 11:12 am</a>		</div>
+
+		<p>It didn&#8217;t do quite as much back then.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

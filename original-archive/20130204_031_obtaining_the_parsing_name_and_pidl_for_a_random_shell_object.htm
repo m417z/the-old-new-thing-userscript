@@ -1,0 +1,348 @@
+<html>
+<head>
+<title>Obtaining the parsing name (and pidl) for a random shell object</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Obtaining the parsing name (and pidl) for a random shell object</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 4, 2013 / year-entry #32</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130204-00/?p=5363</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The parsing name for a shell item is handy, because it lets you regenerate the item later. Actually, the pidl for the shell item is even better, because that is the official way of saving and restoring objects. It's the pidl that gets saved in a shortcut, and since shortcuts can be copied around from...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The parsing name for a shell item is handy,
+because it lets you regenerate the item later.
+Actually, the pidl for the shell item is even better,
+because that is the official way of saving and restoring objects.
+It's the pidl that gets saved in a shortcut,
+and since shortcuts can be copied around from machine to machine,
+pidls must be transportable and forward compatible.
+(A shortcut file created on Windows&nbsp;XP needs to keep working
+on all future versions of Windows.)
+</p>
+<p>
+Here's a handy little tool for grabbing the parsing name and pidl
+for a random shell object.
+Start with our
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2003/07/23/54576.aspx">
+scratch program</a>,
+and add in the
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/05/03/10006065.aspx">
+<code>Simple&shy;Drop&shy;Target</code></a>
+class, with the following tweaks:
+</p>
+<pre>
+public:
+ SimpleDropTarget() : m_cRef(1) { <font COLOR=red><strike>/* g_ppr-&gt;AddRef(); */</strike></font> }
+ ~SimpleDropTarget() { <font COLOR=red><strike>g_ppr-&gt;Release();</strike></font> }
+
+...
+ // *** IDropTarget ***
+ STDMETHODIMP DragEnter(IDataObject *pdto,
+    DWORD grfKeyState, POINTL ptl, DWORD *pdwEffect)
+ {
+  *pdwEffect &amp;= <font COLOR=blue>DROPEFFECT_LINK</font>;
+  return S_OK;
+ }
+
+ STDMETHODIMP DragOver(DWORD grfKeyState,
+   POINTL ptl, DWORD *pdwEffect)
+ {
+  *pdwEffect &amp;= <font COLOR=blue>DROPEFFECT_LINK</font>;
+  return S_OK;
+ }
+...
+};
+</pre>
+<p>
+We are not a COM local server,
+so we won't worry about managing our process reference.
+And we will accept anything that has a pidl,
+so we say that we will accept objects via linking.
+(The original code accepted by copying,
+which would have made us reject non-copyable objects.)
+</p>
+<p>
+Now we can hook these up to our scratch program.
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+  <font COLOR=blue>g_hwndChild = CreateWindow(
+      TEXT("edit"), nullptr, ES_MULTILINE |
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+      0, 0, 0,0, hwnd, (HMENU)1, g_hinst, 0);
+  SimpleDropTarget *psdt = new(std::nothrow) SimpleDropTarget();
+  if (psdt) {
+    RegisterDragDrop(hwnd, psdt);
+    psdt-&gt;Release();
+  }</font>
+  return TRUE;
+}
+
+void
+OnDestroy(HWND hwnd)
+{
+  <font COLOR=blue>RevokeDragDrop(hwnd);</font>
+  PostQuitMessage(0);
+}
+
+...
+    // Change CoInitialize and CoUninitialize to Ole
+    if (SUCCEEDED(<font COLOR=blue>OleInitialize</font>(NULL))) {
+...
+        <font COLOR=blue>OleUninitialize();</font>
+</pre>
+<p>
+Finally, we need to say what to do when the drop occurs.
+</p>
+<pre>
+void AppendText(LPCWSTR psz)
+{
+  SendMessageW(g_hwndChild, EM_REPLACESEL, 0, (LPARAM)psz);
+}
+
+void OpenFilesFromDataObject(IDataObject *pdto)
+{
+  CComPtr&lt;IShellItemArray&gt; spsia;
+  if (SUCCEEDED(SHCreateShellItemArrayFromDataObject(
+                                  pdto, IID_PPV_ARGS(&amp;spsia)))) {
+    CComPtr&lt;IEnumShellItems&gt; spenum;
+    spsia-&gt;EnumItems(&amp;spenum);
+    if (spenum) {
+      for (CComPtr&lt;IShellItem&gt; spsi;
+           spenum-&gt;Next(1, &amp;spsi, nullptr) == S_OK;
+           spsi.Release()) {
+        CComHeapPtr&lt;wchar_t&gt; spszName;
+        if (SUCCEEDED(spsi-&gt;GetDisplayName(
+                     SIGDN_DESKTOPABSOLUTEPARSING, &amp;spszName))) {
+          AppendText(spszName);
+          AppendText(L"\r\n");
+        }
+        CComHeapPtr&lt;ITEMIDLIST_ABSOLUTE&gt; spidl;
+        if (SUCCEEDED(CComQIPtr&lt;IPersistIDList&gt;(spsi)-&gt;
+                                            GetIDList(&amp;spidl))) {
+          UINT cb = ILGetSize(spidl);
+          BYTE *pb = reinterpret_cast&lt;BYTE *&gt;
+                          (static_cast&lt;PIDLIST_ABSOLUTE&gt;(spidl));
+          for (UINT i = 0; i &lt; cb; i++) {
+            WCHAR szHex[4];
+            StringCchPrintf(szHex, ARRAYSIZE(szHex),
+                            L"%02X ", pb[i]);
+            AppendText(szHex);
+          }
+          AppendText(L"\r\n");
+        }
+      }
+    }
+  }
+}
+</pre>
+<p>
+When the drop occurs, we convert the data object into a shell
+item array, enumerate the items, and print the parsing name
+for the item
+as well as a hex dump of the pidl associated with the item.
+</p>
+<p>
+I guess we need some header files.
+</p>
+<pre>
+#include &lt;shlobj.h&gt;
+#include &lt;strsafe.h&gt;
+#include &lt;atlbase.h&gt;
+#include &lt;atlalloc.h&gt;
+</pre>
+<p>
+Run this program and drop the Recycle Bin onto it, say.
+</p>
+<pre>
+::{645FF040-5081-101B-9F08-00AA002F954E}
+14 00 1F 78 40 F0 5F 64 81 50 1B 10 9F 08 00 AA 00 2F 95 4E 00 00 
+</pre>
+<p>
+This tells you two things.
+First, that if you want to generate the Recycle Bin
+from a parsing name,
+you can use that string that starts with two colons.
+</p>
+<pre>
+var shell = new ActiveXObject("Shell.Application");
+var recycleBin = shell.Namespace(
+      "::{645FF040-5081-101B-9F08-00AA002F954E}");
+var items = recycleBin.Items();
+for (var i = 0; i &lt; items.Count; i++) {
+ WScript.StdOut.WriteLine(items.Item(i));
+}
+</pre>
+<p>
+Of course, there is a predefined enumeration for the Recycle
+Bin, so this was a bit of a waste.
+You could've just written
+</p>
+<pre>
+var recycleBin = shell.Namespace(10);
+</pre>
+<p>
+But this technique generalizes to other locations in the shell
+namespace that do not have a special shorthand value.
+</p>
+<p>
+The second thing the program tells you is that if you want
+to generate the Recycle Bin from a pidl,
+you can just use that chunk of bytes.
+Okay, that's not quite so interesting from a scripting point of view,
+but if you're manipulating pidls,
+this can be quite handy.
+</p>
+<p>
+We'll use this program a little bit in a few weeks,
+but at this point, it's just a "Little Program" for today.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1037143">
+				<div id="div-comment-1037143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130204-00/?p=5363#comment-1037143">
+			February 4, 2013 at 9:31 am</a>		</div>
+
+		<p>Parsing names don&#39;t always round trip back to a pidl. The control panel and 3rd party stuff can be problematic.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1037213">
+				<div id="div-comment-1037213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130204-00/?p=5363#comment-1037213">
+			February 5, 2013 at 6:10 am</a>		</div>
+
+		<p><!-- Nitpick: CComPtr&lt;IShellItemArray&lt; has a less-than sign at the end instead of a greater-than.</p>
+
+ --></p>
+<p>In the for statement, is spsi.Release() really necessary?</p>
+<p>I wonder, do you use an IDE when building these examples? If not, do you know all of this from the top of your head, or are you retrieving past source code snippets?</p>
+<p>I mean, I&#39;ve done code similar to this (in terms of ATL templates, smart pointers and Win32) with a plain text editor (don&#39;t ask&#8230;), but it took quite a few round trips between the editor and the documentation.</p>
+<div class="post">[<em>Remove the <code>spsi.Release()</code> and run the code and see what happens. (A debug build will identify the problem more quickly.) -Raymond</em>]</div></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1037253">
+				<div id="div-comment-1037253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130204-00/?p=5363#comment-1037253">
+			February 5, 2013 at 7:40 am</a>		</div>
+
+		<p>@Raymond, you&#39;re entirely right. It would leak memory. A debug build would also complain about the pointer not being NULL right on the second iteration&#39;s test, the purpose indeed seems to be to make the developer stumble on such cases.</p>
+<p>For the matter of the mental exercise, I didn&#39;t compile it, but I peeked the implementation of CComPtr and CComPtrBase.</p>
+<p>Somehow, I was hoping C++ would do the RAII dispose pattern when resetting the pointer, but that&#39;s not the case. This is what so much time away from C++ does, especially coming from more dynamic environments. In some languages, you can setup e.g. a setter that releases the previous pointer if not NULL before setting it to the new value, together with syntax/macros that allocate temporary pointers to &quot;foreign calls&quot;, so you never change the field directly without notification.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1037343">
+				<div id="div-comment-1037343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130204-00/?p=5363#comment-1037343">
+			February 5, 2013 at 9:30 am</a>		</div>
+
+		<p>Microsoft&#39;s C++ frameworks predate modern C++ thought and so don&#39;t understand RAII. Can&#39;t really blame them, but the stuff looks old and mis-designed now.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1037793">
+				<div id="div-comment-1037793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130204-00/?p=5363#comment-1037793">
+			February 7, 2013 at 4:25 am</a>		</div>
+
+		<p>@Joshua, having &amp; and * operators that return the address of the inner pointer (with an assertion) is relatively modern C++. What C++ doesn&#39;t do for you, even a more modern one, is a code transformation around the &amp; operator that:</p>
+<p>&#8211; creates a temporary variable of T*</p>
+<p>&#8211; uses the smart pointer&#39;s pointer getter to initialize the temp</p>
+<p>&#8211; invokes the function with the temp</p>
+<p>&#8211; uses the smart pointer&#39;s pointer setter with the value of temp</p>
+<p>And it shouldn&#39;t, not now that we rely on how the &amp; and * operators work. But one may do this with further RAII (there goes the concise for loop) or with a template.</p>
+<p>To correct myself, the order of execution in the setter must be to first AddRef the new value if not NULL and then Release the old value if not NULL: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2004/04/06/108395.aspx" rel="nofollow">blogs.msdn.com/&#8230;/108395.aspx</a></p>
+<p>At first thought, it just sounds so &quot;obvious&quot; we should Release the old value and AddRef the new one, but it only becomes clear there is an order it must be done with further insight, when you realize the new value can be an interface pointer sharing a refcount (e.g. same underlying object) with the old value.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,877 @@
+<html>
+<head>
+<title>Adventures in undefined behavior: The premature downcast</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Adventures in undefined behavior: The premature downcast</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 31, 2012 / year-entry #204</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>45</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer encountered the following problem: class Shape { public: virtual bool Is2D() { return false; } }; class Shape2D : public Shape { public: virtual bool Is2D() { return true; } }; Shape *FindShape(Cookie cookie); void BuyPaint(Cookie cookie) { Shape2D *shape = static_cast<Shape2D *>(FindShape(cookie)); if (shape->Is2D()) { .. do all sorts of stuff ......</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer encountered the following problem:
+</p>
+<pre>
+class Shape
+{
+public:
+    virtual bool Is2D() { return false; }
+};
+
+class Shape2D : public Shape
+{
+public:
+    virtual bool Is2D() { return true; }
+};
+
+Shape *FindShape(Cookie cookie);
+
+void BuyPaint(Cookie cookie)
+{
+    Shape2D *shape = static_cast&lt;Shape2D *&gt;(FindShape(cookie));
+    if (shape-&gt;Is2D()) {
+       .. do all sorts of stuff ...
+    }
+}
+</pre>
+<p>
+The <code>Buy&shy;Paint</code> function converts the cookie back
+to a <code>Shape</code> object, and then checks if the object
+is a <code>Shape2D</code> object by calling <code>Is&shy;2D</code>.
+If so, then it does some more stuff to figure out what type of paint
+to buy.
+</p>
+<p>
+(Note to nitpickers:
+The actual scenario was not like this, but I presented it this way
+to illustrate the point.
+If you say "You should've
+used RTTI" or "You should've had a BuyPaint method on the Shape class",
+then you're missing the point.)
+</p>
+<p>
+The programmers figured they'd save some typing by casting the
+result of <code>Find&shy;Shape</code> to a <code>Shape2D</code>
+right away,
+because after all, since <code>Is&shy;2D</code> is a virtual
+method, it will call the right version of the function,
+either <code>Shape::<wbr>Is&shy;2D</code>
+or <code>Shape2D::<wbr>Is&shy;2D</code>,
+depending on the actual type of the underlying object.
+</p>
+<p>
+But when compiler optimizations were turned on, they discovered
+that the call to <code>Is&shy;2D</code> was optimized away,
+and the <code>Buy&shy;Paint</code> function merely assumed
+that it was always operating on a <code>Shape2D</code> object.
+It then ended up trying to buy paint even for one-dimensional objects
+like points and lines.
+</p>
+<p>
+Compiler optimization bug?
+Nope.
+Code bug due to reliance on undefined behavior.
+</p>
+<p>
+The C++ language says (9.3.1)
+"If a nonstatic member function of a class <code>X</code>
+is called for an object that is not of type <code>X</code>,
+or of a type derived from <code>X</code>, the behavior is undefined."
+In other words,
+if you are invoking a method on an object of type <code>X</code>,
+then you are promising that it really is of type <code>X</code>,
+or a class derived from it.
+</p>
+<p>
+The code above violates this rule,
+because it is invoking the <code>Is&shy;2D</code> method
+on a <code>Shape2D*</code>,
+which therefore comes with the promise
+"This really is a <code>Shape2D</code> object
+(or something derived from it)."
+But this is a promise the code cannot deliver on, because the
+object returned by <code>Find&shy;Shape</code> might be a simple
+<code>Shape</code>.
+</p>
+<p>
+The compiler ran with the (false) promise and said,
+"Well, since you are guaranteeing that the object is at least
+a <code>Shape2D</code>,
+and since I have studied your code and determined that no
+classes which further derive from <code>Shape2D</code> override
+the <code>Is&shy;2D</code> method,
+I have therefore proved that the <i>final overrider</i> is
+<code>Shape2D::<wbr>Is&shy;2D</code> and can therefore
+inline that method."
+</p>
+<p>
+Result: The compiler inlines <code>Shape2D::<wbr>Is&shy;2D</code>,
+which returns <code>true</code>, so the "if" test can be optimized out.
+The compiler can assume that <code>Buy&shy;Paint</code> is always
+called with cookies that represent two-dimensional objects.
+</p>
+<p>
+The fix is to do the annoying typing that the original authors
+were trying to avoid:
+</p>
+<pre>
+void BuyPaint(Cookie cookie)
+{
+    Shape *shape = FindShape(cookie);
+    if (shape-&gt;Is2D()) {
+      Shape2D *shape2d = static_cast&lt;Shape2D *&gt;(shape);
+       .. do all sorts of stuff (with shape2d) ...
+    }
+}
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (45)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1008423">
+				<div id="div-comment-1008423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008423">
+			August 31, 2012 at 7:16 am</a>		</div>
+
+		<p>That sort of optimization would have to be done in the linker (e.g. using /LTCG with the VS compiler), since the compiler has no way of knowing if another translation unit defines a subclass that overrides that method.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008453">
+				<div id="div-comment-1008453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008453">
+			August 31, 2012 at 7:50 am</a>		</div>
+
+		<p>Last I checked (MSVC6) dynamic_cast used string comparisons of the class name. How many would depend on the inheritance hierarchy.</p>
+<p>I imagine that would be slower than a single virtual call.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008463">
+				<div id="div-comment-1008463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christian Vetter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008463">
+			August 31, 2012 at 8:03 am</a>		</div>
+
+		<p>Can the compiler ( or linker ) even decide whether there is a derived class or not? One could be linked during dynamic linking, couldn&#39;t it? Most plugin systems work that way.</p>
+<p>The compiler has to prove, that there is no way, that the object would be a derived type, and only then it can optimize that code.</p>
+<p>E.g.:</p>
+<p>Shape* shape = new Shape2D;</p>
+<p>shape-&gt;Is2D(); // could be optimized</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-brunopitrus odd alt thread-odd thread-alt depth-1" id="comment-1008473">
+				<div id="div-comment-1008473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kinokijuf' rel='external nofollow' class='url'>kinokijuf</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008473">
+			August 31, 2012 at 8:15 am</a>		</div>
+
+		<blockquote><p>
+  one-dimensional objects like points and lines
+</p></blockquote>
+<p>Objection! Points are zero-dimensional!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008483">
+				<div id="div-comment-1008483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008483">
+			August 31, 2012 at 8:20 am</a>		</div>
+
+		<p>@Christian Vetter: Can you do dynamic linking of C++ classes?</p>
+<p>If you can, maybe the compiler undoes such optimizations as there if that happens :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008493">
+				<div id="div-comment-1008493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008493">
+			August 31, 2012 at 8:20 am</a>		</div>
+
+		<p>MSVC6 is 14 years old. &nbsp;I&#39;m sure they have better/faster ways of dynamic casting than string comparisons today!! &nbsp;What about, say, MSVC 2010? &nbsp;GCC?</p>
+<p>@Christian Vetter: if the class isn&#39;t exported from the project then how could something use it from dynamic linking? (e.g. DLL plug-in)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008513">
+				<div id="div-comment-1008513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008513">
+			August 31, 2012 at 8:21 am</a>		</div>
+
+		<p>&quot;and since I have studied your code and determined that no classes which further derive from Shape2D override the Is­2D method&quot;</p>
+<p>How the heck could it know that? &nbsp;That isn&#39;t even known at link time if the code contains a plugin mechanism.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008523">
+				<div id="div-comment-1008523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Logan Capaldo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008523">
+			August 31, 2012 at 8:39 am</a>		</div>
+
+		<p>LTCG + building an exe or LTCG + not exporting the vtable of the class = being able to state categorically no deriving classes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008533">
+				<div id="div-comment-1008533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008533">
+			August 31, 2012 at 8:40 am</a>		</div>
+
+		<p>@JamesJohnston: Right. &nbsp;If the class isn&#39;t tagged with __declspec(dllexport) or __declspec(dllimport), then the compiler knows it can&#39;t be used for dynamic linking.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008543">
+				<div id="div-comment-1008543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Barry Kelly</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008543">
+			August 31, 2012 at 9:03 am</a>		</div>
+
+		<p>This is an optimization along the lines of &quot;sufficiently smart compiler&quot;, and unfortunately, IMHO, starts to encroach on &quot;smart-ass compiler&quot;.</p>
+<p>Predictability is more valuable than performance. Predictability increases the correspondence between the programmer&#39;s mental model and the runtime behaviour; this reduces bugs. Performance, on the other hand, should be diagnosed with a profiler and targeted specifically if it is a problem.</p>
+<p>There&#39;s a trade-off of course; really common idioms that would otherwise have poor performance but for a simple optimization may well be better off with slightly confusing behaviour, but such idioms should be common enough that most developers know about them. But this should be a relatively high bar, because bugs are typically a bigger problem than poor performance.</p>
+<p>But overall, this is a cultural problem with C++. The spec authors try hard to come up with ways to let vendor compilers be extra smart-ass, and being language lawyers, they often get a perverse kind of pleasure out of counter-intuitive behaviour, because it lets them stroke their egos as they explain what&#39;s going on to the peons in the massed ranks. Not saying Raymond is like this, but quite a few asocial engineers are.</p>
+<p>tl;dr: this is a bug in the spec, and no healthy language culture would prefer this kind of behaviour.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008553">
+				<div id="div-comment-1008553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyte</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008553">
+			August 31, 2012 at 9:10 am</a>		</div>
+
+		<p>@Barry Kelly: I fail to see how it&#39;s smart-ass. A static_cast is effectively telling the compiler &quot;I know about this type than you do, and I&#39;m telling you it&#39;s this particular derived type&quot;. The compiler accepts that and, running from that assumption, inlines the function.</p>
+<p>How is that counter-intuitive?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008563">
+				<div id="div-comment-1008563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Muzer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008563">
+			August 31, 2012 at 9:16 am</a>		</div>
+
+		<p>IMHO what the programmer did was counter-intuitive. I don&#39;t quite get how anyone could even think it would work, when it&#39;s Shape2D that inherits Shape, not the other way around?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008573">
+				<div id="div-comment-1008573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008573">
+			August 31, 2012 at 9:18 am</a>		</div>
+
+		<p>@Barry Kelly: then go use C#/Java and/or don&#39;t compile with optimizations. &nbsp;C++ is a language designed to let you compile one step away from assembly if you write your code well with a good optimizing compiler. &nbsp;In order to do that, it has to let you shoot yourself in the foot. &nbsp;If that&#39;s not acceptable, then use a different language.</p>
+<p>At the end of the day, my C++ code would probably be faster than your equivalent C# code. &nbsp;But my code would have a much higher risk of undefined behavior if I screwed up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008583">
+				<div id="div-comment-1008583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008583">
+			August 31, 2012 at 9:23 am</a>		</div>
+
+		<p>@Joshua:</p>
+<p>&quot;How the heck could it know that? &nbsp;That isn&#39;t even known at link time if the code contains a plugin mechanism.&quot;</p>
+<p>What is going on is that the compiler&#39;s Whole Program Optimisation pass is attempting to remove virtual calls, and has come across a virtual Shape2D::Is2D call. What it then does is build up a graph of everywhere this could end up &#8211; that is to say it could either land at InvalidAddress (if Shape is NULL), Shape2D::Is2D, Shape::Is2D or ExternalDerivesFromShape2D::Is2D.</p>
+<p>The compiler then attempts to reduce this set as much as possible. Firstly it says &#8211; using this undefined behaviour in the C++ definition, we can remove Shape::Is2D and InvalidAddress from the set &#8211; if you&#39;re relying on undefined behaviour, well, it doesn&#39;t matter if the optimisation screws up. You&#39;re on your own in undefined-behaviour-land.</p>
+<p>But what about external calls? Well, to see that, WPO looks at where the Shape2D came from &#8211; in this case from FindShape. Where did FindShape get it from? Well, WPO is able to look at FindShape and see that FindShape is from raymond_example_lib.lib and that it doesn&#39;t make any virtual calls (i.e. virtual/abstract calls in C++ or pointer calls via GetProcAddress/COM etc). Consequently, FindShape&#39;s shape MUST come from a type known to raymond_example_lib. Since raymond_example_lib doesn&#39;t know about any other object that derives from Shape2D, ExternalDerivesFromShape2D::Is2D CANNOT be a valid target for the virtual call.</p>
+<p>Having done all of this, the compiler has reduced this all down to the single target Shape::Is2D, and hence it can convert virtcall Shape2D -&gt; Is2D into instcall Shape2D -&gt; Is2D.</p>
+<p>Now since Shape2D::Is2D is known and is an instance call, it can be inlined, so it can replace</p>
+<p>instcall Shape2D::Is2D($shape) returns into $resultreg</p>
+<p>into</p>
+<p>$resultreg = TRUE</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008593">
+				<div id="div-comment-1008593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008593">
+			August 31, 2012 at 9:28 am</a>		</div>
+
+		<p>So the point of all that is that the compiler MIGHT make this optimisation under certain conditions, and only if it is able to confirm that the object really didn&#39;t come from a plugin.</p>
+<p>The good thing about optimisations is that the default state of &quot;leave it alone&quot; is always there. The compiler&#39;s first job is to produce CORRECT rather than FAST code.</p>
+<p>Consequently if any of your respective special cases are applicable, or the optimisation can&#39;t PROVE it will be safe, or can&#39;t be bothered to prove it will be safe (i.e. compilation is taking too long) within the defined behaviour of C++ (even if it usually is), then the optimisation won&#39;t remove the virtual call and you&#39;ll end up with slower, but correct code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008603">
+				<div id="div-comment-1008603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pm100</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008603">
+			August 31, 2012 at 9:37 am</a>		</div>
+
+		<p>its an interesting gotcha but the standard bits you quoted are not relevant. The Is2d method is a method of the shape class so the results are not undefined as per that part of the spec. &nbsp;There is presumably a bit in the spec that says something like &#39;static cast of a pointer to class X to a pointer to class Y where X!=Y and X not subclass of Y results in undefined&#39;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008613">
+				<div id="div-comment-1008613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008613">
+			August 31, 2012 at 9:45 am</a>		</div>
+
+		<p>If you were following this code in your head, you would look at the &quot;shape-&gt;Is2D()&quot; call and say &quot;well, shape is defined as Shape2D*, and I know that there are no subclasses of Shape2D, so this must be calling Shape2D::Is2D, which returns true&quot;.</p>
+<p>What reasonable person reading the code would see &quot;shape-&gt;Is2D&quot; and think &quot;maybe Shape::Is2D will get called instead&quot;? I would look at the code, naively assume that only Shape2D pointers will get returned from FindShape based on the existence of the static cast, and then wonder why the redundant Is2D() call is there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008643">
+				<div id="div-comment-1008643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008643">
+			August 31, 2012 at 11:15 am</a>		</div>
+
+		<p>Mmm&#8230;. Compiler optimizations: always nasty, always correct. Love &#39;em!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008653">
+				<div id="div-comment-1008653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008653">
+			August 31, 2012 at 11:36 am</a>		</div>
+
+		<p>So, this is one of the cases where it is NOT easier to ask for forgiveness than to ask for permission.</p>
+<p>(i.e., you should check whether an object has type T before you go around claiming that it has type T).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008673">
+				<div id="div-comment-1008673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008673">
+			August 31, 2012 at 12:21 pm</a>		</div>
+
+		<p>If you want to learn more about undefined behavior, here is a set of seven useful links: <a rel="nofollow" target="_new" href="http://lwn.net/Articles/511767/" rel="nofollow">lwn.net/&#8230;/511767</a> (as a comment to an article on yet another way undefined behavior can hurt you).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008703">
+				<div id="div-comment-1008703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">IAdvise</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008703">
+			August 31, 2012 at 1:23 pm</a>		</div>
+
+		<p>The compiler is doing the right thing. And who would build a map when you trust the programmers. But yea, never understood the idea of trusting a magic number in the object&#39;s memory layout. Crashing rightfully is cool. Plus, spherical cow.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008713">
+				<div id="div-comment-1008713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008713">
+			August 31, 2012 at 1:45 pm</a>		</div>
+
+		<p>@Cesar:</p>
+<p>The undefined behaviour isn&#39;t the cast. It&#39;s the use of the pointer afterwards, hence my second example is safe (since the pointer is valid because of the prior call to Is2D on the base object).</p>
+<p>This is made clear in the spec that Raymond quoted:</p>
+<p>The C++ language says (9.3.1) &quot;If a nonstatic member function of a class X is called for an object that is not of type X, or of a type derived from X, the behavior is undefined.&quot; In other words, if you are invoking a method on an object of type X, then you are promising that it really is of type X, or a class derived from it.</p>
+<p>C/C++ explicitly allow you to hold invalid pointer values and keep going &#8211; just not to dereference them. If it didn&#39;t, you&#39;d immediately break on the statement after a &quot;delete&quot; &#8211; since the variable you just deleted is now in an undefined state. Indeed &#8211; you&#39;d also break whenever you entered a function that declares a pointer-type local variable, since the local-variable has undefined value until you initialize it. C/C++ is fine with letting you hang on to undefined values. It just doesn&#39;t have defined behaviour when you try and USE the value.</p>
+<div class="post">[<i>5.2.9(11) says that &quot;the result of the cast is undefined.&quot; Undefined means &quot;anything can happen&quot;, as opposed to &quot;indeterminate&quot; which means &quot;not an error, but the result is not predictable.&quot; Uninitialized local variables have indeterminate value, not undefined (8.5). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008433">
+				<div id="div-comment-1008433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DrkMatter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008433">
+			August 31, 2012 at 7:17 am</a>		</div>
+
+		<p>It&#39;s been a few years since I did any C++, so I&#39;m confused. Shouldn&#39;t static_cast&lt;Shape2D *&gt;(shape) fail at compile-time since there is no guarantee that a Shape * object can be casted down to a Shape2D *? I&#39;d expect reinterpret_cast&lt;Shape2D *&gt; to cause the behaviour in the exemple, but static_cast to cause a compile time error.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008443">
+				<div id="div-comment-1008443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008443">
+			August 31, 2012 at 7:24 am</a>		</div>
+
+		<p>@DrkMatter: static_cast is perfectly legal here; you&#39;re telling the compiler that you know in advance that the type can be casted as specified and that the downcast is legal. &nbsp;That saves the program from checking at runtime to see whether Shape is actually a Shape2D; it&#39;s faster to just assume it and carry on. &nbsp;reinterpret_cast shouldn&#39;t really be used here; that cast is for dirty pointer casts like casting a pointer to/from an integer, for example.</p>
+<p>What I would like to know is why didn&#39;t they use dynamic_cast and eliminate the whole Is2D method? &nbsp;Was this a performance-sensitive bit of code and it turns out dynamic_cast was slow? &nbsp;(How slow is dynamic_cast anyway compared to the Is2D virtual method? &nbsp;I use dynamic_cast all the time but never worry since I rarely do anything remotely performance-sensitive and dynamic_cast seems safer since a null pointer is better than a pointer to an undefined object of the wrong type.)</p>
+<p>Shape2D *shape = dynamic_cast&lt;Shape2D*&gt;(shape)</p>
+<p>if (shape) {</p>
+<p>&nbsp; &nbsp;// carry on&#8230;</p>
+<p>}</p>
+<div class="post">[<i>See &quot;Note to nitpickers.&quot; Developing an example even with <code>dynamic_cast</code> is left as an exercise. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008623">
+				<div id="div-comment-1008623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008623">
+			August 31, 2012 at 10:36 am</a>		</div>
+
+		<p>I suppose another way of looking at it is that if FindShape()&#39;s result is not ALWAYS a Shape2D, then the line</p>
+<p> &nbsp; &nbsp;Shape2D *shape = static_cast&lt;Shape2D *&gt;(FindShape(cookie));</p>
+<p>makes shape an meaningless pointer, in much the same way that</p>
+<p> &nbsp; &nbsp;IUnknown *obj = (IUnknown *)(FindShape(cookie));</p>
+<p>would make obj an invalid pointer if FindShape doesn&#39;t return something which is actually an IUnknown.</p>
+<p>If you then ever dereference obj or shape &#8211; particularly to call a virtual function, then frankly you shouldn&#39;t be surprised if you end up in invalid memory.</p>
+<p>The solution therefore is to either do</p>
+<p>Shape* shape = FindShape(cookie);</p>
+<p>if(shape-&gt;Is2D())</p>
+<p>{</p>
+<p> &nbsp;Shape2D* shape2D = static_cast&lt;Shape2D*&gt;(shape);</p>
+<p> &nbsp;DoAwesome2DStuff(shape2D);</p>
+<p>}</p>
+<p>shape-&gt;Release();</p>
+<p>or if you&#39;re feeling particularly brave:</p>
+<p>Shape* shape = FindShape(cookie);</p>
+<p>Shape2D* shape2D = static_cast&lt;Shape2D*&gt;(shape); // FOR GOD&#39;S SAKE DON&#39;T USE THIS YET</p>
+<p>if(shape-&gt;Is2D())</p>
+<p>{</p>
+<p> &nbsp;DoAwesome2DStuff(shape2D); // Oh, thank god we&#39;re safe</p>
+<p>}</p>
+<p>else</p>
+<p>{</p>
+<p> &nbsp;shape2D = NULL; // BAIL BAIL BAIL before someone is stupid enough to try anything with this pointer!</p>
+<p>}</p>
+<p>shape-&gt;Release();</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm odd alt thread-odd thread-alt depth-1" id="comment-1008633">
+				<div id="div-comment-1008633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008633">
+			August 31, 2012 at 10:48 am</a>		</div>
+
+		<p>&quot;its an interesting gotcha but the standard bits you quoted are not relevant.&quot;</p>
+<p>They are exactly relevant. &nbsp;Try reading it this way:</p>
+<p>&quot;If a nonstatic member function of a class Shape2D is called for an object that is not of type Shape2D, or of a type derived from Shape2D, the behavior is undefined.&quot;</p>
+<p>Since you don&#39;t know yet whether or not the object is of type Shape2D, or derived from Shape2D, you can get undefined behavior. &nbsp;It doesn&#39;t matter at all that the function you are calling is also virtual in the base class. &nbsp;The compiler searches Shape2D *first*, and finds the virtual function there.</p>
+<p>&quot;The Is2d method is a method of the shape class so the results are not undefined as per that part of the spec.&quot;</p>
+<p>Except that you&#39;re not calling Shape::Is2D(), you&#39;re calling Shape2D::Is2D().</p>
+<p>&quot;There is presumably a bit in the spec that says something like &#39;static cast of a pointer to class X to a pointer to class Y where X!=Y and X not subclass of Y results in undefined&#39;&quot;</p>
+<p>That&#39;s true, this program can invoke undefined behavior two times on the same line of code.</p>
+<div class="post">[<i>Yup. 5.2.9(8) says that if you <code>static_cast</code> to a derived type that the object is not a sub-object of, then the result is undefined. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matteo even thread-even depth-1" id="comment-1008683">
+				<div id="div-comment-1008683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008683">
+			August 31, 2012 at 12:21 pm</a>		</div>
+
+		<p>@Barry Kelly: actually, in my opinion the problem here is that *the developer* is trying to be a smartass: &quot;I know that the vtable will still be there after the cast, so I&#39;ll just cast to Shape2D and check later; I avoided two lines of code, what a smart developer I am!&quot;.</p>
+<p>Inlining of virtual methods can be a blessing in performance-sensitive areas, and I for one want it enabled (especially if this stops people to roll out enormous switch statements because &quot;virtual functions are expensive&quot;). If some smartass developer wants to trade speed for conformance to a mental model just to avoid a few lines of code here and there he&#39;s welcome to disable all optimizations.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008693">
+				<div id="div-comment-1008693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008693">
+			August 31, 2012 at 12:35 pm</a>		</div>
+
+		<p>@Matt: your second example is a bad one. The compiler _knows_ shape is in fact a Shape2D*, since you did a static_cast of it to a Shape2D*, and the only way the cast could be valid is if shape was a Shape2D. Then the compiler makes a mental note, &quot;shape is in fact a Shape2D*&quot; (even while its type is still Shape*), and when it sees the shape-&gt;is2D(), it knows that it can inline to &quot;true&quot;.</p>
+<p>After you do something undefined, your whole program state is undefined, so the compiler can assume you did NOT do the undefined thing and optimize accordingly. In fact, even *before* you do something undefined, your program state is already undefined! Therefore, if you do something like &quot;if (shape-&gt;is2D()) { &#8230; } Shape2D* shape2D = static_cast&lt;Shape2D*&gt;(shape);&quot;, the compiler can also assume shape-&gt;is2D() inlines to &quot;true&quot;.</p>
+<p>It might be better to think of &quot;undefined&quot; as &quot;impossible&quot;. As in, the compiler assumes anything which is undefined will not happen, so any path leading to or from it will not be taken. In the original example, any path where shape is not a Shape2D* is impossible, because if it were possible, you would be executing undefined behavior, which is something that from the point of view of the compiler no programmer is going to do.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008743">
+				<div id="div-comment-1008743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paramanand Singh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008743">
+			August 31, 2012 at 10:49 pm</a>		</div>
+
+		<p>I don&#39;t really understand that if we are using virtual functions then why is there a need to know the specific type to which an object belongs. The whole point of using virtual functions (and polymorphism) is that the client code needs to know only the interface provided by base class and then let the derived classes take care by overriding the interface functions according.</p>
+<p>For example suppose in this code we have another virtual function Shape::FindArea() which makes sense only for 2D objects then this function would have appropriate definition only for Shape2D class, but say for Shape1D this function will just return 0 without performing any calculation.</p>
+<p>Thus the point of checking whether the object is 2D or not through the function Shape::Is2D is unnecessary. May be sometimes we do need to know the type of an object, but in general I prefer to avoid such code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008763">
+				<div id="div-comment-1008763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008763">
+			September 1, 2012 at 8:47 am</a>		</div>
+
+		<p>@cesar: you mean like GCC&#39;s now famous optimization of assuming null pointer dereferences crash?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008773">
+				<div id="div-comment-1008773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">abc of oo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008773">
+			September 1, 2012 at 12:19 pm</a>		</div>
+
+		<p>In a abc I would prefer:</p>
+<p>class Shape</p>
+<p>{</p>
+<p>public:</p>
+<p>&nbsp; &nbsp;virtual double GetDimensions();</p>
+<p>}</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008753">
+				<div id="div-comment-1008753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008753">
+			September 1, 2012 at 5:46 am</a>		</div>
+
+		<p>At the very least I would replace virtual bool Is2D() { return false; } with virtual Shape2D* As2D() { return nullptr; } thus allowing you to write Shape2D *shape = FindShape(cookie)-&gt;as2D();</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008803">
+				<div id="div-comment-1008803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008803">
+			September 1, 2012 at 8:25 pm</a>		</div>
+
+		<p>@Joshua: yes, precisely.</p>
+<p>And null pointer references do crash, unless you mmap()ed something at the first page of the virtual address space. Modern distributions do not allow that by default (mmap_min_addr), but that is configurable. So, dereferencing a null pointer without crashing can be possible.</p>
+<p>But gcc is still right that dereferencing a null pointer is something no sane programmer is going to do. Which leads gcc to assume that the pointer cannot possibly be null at that point. After all, programmers never make mistakes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008833">
+				<div id="div-comment-1008833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">steveg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008833">
+			September 2, 2012 at 2:55 pm</a>		</div>
+
+		<p>I think the solution to the problem is a better way to code. The main benefit is being able to easily debug what&#39;s going on. The resulting code is easier to understand, which means you can get away with less thinking. I hate code that makes me think unnecessarily.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008853">
+				<div id="div-comment-1008853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008853">
+			September 3, 2012 at 7:46 am</a>		</div>
+
+		<p>Cesar, thanks for that link. It made for very interesting reading and should convince anyone that C(++) is terrible language family.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ricardog odd alt thread-odd thread-alt depth-1" id="comment-1008863">
+				<div id="div-comment-1008863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/RicarDog' rel='external nofollow' class='url'>RicarDog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008863">
+			September 3, 2012 at 8:38 am</a>		</div>
+
+		<p>@JamesJohnston Regarding dynamic_cast, VS2010 still uses the same slow method of comparing strings. I would recommend against using RTTI in general if your application&#39;s performance is critical.</p>
+<p>@Barry Kelly &quot;Predictability is more valuable than performance.&quot; This is a case of &quot;my scenario is better than yours&quot;. Some applications do have high performance requirements, and the C++ language was designed with them in mind. It&#39;s not an ego issue, it&#39;s just that computers don&#39;t have brains yet so they have to rely on yours.</p>
+<p>As a side note, please NEVER cast base to derived pointers using reinterpret_cast or C-style cast such as Shape2D* shape2d = (Shape2D*)shape, even if you have guarantee that the cast is valid, because it results in undefined behavior when the type is incomplete (i.e. Shape2D is a forward-declared type) and the compiler won&#39;t complain about it. On the other hand, static_cast does generate a compile error in such cases.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008923">
+				<div id="div-comment-1008923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008923">
+			September 3, 2012 at 6:12 pm</a>		</div>
+
+		<p>@Cesar: It got famous when it was discovered that optimization was a <em>bad</em> idea in kernel mode.</p>
+<p>If I were compiling for 32 bit nommu mode (enable 32 bit protected mode and set the segment selectors up for the famous unreal mode but stay in protected mode), I&#39;d definitely disable this optimization as the interrupt vector table (which I will be accessing) is still at NULL.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1008943">
+				<div id="div-comment-1008943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008943">
+			September 3, 2012 at 11:37 pm</a>		</div>
+
+		<p>@Joshua</p>
+<p>I&#39;d disagree. The Interrupt Vector Table is at address 0. Just because there&#39;s no way to distinguish between &quot;pointer to address 0&quot; and &quot;NULL pointer&quot; doesn&#39;t mean that the two distinct concepts should be conflated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1009013">
+				<div id="div-comment-1009013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mbrierst</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1009013">
+			September 4, 2012 at 8:03 am</a>		</div>
+
+		<p>Thanks for the cheat sheet. &nbsp;Lesson learned.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1009173">
+				<div id="div-comment-1009173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1009173">
+			September 4, 2012 at 11:28 am</a>		</div>
+
+		<p>@POKE53280,0: &nbsp;Wrong; you get a null pointer if the cast is invalid, which is then noticed by the following &quot;if&quot; statement.</p>
+<p>bad_cast is for references because there is no such thing as a null reference; for example:</p>
+<p>Shape &shape;</p>
+<p>Shape2D &amp;shape2D = dynamic_cast&lt;Shape2D&amp;&gt;(shape); // may throw bad_cast</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1008973">
+				<div id="div-comment-1008973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mbrierst</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1008973">
+			September 4, 2012 at 7:00 am</a>		</div>
+
+		<p>I&#39;ve failed the &quot;example even with dynamic_cast&quot; exercise, and I don&#39;t see it posted anywhere in the comments. &nbsp;Does anyone have a teacher&#39;s edition of this blog with this exercise completed?</p>
+<div class="post">[<i>Shape2D *shape = dynamic_cast&lt;Shape2D*&gt;(shape);<br />if (shape) { &#8230; }<br />shape-&gt;Something(); /* tells the compiler that the dynamic_cast succeeded, so it can assume that shape is a Shape2D. */ -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1009233">
+				<div id="div-comment-1009233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1009233">
+			September 4, 2012 at 2:30 pm</a>		</div>
+
+		<p>bad_cast is thrown only is you cast into a reference type. dynamic_cast to a pointer doesn&#39;t throw.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1009123">
+				<div id="div-comment-1009123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">POKE53280,0</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1009123">
+			September 4, 2012 at 10:24 am</a>		</div>
+
+		<p>A simple note to Raymond&#39;s code posted on mbrierst comment:</p>
+<p>[Shape2D *shape = dynamic_cast&lt;Shape2D*&gt;(shape);</p>
+<p>if (shape) { &#8230; }]</p>
+<p>I think if dynamic_cast&lt;&gt; fails, a std::bad_cast C++ exception is thrown, so probably the simple &quot;if (shape)&#8230;&quot; check is not correct.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1009693">
+				<div id="div-comment-1009693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">@JamesJohnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1009693">
+			September 6, 2012 at 9:05 am</a>		</div>
+
+		<p>Shape &shape;</p>
+<p>will not compile. You cannot declare a reference without assigning to it, since, well, there is no such things as a null reference ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1009763">
+				<div id="div-comment-1009763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120831-00/?p=6713#comment-1009763">
+			September 6, 2012 at 12:25 pm</a>		</div>
+
+		<p>Yeah I know&#8230;. it won&#39;t work in a function. &nbsp;I think that should work if it&#39;s a class member, though. &nbsp;Just the constructors need to initialize it in the initializer lists. :) &nbsp;I probably should have clarified it more.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

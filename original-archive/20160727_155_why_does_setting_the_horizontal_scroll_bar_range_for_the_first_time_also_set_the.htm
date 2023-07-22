@@ -1,0 +1,397 @@
+<html>
+<head>
+<title>Why does setting the horizontal scroll bar range for the first time also set the vertical range, and vice versa?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does setting the horizontal scroll bar range for the first time also set the vertical range, and vice versa?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 27, 2016 / year-entry #156</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">An attempt at delay-initialization.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer observed that if a window has never set any scroll bar
+parameters, then it reports its scroll bar range as
+<var>nMin</var> = <var>nMax</var> = 0 in both horizonal and vertical directions.
+But once you set the (say) horizontal scroll bar range to
+anything (say, <var>nMin</var> = 0, <var>nMax</var> = 999),
+then the vertical scroll bar range reports itself as
+<var>nMin</var> = 0, <var>nMax</var> = 100.
+Why does changing one scroll bar affect the other?
+</p>
+<p>For convenience, let's use the notation
+[<var>nMin</var>, <var>nMax</var>] to represent a scroll bar range.</p>
+<pre>
+SCROLLINFO si = { sizeof(si), SIF_RANGE };
+GetScrollInfo(hwnd, SB_HORZ, &amp;si); // produces [0, 0]
+GetScrollInfo(hwnd, SB_VERT, &amp;si); // produces [0, 0]
+SetScrollRange(hwnd, SB_HORZ, 0, 999);
+GetScrollInfo(hwnd, SB_HORZ, &amp;si); // produces [0, 999]
+GetScrollInfo(hwnd, SB_VERT, &amp;si); // produces [0, 100]
+</pre>
+<p>
+This is a case of incomplete virtualization.
+Every standard scroll bar
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/bb787587(v=vs.85).aspx">
+defaults to a range of [0, 100]</a>.
+In practice, few windows create scroll bars,
+so the window manager doesn't allocate scroll bar information
+until a window activates its scroll bars.
+But once a window activates any scroll bar,
+the window manager allocates scroll bar information for both
+directions.
+</p>
+<p>
+This behavior came from 16-bit Windows,
+so let's
+calculate how much memory 16-bit Windows
+is saving by using this one weird trick.
+The scroll bar information for each direction is 8 bytes
+(four 16-bit values: minimum, maximum, position, and page size),
+and let's say that heap overhead is two pointers per allocation.
+Delay-allocating the scroll bar information in one direction
+on a 16-bit system
+means that instead of putting 8 bytes of memory in the main
+heap allocation for a window,
+you instead put just 2 bytes of memory in the main heap allocation,
+but an additional cost of
+8 + 2 &times; 2 = 12 bytes of heap memory if the window actually
+uses the scroll bar.
+</p>
+<p>
+Let's
+say that ten percent of the windows in the system use
+scroll bars, a rather high estimate, I think, especially when
+you consider dialog boxes which have tons of windows without
+any scroll bars.&sup1;
+With that assumption, the average cost per window drops from 8 bytes to
+2 + 10% &times; 12 = 3.2 bytes per window for a single scroll
+bar direction, or from 16 bytes to 6.4 bytes for the pair.
+</p>
+<p>
+We can save even more memory by putting the
+horizontal and vertical scroll bar info together in the same
+allocation,
+since that reduces the heap overhead, and it means that you
+need to leave only one forwarding pointer behind to cover
+two blocks of data.
+With this additional assumption, the average cost per window drops
+from 16 bytes to
+<strike>2 + 10% &times; 16 = 3.6 bytes</strike>
+2 + 10% &times; 20 = 4 bytes.
+</p>
+<p>
+This savings by using combined storage for both directions
+does mean that
+the cost for a window that uses only
+one of the two directions is
+<strike>2 + 16 = 18 bytes</strike>
+2 + 20 = 22 bytes,
+when it would have been
+2 + (2 + 12) = 16 bytes if the two allocations
+had been separate.
+Most of the time, a window that has a horizontal scroll bar
+will also have a vertical scroll bar.
+(Edit boxes are a notable exception.)
+If we say that half of the time will a window have only
+one of the scroll bars,
+then the tradeoff is a 50% chance of 16 bytes against an 50% chance
+of 4 + 24 = 28 bytes,
+for an average cost of 22 bytes per window,
+which is no better than the 22 bytes per window
+from combining the two allocations.
+</p>
+<p>
+Given that
+16-bit Windows had only
+64<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090611-00/?p=17933">KB</a>
+ of memory for all window-related
+objects,
+reducing the base memory cost of a window from 102 bytes
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20050315-00/?p=36183">
+to 88 bytes</a>
+is a huge savings.
+</p>
+<p>
+Okay, let's return to the present.
+If standard scroll bars default to [0, 100],
+why does reading the scroll bar range of an uninitialized
+scroll bar return [0, 0] instead of [0, 100]?
+</p>
+<p>
+Actually, reading the scroll bar range of an uninitialized
+scroll bar doesn't return a range of [0, 0].
+What's actually happening is that the call to
+<code>Get&shy;Scroll&shy;Info</code> is failing
+with the error code
+<code>ERROR_<wbr>NO_<wbr>SCROLL&shy;BARS</code>,
+and you are reading back the zero values that were
+already in the
+<code>SCROLL&shy;INFO</code> structure that you
+passed in.
+</p>
+<p>
+When you call <code>Set&shy;Scroll&shy;Range</code>
+(or <code>Set&shy;Scroll&shy;Info</code> or
+<code>Set&shy;Scroll&shy;Pos</code>)
+the window manager initializes the scroll
+bar information on demand,
+and that's where the default values of [0, 100] are
+established.
+Those values then get read out by the subsequent calls to
+<code>Get&shy;Scroll&shy;Info</code>.
+</p>
+<p>
+Basically, Windows pretends that all windows have a
+scroll bar with a range of [0, 100],
+but it doesn't allocate any memory to record
+that information until you use it.
+</p>
+<p>
+<b>Exercise</b>:
+Theoretically, the window manager
+could also have avoided allocating
+the memory if you set the range to [0, 100],
+since that's the default range.
+Why doesn't it bother with this optimization?
+</p>
+<p>
+What you're seeing is that the virtualization is incomplete.
+When you try to read the scroll range from an uninitialized
+scroll bar,
+the <code>Get&shy;Scroll&shy;Info</code> function could
+have reported a range of [0, 100] instead of simply failing
+the call.
+Or possibly report a range of [0, 100] <i>and</i> fail the call,
+reporting the default range to cover for the programs (like the one above)
+that ignore the return value.
+</p>
+<p>
+My guess is that the original designers of the window
+manager chose to expose this "uninitialized" state explicitly
+on the off chance that some program might&sup2; want to check whether
+scroll bars are initialized
+so that they can perform some
+super-precise optimization.
+</p>
+<p>
+Though in practice I bet nobody does.
+</p>
+<p>
+&sup1; I just ran a quick test on my system.
+My guesses were waaaaaaay too generous.
+</p>
+<table BORDER=1 BORDERCOLOR=black STYLE="border-collapse: collapse"
+    CELLPADDING=3>
+<thead>
+<tr>
+<th>Window type</th>
+<th>With scroll bars</th>
+<th>Total</th>
+<th>Percent</th>
+</tr>
+</thead>
+<tbody STYLE="border: solid black; border-width: 2px 1px">
+<tr>
+<td>Top-level</td>
+<td ALIGN=right>1</td>
+<td ALIGN=right>465</td>
+<td ALIGN=right>0.21%</td>
+</tr>
+<tr>
+<td>Child</td>
+<td ALIGN=right>7</td>
+<td ALIGN=right>1034</td>
+<td ALIGN=right>0.68%</td>
+</tr>
+</tbody>
+<tfoot>
+<tr>
+<td>Overall</td>
+<td ALIGN=right>8</td>
+<td ALIGN=right>1499</td>
+<td ALIGN=right>0.53%</td>
+</tr>
+</tfoot>
+</table>
+<p>
+&sup2;
+This design principle dates back to the days when
+Windows assumed that programmers were super-experts who wanted fine control
+of everything by default.
+"Here's your fine control. Good luck."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1258065">
+				<div id="div-comment-1258065" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258065">
+			July 27, 2016 at 8:15 am</a>		</div>
+
+		<p>I&#8217;m guessing even if a program sets the scroll range to [0&#8230;100], the likelyhood that the scroll position and page size stays 0 over the life of the window is close to nil.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1258075">
+				<div id="div-comment-1258075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258075">
+			July 27, 2016 at 8:42 am</a>		</div>
+
+		<p>It doesn&#8217;t optimize 0,100 because the allocated memory stores the position and page size as well.<br />
+&#8220;minimum, maximum, position, and page size&#8221;</p>
+<p>They probably assumed that if you have set a minimum and maximum then at some point you will actually scroll it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk even thread-even depth-1" id="comment-1258085">
+				<div id="div-comment-1258085" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258085">
+			July 27, 2016 at 11:53 am</a>		</div>
+
+		<p>Residents of (your city here) are shocked to learn about this new rule.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1258086">
+				<div id="div-comment-1258086" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">12BitSlab</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258086">
+			July 27, 2016 at 12:51 pm</a>		</div>
+
+		<p>I am still amazed at how Microsoft got 16 bit Windows to work and then shoe horning Win32 from Win95 into the kind of memory space that was available.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1258105">
+				<div id="div-comment-1258105" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zboot</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258105">
+			July 27, 2016 at 3:07 pm</a>		</div>
+
+		<p>I knew it! You can slim down with one weird trick from the internet!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ian-griffiths odd alt thread-odd thread-alt depth-1 parent" id="comment-1258115">
+				<div id="div-comment-1258115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/IanG' rel='external nofollow' class='url'>IanG</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258115">
+			July 27, 2016 at 10:41 pm</a>		</div>
+
+		<p>I don&#8217;t understand the cost for a window that uses only one of the two directions is 2 + 16 = 18 bytes&#8221;? I understand that it takes 16 bytes to hold two sets of scrollbar data, but you put the heap overhead at two pointers. Earlier you calculated a marginal &#8220;cost of 8 + 2 × 2 = 12 bytes of heap memory if the window actually uses the scroll bar&#8221; in the case where a single scroll bar&#8217;s data was delay-allocated. Wouldn&#8217;t adding another 8 bytes of data for the 2nd scrollbar bump this to 20 bytes? (So that&#8217;s 4 bytes of heap overhead, and 16 bytes of data.) I&#8217;m also not following your calculation for separate horizontal and vertical calculation of &#8220;4 + 12 = 16&#8221; since you already calculated the memory cost for a delay-loaded single scrollbar as &#8220;8 + 2 × 2 = 12 bytes&#8221;. (I&#8217;m not sure where you&#8217;re putting your pointer to the optional 2nd scroll block; if that goes in the 1st scroll block, wouldn&#8217;t that just add 2 bytes to your initial calculation, making it 14 bytes?) I&#8217;m guessing that by the time we reach these calculations something has changed to invalidate the assumptions behind your initial calculation of 12 bytes, but I can&#8217;t spot it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1259565">
+				<div id="div-comment-1259565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1259565">
+			August 9, 2016 at 10:16 am</a>		</div>
+
+		<p>An older version of this article had different (wrong) cost calculations, and I didn&#8217;t update all the numbers when I fixed them. Fixed. And the 8 + 2 × 2 is the marginal cost of creating a scroll bar (assuming the 2 bytes in the main allocation are already accounted elsewhere). I tried to clarify.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jeremytais odd alt thread-even depth-1" id="comment-1258425">
+				<div id="div-comment-1258425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160727-00/?p=93965#comment-1258425">
+			August 1, 2016 at 7:26 am</a>		</div>
+
+		<p>I suspect in Windows 3.1 that the percentage of windows with scroll bars is somewhat higher since today many windows are more or less acting as an empty canvas and doing full custom drawing rather than win32 windows composition (looking at anything that is XAML or web based).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

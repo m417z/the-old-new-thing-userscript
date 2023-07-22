@@ -1,0 +1,661 @@
+<html>
+<head>
+<title>How do I delete bytes from the beginning of a file?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I delete bytes from the beginning of a file?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 1, 2010 / year-entry #330</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>29</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It's easy to append bytes to the end of a file: Just open it for writing, seek to the end, and start writing. It's also easy to delete bytes from the end of a file: Seek to the point where you want the file to be truncated and call SetEndOfFile. But how do you delete...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+It's easy to append bytes to the end of a file:
+Just open it for writing, seek to the end, and start writing.
+It's also easy to delete bytes from the end of a file:
+Seek to the point where you want the file to be truncated and call
+<code>SetEndOfFile</code>.
+But how do you delete bytes from the beginning of a file?
+</p>
+<p>
+You can't, but you sort of can, even though you can't.
+</p>
+<p>
+The underlying abstract model for storage of file contents is in the
+form of a chunk of bytes, each indexed by the file offset.
+The reason appending bytes and truncating bytes is so easy
+is that doing so doesn't alter the file offsets of any other
+bytes in the file.
+If a file has ten bytes and you append one more,
+the offsets of the first ten bytes stay the same.
+On the other hand, deleting bytes from the front or middle of a file
+means that all the bytes that came after the deleted bytes
+need to "slide down" to close up the space.
+And there is no "slide down" file system function.
+</p>
+<p>
+One reason for the absence of a "slide down" function is that
+disk storage is typically not byte-granular.
+Storage on disk is done in units known as <i>sectors</i>,
+a typical sector size being 512 bytes.
+And the storage for a file
+is allocated in units of sectors,
+which we'll call <i>storage chunks</i> for lack of a better term.
+For example, a 5000-byte file occupies ten sectors of storage.
+The first 512 bytes go in sector&nbsp;0,
+the next 512 bytes go in sector&nbsp;1,
+and so on, until the last 392 bytes go into sector&nbsp;9,
+with the last 120 bytes of sector&nbsp;9 lying unused.
+(There are exceptions to this general principle, but they
+are not important to the discussion,
+so there's no point bringing them up.)
+</p>
+<p>
+To append ten bytes to this file, the file system can just
+store them after the last byte of the existing contents.
+leaving 110 bytes of unused space instead of 120.
+Similarly, to truncate those ten bytes back off,
+the logical file size can be set back to 110,
+and the extra ten bytes are "forgotten."
+</p>
+<p>
+In theory, a file system could support truncating an
+integral number of storage chunks
+off the front of the file by updating its internal
+bookkeeping about file contents without having to
+move data physically around the disk.
+But in practice, no popular file system implements this,
+because, as it turns out,
+the demand for the feature isn't high enough to warrant
+the extra complexity. (Remember: Minus 100 points.)
+</p>
+<p>
+But what's this "you sort of can" tease?
+Answer: Sparse files.
+</p>
+<p>
+You can use an NTFS sparse file
+to decommit the storage for the data at the start of the file,
+effectively "deleting" it.
+What you've really done is set the bytes to logical zeroes,
+and if there are any whole storage chunks in that range, they can
+be decommitted and don't occupy any physical space on the drive.
+(If somebody tries to read from decommitted storage chunks, they just
+get zeroes.)
+</p>
+<p>
+For example, consider a
+1<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/06/11/9725386.aspx">MB</a>
+file on a disk that uses 64KB storage chunks.
+If you decide to decommit the first 96KB of the file,
+the first storage chunk of the file will be returned to the drive's
+free space,
+and the first 32KB of the second storage chunk will be set to zero.
+You've effectively "deleted" the first 96KB of data off the front
+of the file, but the file offsets haven't changed.
+The byte at offset 98,304 is still at offset 98,304 and did not
+move to offset zero.
+</p>
+<p>
+Now, a minor addition to the file system would get you that
+magic "deletion from the front of the file":
+Associated with each file would be a 64-bit value representing
+the <i>logical byte zero</i> of the file.
+For example, after you decommitted the first 96KB of the file above,
+the <i>logical byte zero</i> would be 98,304,
+and all file offset calculations on the file would be biased by
+98,304 to convert from logical offsets to physical offsets.
+For example, when you asked to see byte 10, you would actually get
+byte 98314.
+</p>
+<p>
+So why not just do this?
+The <i>minus 100 points</i> rule applies.
+There are a lot of details that need to be worked out.
+</p>
+<p>
+For example, suppose somebody has opened the file and seeked
+to file position 102,400.
+Next, you attempt to delete 98,304 bytes from the front of the file.
+What happens to that other file pointer?
+One possibility is that the file pointer offset stays at 102,400,
+and now it points to the byte that used to be at offset
+200,704.
+This can result in quite a bit of confusion, especially
+if that file handle was being written to:
+The program writing to the handle issued two consecutive
+write operations, and the results ended up 96KB apart!
+You can imagine the exciting data corruption scenarios that would
+result from this.
+</p>
+<p>
+Okay, well another possibility is that the file pointer offset
+moves by the number of bytes you deleted from the front of the file,
+so the file handle that was at 102,400 now shifts to file position 4096.
+That preserves the consecutive read and consecutive write patterns
+but it completely messes up another popular pattern:
+</p>
+<pre>
+off_t oldPos = ftell(fp);
+fseek(fp, newPos, SEEK_SET);
+... do stuff ...
+fseek(fp, oldPos, SEEK_SET); // restore original position
+</pre>
+<p>
+If bytes are deleted from the front of the file during the
+<i>do stuff</i> portion of the code, the attempt to restore
+the original position will restore the wrong original position
+since it didn't take the deletion into account.
+</p>
+<p>
+And this discussion still completely ignores the issue of
+file locking.
+If a region of the file has been locked, what happens when
+you delete bytes from the front of the file?
+</p>
+<p>
+If you really like this <i>simulate deleting
+from the front of the file by decommitting bytes from the
+front and applying an offset to future file operations</i>
+technique, you can do it yourself.
+Just keep track of the magic offset and apply it to all your
+file operations.
+And I suspect the fact that you can simulate the operation
+yourself is a major reason why the feature doesn't exist:
+Time and effort is better-spent adding features that applications
+couldn't simulate on their own.
+</p>
+<p>
+[Raymond is currently away; this message was pre-recorded.]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (29)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-878023">
+				<div id="div-comment-878023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nerf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878023">
+			December 1, 2010 at 8:00 am</a>		</div>
+
+		<p>Sparse files also lead to some interesting backup situations. &nbsp;(My example is from unix, but the same theory applies)</p>
+<p>So in some version of linux you would see this:</p>
+<h1>ls -lh /var/log/lastlog</h1>
+<p>-r&#8212;&#8212;&#8211; &nbsp; &nbsp;1 root &nbsp; &nbsp; root &nbsp; &nbsp; &nbsp; &nbsp; 1.1T Nov 23 16:39 /var/log/lastlog</p>
+<h1>df -h /var</h1>
+<p>Filesystem &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;Size &nbsp;Used Avail Use% Mounted on</p>
+<p>/dev/Volume00/LogVol05</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;5.8G &nbsp;868M &nbsp;4.7G &nbsp;16% /var</p>
+<p>For those not familiar, that a 1.1 terabyte file on a filesystem that&#39;s only 5.8 gigabytes (and only 868 megabytes used).</p>
+<p>But some backup software isn&#39;t slick enough to realize this is a sparse file, so it backs up all 1.1TB. &nbsp;You can imagine the fun it provides with restores.</p>
+<p>The solution in this case it to ignore the file &#8211; it&#39;s not important enough to back up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878043">
+				<div id="div-comment-878043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878043">
+			December 1, 2010 at 8:05 am</a>		</div>
+
+		<p>&quot;Similarly, to truncate those ten bytes back off, the logical file size can be set back to 110, and the extra ten bytes are &quot;forgotten.&quot; &quot;</p>
+<p>Just goes to show the danger of wandering away from home, leaving a blog on autopilot. &nbsp;:)</p>
+<p>Surely (insert Leslie Nielsen homage joke here) if the file was originally 5000 bytes in length, and then 10 bytes are appended, then removed again, the logical file size winds up being &quot;set back to 5000&quot;, rather than &quot;to 110&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878053">
+				<div id="div-comment-878053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bill P. Godfrey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878053">
+			December 1, 2010 at 8:11 am</a>		</div>
+
+		<p>My 20 year old self likes this concept of decommitting blocks in the middle of a file. He thinks it would be useful for deleting records in the middle of a file without moving blocks around.</p>
+<p>My current 36 year old self uses a database library, but misses the days when he would design his own custom file formats.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878073">
+				<div id="div-comment-878073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Bugglin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878073">
+			December 1, 2010 at 8:20 am</a>		</div>
+
+		<p>@Nerf that reminds me of AV software that isn&#39;t aware of NTFS Junctions&#8230; Vista makes use of them to allow for new paths for user profiles while allowing poorly coded legacy apps to work using the old XP paths, but AV software can end up in an infinite loop because (IIRC) %USERPROFILE%AppDataLocalApplication Data points to %USERPROFILE%AppDataLocal and so pre-Vista AV software, since most XP systems didn&#39;t have NTFS Junctions, would end up recursing infinitely until they overflowed their path string buffers and crashed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878083">
+				<div id="div-comment-878083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Bugglin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878083">
+			December 1, 2010 at 8:23 am</a>		</div>
+
+		<p>@pete.d: He meant the size of the data stored in the last cluster, not the total file size.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878123">
+				<div id="div-comment-878123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">man</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878123">
+			December 1, 2010 at 1:14 pm</a>		</div>
+
+		<p>man split</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878133">
+				<div id="div-comment-878133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878133">
+			December 1, 2010 at 1:16 pm</a>		</div>
+
+		<p>I&#39;m afraid this horse already has been beaten to death. These questions &quot;how do I insert bytes into beginning/middle of the file&quot; are of &quot;pls send me teh codez&quot; class.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878143">
+				<div id="div-comment-878143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">joh6nn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878143">
+			December 1, 2010 at 1:55 pm</a>		</div>
+
+		<p>@Alex Grigoriev</p>
+<p>hi thanx. &nbsp;you know how i do insert bytes into beginning/middle of the file? &nbsp;pls send me the codes. &nbsp;most welcome.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878173">
+				<div id="div-comment-878173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Muller</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878173">
+			December 1, 2010 at 3:21 pm</a>		</div>
+
+		<p>I once made a 5 1/4 floppy that contained an infinite file. I manually edited the &#39;next cluster&#39; data for one of the clusters to point to itself.</p>
+<p>For another good laugh, and an excellent test for anti-virus software, lookup &#39;zip quine&#39;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878193">
+				<div id="div-comment-878193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kert</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878193">
+			December 1, 2010 at 4:39 pm</a>		</div>
+
+		<p>dd if=input.txt of=output.txt ibs=1 skip=number_of_bytes_to_skip</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878203">
+				<div id="div-comment-878203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Falcon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878203">
+			December 1, 2010 at 5:51 pm</a>		</div>
+
+		<p>@Dan Bugglin:</p>
+<p>I thought those junctions had ACLs that denied List folder permission to Everyone. Raymond discussed this in his Windows Confidential column in the December 2009 issue of TechNet Magazine. There should be no loops or duplicate folders unless someone/something has messed with the ACLs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878213">
+				<div id="div-comment-878213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Blake</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878213">
+			December 1, 2010 at 6:10 pm</a>		</div>
+
+		<p>&quot;exciting data corruption scenarios&quot; &#8211; I am going to have to use that phrase.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878223">
+				<div id="div-comment-878223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Crescens2k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878223">
+			December 1, 2010 at 6:15 pm</a>		</div>
+
+		<p>@Falcon</p>
+<p>The thing you missed in this equation is the backup privilege. Don&#39;t forget that can be used to access files the user normally doesn&#39;t have access to in order to back them up. The thing this privilege does is that when it is on, it will give you read privilege regardless of the ACL.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878233">
+				<div id="div-comment-878233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joseph Koss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878233">
+			December 1, 2010 at 6:44 pm</a>		</div>
+
+		<p>Remember that the history of Microsoft&#39;s file system is that its originally based off of CP/M&#39;s system.</p>
+<p>Thats where we got 8.3 filenames, where we got drive letters, and also where we got the EOF marker in text files.. and this last one is on point with this topic.</p>
+<p>CP/M&#39;s file system only stored the number of sectors (128 byte records) that a file consumed, so it did not even support &quot;deleting bytes&quot; from the end of a file.. at least not in the way we mean it here.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878243">
+				<div id="div-comment-878243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878243">
+			December 1, 2010 at 7:50 pm</a>		</div>
+
+		<p>@Dan Bugglin</p>
+<p>I find it remarkable that you know what he meant. &nbsp;Did he actually tell you that, or are you psychic?</p>
+<p>Regardless, whatever he meant, the text doesn&#39;t make sense as written. &nbsp;He <em>might</em> have meant the number and written the wrong words, or he might have meant the words he wrote and written the wrong number. &nbsp;Either way, it&#39;s something that ought to be fixed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878263">
+				<div id="div-comment-878263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Falcon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878263">
+			December 1, 2010 at 10:14 pm</a>		</div>
+
+		<p>@Crescens2k:</p>
+<p>Yeah, you&#39;re right. I guess it makes sense for AV to make use of the privilege as well.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878293">
+				<div id="div-comment-878293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878293">
+			December 2, 2010 at 1:58 am</a>		</div>
+
+		<p>Of course, if the FS were to associate a &quot;logical zero&quot; index to a file, it would have to account for it in all actions pertaining the file &#8211; interpreting file pointers, seek, lock, etc.</p>
+<p>This is definitely not something I&#39;d expect to be handled at the FS level.</p>
+<p>@Bill P. Godfrey: ++</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878313">
+				<div id="div-comment-878313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">COW?</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878313">
+			December 2, 2010 at 5:32 am</a>		</div>
+
+		<p>NTFS has a copy-on-write by way of single-instance-storage or volume-shadow-copy. &nbsp;If one could create such a copy-on-write that shared a tail of a file then one could create a new file that had the first X bytes removed very cheaply and without any races or data corruption scenarios.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878323">
+				<div id="div-comment-878323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f0dder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878323">
+			December 2, 2010 at 5:50 am</a>		</div>
+
+		<p>@Kert: doesn&#39;t apply.</p>
+<p>1) you create a new file rather than updating the existing.</p>
+<p>2) you copy all pre- and post-data, instead of supporting a fast &quot;punch-holes&quot; operation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878333">
+				<div id="div-comment-878333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f0dder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878333">
+			December 2, 2010 at 5:51 am</a>		</div>
+
+		<p>@Kert: doesn&#39;t apply.</p>
+<p>1) you create a new file rather than updating the existing.</p>
+<p>2) you copy all pre- and post-data, instead of supporting a fast &quot;punch-holes&quot; operation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878343">
+				<div id="div-comment-878343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Hart</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878343">
+			December 2, 2010 at 6:12 am</a>		</div>
+
+		<p>I don&#39;t see why you wouldn&#39;t open the file in write mode (truncate), copy the contents into volatile memory (into a character array), then write the file, starting at the desired offset. &nbsp;With files &lt; 1 GB this really shouldn&#39;t be a huge issue, especially if you break larger files into chunks (like 50 MB at a time)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878393">
+				<div id="div-comment-878393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">P&#225;draig Brady</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878393">
+			December 2, 2010 at 7:43 am</a>		</div>
+
+		<p>From the UNIX angle, to replace the file efficiently &amp; atomically you could:</p>
+<p>&nbsp;(dd bs=1 skip=100; cat) &lt;in &gt;tmp &amp;&amp; mv tmp in</p>
+<p>For caveats on using mv for the atomic replace, see: <a rel="nofollow" target="_new" href="http://www.pixelbeat.org/docs/unix_file_replacement.html" rel="nofollow">http://www.pixelbeat.org/&#8230;/unix_file_replacement.html</a></p>
+<p>Note GNU/Linux will soon get arbitrary offset deallocation support with fallocate (fd, FALLOC_FL_PUNCH_HOLE, offset, len);</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878433">
+				<div id="div-comment-878433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878433">
+			December 2, 2010 at 9:48 am</a>		</div>
+
+		<p>Pádraig Brady: You&#39;re right about caveats &#8212; your link doesn&#39;t even mention them all!</p>
+<p>If you used your trick to shorten your web server&#39;s log file, you&#39;d probably end up with new log entries going to the old log file, taking up space in a file that you can&#39;t see. Then when you restart the web server to make the old log file stop taking up space, it can&#39;t use the new shorter file because it has the wrong file ownership/permissions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-878483">
+				<div id="div-comment-878483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878483">
+			December 2, 2010 at 11:42 am</a>		</div>
+
+		<ol>
+<li>Only 1 handle can be opened to a file with write access.</li>
+<li>
+<p>If a file is opened with write access, no other handle (read or write) can be done.</p>
+</li>
+<li>
+<p>Setting start of file requires an opened write handle.</p>
+</li>
+</ol>
+<p>This is the simple readers-writers-problem, fundamental to concurrent data access. How on earth can you not have a clue about this?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-878573">
+				<div id="div-comment-878573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Falcon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-878573">
+			December 2, 2010 at 8:14 pm</a>		</div>
+
+		<p>@640k:</p>
+<p>Wouldn&#39;t points 1 and 2 depend on the sharing mode of open handles? According to MSDN docs, it IS possible to open multiple handles for write access. Whether this is desirable or not is another matter.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-879213">
+				<div id="div-comment-879213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zzz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-879213">
+			December 4, 2010 at 12:02 pm</a>		</div>
+
+		<p>I don&#39;t see why anyone would want to delete bytes from the beginning.</p>
+<p>However most average people want to split files, large media files that is, without copying them in the process. </p>
+<p>As volume is X and the file is only slightly smaller than X, the problem that filesystem of any merit should be solving is to split that file at arbitrary point without copying more than 2 sectors of data in the process.</p>
+<p>Similarly, you should have ability to merge smaller file into the beginning of the larger file without moving any bytes of the larger file. This is so that headers can be added to split files.</p>
+<div class="post">[<i>Can you name any filesystems of any merit? Or are you saying that all file systems are meritless? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-879123">
+				<div id="div-comment-879123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">f0dder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-879123">
+			December 4, 2010 at 5:00 am</a>		</div>
+
+		<p>@Alex Hart: works, but is much slower than if you could simply &quot;punch holes&quot; &#8211; and there&#39;s data-consistency issues if you want to handle crashes gracefully, and on top of that you&#39;ll need to have the file open in exclusive mode for the full duration of the move-data-down operation.</p>
+<p>@Pádraig Brady: unless &#39;dd&#39; can do that without *copying* all the remaining bytes, I wouldn&#39;t call it efficient &#8211; and indeed the mv is problematic for reasons mentioned by others. FALLOC_FL_PUNCH_HOLE sounds *very* interesting, though!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-879333">
+				<div id="div-comment-879333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-879333">
+			December 6, 2010 at 1:15 am</a>		</div>
+
+		<p>A common reason for wanting to delete bytes from the beginning of a file is a produce/consumer scenario. A program is producing data at the end of a persistent queue and one or more programs are consuming data at the beginning. Ideally the consumer could delete the data at the beginning of the file once it was done with it, leading to a file that was only the size of the unconsumed data in the queue.</p>
+<p>When the NTFS team was faced with this problem while implementing the USN Journal, they came up with FSCTL_SET_ZERO_DATA. Ever-growing sparse files have their own problems, but those problems are negligible compared to those Raymond elucidated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-879653">
+				<div id="div-comment-879653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">P&#225;draig Brady</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101201-00/?p=12153#comment-879653">
+			December 7, 2010 at 7:52 am</a>		</div>
+
+		<p>@f0dder Oops right, I forgot the count=0 parameter to that dd command</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

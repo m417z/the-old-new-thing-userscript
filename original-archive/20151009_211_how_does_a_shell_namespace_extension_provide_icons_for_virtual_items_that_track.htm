@@ -1,0 +1,229 @@
+<html>
+<head>
+<title>How does a shell namespace extension provide icons for virtual items that track the standard icons set by the user's file associations?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How does a shell namespace extension provide icons for virtual items that track the standard icons set by the user&#8217;s file associations?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 9, 2015 / year-entry #212</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151009-00/?p=91401</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer asked, "What is the correct way to retrieve the icon associated with a file extension? We are writing a shell namespace extension that holds virtual file content, and we want to show the icon that would have been shown if the file were a physical file on disk rather than a virtual one....</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer asked,
+"What is the correct way to retrieve the icon associated with a file
+extension?
+We are writing a shell namespace extension
+that holds virtual file content,
+and we want to show the icon that would have been shown if the file were
+a physical file on disk rather than a virtual one.
+We tried using
+<code>SH&shy;Get&shy;File&shy;Info</code>,
+expecting it to return the icon location and index,
+but the <code>szDisplay&shy;Name</code> comes out as a blank string.
+(See sample program attached.)
+What's the right way to get the location so we can return it
+in our own
+<code>Get&shy;UI&shy;Object&shy;Of(<wbr>IExtract&shy;Icon)</code>
+handler?"
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;iostream&gt;
+
+int main()
+{
+ SHFILEINFOW info;
+ ::CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+ ::SHGetFileInfoW(L".txt", FILE_ATTRIBUTE_NORMAL,
+    &amp;info, sizeof(info),
+    SHGFI_ICONLOCATION | <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/06/01/145428.aspx">SHGFI_USEFILEATTRIBUTES</a>);
+ std::wcout &lt;&lt; info.szDisplayName &lt;&lt; std::endl;
+ std::wcout &lt;&lt; info.iIcon &lt;&lt; std::endl;
+ return 0;
+}
+</pre>
+<p>
+The location is coming out blank because the file location returned
+is <code>GIL_<wbr>NOT&shy;FILENAME</code> so there is no file name to return.
+</p>
+<p>
+But let's look past the question to the problem.
+The problem is that you want to implement
+<code>IShell&shy;Folder::<wbr>Get&shy;UI&shy;Object&shy;Of(<wbr>IExtract&shy;Icon)</code>
+for your shell namespace extension.
+Your plan is to create a custom implementation of
+<code>IExtract&shy;Icon</code> and tell it to report
+the information you obtained from
+<code>SH&shy;Get&shy;File&shy;Info</code>.
+The catch is that this information is lossy because
+<code>IExtract&shy;Icon::<wbr>Get&shy;Icon&shy;Location</code>
+returns additional information that is not captured by
+<code>SH&shy;Get&shy;File&shy;Info</code>.
+</p>
+<p>
+Avoid the loss of fidelity by removing the middle man.
+Just ask for the standard icon extractor and return <i>that</i>.
+</p>
+<p>
+We start with a helper function that takes its inspiration from
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/09/20/231739.aspx">
+<code>Get&shy;UI&shy;Object&shy;Of&shy;File</code></a>
+but applies a little seasoning from
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/05/03/10415778.aspx">
+<code>Create&shy;Simple&shy;Pidl</code></a>:
+</p>
+<pre>
+HRESULT GetUIObjectOfVirtualFile(HWND hwnd, LPCWSTR pszPath,
+    REFIID riid, void **ppv)
+{
+  *ppv = nullptr;
+
+  WIN32_FIND_DATAW fd = {};
+  fd.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+  CComHeapPtr&lt;ITEMIDLIST_ABSOLUTE&gt; spidlSimple;
+  HRESULT hr = CreateSimplePidl(&amp;fd, pszPath, &amp;spidlSimple);
+  if (FAILED(hr)) return hr;
+
+  CComPtr&lt;IShellFolder&gt; spsf;
+  PCUITEMID_CHILD pidlChild;
+  hr = SHBindToParent(spidlSimple, IID_PPV_ARGS(&amp;spsf), &pidlChild);
+  if (FAILED(hr)) return hr;
+
+  return spsf-&gt;GetUIObjectOf(hwnd, 1, &amp;pidlChild, riid, NULL, ppv);
+}
+</pre>
+<p>
+This helper function is like
+<code>Get&shy;UI&shy;Object&shy;Of&shy;File</code> except that
+it uses a simple pidl to get the UI object for a file that doesn't
+actually exist.
+</p>
+<p>
+We can use this function to get the icon extractor for an arbitrary
+file extension.
+</p>
+<pre>
+HRESULT GetIconExtractorForExtension(
+    HWND hwnd,
+    PCWSTR pszExtension,
+    REFIID riid,
+    void **ppv)
+{
+ *ppv = nullptr;
+
+ wchar_t szPath[MAX_PATH];
+ HRESULT hr = StringCchPrintfW(szPath, ARRAYSIZE(szPath),
+                              L"C:\\a%ls", pszExtension);
+ if (FAILED(hr)) return hr;
+
+ return GetUIObjectOfVirtualFile(hwnd, szPath, riid, ppv);
+}
+</pre>
+<p>
+and then use this function when handling the
+request for
+<code>IExtract&shy;Icon</code>.
+</p>
+<pre>
+if (interfaceId == IID_IExtractIconW ||
+    interfaceId == IID_IExtractIconA)
+{
+  return GetIconExtractorForExtension(hwnd, L".txt", riid, ppv);
+}
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-scott-brickey even thread-even depth-1" id="comment-1198951">
+				<div id="div-comment-1198951" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Scott+Brickey' rel='external nofollow' class='url'>Scott Brickey</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151009-00/?p=91401#comment-1198951">
+			October 9, 2015 at 9:23 am</a>		</div>
+
+		<p>Still, a well articulated problem/question, with reduced sample project.</p>
+<p>I imagine your answer is/was well received.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1198611">
+				<div id="div-comment-1198611" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kelden</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151009-00/?p=91401#comment-1198611">
+			October 13, 2015 at 4:10 pm</a>		</div>
+
+		<p>I would like to know how to get the icon for a printer.</p>
+<p>If you install the drivers from the manufacturers, they also supply images and you can see them in &quot;Devices and Printers&quot;. But how can I load the picture?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

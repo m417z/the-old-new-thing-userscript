@@ -1,0 +1,468 @@
+<html>
+<head>
+<title>BeginBufferedPaint: It's not just for buffered painting any more</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>BeginBufferedPaint: It&#8217;s not just for buffered painting any more</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 20, 2011 / year-entry #124</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">I covered the BeginBufferedPaint function in my 2008 PDC presentation, but one thing I didn't mention is that the buffered paint functions are very handy even if you have no intention of painting. Since the buffered paint functions maintain a cache (provided that you remembed to call Buffered­Paint­Init), you can use Begin­Buffered­Paint to get a...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+I covered the <code>BeginBufferedPaint</code> function in
+<a HREF="https://channel9.msdn.com/pdc2008/PC43/">
+my 2008 PDC presentation</a>,
+but one thing I didn't mention is that the buffered paint functions
+are very handy even if you have no intention of painting.
+</p>
+<p>
+Since the buffered paint functions maintain a cache
+(provided that you remembed to call
+<code>Buffered&shy;Paint&shy;Init</code>),
+you can use
+<code>Begin&shy;Buffered&shy;Paint</code> to get a temporary bitmap
+even if you have no intention of actually painting to the screen.
+You might want a bitmap to do some off-screen composition,
+or for some other temporary purpose,
+in which case you can ask
+<code>Begin&shy;Buffered&shy;Paint</code> to give
+you a bitmap,
+use the bitmap for whatever you like,
+and then pass <code>fUpdateTarget = FALSE</code> when you call
+<code>End&shy;Buffered&shy;Paint</code>
+to say "Ha ha, just kidding."
+</p>
+<p>
+One thing to have to be aware of is that the bitmap provided
+by <code>Begin&shy;Buffered&shy;Paint</code>
+is not guaranteed to be exactly
+the size you requested; it only promises that the bitmap will be
+<i>at least</i> the size you requested.
+Most of the time,
+your code won't care (there are just pixels out there that you aren't
+using),
+but if you use the
+<code>Get&shy;Buffered&shy;Paint&shy;Bits</code>
+function to obtain direct access to the bits,
+don't forget to take the stride into account.
+</p>
+<p>Consider this artifical example of a program that uses
+<code>Create&shy;DIB&shy;Section</code> to create a temporary 32bpp bitmap
+for the purpose of updating a layered window.
+Start with the
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2003/07/23/54576.aspx">
+scratch program</a>
+and make these changes:
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ <font COLOR=blue>BOOL fRc = FALSE;
+ HDC hdcWin = GetDC(hwnd);
+ if (hdcWin) {
+  HDC hdcMem = CreateCompatibleDC(hdcWin);
+  if (hdcMem) {
+   const int cx = 200;
+   const int cy = 200;
+   RECT rc = { 0, 0, cx, cy };
+   BITMAPINFO bmi = { 0 };
+   bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+   bmi.bmiHeader.biWidth = cx;
+   bmi.bmiHeader.biHeight = cy;
+   bmi.bmiHeader.biPlanes = 1;
+   bmi.bmiHeader.biBitCount = 32;
+   bmi.bmiHeader.biCompression = BI_RGB;
+   RGBQUAD *prgbBits;
+   HBITMAP hbm = CreateDIBSection(hdcWin, &amp;bmi,
+             DIB_RGB_COLORS, &amp;reinterpret_cast&lt;void*&amp;&gt;(prgbBits),
+                                                        NULL, 0);
+   if (hbm) {
+    HBITMAP hbmPrev = SelectBitmap(hdcMem, hbm);
+
+    // Draw a simple picture
+    FillRect(hdcMem, &amp;rc,
+                     reinterpret_cast&lt;HBRUSH&gt;(COLOR_INFOBK + 1));
+    rc.left = cx / 4;
+    rc.right -= rc.left;
+    rc.top = cy / 4;
+    rc.bottom -= rc.top;
+    FillRect(hdcMem, &amp;rc,
+                   reinterpret_cast&lt;HBRUSH&gt;(COLOR_INFOTEXT + 1));
+
+    // Apply the alpha channel (and premultiply)
+    for (int y = 0; y &lt; cy; y++) {
+     for (int x = 0; x &lt; cx; x++) {
+      RGBQUAD *prgb = &amp;prgbBits[y * cx + x];
+      BYTE bAlpha = static_cast&lt;BYTE&gt;(cx * x / cx);
+      prgb-&gt;rgbRed = static_cast&lt;BYTE&gt;(prgb-&gt;rgbRed * bAlpha / 255);
+      prgb-&gt;rgbBlue = static_cast&lt;BYTE&gt;(prgb-&gt;rgbBlue * bAlpha / 255);
+      prgb-&gt;rgbGreen = static_cast&lt;BYTE&gt;(prgb-&gt;rgbGreen * bAlpha / 255);
+      prgb-&gt;rgbReserved = bAlpha;
+     }
+    }
+
+    // update the layered window
+    POINT ptZero = { 0, 0 };
+    SIZE siz = { cx, cy };
+    BLENDFUNCTION bf =  { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    fRc = UpdateLayeredWindow(hwnd, NULL, &amp;ptZero, &amp;siz, hdcMem,
+                              &amp;ptZero, 0, &amp;bf, ULW_ALPHA);
+    SelectBitmap(hdcMem, hbmPrev);
+    DeleteObject(hbm);
+   }
+   DeleteDC(hdcMem);
+  }
+  ReleaseDC(hwnd, hdcWin);
+ }
+ return fRc;</font>
+}
+</pre>
+<p>
+Pretty standard stuff.
+But let's convert this to use the buffered paint functions
+to take advantage of the buffered paint bitmap cache.
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+ BOOL fRc = FALSE;
+ HDC hdcWin = GetDC(hwnd);
+ if (hdcWin) {
+  <font COLOR=blue>HDC hdcMem;</font>
+  <font COLOR=red><strike>// HDC hdcMem = CreateCompatibleDC(hdcWin);</strike></font>
+  <font COLOR=red><strike>// if (hdcMem) {</strike></font>
+   const int cx = 200;
+   const int cy = 200;
+   RECT rc = { 0, 0, cx, cy };
+   <font COLOR=red><strike>// BITMAPINFO bmi = { 0 };</strike></font>
+   <font COLOR=red><strike>// bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);</strike></font>
+   <font COLOR=red><strike>// bmi.bmiHeader.biWidth = cx;</strike></font>
+   <font COLOR=red><strike>// bmi.bmiHeader.biHeight = cy;</strike></font>
+   <font COLOR=red><strike>// bmi.bmiHeader.biPlanes = 1;</strike></font>
+   <font COLOR=red><strike>// bmi.bmiHeader.biBitCount = 32;</strike></font>
+   <font COLOR=red><strike>// bmi.bmiHeader.biCompression = BI_RGB;</strike></font>
+   RGBQUAD *prgbBits;
+   <font COLOR=blue>BP_PAINTPARAMS params = { sizeof(params), BPPF_NOCLIP };
+   HPAINTBUFFER hbp = BeginBufferedPaint(hdcWin, &amp;rc,
+                              BPBF_TOPDOWNDIB, &amp;params, &amp;hdcMem);
+   if (hbp) {
+    int cxRow;
+    if (SUCCEEDED(GetBufferedPaintBits(hpb, &amp;prgbBits, &amp;cxRow))) {</font>
+   <font COLOR=red><strike>// HBITMAP hbm = CreateDIBSection(hdcWin, &amp;bmi,</strike></font>
+   <font COLOR=red><strike>//        DIB_RGB_COLORS, &amp;reinterpret_cast&lt;void*&amp;&gt;(prgbBits),</strike></font>
+   <font COLOR=red><strike>//                                                   NULL, 0);</strike></font>
+   <font COLOR=red><strike>// if (hbm) {</strike></font>
+    <font COLOR=red><strike>// HBITMAP hbmPrev = SelectBitmap(hdcMem, hbm);</strike></font>
+
+    // Draw a simple picture
+    FillRect(hdcMem, &amp;rc,
+                     reinterpret_cast&lt;HBRUSH&gt;(COLOR_INFOBK + 1));
+    rc.left = cx / 4;
+    rc.right -= rc.left;
+    rc.top = cy / 4;
+    rc.bottom -= rc.top;
+    FillRect(hdcMem, &amp;rc,
+                   reinterpret_cast&lt;HBRUSH&gt;(COLOR_INFOTEXT + 1));
+
+    // Apply the alpha channel (and premultiply)
+    for (int y = 0; y &lt; cy; y++) {
+     for (int x = 0; x &lt; cx; x++) {
+      RGBQUAD *prgb = &amp;prgbBits[y * <font COLOR=blue>cxRow</font> + x];
+      BYTE bAlpha = static_cast&lt;BYTE&gt;(cx * x / cx);
+      prgb-&gt;rgbRed = static_cast&lt;BYTE&gt;(prgb-&gt;rgbRed * bAlpha / 255);
+      prgb-&gt;rgbBlue = static_cast&lt;BYTE&gt;(prgb-&gt;rgbBlue * bAlpha / 255);
+      prgb-&gt;rgbGreen = static_cast&lt;BYTE&gt;(prgb-&gt;rgbGreen * bAlpha / 255);
+      prgb-&gt;rgbReserved = bAlpha;
+     }
+    }
+
+    // update the layered window
+    POINT ptZero = { 0, 0 };
+    SIZE siz = { cx, cy };
+    BLENDFUNCTION bf =  { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    fRc = UpdateLayeredWindow(hwnd, NULL, &amp;ptZero, &amp;siz, hdcMem,
+                              &amp;ptZero, 0, &amp;bf, ULW_ALPHA);
+    <font COLOR=red><strike>// SelectBitmap(hdcMem, hbmPrev);</strike></font>
+    <font COLOR=red><strike>// DeleteObject(hbm);</strike></font>
+   }
+   <font COLOR=blue>EndBufferedPaint(hpb, FALSE);</font>
+   <font COLOR=red><strike>// DeleteDC(hdcMem);</strike></font>
+  }
+  ReleaseDC(hwnd, hdcWin);
+ }
+ return fRc;</font>
+}
+
+// changes to WinMain
+ <font COLOR=blue>if (SUCCEEDED(BufferedPaintInit())) {</font>
+ <font COLOR=red><strike>// if (SUCCEEDED(CoInitialize(NULL))) {/* In case we use COM */</strike></font>
+  <font COLOR=blue>hwnd = CreateWindowEx(WS_EX_LAYERED,</font>
+  <font COLOR=red><strike>// hwnd = CreateWindow(</strike></font>
+  ...
+  <font COLOR=blue>BufferedPaintUnInit();</font>
+  <font COLOR=red><strike>// CoUninitialize();</strike></font>
+  ...
+</pre>
+<p>
+We're using the buffered paint API not for buffered painting
+but just as a convenient way to get a bitmap and a DC at one shot.
+It saves some typing (you don't have to create the bitmap and the DC
+and select the bitmap in and out),
+and when you return the paint buffer to the cache, some other
+window that calls <code>Begin&shy;Buffered&shy;Paint</code> may be able
+to re-use that bitmap.
+</p>
+<p>
+There are a few tricky parts here.
+First, if you're going to be accessing
+the bits directly, you need to call
+<code>Get&shy;Buffered&shy;Paint&shy;Bits</code>
+and use the <code>cxRow</code> to determine the bitmap stride.
+Next, when we're done, we pass <code>FALSE</code> to
+<code>End&shy;Buffered&shy;Paint</code> to say,
+"Yeah, um, thanks for the bitmap, but don't <code>Bit&shy;Blt</code> the
+results back into the DC we passed to
+<code>Begin&shy;Buffered&shy;Paint</code>.
+Sorry for the confusion."
+</p>
+<p>
+A less obvious trick is that we used <code>BPPF_<wbr>NOCLIP</code>
+to get a full bitmap.
+By default, <code>Begin&shy;Buffered&shy;Paint</code>
+returns you a bitmap which
+is clipped to the DC you pass as the first parameter.
+This is an optimization to avoid allocating memory for pixels that
+can't be seen anyway when <code>End&shy;Buffered&shy;Paint</code>
+goes to copy
+the bits back to the original DC.
+We don't want this optimization, however, since we have no intention
+of blitting the results back to the original DC.
+The clip region of the original DC is irrelevant to us because
+we just want a temporary bitmap for some internal calculations.
+</p>
+<p>
+Anyway, there you have it, an example of using
+<code>Begin&shy;Buffered&shy;Paint</code> to obtain a temporary bitmap.
+It doesn't win much in this example (since we call it only once,
+at window creation time),
+but if you have code which creates a lot of DIB sections for temporary
+use, you can use this trick to take advantage of the buffered paint
+cache and reduce the overhead of bitmap creation and deletion.
+</p>
+<p>
+<b>Pre-emptive snarky comment</b>:
+"<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/08/10151258.aspx#10151864"
+>How dare you show us an alternative method that isn't
+available on Windows 2000</a>!"</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-914323">
+				<div id="div-comment-914323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914323">
+			May 20, 2011 at 8:50 am</a>		</div>
+
+		<p>While I certainly wouldn&#39;t say &quot;How dare you show us an alternative method that isn&#39;t available on Windows 2000!&quot;, I do have to admit that while very interesting, this isn&#39;t practical for many of us who do have to write software that still runs on Windows XP.</p>
+<p>Certainly, the day our Product Management gives us the go ahead to drop XP, stuff like this will be useful. &nbsp;But since we barely dropped Win95 support 5 years ago, I doubt that day is coming any time soon. (Which I find sad, since there is a ton of stuff in Vista and Win 7 that would make my life easier if I could use it).</p>
+<p>Anyway, thanks for the tip, I hope I can use it someday.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-914353">
+				<div id="div-comment-914353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GrumpyYoungMan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914353">
+			May 20, 2011 at 9:57 am</a>		</div>
+
+		<p>@SimonRev</p>
+<p>Amazing. &nbsp;Raymond goes out of his way to preempt such comments and you go ahead and do it anyway. &nbsp;Any sympathy I might have had for you was erased instantly. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-914363">
+				<div id="div-comment-914363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914363">
+			May 20, 2011 at 10:06 am</a>		</div>
+
+		<p>Can pre-emptive snarky comments get stars? &nbsp;One is surely deserved here!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-914383">
+				<div id="div-comment-914383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914383">
+			May 20, 2011 at 10:11 am</a>		</div>
+
+		<p>Microsoft has indeed been making improvements to APIs of Windows. Case in point: GetNamedPipeClientSessionId.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-914393">
+				<div id="div-comment-914393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bradley</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914393">
+			May 20, 2011 at 10:17 am</a>		</div>
+
+		<p>Why would you want to do this in the real world? It seems to go out of it&#39;s way to get a bitmap that may or may not work on the OS, and one that might not be the size you asked for. This sounds like a &quot;clever hack&quot; that is just going to cause problems, when it would be FAR easier and safer to just create a bitmap the &quot;normal&quot; way.</p>
+<div class="post">[<i>Consider an app with 500 UI widgets, and when some event occurs, each widget needs to redraw its cached image. You could create and destroy 500 temporary bitmaps or use the same temporary bitmap 500 times. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-914413">
+				<div id="div-comment-914413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914413">
+			May 20, 2011 at 11:53 am</a>		</div>
+
+		<p>@GrumpyYoungMan</p>
+<p>My point was in no way to complain. &nbsp;I hope that nothing in my original post could be construed as &quot;snarky&quot;. &nbsp;</p>
+<p>The fact is I appreciate having these little tidbits pointed out. &nbsp;Unfortunately, XP is victim of its own success and shows no sign disappearing any time soon, leaving 3rd party developers (and in fairness, many teams internal to Microsoft as well) more or less stuck using decade old APIs until XP is finally completely end of lifed.</p>
+<p>That said, I am glad to know of one more tool that I hope I could use one day.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-914443">
+				<div id="div-comment-914443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Worf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914443">
+			May 21, 2011 at 1:48 am</a>		</div>
+
+		<p>Guess I don&#39;t get the snark. I use Windows 2000, but I don&#39;t see the problem &#8211; Microsoft doesn&#39;t support Win2k since July 2010, so&#8230; XP however is 2014.</p>
+<p>Of course, if this article was written in 2008, I suppose it would&#39;ve been appropriate then. In which case it appears Raymond&#39;s queue is around 3 years deep. Which means Raymond&#39;s new pre-emptive snarks about XP will probably be misunderstood as XP is unsupported when we see them in 2014.</p>
+<p>Looks like an interesting API and someone had the foresight to include a &quot;oops&quot; parameter to let it be used in interesting ways.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-914493">
+				<div id="div-comment-914493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914493">
+			May 22, 2011 at 2:47 pm</a>		</div>
+
+		<p>it&#39;s not necessary to do something like call GdiFlush before using the bits of the bitmap?</p>
+<div class="post">[<i>All the standard rules apply. I don&#39;t see where I suggested otherwise. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-914503">
+				<div id="div-comment-914503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914503">
+			May 22, 2011 at 5:49 pm</a>		</div>
+
+		<p>Isn&#39;t FillRect function drawing on the the bitmap bits that are being directly accessed right after, or did I misunderstand the sample? </p>
+<p>If so, isn&#39;t syncing with GDIflush() required at that point, if not, why?</p>
+<div class="post">[<i>Yes, it is necessary. That&#39;s a bug. But it also has nothing to do with the conversion to use BeginBufferedPaint. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-914933">
+				<div id="div-comment-914933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ulric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110520-00/?p=10613#comment-914933">
+			May 24, 2011 at 9:03 pm</a>		</div>
+
+		<p>it would be best to update the sample for posterity; it&#39;s already spending many lines on premultiplying alpha blending; might as well make it 100% correct</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

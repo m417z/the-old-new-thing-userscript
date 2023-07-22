@@ -1,0 +1,446 @@
+<html>
+<head>
+<title>Debugging walkthrough: Access violation on nonsense instruction, episode 3</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Debugging walkthrough: Access violation on nonsense instruction, episode 3</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 28, 2015 / year-entry #181</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>23</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A colleague of mine asked for help debugging a strange failure. Execution halted on what appeared to be a nonsense instruction.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A colleague of mine asked for help debugging a strange failure.
+Execution halted on what appeared to be a nonsense instruction.
+<span id="more-91711"></span>
+</p>
+<pre>
+eax=022b13a0 ebx=00000000 ecx=02570df4 edx=769f4544 esi=02570dec edi=05579748
+eip=76c49131 esp=05cce038 ebp=05cce07c iopl=0         nv up ei pl nz na po nc
+cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010202
+KERNELBASE!GetFileAttributesExW+0x2:
+76c49131 ec              in      al,dx
+</pre>
+<p>
+This is clearly an invalid instruction.
+But observe that the offset is +2,
+which is normally the start of the function,
+because the first two bytes of Windows operating system
+functions are
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/09/21/10214405.aspx">
+a <code>mov edi, edi</code> instruction</a>.
+Therefore, the function is corrupted.
+Lets look back two bytes to see if it gives any clues.
+</p>
+<pre>
+0:006&gt; u 76c49131-2
+KERNELBASE!GetFileAttributesExW:
+76c4912f e95aecebf3      jmp     IoLog!Mine_GetFileAttributesExW (6ab07d8e)
+</pre>
+<p>
+Oh look, somebody is doing API patching
+(already unsupported)
+and they did a bad job.
+They tried to patch code while a thread was in the middle
+of executing it,
+resulting in a garbage instruction.
+</p>
+<p>
+This is a bug in IoLog.
+The great thing about API patching is that when you screw up,
+it looks like an OS bug. That way, nobody ever files bugs against you!
+</p>
+<p>
+(In this case, IoLog is a diagnostic tool which is logging file I/O
+performed by an application which is being instrumented.)
+</p>
+<p>
+My colleague replied,
+"Thanks.
+Looks like a missing lock in IoLog.
+It doesn't surprise me that API patching isn't supported..."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (23)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1206871">
+				<div id="div-comment-1206871" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NotThisMind</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206871">
+			August 28, 2015 at 7:05 am</a>		</div>
+
+		<p>Sorry for &#39;spamming&#39;, for a non-assembly programmer and mostly non-debugger, how can you tell that&#39;s API patching? I know i could google, but if someone is kind to explain here&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1206861">
+				<div id="div-comment-1206861" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206861">
+			August 28, 2015 at 7:11 am</a>		</div>
+
+		<p>@NotThisMind: It is jumping from a low-level usermode dll to a function in another dll that is not a part of Windows. For file APIs it generally goes kernel32 -&gt; kernelbase -&gt; ntdll -&gt; kernelmode, this is just something you learn over time by debugging different issues.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206851">
+				<div id="div-comment-1206851" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pete</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206851">
+			August 28, 2015 at 7:13 am</a>		</div>
+
+		<p>My guess is because the function the crash happens in is called GetFileAttributesEx and the first instruction is </p>
+<p>jmp &nbsp; &nbsp; IoLog!Mine_GetFileAttributesExW</p>
+<p>(Note the names: GetFileAttributesEx jumping to Mine_GetFileAttributesExW)</p>
+<p>Like Raymond said, normally the first two bytes of a Windows function are a mov edi, edi instruction, but in this case it&#39;s a jump to a different function with a &quot;Mine_&quot; name. Looks like IoLog overwrote the function with a jump to their own version.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206841">
+				<div id="div-comment-1206841" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">genumi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206841">
+			August 28, 2015 at 7:22 am</a>		</div>
+
+		<p>I only know enough to be dangerous, and I had the opposite problem:</p>
+<p> I guessed someone was patching, but only after Raymond said the instruction was &#39;clearly&#39; invalid. That isn&#39;t clear to me (see above knowledge assessment)</p>
+<p>Couldn&#39;t it possibly be someone trying something very clever?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206831">
+				<div id="div-comment-1206831" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206831">
+			August 28, 2015 at 7:41 am</a>		</div>
+
+		<p>@genumi: You can&#39;t access IO ports from usermode. Besides, it&#39;s a system call wrapper. It&#39;s gonna call another function so the first thing it needs to do is set up its stack frame.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206821">
+				<div id="div-comment-1206821" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206821">
+			August 28, 2015 at 7:43 am</a>		</div>
+
+		<p>@genumi, the instruction is clearly invalid because it is performing direct hardware access, and in Windows, direct hardware access should only happen in kernel mode (besides the fact that this particular function has no business doing hardware access, which it should be delegating to the storage stack, in order to support all manner of different filesystems and busses, including network shares).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206811">
+				<div id="div-comment-1206811" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jeff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206811">
+			August 28, 2015 at 7:56 am</a>		</div>
+
+		<p>You mean using an invalid instruction and catching the resulting exception to do something funky? I really don&#39;t see the point in doing that. I don&#39;t know how you would inject the exception frame in every application that would indirectly execute that invalid instruction. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206791">
+				<div id="div-comment-1206791" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rsola</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206791">
+			August 28, 2015 at 8:58 am</a>		</div>
+
+		<p>I was a bit confused by the title &quot;Access violation on nonsense instruction&quot;, until I realized it belongs to a series of articles. Attempting to execute IN and OUT instructions in user mode will raise a STATUS_PRIVILEGED_INSTRUCTION exception, unless a driver messes with the I/O permission bitmap (x86 specific, 32-bit only).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206771">
+				<div id="div-comment-1206771" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kemp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206771">
+			August 28, 2015 at 10:33 am</a>		</div>
+
+		<p>I am having great difficulty parsing this sentence: &quot;But observe that the offset is +2, which is normally the start of the function, because the first two bytes of Windows operating system functions are a mov edi, edi instruction&quot;. I can&#39;t figure out what the &quot;because&quot; is referring to (&quot;[x is happening/we have made deduction x] because the first two bytes of [&#8230;]&quot;), it doesn&#39;t seem to follow from the start of the sentence. Also, possibly due to my lack of debugger experience, I can&#39;t see where the +2 offset is shown here (maybe that&#39;s causing my parsing error?).</p>
+<p>Anyone able to help out a noob?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-sean_limingmsn-com odd alt thread-odd thread-alt depth-1" id="comment-1206761">
+				<div id="div-comment-1206761" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Sean+Liming' rel='external nofollow' class='url'>Sean Liming</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206761">
+			August 28, 2015 at 10:45 am</a>		</div>
+
+		<p>If I am reading this correctly, using windbg one can go back two bytes using the u command to see what really caused the error. The error is from an application called IoLog. &#8211; Is that correct?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206751">
+				<div id="div-comment-1206751" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Katie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206751">
+			August 28, 2015 at 11:09 am</a>		</div>
+
+		<p>@Kemp</p>
+<p>KERNELBASE!GetFileAttributesExW+0x2 shows that it is 2 bytes into the GetFileAttributesExW function. This is normally the real start of the function, because the first 2 bytes are taken up by &quot;mov edi,edi&quot; for reasons explained in the linked article. Because the offset is +2, it is fairly safe to assume that you&#39;re looking at an actual instruction in the function, not some constant value or anything else where you might expect it to be an invalid instruction.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206741">
+				<div id="div-comment-1206741" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206741">
+			August 28, 2015 at 11:28 am</a>		</div>
+
+		<p>I don&#39;t understand &quot;Looks like a missing lock in IoLog&quot;. How could locking have helped? Surely no lock could have prevented a thread from executing GetFileAttributesExW while IoLog was doing its patching, unless IoLog did it at process startup while the LoaderLock was held (meaning you&#39;d have to link against IoLog rather than loading it at runtime).</p>
+<p>Isn&#39;t the correct thing to do write the JMP Mine_GetFileAttributesExW at GetFileAttributesExW-5 and then write JMP $-5 at GetFileAttributesExW+0?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206731">
+				<div id="div-comment-1206731" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Katie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206731">
+			August 28, 2015 at 11:59 am</a>		</div>
+
+		<p>@Sean Liming</p>
+<p>I thought your name looked familiar &#8211; I used your books at my previous employer while porting an embedded system from XP to WES7.</p>
+<p>&quot;u&quot; is for unassemble. You can see he specifically gives the address where it broke with a -2 to go back two bytes, which he knows is the beginning of the function. Unassembling from there he saw that the &quot;ec&quot; byte that was interpreted as a bad instruction was actually the third byte of a 5-byte instruction encoding a jump to a function in IoLog. The linked article gives a good explanation of how it should be done. But it still isn&#39;t supported. :-P</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206711">
+				<div id="div-comment-1206711" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206711">
+			August 28, 2015 at 12:21 pm</a>		</div>
+
+		<p>@Gabe: As far as correct can be defined for this procedure that is how it&#39;s done.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206691">
+				<div id="div-comment-1206691" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206691">
+			August 28, 2015 at 2:20 pm</a>		</div>
+
+		<p>The correct solution is explained in the linked article: put the real jump in the designated hotpatch area and replace the leading nop with a short jump.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206681">
+				<div id="div-comment-1206681" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kemp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206681">
+			August 28, 2015 at 4:07 pm</a>		</div>
+
+		<p>@Katie</p>
+<p>Thanks for that, the text makes a lot more sense now. Somehow I missed the +2 in the one place it actually made sense to look :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-sean_limingmsn-com even thread-even depth-1" id="comment-1206671">
+				<div id="div-comment-1206671" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Sean+Liming' rel='external nofollow' class='url'>Sean Liming</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206671">
+			August 28, 2015 at 9:31 pm</a>		</div>
+
+		<p>@Katie</p>
+<p>I hope the books helped</p>
+<p>Thanks I was having a hard time understanding the article. Is this a tool in development?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206651">
+				<div id="div-comment-1206651" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">boogaloo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206651">
+			August 30, 2015 at 2:48 pm</a>		</div>
+
+		<p>&quot;I don&#39;t understand &quot;Looks like a missing lock in IoLog&quot;. How could locking have helped?&quot;</p>
+<p>@Gabe It can&#39;t, his colleague didn&#39;t understand and Raymond either didn&#39;t continue the story with how he explained it to him or he didn&#39;t explain it to him at the time and he has just now pointed him to this article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206631">
+				<div id="div-comment-1206631" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">FCotrina</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206631">
+			August 30, 2015 at 9:43 pm</a>		</div>
+
+		<p>oh, I just wish that Windows on ARM had the same possibility of API patching. DLLs and EXEs in Windows Phone are just too tightly packed, leaving no space for any Detour-ing.</p>
+<p>Would anyone happen to know the reason? I mean, this &quot;move edi, edi&quot; is added by the x86 compiler, and it&#39;s absent in the ARM compiler ?</p>
+<p>Given that BigWindows and WoA are using same sources for the kernel and OS, it wouldn&#39;t be extra effort, I believe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206611">
+				<div id="div-comment-1206611" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206611">
+			August 31, 2015 at 7:56 am</a>		</div>
+
+		<p>@FCotrina &nbsp;what environment are you using that you could actually patch the API in Windows on ARM?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206581">
+				<div id="div-comment-1206581" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">boogaloo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206581">
+			August 31, 2015 at 9:24 am</a>		</div>
+
+		<p>@FCotrina It just makes detour-ing more complex, relocating the original code to new ram.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206571">
+				<div id="div-comment-1206571" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206571">
+			August 31, 2015 at 12:50 pm</a>		</div>
+
+		<p>@FCotrina Read the earlier article where Raymond spends half of his time explaining that detouring OS functions is an OS feature. Meaning: Whether Windows on ARM or anywhere else uses or doesn&#39;t use detour shouldn&#39;t bother you at all, because you should not be doing anything with those points at all. </p>
+<p>So why did the Windows on ARM guys decide that this internal feature wasn&#39;t worth it? Probably because the only legitimate reason to use it is never used in the first place (MS has&#39;t hotpatched the kernel for a long time) and it&#39;s now just another backwards compatibility constraint on Intel Windows because some programmers ignored the whole &quot;for internal use only&quot; part and just went ahead with it anyhow.</p>
+<p>Really a win-win situation for them: Less effort and less things that people can screw up for them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206071">
+				<div id="div-comment-1206071" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bruce Dawson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150828-00/?p=91711#comment-1206071">
+			September 3, 2015 at 1:36 pm</a>		</div>
+
+		<p>Note that you can detect image patching with the windbg !chkimg command. It compares the memory saved in a crash dump to the bytes that should be there (as retrieved from a symbol server). This only works, of course, if the patched memory is in the crash dump. Luckily most crash dumps save 256 bytes of memory around EIP (either on all threads or just the crashing thread, I&#39;m not sure) so if the crash happens near where the patching occurred, !chkimg will detect it.</p>
+<p>If the crash happens in a child function (due to the patching sending execution down a bad path) then !chkimg will not help, and in fact windbg will show the code bytes from symbol server, which makes things look really mysterious.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

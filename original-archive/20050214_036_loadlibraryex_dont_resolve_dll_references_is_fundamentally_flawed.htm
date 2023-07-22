@@ -1,0 +1,561 @@
+<html>
+<head>
+<title>LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES) is fundamentally flawed</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES) is fundamentally flawed</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 14, 2005 / year-entry #37</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>25</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">There is a flag to the LoadLibraryEx function called DONT_RESOLVE_DLL_REFERENCES. The documentation says, If this value is used, and the executable module is a DLL, the system does not call DllMain for process and thread initialization and termination. Also, the system does not load additional executable modules that are referenced by the specified module. If...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+There is a flag to
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/loadlibraryex.asp">
+the <code>LoadLibraryEx</code> function</a>
+called
+<code>DONT_RESOLVE_DLL_REFERENCES</code>.
+The documentation says,
+</p>
+<blockquote CLASS=m>
+<p>
+If this value is used, and the executable module is a DLL,
+the system does not call
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/dllmain.asp">
+DllMain</a> for process and thread initialization and termination.
+Also, the system does not load additional executable modules
+that are referenced by the specified module. 
+</p>
+<p>
+If you are planning only to access data or resources in the DLL,
+it is better to use LOAD_LIBRARY_AS_DATAFILE.
+</p>
+</blockquote>
+<p>
+In my opinion, the above text that "suggests" the
+<code>LOAD_LIBRARY_AS_DATAFILE</code> flag is not strong enough.
+</p>
+<p>
+<code>DONT_RESOLVE_DLL_REFERENCES</code> is a time bomb.
+</p>
+<p>
+Look carefully at what the flag does and doesn't do.
+The module is loaded into memory, but its initialization
+function is not called and no dependent DLLs are loaded.
+[Typo fixed, 10am.]
+As a result, you cannot run code from this DLL.
+(More accurately, if you try, it will crash because the DLL
+hasn't initialized itself and none of its imports to
+DLLs have been resolved.)
+However, unlike the
+<code>LOAD_LIBRARY_AS_DATAFILE</code> flag,
+the loaded DLL <strong>can</strong> be found by
+<code>GetModuleHandle</code> and can be used by
+<code>GetProcAddress</code>.
+</p>
+<p>
+Clearly, <code>GetProcAddress</code> is a bad idea for
+something loaded by
+<code>DONT_RESOLVE_DLL_REFERENCES</code>, because
+as we already noted, you can't run any code from the DLL.
+What's the point of getting a procedure address from a DLL
+if you can't call it, after all?
+</p>
+<p>
+The <code>GetModuleHandle</code> part triggers the time bomb.
+</p>
+<p>
+It is common for somebody to call
+<code>GetModuleHandle</code> to see
+if a DLL is loaded, and if so, use
+<code>GetProcAddress</code> to get a procedure address and
+call it.  If the DLL had been loaded with
+<code>DONT_RESOLVE_DLL_REFERENCES</code>, both the
+<code>GetModuleHandle</code> will succeed, but the resulting
+function will crash when called.
+The code doing this has no idea that the DLL was loaded
+with
+<code>DONT_RESOLVE_DLL_REFERENCES</code>; it has no way
+of protecting itself.
+</p>
+<p>
+(Note that code that does this is unsafe anyway, because
+the code that originally loaded the DLL might decide to
+do a <code>FreeLibrary</code> on another thread, causing
+the code to be ripped out from underneath the first thread.
+This second problem can be "fixed" by using
+<code>GetModuleHandleEx</code>, which can be instructed to
+increment the DLL reference count, but that doesn't fix the
+first problem.)
+</p>
+<p>
+Even if you used <code>LoadLibrary</code> to load the DLL
+and passed that handle to <code>GetProcAddress</code>,
+you still crash, because the <code>LoadLibrary</code>
+notices that the DLL is already loaded and merely increments
+the reference count.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+
+typedef HINSTANCE (WINAPI *SXA)(HWND, LPCSTR, LPCSTR,
+                                LPCSTR, LPCSTR, int);
+
+int __cdecl main(int argc, char* argv[])
+{
+ if (argc &gt; 1) // set the time bomb
+  LoadLibraryEx("shell32.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
+
+ // victim code runs here
+ HINSTANCE h = LoadLibrary("shell32.dll");
+ if (h) {
+  SXA f = (SXA)GetProcAddress(h, "ShellExecuteA");
+  if (f) {
+   f(NULL, NULL, "notepad.exe", NULL, NULL, SW_SHOWNORMAL);
+  }
+  FreeLibrary(h);
+ }
+}
+</pre>
+<p>
+If you run this program with no command line arguments, then
+everything works just fine:  Notepad is launched without
+incident.
+However, if you pass a command line argument, this sets the time bomb,
+and the call to ShellExecuteA crashes in flames because
+shell32.dll was loaded without having its DLL references resolved.
+</p>
+<p>
+In other words,
+<code>DONT_RESOLVE_DLL_REFERENCES</code> is fundamentally flawed
+and should be avoided.
+It continues to exist solely for backwards compatibility.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (25)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-255173">
+				<div id="div-comment-255173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">fckgw</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255173">
+			February 14, 2005 at 7:15 am</a>		</div>
+
+		<p>Maybe the dll only exports data, not any functions?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255183">
+				<div id="div-comment-255183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gkdada</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255183">
+			February 14, 2005 at 7:16 am</a>		</div>
+
+		<p>Raymond, you are playing CarTalk puzzler now. WHAT backward compatibility?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255203">
+				<div id="div-comment-255203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gkdada</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255203">
+			February 14, 2005 at 7:18 am</a>		</div>
+
+		<p>I meant: for WHAT purpose was the flag originally used? was it used to mean LOAD_LIBRARY_AS_DATAFILE? Did they then realize the havoc and added the newer flag?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255243">
+				<div id="div-comment-255243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dmitry Shaporenkov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255243">
+			February 14, 2005 at 7:40 am</a>		</div>
+
+		<p>The sentence &quot;The module is loaded into memory, but its initialization function is called &#8230;&quot; should read &quot;is NOT called&quot;, right?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255253">
+				<div id="div-comment-255253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dmitry Shaporenkov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255253">
+			February 14, 2005 at 7:40 am</a>		</div>
+
+		<p>The sentence &quot;The module is loaded into memory, but its initialization function is called &#8230;&quot; should be &quot;is NOT called&quot;, right?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255263">
+				<div id="div-comment-255263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255263">
+			February 14, 2005 at 7:53 am</a>		</div>
+
+		<p>Isn&#8217;t it possible to write a DLL function without any imports? To do something at least a little useful, it could accept a callback pointer back into a module already loaded.</p>
+<p>If you just give the function the pointers to LoadLibrary and GetProcAddress, it can do everything it may ever need. Or maybe not?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255293">
+				<div id="div-comment-255293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Garlans</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255293">
+			February 14, 2005 at 8:38 am</a>		</div>
+
+		<p>Is there any situation where you would ever WANT to load a DLL without calling any of its initialization? Surely there are and have been better ways than, for example, extracting resources (AS_DATAFILE isn&#8217;t that new is it?)</p>
+<p>This particular flag seems to be way beyond the level of kludge you&#8217;d expect to find in a professional API like win32 :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255303">
+				<div id="div-comment-255303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.valhallalegends.com/skywing' rel='external nofollow' class='url'>Skywing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255303">
+			February 14, 2005 at 8:38 am</a>		</div>
+
+		<p>I&#8217;ve actually found this useful for when I&#8217;m doing some rather underhanded, hackish things .. but it&#8217;s definitely only useful in a few limited situations and only when you&#8217;re very sure of what you&#8217;re doing.</p>
+<p>In particular, I&#8217;ve used this when I&#8217;m going to be loading and then patching somebody else&#8217;s DLL before calling it, and I don&#8217;t want to have to carry around a lot of dependencies that are unnecessary for a small section of code I want to use.</p>
+<p>(No, I probably wouldn&#8217;t do anything like this in production code.  But I&#8217;ve found it useful when writing some specialized things for my own personal use.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255313">
+				<div id="div-comment-255313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.valhallalegends.com/skywing' rel='external nofollow' class='url'>Skywing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255313">
+			February 14, 2005 at 8:39 am</a>		</div>
+
+		<p>CN: No, it&#8217;s not possible.  LDR will refuse to load any image with an empty imports table.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255323">
+				<div id="div-comment-255323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Becke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255323">
+			February 14, 2005 at 9:30 am</a>		</div>
+
+		<p>I recall once making an EXE file that imported nothing at all. It seemed perfectly valid &#8211; a program that performs some unspecified task that involves no IO using OS functions then returns something.</p>
+<p>It would not start. It crashed &#8211; on Win2K &#8211; at an address where presumably Kernel32.dll should have been mapped.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255353">
+				<div id="div-comment-255353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PNgan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255353">
+			February 14, 2005 at 9:50 am</a>		</div>
+
+		<p>In my current project, we put resources for each supported language into a separate satellite dll, and load the appropriate dll when the application starts. These dll&#8217;s contain resources only.</p>
+<p>The LOAD_LIBRARY_AS_DATAFILE flag worked, with one exception; ::CreateDialogParam() would fail if the dialog contained an EDITTEXT control. The problem went away when DONT_RESOLVE_DLL_REFERENCES was used.</p>
+<p>This issue was mentioned in passing in the Windows Template Group ( <a target="_new" href="http://groups.yahoo.com/group/wtl/message/6298" rel="nofollow">http://groups.yahoo.com/group/wtl/message/6298</a>) so it seems that other people have observed the same behavior.</p>
+<p>Are resource only dll&#8217;s a legitimate case for using the DONT_RESOLVE_DLL_REFERENCES flag?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255453">
+				<div id="div-comment-255453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">wd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255453">
+			February 14, 2005 at 12:10 pm</a>		</div>
+
+		<p>I&#8217;ve used DONT_RESOLVE_DLL_REFERENCES in much the same manner as Skywing: the DLL was loaded, then the imports section was patched to call functions provided by me. I&#8217;ve found this to be pretty useful for emulating plugin API&#8217;s for example (and certainly never had any problems with it crashing).</p>
+<p>FTR I agree with Dmitry about the sentence change; I don&#8217;t recall DONT_RESOLVE_DLL_REFERENCES actually calling the initialization code (since, presumably, the init code would crash and burn if it relied on any of the imports being resolved).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255473">
+				<div id="div-comment-255473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/mgrier' rel='external nofollow' class='url'>Michael Grier [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255473">
+			February 14, 2005 at 2:08 pm</a>		</div>
+
+		<p>My team maintained this code during Windows XP development and my belief is that gkdada got it right in their second reply: the flag was added and then too late they figured that it was a time bomb.  It probably had already shipped so they had to just add yet another flag.</p>
+<p>Re: why it sometimes works when other things don&#8217;t:</p>
+<p>When you use LOAD_LIBRARY_AS_DATAFILE, the PE is mapped as a flag/linear data section.  Offsets in the PE headers and data tend to be RVAs (Relative Virtual Addresses), which are offsets from the image header, when mapped as a PE (such that the various image sections have their alignments applied correctly).</p>
+<p>So for images mapped as a data file, any code that has to peruse the PE has to understand how to remap the RVAs rather than just taking the HINSTANCE and adding the offset.  There&#8217;s standard code for it but we have been finding code paths over time that don&#8217;t always do it right.  Thus why mapping it as an image but not initializing it tended to work for certain situations.</p>
+<p>Some people want to &quot;fix&quot; it to make it work &quot;right&quot; but of course this will break compatibility just as badly as removing it.</p>
+<p>Re: why can&#8217;t you just use it when you know your DLL won&#8217;t have code:</p>
+<p>Ok, so the DLL you&#8217;re loading right now may not have code, or your comfortable not running the code, but what about in the future?  What if they add an initialization section just to fix up exported data?  What happens when someone else in the process wants to load it in order to run code?  Boom.</p>
+<p>Just try to avoid this flag.  It doesn&#8217;t work right and any uses of it are timebombs.  They may never go off before the end of time but that doesn&#8217;t mean that they&#8217;re not timebombs.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255493">
+				<div id="div-comment-255493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Muck</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255493">
+			February 14, 2005 at 2:46 pm</a>		</div>
+
+		<p>The real problem here is the documentation author&#8217;s attempt at political correctness. A part of the API like this flag that &#8212; I&#8217;m quoting Raymond &#8212; exists solely for reasons of backwards compatibility should be clearly marked as such:</p>
+<p>&quot;[bold]Deprecated.[/bold] This flag is inherently unsafe. (Explanation) (Safe Alternative).&quot; That was a direct quote from the Java API docs.</p>
+<p>Such a warning fulfills three purposes:<br />
+<br />a) clearly states that using X is a bad idea, and that X is preserved only for reasons of backwards compatibility.<br />
+<br />b) explains the reason for a).<br />
+<br />c) points to Y, a safe alternative for X.</p>
+<p>The quoted example from the docs &quot;it might be better to use Y&quot; is a half-hearted attempt at c). Somehow a) and b) were not important enough to be included in the docs, so they remain hidden in some blog written by some Microsoft employee to be found somewhere on the internet.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255503">
+				<div id="div-comment-255503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://perlmonks.org/?node=theorbtwo' rel='external nofollow' class='url'>James Mastros (theorbtwo)</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255503">
+			February 14, 2005 at 3:34 pm</a>		</div>
+
+		<p>I&#8217;m quite with Muck.  One of the reasons you keep having to support poor design decisions until the end of time is that people keep using them in new code, because they don&#8217;t know not to use them.  In some cases, the blame for that goes to the user &#8212; they didn&#8217;t read documentation, just saw an existing use somewhere, or they didn&#8217;t read enough of the documentation.  In this case, it&#8217;s all your (in the plural!) fault &#8212; you didn&#8217;t provide nearly enough warning not to use it.  In fact, &quot;If you are planning only to access data or resources in the DLL&#8230;&quot; suggests there are reasons to use DONT_RESOLVE_DLL_REFERENCES other then accessing data or resources.  (And, indeed, I would tend to say that even if you only access data or resources, then you should still run DllMain &#8212; if it does not have one, then nothing wasted, and if it does, it may well need to run.)<br />
+<br />Also, never, ever use the &quot;word&quot; DONT.  If you can not use an apostrophie, use DO_NOT.  It will either lead to typos, or, worse, lead people to think that DONT is a valid word.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255333">
+				<div id="div-comment-255333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.valhallalegends.com/skywing' rel='external nofollow' class='url'>Skywing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255333">
+			February 14, 2005 at 9:38 am</a>		</div>
+
+		<p>If you want to make an image that hard-imports nothing, then you should just import something from NTDLL.  NTDLL is always loaded into every process, unlike KERNEL32.  (KERNEL32 is loaded into every *Win32* process.  However, NTOSKRNL will map in NTDLL before anything else, so that&#8217;s always going to be present.  You might as well import from it and make LDR happy.  If you still care about Win9x, you can just dummy import one of the RtlExtended* math functions that the Win9x NTDLL implements and not have to worry about any unresolved symbols.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255463">
+				<div id="div-comment-255463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Charles Stanhope</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255463">
+			February 14, 2005 at 12:45 pm</a>		</div>
+
+		<p>I use this flag while enumerating a directory containing an unknown number of application specific DLLs that may or may not actually be used during the course of execution depending on the configuration and what the user does.  Once I enumerate a DLL, I unload it but save the interesting information away someplace.  If the DLL is later used, I load it in the normal fashion.</p>
+<p>This allows me to do two things.  One, I can retrieve constant data embedded in the DLLs that can be browsed by the user at runtime.  This works even if the DLL can&#8217;t actually be loaded and fully resolved because some other DLL it depends on hasn&#8217;t been installed on the system.  This is a benefit to the user and can help with debugging an installation.  </p>
+<p>Two, so I can *avoid* calling DllMain() on the DLL and any of its dependencies.  Why is this desirable?  Because I&#8217;ve had to use third party DLLs (often implicitly linked) that caused undesirable &quot;side effects&quot; just by executing their DllMain().  It&#8217;s nice to contain trouble when possible.</p>
+<p>Unfortunately, I discoverd that this flag appears to be ignored by Windows 95 and 98.  Fortunately, Windows 95 and 98 are on their way out (for the users of this application at any rate).</p>
+<p>Of course, I realize this is a very specific application of the flag.  The DLLs are designed to be used by the application and will not be implicitly linked to by other unkown pieces of code.  But the flag does have a use.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255593">
+				<div id="div-comment-255593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">wd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255593">
+			February 14, 2005 at 11:42 pm</a>		</div>
+
+		<p>If DONT_RESOLVE_DLL_REFERENCES became deprecated how would one produce their own psuedo-loader which just patched up the PE import table (which is what I&#8217;ve used DONT_RESOLVE_DLL_REFERENCES for in the past)? It seems to me that, rather than deprecating the use of DONT_RESOLVE_DLL_REFERENCES (or worse, dropping support for it), the documentation should be updated to highlight what exactly it could be used for (and then drop hints for the other flags/functions that can be used for other tasks).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255603">
+				<div id="div-comment-255603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/junfeng' rel='external nofollow' class='url'>Junfeng Zhang</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255603">
+			February 14, 2005 at 11:53 pm</a>		</div>
+
+		<p>Incidentally, the Unix version of LoadLibrary (dlopen) has options of RTLD_NOW and RTLD_LAZY, but it does not have an option of RTLD_NO. </p>
+<p><a target="_new" href="http://www.opengroup.org/onlinepubs/009695399/functions/dlopen.html" rel="nofollow">http://www.opengroup.org/onlinepubs/009695399/functions/dlopen.html</a></p>
+<p>All these three flags make sense in certain scenarios. </p>
+<p>It is interesting that both Windows and Unix miss one of the three.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255623">
+				<div id="div-comment-255623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Muck</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255623">
+			February 15, 2005 at 5:09 am</a>		</div>
+
+		<p>md, something being deprecated does not mean that you can&#8217;t use it. The flag won&#8217;t suddenly disappear. Being deprecated just means that you should have a very good reason to use it despite the clear warning.</p>
+<p>Why would a warning bother you? The flag is &quot;fundamentally flawed&quot;, as Raymond puts it, whether this fact is clearly indicated in the documentation or not.</p>
+<p>Maybe it&#8217;s the same reason why for many people, smoking &quot;feels better&quot; if the cigarette box doesn&#8217;t say &quot;SMOKING KILLS&quot;. Even though it doesn&#8217;t actually matter, because the effect is the same.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-255663">
+				<div id="div-comment-255663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://RussellOsterlund@adelphia.net' rel='external nofollow' class='url'>smidgeonsoft</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-255663">
+			February 15, 2005 at 7:40 am</a>		</div>
+
+		<p>Check out the following MSDN article for a discussion of what this flag does: <a target="_new" href="http://msdn.microsoft.com/msdnmag/issues/02/03/Loader/" rel="nofollow">http://msdn.microsoft.com/msdnmag/issues/02/03/Loader/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-256003">
+				<div id="div-comment-256003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">wd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-256003">
+			February 15, 2005 at 6:33 pm</a>		</div>
+
+		<p>Muck,</p>
+<p>Whether it&#8217;s flawed or not depends on what the original intended usage for it was. If the goal is to get at data in the DLL, the documentation is correct that you should use LOAD_LIBRARY_AS_DATAFILE. However, if your goal is API replacement, then DONT_RESOLVE_DLL_REFERENCES is the most reliable way of doing that.</p>
+<p>Unless someone from MS wants to step in and say what DONT_RESOLVE_DLL_REFERENCES was originally intended for, I&#8217;m going to stick with my idea that it was for taking over imports. ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-256283">
+				<div id="div-comment-256283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nektar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-256283">
+			February 17, 2005 at 3:26 am</a>		</div>
+
+		<p>Why don&#8217;t you clearly mark the api functions that exist only for backwards compatibility in the documentation so that developers writing new software will avoid them? IE you can move all the backwards compatibility functions in a special section of the documentation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-261283">
+				<div id="div-comment-261283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-261283">
+			March 5, 2005 at 3:31 pm</a>		</div>
+
+		<blockquote><p>
+  Are resource only dll&#8217;s a legitimate case for using the DONT_RESOLVE_DLL_REFERENCES flag?</p>
+<p>True resource only DLLs shouldn&#8217;t have any code, so neither flag should be necessary.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-662223">
+				<div id="div-comment-662223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.globalmapperforum.com/forums/sdk/2792-sdk-borland-c-builder-2008-a.html#post5216' rel='external nofollow' class='url'>SDK and Borland C++ Builder 2008 - Global Mapper Forum</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20050214-00/?p=36463#comment-662223">
+			August 26, 2008 at 9:10 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.globalmapperforum.com/forums/sdk/2792-sdk-borland-c-builder-2008-a.html#post5216" rel="nofollow">http://www.globalmapperforum.com/forums/sdk/2792-sdk-borland-c-builder-2008-a.html#post5216</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

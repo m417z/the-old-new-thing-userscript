@@ -1,0 +1,331 @@
+<html>
+<head>
+<title>Painting only when your window is visible on the screen</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Painting only when your window is visible on the screen</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 29, 2003 / year-entry #38</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Sometimes you want to perform an activity, such as updating a status window, only as long as the window is not covered by another window. The easiest way to determine this is by not actually trying to determine it. For example, here's how the taskbar clock updates itself: It computes how much time will elapse...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+        Sometimes you want to perform an activity, such as updating a status window, only
+        as long as the window is not covered by another window. 
+    </p>
+<p>
+        The easiest way to determine this is by not actually trying to determine it. For example,
+        here's how the taskbar clock updates itself: 
+    </p>
+<ol>
+<li>
+            It computes how much time will elapse before the next minute ticks over. 
+        </li>
+<li>
+            It calls <code>SetTimer</code> with the amount of time it needs to wait. 
+        </li>
+<li>
+            When the timer fires, it does an <code>InvalidateRect</code> of itself and the kills
+            the timer. 
+        </li>
+<li>
+            The <code>WM_PAINT</code> handler draws the current time, then returns to step 1. 
+        </li>
+</ol>
+<p>
+        If the taskbar clock is not visible, because it got auto-hidden or because somebody
+        covered it, Windows will not deliver a <code>WM_PAINT</code> message, so the taskbar
+        clock will simply go idle and consume no CPU time at all. Here's how we can make
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2003/07/23/54576.aspx">our
+        scratch program</a> do the same thing: 
+    </p>
+<p>
+        Our scratch program displays the current time. It also puts the time into the title
+        bar so we can see the painting action (or lack thereof) when the window is covered
+        or minimized, by watching the taskbar. 
+    </p>
+<pre>void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+    TCHAR szTime[100];
+    if (GetTimeFormat(LOCALE_USER_DEFAULT, 0, NULL, NULL,
+                      szTime, 100)) {
+        SetWindowText(hwnd, szTime);
+        TextOut(pps-&gt;hdc, 0, 0, szTime, lstrlen(szTime));
+    }
+}
+</pre>
+<p>
+        Here is the timer callback that fires once we decide it's time to update. It merely
+        kills the timer and invalidates the rectangle. The next time the window becomes uncovered,
+        we will get a <code>WM_PAINT</code> message. (And if the window is uncovered right
+        now, then we'll get one almost immediately.) 
+    </p>
+<pre>void CALLBACK
+InvalidateAndKillTimer(HWND hwnd, UINT uMsg,
+                       UINT_PTR idTimer, DWORD dwTime)
+{
+    KillTimer(hwnd, idTimer);
+    InvalidateRect(hwnd, NULL, TRUE);
+}
+</pre>
+<p>
+        Finally, we add some code to our <code>WM_PAINT</code> handler to restart the timer
+        each time we paint a nonempty rectangle. 
+    </p>
+<pre>void
+OnPaint(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    BeginPaint(hwnd, &amp;ps);
+    <font color="blue">if (!IsRectEmpty(&amp;ps.rcPaint)) {
+        // compute time to next update - we update once a second
+        SYSTEMTIME st;
+        GetSystemTime(&amp;st);
+        DWORD dwTimeToNextTick = 1000 - st.wMilliseconds;
+        SetTimer(hwnd, 1, dwTimeToNextTick, InvalidateAndKillTimer);
+    }</font>
+
+    PaintContent(hwnd,&amp;ps);
+    EndPaint(hwnd, &amp;ps);
+}
+</pre>
+<p>
+        Compile and run this program, and watch it update the time. When you minimize the
+        window or cover it with another window, the time stops updating. If you take the window
+        and drag it to the bottom of the screen so only the caption is visible, it also stops
+        updating: The <code>WM_PAINT</code> message is used to paint the client area, and
+        the client area is no longer on-screen. 
+    </p>
+<p>
+        This method also stops updating the clock when you switch to another user or lock
+        the workstation, though you can't really tell because there's no taskbar you can consult
+        to verify. But you can use your speakers: Stick a call to <code>MessageBeep(-1);</code> in
+        the <code>PaintContent()</code> function, so you will get an annoying beep each time
+        the time is repainted. When you switch to another user or lock the workstation, the
+        beeping will stop. 
+    </p>
+<p>
+        This technique of invalidation can be extended to cover the case where only one section
+        of the screen is interesting: Instead of invalidating the entire client area, invalidate
+        only the area that you want to update, and restart the timer only if that rectangle
+        is part of the update region. Here are the changes we need to make. 
+    </p>
+<pre>// The magic updating rectangle
+RECT g_rcTrigger = { 50, 50, 200, 100 };
+</pre>
+<p>
+        When the timer fires, we invalidate only the magic rectangle instead of the entire
+        client area. (As an optimization, I disabled background erasure for reasons you'll
+        see later.) 
+    </p>
+<pre>void CALLBACK
+InvalidateAndKillTimer(HWND hwnd, UINT uMsg,
+                       UINT_PTR idTimer, DWORD dwTime) {
+    KillTimer(hwnd, idTimer);
+    <font color="blue">InvalidateRect(hwnd, &amp;g_rcTrigger, FALSE);</font>
+}
+</pre>
+<p>
+        To make it more obvious where the magic rectangle is, we draw it in the highlight
+        color and put the time inside it. By using the <code>ETO_OPAQUE</code> flag, we draw
+        both the foreground and background simultaneously. Consequently, we don't need to
+        have it erased for us. 
+    </p>
+<pre>void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+    TCHAR szTime[100];
+    if (GetTimeFormat(LOCALE_USER_DEFAULT, 0, NULL, NULL,
+                      szTime, 100)) {
+        SetWindowText(hwnd, szTime);
+        COLORREF clrTextPrev = SetTextColor(pps-&gt;hdc,
+                            GetSysColor(COLOR_HIGHLIGHTTEXT));
+        COLORREF clrBkPrev = SetBkColor(pps-&gt;hdc,
+                                GetSysColor(COLOR_HIGHLIGHT));
+        ExtTextOut(pps-&gt;hdc, g_rcTrigger.left, g_rcTrigger.top,
+                   ETO_CLIPPED | ETO_OPAQUE, &amp;g_rcTrigger,
+                   szTime, lstrlen(szTime), NULL);
+        SetBkColor(pps-&gt;hdc, clrBkPrev);
+        SetTextColor(pps-&gt;hdc, clrTextPrev);
+    }
+}
+</pre>
+<p>
+        Finally, the code in the <code>WM_PAINT</code> handler needs to check the magic rectangle
+        for visibility instead of using the entire client area. 
+    </p>
+<pre>void
+OnPaint(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    BeginPaint(hwnd, &amp;ps);
+    if (<font color="blue">RectVisible(ps.hdc, &amp;g_rcTrigger)</font>) {
+        // compute time to next update - we update once a second
+        SYSTEMTIME st;
+        GetSystemTime(&amp;st);
+        DWORD dwTimeToNextTick = 1000 - st.wMilliseconds;
+        SetTimer(hwnd, 1, dwTimeToNextTick, InvalidateAndKillTimer);
+    }
+    PaintContent(hwnd,&amp;ps);
+    EndPaint(hwnd, &amp;ps);
+}
+</pre>
+<p>
+        Run this program and do various things to cover up or otherwise prevent the highlight
+        box from painting. Observe that once you cover it up, the title stops updating. 
+    </p>
+<p>
+        As I noted above, this technique is usually enough for most applications. There's
+        an even more complicated (and more expensive) method, too, which I'll cover next week. 
+    </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-122693">
+				<div id="div-comment-122693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Schroedl</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743#comment-122693">
+			August 29, 2003 at 12:57 pm</a>		</div>
+
+		<p>Cool tip!  Thanks, I&#8217;ll use this.</p>
+<p>John (eagerly awating part 9 of the scrollbar saga)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-122703">
+				<div id="div-comment-122703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Murph</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743#comment-122703">
+			August 30, 2003 at 1:24 pm</a>		</div>
+
+		<p>Thank you very much for posting this.  These seemingly little details are so important for quality programs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-122713">
+				<div id="div-comment-122713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Thom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743#comment-122713">
+			September 13, 2003 at 8:55 pm</a>		</div>
+
+		<p>Great stuff!</p>
+<p>Your declaration of InvalidateAndKillTimer is as follows:<br />
+  void CALLBACK InvalidateAndKillTimer(HWND hwnd, UINT uMsg, UINT_PTR idTimer, DWORD dwTime) { &#8230; }</p>
+<p>I had to change the type of idTimer to UINT to get it to compile (I&#8217;m using MS DevStudio 6.0).</p>
+<p>Is this a bug in your web page, or did I get something wrong?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-122723">
+				<div id="div-comment-122723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.gotdotnet.com/raymondc/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743#comment-122723">
+			October 8, 2003 at 8:44 pm</a>		</div>
+
+		<p>If you don&#8217;t have a definition for UINT_PTR, you need to get an updated Platform SDK. UINT_PTR is a special type that allows you to port your code to 64-bit Windows.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-350633">
+				<div id="div-comment-350633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.syncadia.com/blogs/st_jh/archive/2006/02/28/95.aspx' rel='external nofollow' class='url'>Simon Thorneycroft and Jonathan Hodgson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743#comment-350633">
+			February 28, 2006 at 2:54 pm</a>		</div>
+
+		<p>If you are writing rich-client applications for the Windows desktop there are lots of little touches&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-388743">
+				<div id="div-comment-388743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/06/07/620776.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20030829-00/?p=42743#comment-388743">
+			June 7, 2006 at 10:00 am</a>		</div>
+
+		<p>Otherwise you end up creating the impossible.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

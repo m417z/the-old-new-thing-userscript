@@ -1,0 +1,270 @@
+<html>
+<head>
+<title>Lock free many-producer/single-consumer patterns: A work queue with task coalescing</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock free many-producer/single-consumer patterns: A work queue with task coalescing</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 21, 2016 / year-entry #244</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>7</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Starting out simple.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today we're going to implement a very simple producer/consumer
+pattern:
+There are many producers who are producing work,
+and a single consumer who processes the work.
+The work is all identical, and it is idempotent.
+That means that doing the work twice is the same
+as doing it once.
+</p>
+<p>
+You see this pattern when the work is something
+like <i>Refresh</i>.
+Refreshing once is the same as refreshing twice,
+as long as the single refresh is the last one.
+</p>
+<p>
+The na&iuml;ve way of doing this is to avoid
+the coalescing at all and have each refresh
+request notify the consumer to perform a refresh.
+This means, however, that if a thousand
+refresh requests come in rapid succession,
+the consumer thread will perform a thousand
+refreshes,
+nearly all of which were unnecessary.
+</p>
+<p>
+A less na&iuml;ve solution is to
+have a flag that says whether a refresh was requested.
+The first person to request a refresh wakes up
+the consumer.
+The second and subsequent people
+to request a refresh merely
+reminds the consumer that another refresh request
+arrived.
+When the consumer wakes up, it performs
+an atomic test-and-reset of the flag.
+If set, then it performs a refresh,
+and then it goes back and performs another
+test-and-reset of the flag to see whether
+a refresh request arrived while the previous
+one was in progress.
+</p>
+<pre>
+LONG RefreshRequested;
+
+void RequestRefresh()
+{
+ if (!InterlockedExchange(&amp;RefreshRequested, TRUE)) {
+  // You provide the WakeConsumer() function.
+  WakeConsumer();
+ }
+}
+
+// You call this function when the consumer receives the
+// signal raised by WakeConsumer().
+void ConsumeRefresh()
+{
+ while (InterlockedExchange(&amp;RefreshRequested, FALSE)) {
+  Refresh();
+ }
+}
+</pre>
+<p>
+Note that we wake the consumer only on the transition
+from <code>FALSE</code> to <code>TRUE</code>.
+(In the lingo, the consumer is <i>edge-triggered</i>
+rather than <i>level-triggered</i>.)
+This reduces traffic between the two threads,
+which is important if your communication channel
+is something like <code>Post&shy;Message</code>,
+because you don't want to spam the message queue
+with 10,000 identical messages.
+Not only does this cause <code>Consume&shy;Refresh</code>
+to run 9,999 times more than necessary,
+but you run the risk of
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20090126-00/?p=19393">
+overflowing your message queue</a>.
+</p>
+<p>
+Remember, there is only one consumer,
+so if <code>Wake&shy;Consumer</code> is called
+while <code>Consume&shy;Refresh</code> is still
+running, the wake will not start a new consumer
+immediately.
+It will wait for the existing
+<code>Consume&shy;Refresh</code> to complete
+before starting a new
+<code>Consume&shy;Refresh</code>.
+</p>
+<p>
+Okay, that scenario was easy.
+We're still warming up.
+More next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (7)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1274555">
+				<div id="div-comment-1274555" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1274555">
+			November 22, 2016 at 2:24 am</a>		</div>
+
+		<p>OK, I&#8217;ll bite; I can&#8217;t see the point of the double test. In fact, I wouldn&#8217;t even test the flag at wake up, since only a new refresh could cause a wake. The flag then remains set until the refresh completes, and only then would I reset it. (There&#8217;s also probably a good reason why I&#8217;d still have to reset it atomically, but I&#8217;d have to go back and reread your previous posts to remind myself why.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1274565">
+				<div id="div-comment-1274565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1274565">
+			November 22, 2016 at 2:30 am</a>		</div>
+
+		<p>Not sure where there is a double test. Each function has only one test. And in the consumer, if you test at the end of the loop instead of the beginning, you end up performing two refreshes in response to a single refresh request.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1274705">
+				<div id="div-comment-1274705" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1274705">
+			November 23, 2016 at 2:26 am</a>		</div>
+
+		<p>&#8220;If set, then it performs a refresh, and then it goes back and performs another test-and-reset of the flag to see whether a refresh request arrived while the previous one was in progress&#8221; is what I meant by double test. And in my mind, the consumer needs no tests at all, since the wake counts as the test. But the real answer to my question turns out to be that this is the base case of the pattern since otherwise the derived cases wouldn&#8217;t make sense. (Where&#8217;s that time machine when you need it?)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-4 parent" id="comment-1274725">
+				<div id="div-comment-1274725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1274725">
+			November 23, 2016 at 6:51 am</a>		</div>
+
+		<p>Ah, I see. Yes, the next Wake will kick the consumer. The idea here is that since the Refresh code is now in cache, you may as well opportunistically do more updates while the going is still cheap. And, as you noted, it&#8217;s a base case for future exploration where looping back may be non-optional. (The extra test is there in case there are spurious wakes. A number of synchronization primitives allow spurious wakes, so we may as well protect against them.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1274865">
+				<div id="div-comment-1274865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1274865">
+			November 24, 2016 at 2:32 am</a>		</div>
+
+		<p>Ah, spurious wakes and opportunistic refreshes, that makes much more sense now, thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jan-ringos odd alt thread-odd thread-alt depth-1" id="comment-1274755">
+				<div id="div-comment-1274755" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Jan+Ringo%C5%A1' rel='external nofollow' class='url'>Jan Ringoš</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1274755">
+			November 23, 2016 at 8:19 am</a>		</div>
+
+		<p>In this case I&#8217;d probably just use SetEvent, although it&#8217;s likely not as efficient.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1275055">
+				<div id="div-comment-1275055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://firstclassthoughts.co.uk' rel='external nofollow' class='url'>Kasper</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20161121-00/?p=94755#comment-1275055">
+			November 27, 2016 at 2:11 pm</a>		</div>
+
+		<p>I once measured the speed of the lock construct. It&#8217;s surprisingly fast and less confusing to the eye. See the measurements here  <a href="http://firstclassthoughts.co.uk/Articles/Programming/DotNetLocksAreReallyFast.html" rel="nofollow">http://firstclassthoughts.co.uk/Articles/Programming/DotNetLocksAreReallyFast.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

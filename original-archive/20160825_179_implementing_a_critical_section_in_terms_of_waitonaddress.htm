@@ -1,0 +1,367 @@
+<html>
+<head>
+<title>Implementing a critical section in terms of WaitOnAddress</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Implementing a critical section in terms of WaitOnAddress</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 25, 2016 / year-entry #180</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Building things out of other things.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<!-- backref: Implementing a synchronization barrier in terms of WaitOnAddress -->
+Last time</a>,
+we built a synchronization barrier out of
+<code>Wait&shy;On&shy;Address</code>.
+Today, we'll build a critical section.
+Remember that this is an exercise just to demonstrate
+ways of using
+<code>Wait&shy;On&shy;Address</code>;
+in real life, you should just use
+<code>Enter&shy;Critical&shy;Section</code>
+because it has stuff like spin counts
+and
+<a HREF="http://joeduffyblog.com/2006/12/14/anticonvoy-locks-in-windows-server-2003-sp1-and-windows-vista/">
+lock convoy resistance</a>.
+</p>
+<p>
+Okay, enough with the warnings. Let's try it.
+</p>
+<pre>
+struct ALTCS
+{
+  DWORD OwnerThread;
+  LONG ClaimCount;
+};
+
+void InitializeAltCS(ALTCS* Cs)
+{
+    Cs-&gt;OwnerThread = 0;
+    Cs-&gt;ClaimCount = 0;
+}
+</pre>
+<p>
+Our alternative critical section
+keeps track of its owner and the number
+of times the owner thread (if any) has
+entered the critical section.
+If the owner thread is zero,
+then the critical section is available.
+</p>
+<pre>
+void EnterAltCs(ALTCS* Cs)
+{
+  DWORD ThisThread = GetCurrentThreadId();
+  while (true) {
+    DWORD PreviousOwner = InterlockedCompareExchangeAcquire(
+               &amp;Cs-&gt;OwnerThread, ThisThread, 0);
+    if (PreviousOwner == 0) {
+      Cs-&gt;ClaimCount++;
+      return;
+    }
+
+    if (PreviousOwner == ThisThread) {
+      Cs-&gt;ClaimCount++;
+      return;
+    }
+
+    WaitOnAddress(&amp;Cs-&gt;OwnerThread,
+                  &amp;PreviousOwner, sizeof(PreviousOwner), INFINITE);
+  }
+}
+</pre>
+<p>
+To enter the critical section,
+we try to change the owner from nobody to ourselves.
+If that succeeds,
+then we increment the claim count (from zero to one)
+and we're done.
+Note that the increment doesn't need to be interlocked,
+because only the owner thread will manipulate the claim
+count, and we are the owner.
+</p>
+<p>
+If the attempt to change the owner from nobody to ourselves
+fails because we are already the owner,
+then great!
+Increment the claim count and we're done.
+</p>
+<p>
+Otherwise, the critical section is owned by somebody else.
+This means we have to wait.
+Use
+<code>Wait&shy;On&shy;Address</code> to wait for the
+owner to change,
+after which we go back
+and try to claim the critical section again.
+There's a wrinkle here:
+As written,
+it looks like we will wake up when the critical section
+becomes free (owner is zero)
+or when it becomes claimed by another thread
+(owner is nonzero).
+But look at this function:
+When the
+<code>Interlocked&shy;Compare&shy;Exchange&shy;Acquire</code>
+succeeds,
+which means that the critical section owner
+has changed to a nonzero value,
+we do not call
+<code>Wake&shy;By&shy;Address&shy;Xxx</code>.
+This means that the
+<code>Wait&shy;On&shy;Address</code>
+does not wake when the critical section becomes claimed.
+As we'll see below, we wake the wait only
+when the critical section becomes available.
+(Of course, you also have to worry about spurious wakes.)
+</p>
+<p>
+Next comes the code to leave the critical section:
+</p>
+<pre>
+void LeaveAltCs(ALTCS* Cs)
+{
+  Cs-&gt;ClaimCount--;
+  if (Cs-&gt;ClaimCount != 0) {
+     return;
+  }
+
+  InterlockedExchange(&amp;Cs-&gt;OwnerThread, 0);
+
+  WakeByAddressSingle(&amp;Cs-&gt;OwnerThread);
+}
+</pre>
+<p>
+Only the thread that owns the critical section is allowed
+to leave it, so we can assume that
+the <code>Owner&shy;Thread</code> is the current thread.
+Decrement the claim count, and if it hasn't dropped
+to zero, then the critical section remains claimed,
+and we're done.
+</p>
+<p>
+If the claim count drops to zero, then we release the
+critical section by setting the owner to zero.
+Note that we use an interlocked operation to ensure that
+the
+claim count is published as zero before the owner thread
+is cleared.
+(Ideally, we'd use
+<code>Interlocked&shy;Exchange&shy;Release</code> if such
+a thing existed.
+I guess we could have done
+</p>
+<pre>
+  InterlockedCompareExchangeRelease(
+    &amp;Cs-&gt;OwnerThread, 0, Cs-&gt;OwnerThread);
+</pre>
+<p>
+because we know that no other thread can change
+the owner.)
+</p>
+<p>
+Once we've set the owner to zero, indicating that the
+critical section is available,
+we use
+<code>Wake&shy;By&shy;Address&shy;Single</code>
+to wake up just one waiting thread (if any).
+</p>
+<p>
+Next time, we'll peek behind the curtain of
+<code>Wait&shy;On&shy;Address</code> a little bit.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1262225">
+				<div id="div-comment-1262225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Craig</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262225">
+			August 25, 2016 at 7:56 am</a>		</div>
+
+		<p>&#8220;Ideally, we&#8217;d use Interlocked­Exchange­Release if such a thing existed.&#8221;<br />
+You seem to be using InterlockedExchange as an atomic store.  You aren&#8217;t looking at the old value in this example.<br />
+If your compiler supports C11 (yes, C11, not C++11), then you can do this to get the effect you want:<br />
+  atomic_store_explicit(&amp;OwnerThread, 0, memory_order_release);<br />
+With C++11, you can do the same thing, but you need to use atomic all over the place, and that would make calling WakeByAddressSingle (WBAS) and WaitOnAddress (WOA) more awkward.</p>
+<p>I do think you should be using a full InterlockedCompareExchange in your enter function.  Typically, locks provide full sequential consistency, and not just acquire-release guarantees.  The WakeByAddressSingle provides the full seq-cst guarantee on the exit side of things.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1262235">
+				<div id="div-comment-1262235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">lucidfox</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262235">
+			August 25, 2016 at 8:58 am</a>		</div>
+
+		<p>So what happens if the owning thread signals the address between the entering thread calling InterlockedCompareExchangeAcquire and WaitOnAddress?</p>
+<p>Imagine this sequence:</p>
+<p>1. Thread A calls InterlockedCompareExchangeAcquire and sees that the owning thread is neither 0 nor itself.<br />
+2. Thread B leaves the ALTCS and calls WakeByAddressSingle.<br />
+3. Thread A calls WaitOnAddress.</p>
+<p>Since thread A missed the wake, it seems to me that it will be stuck waiting on a now-unowned ALTCS, possibly forever.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1263315">
+				<div id="div-comment-1263315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1263315">
+			September 2, 2016 at 8:13 am</a>		</div>
+
+		<p>When thread A calls WaitOnAddress, the WaitOnAddress function notices that the value is already different from the undesirable value and returns immediately.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ipoverscsi odd alt thread-even depth-1 parent" id="comment-1262255">
+				<div id="div-comment-1262255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ipoverscsi' rel='external nofollow' class='url'>ipoverscsi</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262255">
+			August 25, 2016 at 12:02 pm</a>		</div>
+
+		<p>I&#8217;m a little confused by the use of InterlockedCompareExchangeAcquire() in the EnterAltCs() implementation.</p>
+<p>If I understand acquire/release correctly, the acquire semantics means that no code below that statement can moved via optimization above the acquire line.  But looking at the sequence of operations and how the data flows through the function, it would seem impossible for any statement to be re-ordered and maintain correct behavior. </p>
+<p>It seems that the implementation implies acquire/release semantics by it&#8217;s very nature, so why even use the somewhat weaker InterlockedCompareExchangeAcquire()?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1262285">
+				<div id="div-comment-1262285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262285">
+			August 25, 2016 at 2:57 pm</a>		</div>
+
+		<p>There are several orderings involved and they are only loosely coupled:</p>
+<p>The order of operations in the instructions emitted by the compiler.  As you say, data dependencies imply the correct order in this case.</p>
+<p>The order in which the instructions are executed by the CPU.</p>
+<p>The order in which writes to memory are flushed from cache to main memory.</p>
+<p>The order in which writes to memory become visible to other CPUs.</p>
+<p>The Acquire/Release semantics are needed in this case to constrain the last ordering.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1262305">
+				<div id="div-comment-1262305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262305">
+			August 25, 2016 at 3:38 pm</a>		</div>
+
+		<p>It&#8217;s Acquire because there&#8217;s no need to wait for writes that occurred outside the critical section to be retired before the critical section is entered. Those writes happened outside the critical section; they are already unordered!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1262446">
+				<div id="div-comment-1262446" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kme</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262446">
+			August 28, 2016 at 7:51 pm</a>		</div>
+
+		<p>ipoverscsi: It needs to be Acquire because the entire EnterAltCs() function needs to have Acquire semantics in the code that it&#8217;s called from.  You can&#8217;t have writes inside the critical section being migrated before the call that enters the critical section.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-winterberg odd alt thread-odd thread-alt depth-1" id="comment-1262275">
+				<div id="div-comment-1262275" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Michael+Winterberg' rel='external nofollow' class='url'>Michael Winterberg</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160825-00/?p=94165#comment-1262275">
+			August 25, 2016 at 1:52 pm</a>		</div>
+
+		<p>This being the blog that it is, I&#8217;m assuming the answer is going to be &#8220;what do you think?&#8221;, but:<br />
+Relating to the thought of &#8220;InterlockedExchangeRelease would be nice if it existed&#8221;, starting possibly with the Windows 8 SDK, winnt.h gained several intriguingly named functions, like ReadAcquire, WriteRelease. However, they&#8217;re not documented. Are they not documented because they&#8217;re not supported? Or are they not documented because &#8220;oops, missed them&#8221;?<br />
+Since you&#8217;ve had two opportunities to use them alongside other Win8+ features, I&#8217;m assuming not supported, but there seems to be little harm in asking for clarification.<br />
+It also seems like they&#8217;re only defined for desktop apps, but these three functions are listed as supported for Store apps, too. So that&#8217;d be another reason for you not using them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

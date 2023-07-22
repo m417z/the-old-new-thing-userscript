@@ -1,0 +1,520 @@
+<html>
+<head>
+<title>The dangers of mixing synchronous and asynchronous state</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The dangers of mixing synchronous and asynchronous state</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 18, 2009 / year-entry #181</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The window manager distinguishes between synchronous state (the state of the world based on what messages your program has received) and asynchronous state (the actual state of the world this very instant). We saw this earlier when discussing the difference between GetKeyState and GetAsyncKeyState. Here are some other functions and their relationship to the queue...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The window manager distinguishes between synchronous state
+(the state of the world based on what messages your program
+has received)
+and asynchronous state (the actual state of the world this very instant).
+We saw this earlier when discussing
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/11/30/272262.aspx">
+the difference between <code>GetKeyState</code> and
+<code>GetAsyncKeyState</code></a>.
+Here are some other functions and their relationship to the queue state:
+</p>
+<table BORDER=1 BORDERCOLOR=black RULES=all STYLE="border-collapse: collapse">
+<tr>
+<th>Use synchronous state</th>
+<th>Use asynchronous state</th>
+</tr>
+<tr>
+<td><code>GetActiveWindow</code></td>
+<td><code>GetForegroundWindow</code></td>
+</tr>
+<tr>
+<td><code>GetMessagePos</code></td>
+<td><code>GetCursorPos</code></td>
+</tr>
+<tr>
+<td><code>GetMessageTime</code></td>
+<td><code>GetTickCount</code></td>
+</tr>
+</table>
+<p>
+If you query the asynchronous state while processing a message,
+you can find yourself caught in a race condition,
+because the synchronous state of the system when the message was generated
+may not match the asynchronous state of the system when you receive it.
+For example, if the users presses a key, and then moves the mouse,
+calling <code>GetCursorPos</code> from your keypress handler
+will tell you were the cursor is right now,
+which is not the same as where the cursor was when the key was pressed.
+</p>
+<p>
+Generally speaking, you should use the synchronous state during message
+handling so that you react to the state of the system at the time the
+input event took place.
+Reacting to the asynchronous state of the system introduces race
+conditions if there is a change to the system state between the time
+the message was generated and the time the message is processed.
+</p>
+<p>
+Of the above functions, <code>GetTickCount</code> is the only one
+I can think of that has a legitimate usage pattern in common use,
+namely, when creating timing loops.
+But if you want to know what time it was when
+a key was pressed, then
+<code>GetMessageTime</code> is the function to use.
+</p>
+<p>
+This is all a rather length lead-in for my remarks regarding
+a comment claiming that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/05/23/8535427.aspx#8550623">
+there is no practical reason why you can't use
+<code>GetForegroundWindow</code> to determine which window
+was the one that had focus when a keyboard message was generated</a>.
+Well, actually, there is, and it's precisely the race condition
+I've spent most of this article describing.
+Suppose the user presses a key
+and then switches to another program.
+Now your program gets around to processing the keyboard input,
+and you call <code>GetForegroundWindow</code>,
+and instead of getting a window from your application,
+you get some other window from another program.
+You then pass that window handle to <code>TranslateAccelerator</code>,
+the keyboard event matches an entry in the accelerator,
+and boom, you just sent a random <code>WM_COMMAND</code> message
+to a program that will interpret it to mean something completely
+different.
+</p>
+<p>
+Remember, just because your program has the line
+</p>
+<pre>
+#define IDC_REFRESH    814
+</pre>
+<p>
+doesn't mean that another program can't have the line
+</p>
+<pre>
+#define IDC_DELETEALL  814
+</pre>
+<p>
+Now the user presses <code>F5</code> and switches from your program
+to that other program.
+Your program processes the message, queries the <i>asynchronous</i>
+foreground state with <code>GetForegroundWindow</code>, and gets
+that other program's window back.
+You then translate the accelerator, and <code>TranslateAccelerator</code>
+posts the <code>WM_COMMAND(814)</code> message to that other program,
+which interprets it as "delete all".
+</p>
+<p>
+The great thing about this is that the users will probably blame the
+other program.
+"Sometimes, when I use this program, it spontaneously deletes all my
+items.
+Stupid program.
+It's so buggy."
+</p>
+<p>
+Commenter poenits correctly points out that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/05/23/8535427.aspx#8545605">
+I failed to take into account the case where the message is posted
+directly to the dialog</a>.
+(The dialog manager tries not to put keyboard focus on the dialog itself,
+but if you play weird games, you can find yourself backed into that
+situation, such as if you delete all the controls on a dialog!)
+The fix, however, is not to translate the message directly to the
+window with keyboard focus, because the window with keyboard focus
+might belong to a <i>third</i> dialog that you don't want to translate
+accelerators for.
+(That other window might have used the other header file which defines
+message 814 to be <code>IDC_DELETEALL</code>.)
+Just check for your specific window directly:
+</p>
+<pre>
+if (hwnd1== msg.hwnd || IsChild(hwnd1, msg.hwnd))
+    TranslateAccelerator(hwnd1, hAccel, &amp;msg);
+else if (hwnd2 == msg.hwnd || IsChild(hwnd2, msg.hwnd))
+    TranslateAccelerator(hwnd2, hAccel, &amp;msg);
+</pre>
+<p>
+Think of <code>TranslateAccelerator</code> as
+<code>MaybePostWM_COMMAND</code>.
+The first parameter to <code>TranslateAccelerator</code> must
+be a window you are certain knows how to
+interpret the <code>WM_COMMAND</code> message that you might
+end up posting.
+You know which windows understand your custom <code>WM_COMMAND</code>
+messages.
+Pass one of those known windows, not some random unknown window that
+you calculated from unknown sources.
+</p>
+<p>
+Passing an unknown window as the first parameter to
+<code>TranslateAccelerator</code>
+is like
+falling for one of those phishing scams.
+If you get a random piece of email telling you "Hey, call this
+number and give me your personal information,"
+you're not going to do it.
+If you really want to contact your bank,
+you ignore the phone number in the email
+and just call the number you know and trust to be your bank's
+service desk.
+Similarly, you shouldn't be posting your personal messages to 
+some random window you receive.
+Post it to the known trusted window.
+Otherwise you're just sending your money
+to some unknown recipient in Nigeria.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-747523">
+				<div id="div-comment-747523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexandre Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747523">
+			June 18, 2009 at 10:22 am</a>		</div>
+
+		<p>One example when you just can&#8217;t get the synchronous mouse position is when you want to display a context menu in response to the click on your icon in the tray.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747543">
+				<div id="div-comment-747543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747543">
+			June 18, 2009 at 10:36 am</a>		</div>
+
+		<p>This is one of the things people &quot;just don&#8217;t get&quot; about Win32 programming. &nbsp;Perhaps it would help if APIs were tagged and separated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-747593">
+				<div id="div-comment-747593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747593">
+			June 18, 2009 at 11:47 am</a>		</div>
+
+		<p>Isn&#8217;t GetFocus the right way to get the focused window? Most likely you care about the focus in your particular thread.</p>
+<p>BTW, the docs for GetFocus mention GetForegroundWindow so maybe that&#8217;s why people use it instead.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747613">
+				<div id="div-comment-747613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747613">
+			June 18, 2009 at 12:24 pm</a>		</div>
+
+		<p>OK, I realise that back when Win32 was created, passing an extra pointer parameter to a function involved something like 3 extra instructions which is clearly a performance hit you didn&#8217;t want to incur, but in this day and age is it really too much to ask for an API which does not rely on hidden/opaque global state?</p>
+<p>How about:</p>
+<p>DWORD GetCursorPosEx(LPMSG lpMsg);</p>
+<p>HWND GetForegroundWindow(LPMSG lpMsg);</p>
+<p>If lpMsg is non-NULL, it gets the data (cursor position, foreground window) as was at the time the message was created. If lpMsg is NULL, it gets the async data.</p>
+<p>Less &#8220;magic&#8221;, more understandable, harder to misuse.</p>
+<p>Global variables/state; just say &#8220;no^H^Hsurely there must be a better way&#8221;</p>
+<div class=post>[<i>There is not enough information in a <code>MSG</code> structure to uniquely identify the message. Each time a timer ticks, the exact same <code>MSG</code> structure is returned, even though the mouse may very well have been in a different position at each tick. (And what happens if you pass in a message that was generated 5 minutes ago? Does the window manager have to remember all message history so it can produce this information on the off chance somebody asks for it an hour from now?) The window manager remembers the current state. If you want older state, you&#8217;ll have to save it yourself. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-747643">
+				<div id="div-comment-747643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bob</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747643">
+			June 18, 2009 at 1:52 pm</a>		</div>
+
+		<p>Karellen: People would just pass NULL by default anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747683">
+				<div id="div-comment-747683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Duran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747683">
+			June 18, 2009 at 4:24 pm</a>		</div>
+
+		<p>Very interesting post. &nbsp;</p>
+<p>This seems like a very subtle problem. &nbsp;I&#8217;ve definitely coded this brokenly before (and I&#8217;ve put a TODO on my list to fix this in my code). &nbsp;</p>
+<p>This really raises the question, though, of why the window manager/message queue was designed to ever allow this broken pattern. &nbsp;One could imagine different designs that would disallow this, or have the default case do the right thing.</p>
+<p>Stuff like this is, IMO, one of the main differentiators between OSes (or frameworks in general). &nbsp;If it&#8217;s hard for developers to program your framework properly, you&#8217;re going to have a lot of subtly buggy apps. &nbsp;Users will then have a negative opinion of it.</p>
+<p>I&#8217;d love to see a breakdown of &#8220;ease of programmability&#8221; for various areas across major OSes (Windows, Linux, &#8230;).</p>
+<div class=post>[<i>The alternative is&#8230; what? Support only synchronous state queries? (What if somebody wants the asynchronous state?) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-747713">
+				<div id="div-comment-747713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://arnshea.blogspot.com/' rel='external nofollow' class='url'>arnshea</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747713">
+			June 18, 2009 at 4:37 pm</a>		</div>
+
+		<p>A similar problem exists in Windows Forms when handling control events.</p>
+<p>As far as I can tell the best you can do is to create your own synchronous state. &nbsp;At least you&#8217;re processing with respect to a (mostly) single point in time&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747763">
+				<div id="div-comment-747763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Steve Thresher</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747763">
+			June 18, 2009 at 5:25 pm</a>		</div>
+
+		<p>Yet another gem! Keep &#8217;em coming Raymond.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-747773">
+				<div id="div-comment-747773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747773">
+			June 18, 2009 at 5:42 pm</a>		</div>
+
+		<p>I guess this is why, when I ctrl+shift+click on a link in Opera, I need to keep the modifiers held down until the new tab has opened or the modifiers are ignored. It catches me out all the time.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747843">
+				<div id="div-comment-747843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747843">
+			June 18, 2009 at 7:16 pm</a>		</div>
+
+		<p>&#8220;There is not enough information in a MSG structure to uniquely identify the message.&#8221;</p>
+<p>Oh, Sorry. I assumed that when you called GetMessage(), the out parameter which received a copy of the message data, received a copy of the message data, which specifically included the window handle, {l,w}param, time and cursor position for that message.</p>
+<div class=post>[<i>Post WM_USER twice within the same millisecond. The MSG structures will be identical. And how long a message history should the window manager retain? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-747853">
+				<div id="div-comment-747853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747853">
+			June 18, 2009 at 7:23 pm</a>		</div>
+
+		<p>Oops. Premature submission. Anyway&#8230;</p>
+<p>&#8220;Each time a timer ticks, the exact same MSG structure is returned&#8221;</p>
+<p>Huh? Are you required to pass a pointer to the same MSG structure each time you call GetMessage() or something? I don&#8217;t see that documented.</p>
+<p>&#8220;Does the window manager have to remember all message history so it can produce this information on the off chance somebody asks for it an hour from now? [&#8230;] If you want older state, you&#8217;ll have to save it yourself&#8221;</p>
+<p>Yeah, I was sort of assuming that if you wanted to keep message history around, you&#8217;d just do that yourself with your own managed set of MSG structures. That was the point I was trying to make.</p>
+<p>Although, I&#8217;m not entirely clear on the point of the synchronous functions. Why not just access the members of the MSG structure directly?</p>
+<div class=post>[<i>Oh, you&#8217;re suggesting that the operating system track each MSG structure by its address. &#8220;Somebody&#8217;s passing me (MSG*)0x00419148, ah the last time I filled in that MSG structure was this message here, now let me go look up whether the &#8216;A&#8217; key was up or down at that time.&#8221; How long does it keep track of all these message pointers before it says, &#8220;Sorry, that was too long ago, I no longer have information about the state of the keyboard at that time&#8221;? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747873">
+				<div id="div-comment-747873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.henning.makholm.net/' rel='external nofollow' class='url'>HEnning Makholm</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747873">
+			June 18, 2009 at 7:51 pm</a>		</div>
+
+		<p>Karellen: Another reason this will not work well is that the window procedure does not get to see the MSG structure, only a few selected fields from it. So code called from the window procedure (i.e., most everything UI-related in a typical app) would not be able to call your functions anyway.</p>
+<p>If we were to start from scratch and design a windowing system that did not have to be source code compatible with anything in existence, event handlers would probably receive pointers to a much richer event structure than what fits in the few WndProc arguments, including all this kind of synchronous information &#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-748023">
+				<div id="div-comment-748023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-748023">
+			June 19, 2009 at 8:42 am</a>		</div>
+
+		<p>&#8220;There is not enough information in a MSG structure to uniquely identify the message.&#8221;</p>
+<p>Even if the window procedure did receive the full MSG structure, and even if that was enough to identify the message, it&#8217;s not enough to implement functions like GetKeyState().</p>
+<p>For a notional GetMsgKeyState( MSG *pMsg, int nVirtKey ) you&#8217;d need to know the position of every key in the keyboard at the time the MSG was generated. That information is not stored in MSG. Raymond was hinting it could be stored in a history somewhere, with the MSG as an index. An alternative would be to massively increase the size of MSG to include it, and all other state available synchronously. Both approaches have more overhead than the feature is worth.</p>
+<div class=post>[<i>Putting the state in the MSG structure is a non-starter because it prevents new synchronous state from being added in the future. &#8220;We want to add a synchronous InSendMessageEx function but, oh, we can&#8217;t because there&#8217;s no room in the MSG structure for the additional state bits. I guess we can provide only an async version, even though that has race conditions.&#8221; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-747963">
+				<div id="div-comment-747963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-747963">
+			June 19, 2009 at 2:41 am</a>		</div>
+
+		<p>&quot;Oh, you&#8217;re suggesting that the operating system track each MSG structure by its address.&quot;</p>
+<p>Sorry, I&#8217;m having a &quot;understanding the prerequisites&quot; failure, and explaining myself really badly.</p>
+<p>The &quot;understanding the prerequisites&quot; failure was (as HEnning Makholm poitned out) me forgetting that the window procedure does not receive the lpMsg parameter passed to DispatchMessage(), but instead just a few select fields from it. So it doesn&#8217;t have all the information that I thought it did. (Why not?)</p>
+<p>As for explaining myself, I was trying to suggest that the OS not track MSG structures at all. Instead of hanging on to *more* data in &quot;magic&quot; opaque global state somewhere, I was trying to suggest that it become more transparent and do *less*. i.e. once an application has retrieved a message via GetMessage() or the window procedure, then it should be able to keep track of all the state associated with the message itself.</p>
+<p>Don&#8217;t worry. I&#8217;m just smart enough to know when I&#8217;m making a fool of myself. I&#8217;ll sit the rest of this thread out. My apologies.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-748083">
+				<div id="div-comment-748083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MP</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-748083">
+			June 19, 2009 at 12:52 pm</a>		</div>
+
+		<p>&#8221; The great thing about this is that the users will probably blame the other program. &#8220;Sometimes, when I use this program, it spontaneously deletes all my items. Stupid program. It&#8217;s so buggy.&#8221; &#8220;</p>
+<p>It seems to me, as another poster alluded to previously, that it&#8217;s a bit broken for the API to allow nonsense messages to be inadvertently sent to some other process&#8217;s window. I imagine at this point it would be a backwards compatibility nightmare but wouldn&#8217;t it be better to require the programmer to be more explicit about their intentions to message a different process?</p>
+<div class=post>[<i>In 1983, the philosophy was that programmers were to be trusted to know what they were doing. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-748103">
+				<div id="div-comment-748103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-748103">
+			June 19, 2009 at 1:38 pm</a>		</div>
+
+		<p>What about GetKeyboardState? Sync or async?</p>
+<div class=post>[<i>The docs on GetKeyboardState appear to be sufficiently clear. The table above was intended to be illustrative, not comprehensive. I apologize for not making that clear. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-748133">
+				<div id="div-comment-748133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-748133">
+			June 19, 2009 at 2:03 pm</a>		</div>
+
+		<blockquote><p>
+  What about GetKeyboardState? Sync or async?
+</p></blockquote>
+<p>Let me google that for you: <a rel="nofollow" target="_new" href="http://lmgtfy.com/?q=GetKeyboardState&amp;l=1" rel="nofollow">http://lmgtfy.com/?q=GetKeyboardState&#038;l=1</a></p>
+<p>(sync)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-748143">
+				<div id="div-comment-748143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-748143">
+			June 19, 2009 at 2:15 pm</a>		</div>
+
+		<p>&quot;Let me google that for you: <a rel="nofollow" target="_new" href="http://lmgtfy.com/?q=GetKeyboardState&amp;l=1&quot;" rel="nofollow"></a><a href="http://lmgtfy.com/?q=GetKeyboardState&#038;l=1&#038;quot" rel="nofollow">http://lmgtfy.com/?q=GetKeyboardState&#038;l=1&#038;quot</a>;</p>
+<p>That animation is so funny!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-748293">
+				<div id="div-comment-748293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090618-00/?p=17843#comment-748293">
+			June 19, 2009 at 7:38 pm</a>		</div>
+
+		<p>Thanks Raymond for giving this issue a bit of a higher profile. There are still a lot of programs doing this wrong.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

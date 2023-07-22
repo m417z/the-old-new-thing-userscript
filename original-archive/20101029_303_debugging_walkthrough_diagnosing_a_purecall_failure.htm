@@ -1,0 +1,262 @@
+<html>
+<head>
+<title>Debugging walkthrough: Diagnosing a __purecall failure</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Debugging walkthrough: Diagnosing a __purecall failure</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 29, 2010 / year-entry #304</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20101029-00/?p=12413</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Prerequisite: Understanding what __purecall means. I was asked to help diagnose an issue in which a program managed to stumble into the __purecall function. XYZ!_purecall: 00a14509 a100000000 mov eax,dword ptr ds:[00000000h] ds:0023:00000000=???????? The stack at the point of failure looked like this: XYZ!_purecall XYZ!CViewFrame::SetFrame+0x14d XYZ!CViewFrame::SetPresentation+0x355 XYZ!CViewFrame::BeginView+0x1fe The line at XYZ!CViewFrame::SetFrame that called the mystic __purecall...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Prerequisite:
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/04/28/122037.aspx">
+Understanding what <code>__purecall</code> means</a>.
+</p>
+<p>
+I was asked to help diagnose an issue in which a program managed to stumble
+into the <code>__purecall</code> function.
+</p>
+<pre>
+XYZ!_purecall:
+00a14509 a100000000      mov     eax,dword ptr ds:[00000000h] ds:0023:00000000=????????
+</pre>
+<p>
+The stack at the point of failure looked like this:
+</p>
+<pre>
+XYZ!_purecall
+XYZ!CViewFrame::SetFrame+0x14d
+XYZ!CViewFrame::SetPresentation+0x355
+XYZ!CViewFrame::BeginView+0x1fe
+</pre>
+<p>
+The line at <code>XYZ!CViewFrame::SetFrame</code> that
+called the mystic <code>__purecall</code> was a simple <code>AddRef</code>:
+</p>
+<pre>
+  pSomething-&gt;AddRef(); // crashes in __purecall
+</pre>
+<p>
+From what we know of <code>__purecall</code>,
+this means that somebody called into a virtual method on a derived
+class after the derived class's destructor has run.
+Okay, well, let's see if we can find the object in question.
+Since the method being called is a COM method,
+the <code>__stdcall</code> calling convention applies,
+which means that the <code>this</code> pointer is on the stack.
+</p>
+<pre>
+0:023&gt; dd esp+4 l1
+0529f76c  06a88d58
+</pre>
+<p>
+Using our knowledge of
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/02/05/68017.aspx">
+the layout of a COM object</a>,
+we can navigate through memory to find the vtable.
+</p>
+<pre>
+0:023&gt; dps 06a88d58
+06a88d58  009b2eac XYZ!CRegistrationSink::`vftable'
+06a88d5c  06b20058
+06a88d60  00000002 
+06a88d64  00998930 XYZ!CObjectWithBrush::`vftable'
+06a88d68  00000000 
+06a88d6c  009c9c80 XYZ!CBrowseSite::`vftable'
+06a88d70  009c9c70 XYZ!CBrowseSite::`vftable'
+06a88d74  00000000
+....
+0:023&gt; dps 009b2eac
+009b2eac  00a14509 XYZ!_purecall // virtual QueryInterface() = 0
+009b2eb0  00a14509 XYZ!_purecall // virtual AddRef() = 0
+009b2eb4  00a14509 XYZ!_purecall // virtual Release() = 0
+009b2eb8  009cb1e4 XYZ!CRegistrationSink::Register
+009b2ebc  009b3d2d XYZ!CRegistrationSink::Unregister
+</pre>
+<p>
+We see that the object has been destructed down to the
+<code>CRegistrationSink</code> base class,
+and the attempt to increment its reference count has led us
+into the abyss of <code>__purecall</code>.
+</p>
+<p>
+But what was this object before it descended into madness?
+</p>
+<p>
+Well, we know that the object was something derived from
+<code>CRegistrationSink</code>.
+And the other values in memory tell us that the object most
+likely also derived from
+<code>CObjectWithBrush</code>
+and <code>CBrowseSite</code>.
+Just for fun, here's the <code>CObjectWithBrush</code> vtable,
+to confirm that we destructed down to that point:
+</p>
+<pre>
+00998930  00a14509 XYZ!_purecall // virtual QueryInterface() = 0
+00998934  00a14509 XYZ!_purecall // virtual AddRef() = 0
+00998938  00a14509 XYZ!_purecall // virtual Release() = 0
+0099893c  0099880d XYZ!CObjectWithBrush::SetBrush
+00998940  00a319ee XYZ!CObjectWithBrush::GetBrush
+00998944  00a13fd9 XYZ!CObjectWithBrush::`scalar deleting destructor'
+</pre>
+<p>
+Ooh, it looks like <code>CObjectWithBrush</code> has a
+virtual destructor.
+Probably to destroy the brush.
+</p>
+<p>
+A check of the source code tells us that nobody derives from
+<code>CBrowseSite</code>, so that is almost certainly the
+original object type.
+</p>
+<p>
+As a cross-check, we check whether what we have matches
+the memory layout of a <code>CBrowseSite</code>:
+</p>
+<pre>
+0:023&gt; dt XYZ!CBrowseSite 06a88d58
+   +0x000 __VFN_table : 0x009b2eac
+   +0x004 m_prgreg         : 0x06a88d58 Registration
+   +0x008 m_creg           : 2
+   +0x00c __VFN_table : 0x00998930
+   +0x010 m_hbr            : (null)
+   +0x014 __VFN_table : 0x009c9c80
+   +0x018 __VFN_table : 0x009c9c70
+   +0x01c m_cRef           : 0
+</pre>
+<p>
+Looks not unreasonable.
+(Well, aside from the fact that we have a bug...)
+The object has most likely begun its destruction because its
+reference count (<code>_cRef</code>) went to zero.
+</p>
+<p>
+At this point, there was enough information to ask the developers
+responsible for
+<code>CViewFrame</code> and <code>CBrowseSite</code> to work out
+how the <code>CViewFrame</code> ended up running around with a pointer
+to an object that has already been destructed.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-869993">
+				<div id="div-comment-869993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101029-00/?p=12413#comment-869993">
+			October 29, 2010 at 7:55 am</a>		</div>
+
+		<p>Another case in which you&#39;ll see pure call is if you call a virtual member function before the objects constructors have finished running, not just when the destructors are running.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-870003">
+				<div id="div-comment-870003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Barbie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101029-00/?p=12413#comment-870003">
+			October 29, 2010 at 7:59 am</a>		</div>
+
+		<p>@S: Well, yeah. That&#39;s exactly what the purecall link points out.</p>
+<div class="post">[<i>And more relevant to the article, if that was the problem, they wouldn&#39;t have needed my help debugging it. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-870013">
+				<div id="div-comment-870013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101029-00/?p=12413#comment-870013">
+			October 29, 2010 at 8:56 am</a>		</div>
+
+		<p>after many years of looking at these issues, I just short-cutted to &quot;oh, there is a reference count bug. &nbsp;go fix it!&quot; :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-870983">
+				<div id="div-comment-870983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">benjamin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20101029-00/?p=12413#comment-870983">
+			November 2, 2010 at 2:12 pm</a>		</div>
+
+		<p>But &quot;What Is __purecall?&quot;</p>
+<p>That&#39;s the question I ask every time I Google Old New Thing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

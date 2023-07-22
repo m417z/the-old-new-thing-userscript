@@ -1,0 +1,679 @@
+<html>
+<head>
+<title>Dispatch interfaces as connection point interfaces</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Dispatch interfaces as connection point interfaces</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 12, 2013 / year-entry #158</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>18</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Last time, we learned about how connection points work. One special case of this is where the connection interface is a dispatch interface. Dispatch interfaces are, as the name suggests, COM interfaces based on IDispatch. The IDispatch interface is the base interface for OLE automation objects, and if you want your connection point interface to...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/06/11/10424940.aspx">
+Last time</a>,
+we learned about how connection points work.
+One special case of this is where the connection interface
+is a dispatch interface.
+</p>
+<p>
+Dispatch interfaces are, as the name suggests,
+COM interfaces based on <code>IDispatch</code>.
+The <code>IDispatch</code> interface is the base interface
+for OLE automation objects,
+and if you want your connection point interface to be usable
+from script,
+you probably should make it a dispatch interface.
+</p>
+<p>
+I'm assuming you know how <code>IDispatch</code> works.
+The short version is that script that wants to invoke
+a method or property calls
+<code>Get&shy;IDs&shy;Of&shy;Names</code> to get the
+<i>dispatch ID</i> for the method or property it wants
+to access,
+and it uses the type library to figure out
+things like the parameters and return value.
+Once the scripting engine figures out how the method or property
+expects to be called,
+it can call
+<code>IDispatch::<wbr>Invoke</code>
+passing the dispatch ID and a <code>DISPPARAMS</code> structure
+that holds the parameters.
+</p>
+<p>
+Nowadays, this sort of thing goes by the fancy name of <i>reflection</i>,
+but back in the OLE Automation days,
+it was simply all in a day's work.
+<i>You kids think you invented everything</i>.
+</p>
+<p>
+Just like as with regular connection point interfaces,
+a dispatch interface used as a connection point interface
+consists of events which are formally implemented as methods.
+</p>
+<pre>
+dispinterface DWidgetEvents
+{
+ [id(WDISPID_RENAMED)]
+ HRESULT Renamed([in] BSTR oldName, [in] BSTR newName);
+...
+};
+</pre>
+<p>
+You declare that your object is a source of events for this interface
+by noting it in your object declaration.
+(Thanks, Medinoc for
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/06/12/10425215.aspx#10425408">
+noting the error in the original version of this article</a>.)
+</p>
+<pre>
+coclass Widget
+{
+ [default] interface IWidget;
+ <font COLOR=blue>[default, source] dispinterface DWidgetEvents;</font>
+}
+</pre>
+<p>
+A client registers with the connection point with the
+<code>DIID_<wbr>DWidget&shy;Events</code> interface.
+By convention, dispatch interfaces usually end
+with the word <code>Events</code>
+and are often prefixed with the letter <code>D</code>,
+and the interface ID symbol begins with <code>DIID</code>
+rather than simply <code>IID</code>.
+These conventions are not universally adhered-to,
+so don't freak out if you see people who don't follow them.
+(If you declare your dispatch interface in an IDL file,
+then the MIDL compiler will
+generate the dispatch interface ID with
+the <code>DIID</code> prefix for you.)
+</p>
+<p>
+Now, formally, when the connection point wants to invoke
+the <code>Renamed</code> method, it calls
+<code>Get&shy;IDs&shy;Of&shy;Names</code> to get the ID
+for the method called <code>L"Renamed"</code>, and asks
+for the type library to figure out what the parameters are.
+But this is frequently just pointless busy-work:
+The connection point often already knows the answer,
+since the connection point already knows what interface
+it is talking to.
+It doesn't need to do any "reflection" since the connection
+point already knows what the IDs and calling conventions are.
+In the same way, your C# code doesn't need to use reflection
+to call a method on an object whose assembly you already have
+referenced in your project.
+(The <code>Get&shy;IDs&shy;Of&shy;Names</code> exists not for
+connection points, but rather to assist
+dynamically-typed languages, where you can try to invoke any method
+on any object, and the method is looked up at run time.)
+</p>
+<p>
+In other words, the connection point already knows that
+the ID for the method <code>Rename</code> is
+<code>WDISPID_<wbr>RENAMED</code>, and that it takes two
+<code>BSTR</code> parameters,
+because that was part of the contract for registering with
+the connection point in the first place.
+</p>
+<p>
+This means that in practice, the only method on the
+client that is ever called is
+<code>IDispatch::<wbr>Invoke</code>.
+</p>
+<p>
+Here is a template base class that I use for my connection point interface
+implementations of dispatch interfaces.
+We'll discuss the pieces afterwards:
+</p>
+<pre>
+template&lt;typename DispInterface&gt;
+class CDispInterfaceBase : public DispInterface
+{
+public:
+ CDispInterfaceBase() : m_cRef(1), m_dwCookie(0) { }
+
+ /* IUnknown */
+ IFACEMETHODIMP QueryInterface(REFIID riid, void **ppv)
+ {
+  *ppv = nullptr;
+  HRESULT hr = E_NOINTERFACE;
+  if (riid == IID_IUnknown || riid == IID_IDispatch ||
+      riid == __uuidof(DispInterface))
+  {
+   *ppv = static_cast&lt;DispInterface *&gt;
+          (static_cast&lt;IDispatch*&gt;(this));
+   AddRef();
+   hr = S_OK;
+  }
+  return hr;
+ }
+
+ IFACEMETHODIMP_(ULONG) AddRef()
+ {
+  return InterlockedIncrement(&amp;m_cRef);
+ }
+
+ IFACEMETHODIMP_(ULONG) Release()
+ {
+  LONG cRef = InterlockedDecrement(&amp;m_cRef);
+  if (cRef == 0) delete this;
+  return cRef;
+ }
+
+ // *** IDispatch ***
+ IFACEMETHODIMP GetTypeInfoCount(UINT *pctinfo)
+ {
+  *pctinfo = 0;
+  return E_NOTIMPL;
+ }
+
+ IFACEMETHODIMP GetTypeInfo(UINT iTInfo, LCID lcid,
+                            ITypeInfo **ppTInfo)
+ {
+  *ppTInfo = nullptr;
+  return E_NOTIMPL;
+ }
+
+ IFACEMETHODIMP GetIDsOfNames(REFIID, LPOLESTR *rgszNames,
+                              UINT cNames, LCID lcid,
+                              DISPID *rgDispId)
+ {
+  return E_NOTIMPL;
+ }
+
+ IFACEMETHODIMP Invoke(
+    DISPID dispid, REFIID riid, LCID lcid, WORD wFlags,
+    DISPPARAMS *pdispparams, VARIANT *pvarResult,
+    EXCEPINFO *pexcepinfo, UINT *puArgErr)
+ {
+  if (pvarResult) VariantInit(pvarResult);
+  return SimpleInvoke(dispid, pdispparams, pvarResult);
+ }
+
+ // Derived class must implement SimpleInvoke
+ virtual HRESULT SimpleInvoke(DISPID dispid,
+    DISPPARAMS *pdispparams, VARIANT *pvarResult) = 0;
+
+public:
+ HRESULT Connect(IUnknown *punk)
+ {
+  HRESULT hr = S_OK;
+  CComPtr&lt;IConnectionPointContainer&gt; spcpc;
+  if (SUCCEEDED(hr)) {
+   hr = punk-&gt;QueryInterface(IID_PPV_ARGS(&amp;spcpc));
+  }
+  if (SUCCEEDED(hr)) {
+  hr = spcpc-&gt;FindConnectionPoint(__uuidof(DispInterface), &amp;m_spcp);
+  }
+  if (SUCCEEDED(hr)) {
+  hr = m_spcp-&gt;Advise(this, &amp;m_dwCookie);
+  }
+  return hr;
+ }
+
+ void Disconnect()
+ {
+  if (m_dwCookie) {
+   m_spcp-&gt;Unadvise(m_dwCookie);
+   m_spcp.Release();
+   m_dwCookie = 0;
+  }
+ }
+
+private:
+ LONG m_cRef;
+ CComPtr&lt;IConnectionPoint&gt; m_spcp;
+ DWORD m_dwCookie;
+};
+</pre>
+<p>
+First, a distraction: Our <code>Query&shy;Interface</code>
+implementation performs a double-cast of <code>this</code>
+to <code>IDispatch</code>, then to the templated interface.
+This ensures that the templated interface pointer
+and <code>IDispatch</code> are compatible.
+It would be bad if somebody tried to use this
+<code>Query&shy;Interface</code> implementation
+with something unrelated to <code>IDispatch</code>.
+(Yes, I could've used <code>std::is_base_of</code>,
+but I'm an old-timer who grew up before TR1.)
+</p>
+<p>
+The bulk of the class merely stubs out all the methods
+of <code>IDispatch</code>,
+save for
+<code>IDispatch::<wbr>Invoke</code>, which does a little
+grunt work (initializing the result <code>VARIANT</code>)
+and then leaves the derived class to do the heavy lifting.
+</p>
+<p>
+Finally, there are two public methods
+<code>Connect</code> and <code>Disconnect</code>.
+These perform the <code>Advise</code> and
+<code>Unadvise</code> calls we saw yesterday.
+To simplify things for our caller,
+we save the <code>IConnection&shy;Pointer</code>
+we registered against so that the caller doesn't
+have to pass it back in when disconnecting.
+</p>
+<p>
+<b>Exercise</b>:
+Is the <code>m_spcp.Release()</code> call
+in <code>Disconnect</code>
+really necessary?
+(Assuming that <code>Connect</code> is called at most once.)
+</p>
+<p>
+This helper template class makes writing dispatch interface
+connection point clients really simple,
+since all you have to do is implement <code>Simple&shy;Invoke</code>
+in the form of a <code>switch</code> statement on the
+dispatch IDs you care about:
+</p>
+<pre>
+class CWidgetClient : public CDispInterfaceBase<dwidgetEvents>
+{
+public:
+ CWidgetClient() { }
+
+ HRESULT SimpleInvoke(
+    DISPID dispid, DISPPARAMS *pdispparams, VARIANT *pvarResult)
+{
+ switch (dispid) {
+ case WDISPID_RENAMED:
+  HeyLookItGotRenamed(pdispparams-&gt;rgvarg[0].bstrVal,
+                      pdispparams-&gt;rgvarg[1].bstrVal);
+  break;
+ }
+ return S_OK;
+};
+</pre>
+<p>
+In the <code>Simple&shy;Invoke</code> method,
+we switch on the dispatch ID,
+and if we see one we like, we extract the parameters from the
+<code>pdispparams</code>.
+</p>
+<p>
+<b>Update</b>: Commenter parkrrr
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/06/12/10425215.aspx#10425376">
+points out</a> a huge gotcha with the
+<code>DISP&shy;PARAMS</code> structure:
+The parameters are passed in <i>reverse</i> order.
+I don't know why.
+They just are.
+</p>
+<p>
+Next time, we'll start hooking up events to our Little Program
+so it can update when the user navigates an Explorer or
+Internet Explorer window.
+</p>
+<p>
+<b>Warning! Managed code!</b>
+The CLR
+understands the connection point/<wbr>dispatch interface
+convention and exposes a dispatch event
+to managed code
+<a HREF="http://msdn.microsoft.com/library/66ahbe6y">
+in the form of a CLR event and corresponding delegate</a>.
+For example, our <code>Renamed</code> event is
+exposed as an event called <code>Renamed</code>,
+with delegate type
+<code>DWidget&shy;Events_<wbr>Renamed&shy;Event&shy;Handler</code>.
+You can listen on the event the way you listen
+to any other CLR event:
+<code>widget.Renamed += this.OnRenamed;</code>.
+</p>
+<p>
+<b>Note</b>: I completely ignored the subject of dual interfaces.
+You can read about those if you like,
+but we won't need to know about them for the job at hand.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (18)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1060883">
+				<div id="div-comment-1060883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060883">
+			June 12, 2013 at 7:30 am</a>		</div>
+
+		<p>One thing I&#39;ve never understood about IDispatch::Invoke but that nevertheless appears to be true is that the parameters in pdispparams are in reverse order. Thus, you&#39;re calling HeyLookItGotRenamed( newName, oldName ) which may or may not have been your intention.</p>
+<div class="post">[<em>Excellent point! I&#39;ve called it out in the article as an update. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1060893">
+				<div id="div-comment-1060893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jerome</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060893">
+			June 12, 2013 at 7:52 am</a>		</div>
+
+		<p>Thanks for all the work you&#39;ve put into the articles recently. The more technical articles are always fascinating.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1060903">
+				<div id="div-comment-1060903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060903">
+			June 12, 2013 at 8:29 am</a>		</div>
+
+		<p>Rant: OLE type libraries are reflection if your mirrors show people as stick figures. And you have to tell the mirrors what to reflect.</p>
+<p>Sigh: I feel kind of sorry for C++ programmers that do such boilerplate code for a living. No wonder SLOCs are used on them for productivity evaluations and effort estimates.</p>
+<p>Exercise: you could set it to NULL with the same effect, or even destroy the smart pointer. But in essence, you need the actual Release to happen in Disconnect to break the potential and likely cycles you&#39;ve warned us about.</p>
+<p><!-- p>Nitpick: the second DIID is supposed to be just IID (without the first D).
+
+
+<p>Once again, excelent series!</p>
+
+
+</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1060913">
+				<div id="div-comment-1060913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060913">
+			June 12, 2013 at 8:55 am</a>		</div>
+
+		<p>Is it Widget or WidgetClient that implements DWidgetEvents? &nbsp;Shouldn&#39;t the IDL show Widget implementing IConnectionPointContainer?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf even thread-even depth-1" id="comment-1060923">
+				<div id="div-comment-1060923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060923">
+			June 12, 2013 at 9:01 am</a>		</div>
+
+		<p>If this is only about dispinterfaces and not dual interfaces, why make the class a template? From what I understand, dispinterfaces don&#39;t actually exist in C++, so the only interface the class will ever see is IDispatch itself, isn&#39;t it?</p>
+<p>(of course, it becomes useful when dual interfaces appear).</p>
+<div class="post">[<em>Dispinterfaces are interfaces which derive from IDispatch and add no new methods. But they are still separate interfaces with separate IIDs. Otherwise you wouldn&#39;t be able to tell different dispinterfaces apart, which is a problem if you have an object that supports multiple dispinterfaces. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf odd alt thread-odd thread-alt depth-1" id="comment-1060933">
+				<div id="div-comment-1060933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060933">
+			June 12, 2013 at 9:03 am</a>		</div>
+
+		<p>@James, @Raymond: Maybe DWidgetEvents should be declared [source, default] instead of just [default].</p>
+<div class="post">[<em>You&#39;re right. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1060953">
+				<div id="div-comment-1060953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/arcangelpip_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>arcangelpip@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060953">
+			June 12, 2013 at 11:27 am</a>		</div>
+
+		<p>Exercise: Is the m_spcp.Release() call in Disconnect really necessary? (Assuming that Connect is called at most once.)</p>
+<p>This depends on the lifetime of the class itself. But in the case of</p>
+<p>int wmain()</p>
+<p>{</p>
+<p>CoInitialize(nullptr);</p>
+<p>MyDispInterface disp; //based on CDispInterfaceBase</p>
+<p>&#8230; do stuff</p>
+<p>CoUninitialize();</p>
+<p>return 0;</p>
+<p>}</p>
+<p>Then it is needed. The call to Release will cause the contained smart pointer to release its interface right away. If this didn&#39;t happen then it would occur when disp is destroyed at the end of the function. This is bad because CoUninitialize would have run, force unloaded any COM servers left in the process leaving the address of release unallocated. When release is called you would then get an access violation instead.</p>
+<p>This is based on experience -_-;.</p>
+<div class="post">[<em>This is a general problem when you mix RAII and non-RAII: <a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/05/20/135841.aspx">Object destruction and cleanup no longer run in the right order</a>. It&#39;s not a problem specific to this class, so let&#39;s assume that&#39;s not going on. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1060973">
+				<div id="div-comment-1060973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060973">
+			June 12, 2013 at 12:42 pm</a>		</div>
+
+		<p>Who&#39;s responsible for validating that the correct argument types got passed into SimpleDispatch() via this reflection-like system? &nbsp;In other words, is CWidgetClient::SimpleDispatch() guaranteed that pdispparams contains exactly two parameters of type BSTR when dispid is WDISPID_RENAMED? &nbsp;Or is this just another case of the error checking being omitted for expository purposes?</p>
+<div class="post">[<em>It is the caller&#39;s responsibility to pass correct parameters. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-chuckop even thread-even depth-1" id="comment-1060983">
+				<div id="div-comment-1060983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ChuckOp' rel='external nofollow' class='url'>ChuckOp</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060983">
+			June 12, 2013 at 1:50 pm</a>		</div>
+
+		<p>I shuddered when I read &quot;dual interfaces&quot;. &nbsp;I brought back memories (nightmares?) of creating IAccessible as a dual interface supporting IDispatch. &nbsp;Weirdly, If I search Bing with &quot;COM dual interfaces&quot; the IAccessible MSDN documentation is the first result.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1060993">
+				<div id="div-comment-1060993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060993">
+			June 12, 2013 at 3:14 pm</a>		</div>
+
+		<p>[It is the caller&#39;s responsibility to pass correct parameters. -Raymond]</p>
+<p>Hmmm. If the parameters are not checked when marshaling to a privileged COM server, this leads to an interesting potential security problem. Probably yet another UAC bypass and not much else.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061003">
+				<div id="div-comment-1061003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">foo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061003">
+			June 12, 2013 at 5:52 pm</a>		</div>
+
+		<p>For the exercise, I would go with what Crescens2k says. This doesn&#39;t magically solve everything though, since the developer of a class that derives from CDispInterfaceBase may very well put a call to Disconnect() in its destructor just to be helpful, so a crash would still occur on program termination (in the Unadvise call) if someone did a Connect and then just let the derived object&#39;s destructor cleanup on scope exit (after CoUninitialize had been called).</p>
+<p>@Joshua. I&#39;m not sure I understand. It&#39;s true that if the COM marshalling code or the privileged service or the caller are buggy or don&#39;t obey the ground rules of programming (<a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2006/03/20/555511.aspx">blogs.msdn.com/&#8230;/555511.aspx</a>) then sure, you could have a security error. But you would get this anyway. VARIANT arguments make checking types, etc more of a pain, but not impossible.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1060963">
+				<div id="div-comment-1060963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1060963">
+			June 12, 2013 at 12:01 pm</a>		</div>
+
+		<p>I guess it is begins with DIID rather than simply *IID* &nbsp;(spelling mistake)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061013">
+				<div id="div-comment-1061013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/arcangelpip_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>arcangelpip@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061013">
+			June 12, 2013 at 7:01 pm</a>		</div>
+
+		<p>[This is a general problem when you mix RAII and non-RAII: Object destruction and cleanup no longer run in the right order. It&#39;s not a problem specific to this class, so let&#39;s assume that&#39;s not going on. -Raymond]</p>
+<p>If that is the case then no, the Release in unadvise isn&#39;t really necessary. The interface pointer is wrapped in a smart pointer, and the destructor for this is guaranteed to run when the dispinterface class goes out of scope.</p>
+<p>As shamelessly stolen from atlcomcli.h</p>
+<p>~CComPtrBase() throw()</p>
+<p>&nbsp; &nbsp;{</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;if (p)</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;p-&gt;Release();</p>
+<p>&nbsp; &nbsp;}</p>
+<p>The smart pointer releases the contained interface on cleanup.</p>
+<div class="post">[<em>The dispinterface class is a COM object, so it is on the heap, not on the stack. It therefore does not go out of scope. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061023">
+				<div id="div-comment-1061023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/arcangelpip_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>arcangelpip@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061023">
+			June 12, 2013 at 9:24 pm</a>		</div>
+
+		<p>[The dispinterface class is a COM object, so it is on the heap, not on the stack. It therefore does not go out of scope. -Raymond]</p>
+<p>Well, I also assumed that since you were using smart pointers everywhere else, one would be used for the dispinterface too.</p>
+<div class="post">[<em>Sure, but the object is reference-counted, and one of the references is given to an external component (the connection point). The smart pointer can release only its own reference. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061033">
+				<div id="div-comment-1061033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">foo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061033">
+			June 12, 2013 at 9:38 pm</a>		</div>
+
+		<p>So maybe the reason for doing the Release in Disconnect is just to make the Connect/Disconnect methods fully complement one another and work as named. ie: Before calling Connect you are not connected to the server (m_spcp is not set). So having m_spcp still around after calling Disconnect (thus still connected) could be unexpected by users of the class.</p>
+<p>If the server were misbehaved and still called back to clients after they returned from calling Unadvise then you could have potential problems, making it best to Release the thing in the Disconnect method. But I&#39;m guessing since that&#39;s not allowed it shouldn&#39;t considered here. (On the other hand, it is possible to receive callbacks before the call to Un/Advise completes.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061053">
+				<div id="div-comment-1061053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061053">
+			June 13, 2013 at 11:33 am</a>		</div>
+
+		<p>class CWidgetClient : public CDispInterfaceBase</p>
+<p>should probably be changed to </p>
+<p>class CWidgetClient : public CDispInterfaceBase&lt;DWidgetEvents&gt;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1061063">
+				<div id="div-comment-1061063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/arcangelpip_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>arcangelpip@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061063">
+			June 13, 2013 at 11:43 am</a>		</div>
+
+		<p>[Sure, but the object is reference-counted, and one of the references is given to an external component (the connection point). The smart pointer can release only its own reference. -Raymond]</p>
+<p>I have a feeling that we are just going around in circles. So I&#39;ll just spell everything out in one post.</p>
+<p>When the dispinterface is created, it will have one reference. This is the client&#39;s reference so it can do stuff like call Connect and Disconnect. After the call to connect, the dispinterface should have two references, one for the client, the other for the connection point, and the server will have one for the at least one. This is because the call to IConnectionPoint::Advise calls QueryInterface to get the desired interface pointer, and of course the dispinterface has a reference to the connection point.</p>
+<p>Now, the call to Disconnect calls IConnectionPoint::Unadvise, and this calls Release on the stored dispinterface pointer. That means the only other reference is held by the client, when the client releases its reference to the dispinterface, then that will trigger the destructor for the class to be called, and this will cause the contained smart pointer for IConnectionPoint to be destroyed too. This will call Release on the contained interface pointer and that will remove the last reference to the server.</p>
+<div class="post">[<em>That was the logic I was looking for. Just saying &quot;The reference is released when the destructor is run&quot; is not enough, because there might be a reference cycle that prevents the destructor from running. Saying &quot;When the smart pointer releases the object&quot; is still not enough, because there might be references aside from the one in the smart pointer. You have to rule out both before you&#39;re done. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1061083">
+				<div id="div-comment-1061083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">foo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130612-00/?p=4103#comment-1061083">
+			June 13, 2013 at 4:16 pm</a>		</div>
+
+		<p>Meh, I took it as a common understanding that Unadvise calls Release on the client pointer handed it in Advise.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,513 @@
+<html>
+<head>
+<title>The Alpha AXP, part 9: The memory model and atomic memory operations</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Alpha AXP, part 9: The memory model and atomic memory operations</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 17, 2017 / year-entry #186</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">When does it happen? I have no idea!</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The Alpha AXP has a notoriously weak memory model.
+When a processor writes to memory, the result becomes
+visible to other processors eventually,
+but there are very few constraints beyond that.
+</p>
+<p>
+For example, writes can become visible out of order.
+One processor writes a value to a location,
+and then writes a value to another location,
+and another processor can observe the second write
+without the first.
+Similarly, reads can complete out of order.
+One processor reads a value from a location,
+then reads from another location,
+and the result could be that the second read happens
+before the first.&sup1;
+</p>
+<p>
+Assume that memory locations <var>x</var> and <var>y</var>
+are both initially zero.
+The following sequence of operations is valid.
+</p>
+<table BORDER=0 CELLSPACING=0 STYLE="border-collapse: collapse">
+<tr>
+<th STYLE="border: solid 1px black; width: 50%; padding: 2px">Processor 1</th>
+<th STYLE="border: solid 1px black; width: 50%; padding: 2px">Processor 2</th>
+</tr>
+<tr>
+<td>write 1 to <var>x</var></td>
+<td>read <var>y</var> yields 1</td>
+</tr>
+<tr>
+<td></td>
+<td><code>MB</code> (memory barrier)</td>
+</tr>
+<tr>
+<td>write 1 to <var>y</var></td>
+<td>read <var>x</var> yields 0</td>
+</tr>
+</table>
+<p>
+The memory barrier instruction <code>MB</code> instructs
+the processor to make all previous loads and stores
+complete to memory before starting any new loads and stores.
+However, it doesn't force other processors to do anything;
+other processors can still complete their memory operations
+out of order,
+and that's what happened in the above example.
+</p>
+<p>
+Similarly, the following sequence is also legal:
+</p>
+<table BORDER=0 CELLSPACING=0 STYLE="border-collapse: collapse">
+<tr>
+<th STYLE="border: solid 1px black; width: 50%; padding: 2px">Processor 1</th>
+<th STYLE="border: solid 1px black; width: 50%; padding: 2px">Processor 2</th>
+</tr>
+<tr>
+<td>write 1 to <var>x</var></td>
+<td>read <var>y</var> yields 1</td>
+</tr>
+<tr>
+<td><code>MB</code> (memory barrier)</td>
+<td></td>
+</tr>
+<tr>
+<td>write 1 to <var>y</var></td>
+<td>read <var>x</var> yields 0</td>
+</tr>
+</table>
+<p>
+This is also legal because the memory barrier on processor 1
+ensures that the value of <var>x</var> gets updated before
+the value of <var>y</var>,
+but it doesn't prevent processor 2 from performing the reads
+out of order.
+</p>
+<p>
+In order to prevent <var>x</var> and <var>y</var> from appearing
+to be updated out of order,
+<i>both</i> sides need to issue memory barriers.
+Processor 1 needs a memory barrier to ensure that the write to
+<var>x</var> happens before the write to <var>y</var>,
+and processor 2 needs a memory barrier to ensure that the
+read from <var>y</var> happens before the read from <var>x</var>.
+</p>
+<p>
+Okay, onward to atomic operations.
+</p>
+<p>
+Performing atomic operations on memory requires the help of
+two new pairs of instructions:
+</p>
+<pre>
+    LDL_L   Ra, disp16(Rb)  ; load locked
+    LDQ_L   Ra, disp16(Rb)
+
+    STL_C   Ra, disp16(Rb)  ; store conditional
+    STQ_C   Ra, disp16(Rb)
+</pre>
+<p>
+The <i>load locked</i> instruction performs a traditional
+read from memory, but also sets the <var>lock_</var><var>flag</var>
+and memorizes the physical address in <var>phys_locked</var>.
+The processor monitors for any changes to that physical
+address from any processor, and if a change is detected,&sup2;
+the <var>lock_</var><var>flag</var> is cleared.
+</p>
+<p>
+The <var>lock_</var><var>flag</var> is also cleared by a variety
+of other conditions, most notably when the
+processor returns from kernel mode back to user mode.
+This means that any hardware interrupt or trap
+(such as a page fault,
+or executing an emulated instruction)
+will clear the
+<var>lock_</var><var>flag</var>.
+It is recommended that operating systems
+allow at least 40 instructions to execute between timer interrupts.
+</p>
+<p>
+You can later do a <i>store conditional</i> operation which
+will store a value to a memory address, provided the
+<var>lock_</var><var>flag</var> is still set.
+If so, then the source register is set to 1.
+If not, then the source register is set to 0
+and the memory is left unmodified.
+Regardless of the result,
+the <var>lock_</var><var>flag</var> is cleared.
+</p>
+<p>
+A typical atomic increment looks like this:
+</p>
+<pre>
+retry:
+    LDL_L   t1, (t0)        ; load locked
+    ADDL    t1, #1, t1      ; increment value
+    STL_C   t1, (t0)        ; store conditional
+                            ; t1 = 1 if store was successful
+    BEQ     t1, failed      ; jump if store failed
+    ... continue execution ...
+
+failed:
+    BR      zero, retry     ; try again
+</pre>
+<p>
+In the case where the store failed, we jump forward,
+and then back.
+Recall that conditional jumps backward are predicted taken,
+and conditional jumps forward are predicted not taken.
+If we had simply jumped backward on failure,
+then the processor would have a branch prediction miss
+in the common case that there is no contention.
+</p>
+<p>
+Note that the above sequence does not impose any memory ordering.
+In practice, you will see a <code>MB</code> before and/or after
+the atomic sequence in order to enforce acquire and/or release semantics.
+</p>
+<p>
+There are a number of practical rules
+regarding the <code>LD<u>x</u>_L</code>
+and <code>ST<u>x</u>_C</code> instructions.
+The most important ones are these:
+</p>
+<ul>
+<li>The <code>ST<u>x</u>_C</code> should be to the same address
+    as the most recently preceding <code>LD<u>x</u>_L</code>.
+    This isn't a problem in practice because storing back
+    to the location of the previous load is the intended use of
+    the instructions.&sup3;
+</li>
+<li>The processor may lose track of your <code>LD<u>x</u>_L</code>
+    if you perform any memory access other than a
+    matching <code>ST<u>x</u>_C</code>,
+    or if you perform a branch instruction,
+    or if you trigger a trap
+    (such as executing an emulated instruction),
+    or if you execute more than 20 instructions after
+    the <code>LD<u>x</u>_L</code>.
+</li>
+</ul>
+<p>Although each
+<code>ST<u>x</u>_C</code> should be preceded by a matching
+<code>LD<u>x</u>_C</code>,
+it is legal to perform a
+<code>LD<u>x</u>_L</code> with no matching
+<code>ST<u>x</u>_C</code>.
+This can happen with conditional interlocked operations,
+where you discover after the
+<code>LD<u>x</u>_L</code> that the condition is not satisfied
+and you abandon the interlocked operation.
+</p>
+<p>
+The second rule says basically that the state created by the
+<code>LD<u>x</u>_L</code> instruction is ephemeral.
+After performing the
+<code>LD<u>x</u>_L</code> instruction,
+do as little work as possible to determine what value you want
+to store, and then store it right away.
+You are not allowed to take any branches,
+but
+<code>CMOV<u>cc</u></code> is okay.
+</p>
+<p>
+The requirement that you get around to the <code>ST<u>x</u>_C</code>
+within 20 instructions is a consequence of the requirement on operating
+systems that they allow
+40 instructions to execute between timer interrupts.
+</p>
+<p>
+Next time, we'll do a little exercise
+based on what we've learned so far.
+</p>
+<p>
+&sup1;
+Mind you, out-of-order reads are pretty common on all architectures.
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170428-00/?p=96065">
+Store-to-load forwarding</a>
+means that a speculated read operation to speculatively-written memory
+can complete before a read operation that occurred notionally earlier
+in the instruction stream.
+However, as
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170815-00/?p=96816#comment-1306565">
+Fabian Giesen notes</a>,
+the x86 has extra logic to avoid getting caught doing so!
+</p>
+<p>
+&sup2;
+The architecture permits implementations to be a little sloppy
+with the change detection.
+In particular, any modification within 128 bytes of the locked address
+is permitted to clear the <var>lock_</var><var>flag</var>.
+This means that targets of atomic operations
+should be at least 128 bytes apart in order
+to minimize the likelihood of false positives.
+</p>
+<p>
+&sup3;
+There are complicated rules about what happens if you violate
+this guideline (including some parts which are left implementation-defined),
+but they are largely irrelevant because you should just follow
+the guideline already.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1306716">
+				<div id="div-comment-1306716" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matthew Vincent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306716">
+			August 17, 2017 at 7:56 am</a>		</div>
+
+		<p>Wow, what a crazily weak memory model! Explicit optimistic locking just to perform consistent updates!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1306765">
+				<div id="div-comment-1306765" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Fabian Giesen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306765">
+			August 17, 2017 at 5:44 pm</a>		</div>
+
+		<p>This set of primitives (LL/SC, load-link/store-conditional) for atomic operations is very common among 90s RISCs. It was very attractive then because it&#8217;s close to the minimum amount of dedicated hardware you can spend that lets programs build more useful higher-level atomic primitives (atomic loads/stores, fetch-and-add, fetch-and-or, swaps, compare-exchange etc.). That list gives you a hint to the original problem: there&#8217;s many such useful operations, everyone wants something different, and adding 6+ atomic operation primitives to a user-mode instruction set that only has around 30 instructions is not an attractive prospect, especially since next year&#8217;s OS might really want another new primitive! Today we have more or less settled on a set of useful atomic operations, but this is after 25 more years of experience with multi-processor systems. It was less clear then.</p>
+<p>The flipside is that you&#8217;re really exposing low-level, nuts-and-bolts details of your processor pipeline and memory subsystem to get there. LL/SC is a natural fit for an in-order classic RISC pipeline, but gets decidedly messier once you build an out-of-order version &#8211; what happens if speculative operations clear your lock bit? Oops. &#8211; or one with several hardware threads: can you guarantee that, with two hardware threads simultaneously trying to perform unrelated atomic operations, at least one of them will eventually make forward progress? The list of rules of exactly what you can and cannot do between a load-link and store-conditional is impressively long and technical for modern architectures.</p>
+<p>It&#8217;s similar to branch delay slots: a simple and elegant solution to a real problem if your architecture is implemented in a certain way, but a source of extra complexity when it isn&#8217;t.</p>
+<p>ARM recently added a bunch of explicit atomic instructions to their ARMv8.1A architecture, including the aforementioned fetch-and-{various operations}, swap, and compare-exchange. What seemed like a substantial amount of extra hardware in the early 90s is less of an issue in the age of CPU cores with 100+ floating-point and SIMD instructions and dozens of kilobytes of caches even at the low end, and knowing that a core is trying to perform say an atomic add enables hardware implementations that try to do so locally first but let a shared cache level perform the operation if there&#8217;s any contention. This takes less time and less power than having two cores race each other in a spin loop, and these days, HW designers are much more willing to throw extra silicon and design effort at a problem if it increases scalability and lowers power consumption.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-yuhong-bao even depth-3" id="comment-1306775">
+				<div id="div-comment-1306775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306775">
+			August 17, 2017 at 7:15 pm</a>		</div>
+
+		<p>The fun thing is that I found out that LL/SC for SList in Windows still has to be double wide because of the depth. Of course, for example ARM64 uses 48-bit addresses allowing 16-bit for the depth.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1306726">
+				<div id="div-comment-1306726" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lance</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306726">
+			August 17, 2017 at 8:45 am</a>		</div>
+
+		<p>While more complicated the x86, if you compare this with PPC and ARM weak models, it is neither unusual nor strange.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1306847">
+				<div id="div-comment-1306847" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306847">
+			August 19, 2017 at 12:12 am</a>		</div>
+
+		<p>Oh no ARM and PPC are positively sane when compared to alphas memory system. </p>
+<p>The fact that loads or stores that depend on previous reads are not ordered is pretty much an Alpha only thing. Meaning that in the case of<br />
+Load x; Load x.field<br />
+making sure that you read the right x is not enough &#8211; you need an additional barrier before loading the field as well.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-3" id="comment-1306865">
+				<div id="div-comment-1306865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306865">
+			August 19, 2017 at 8:43 am</a>		</div>
+
+		<p>You don&#8217;t need a barrier if the same processor is performing both the write and the read. And certainly the read from x.field will use the value of x read by the previous instruction (there are no load delay slots). The weakness comes into play when sharing memory between processors. For example, if processor A writes x.field and then x, processor B can read x and then x.field, but get a stale value for x.field due to the lack of a barrier.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1306875">
+				<div id="div-comment-1306875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lance</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306875">
+			August 19, 2017 at 9:19 am</a>		</div>
+
+		<p>For ARM, I was thinking of the memory order with multiple cpus. You need to add memory barriers for the same reasons.<br />
+For PPC, I was thinking of the optimistic locking sequence, which is the same.  And ARM did require an optimistic sequence for atomic operations at one time, but I suspect that is no longer required.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1306755">
+				<div id="div-comment-1306755" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nico</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306755">
+			August 17, 2017 at 1:58 pm</a>		</div>
+
+		<p>Clearly the safest option is to halt all but one processor during any memory writes :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1306815">
+				<div id="div-comment-1306815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306815">
+			August 18, 2017 at 7:50 am</a>		</div>
+
+		<p>Raymond:  There&#8217;s that time machine you always wanted!  The Alpha AXP processor implements it!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1306825">
+				<div id="div-comment-1306825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306825">
+			August 18, 2017 at 7:58 am</a>		</div>
+
+		<p>For atomic increment, I am familiar with how it&#8217;s done in IBM 370/390 assembler&#8230; and it&#8217;s fairly similar to what&#8217;s shown here. </p>
+<p>BUT, I always wondered why a CPU can&#8217;t just implement an atomic increment&#8230; in hardware.  Why does the programmer need to write code to test the result to see if the increment happened?</p>
+<p>I realize that the memory address is in memory; that is, it&#8217;s inside the memory chip and not inside the CPU.  Still, the requirement for an atomic increment is pretty common, so it seems that the CPU and the northbridge chipset and the microcode and the memory support chips could cooperate and implement an atomic increment without having the programmers go to all this trouble.</p>
+<p>The same ought to be true for decrement, or decrement and test (for zero).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1306826">
+				<div id="div-comment-1306826" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306826">
+			August 18, 2017 at 7:59 am</a>		</div>
+
+		<p>But then again, I&#8217;m not a chipset designer or a CPU designer.  :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1306835">
+				<div id="div-comment-1306835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306835">
+			August 18, 2017 at 2:44 pm</a>		</div>
+
+		<p>As Fabian pointed out, the reason these are left out isn&#8217;t because they are hard, but because they are inflexible (you can&#8217;t use them to build other *efficient* atomic operations) and use up a scarce resource: instruction codes.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1306925">
+				<div id="div-comment-1306925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170817-00/?p=96835#comment-1306925">
+			August 21, 2017 at 11:12 am</a>		</div>
+
+		<p>Decrement and test for zero, implemented in hardware, would be great for building locks and related things.  (Although lock-free code is cool too.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

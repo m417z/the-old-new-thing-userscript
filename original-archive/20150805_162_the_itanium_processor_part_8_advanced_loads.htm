@@ -1,0 +1,1131 @@
+<html>
+<head>
+<title>The Itanium processor, part 8: Advanced loads</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Itanium processor, part 8: Advanced loads</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 5, 2015 / year-entry #163</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>14</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today we'll look at advanced loads, which is when you load a value before you're supposed to, in the hope that the value won't change in the meantime.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today we'll look at advanced loads,
+which is when you load a value before you're supposed to,
+in the hope that the value won't change in the meantime.
+<span id="more-91171"></span>
+</p>
+<p>
+Consider the following code:
+</p>
+<pre>
+int32_t SomeClass::tryGetValue(int32_t *value)
+{
+ if (!m_errno) {
+  *value = m_value;
+  m_readCount++;
+ }
+ return m_errno;
+}
+</pre>
+<p>
+Let's say that the <code>Some&shy;Class</code> has
+<code>m_value</code> at offset zero,
+<code>m_errno</code> at offset 4,
+and <code>m_readCount</code> at offset 8.
+</p>
+<p>
+The na&iuml;ve way of compiling this function
+would go something like this:
+</p>
+<pre>
+        // we are a leaf function, so no need to use "alloc" or to save rp.
+        // on entry: r32 = this, r33 = value
+
+        addl    r30 = 08h, r32          // calculate &amp;m_errno
+        addl    r29 = 04h, r32 ;;       // calculate &amp;m_readCount
+
+        ld4     ret0 = [r30] ;;         // load m_errno
+
+        cmp4.eq p6, p7 = ret0, r0       // p6 = m_errno == 0, p7 = !p6
+
+(p7)    br.ret.sptk.many rp             // return m_errno if there was an error&sup1;
+
+        ld4     r31 = [r32] ;;          // load m_value (at offset 0)
+        st4     [r33] = r31 ;;          // store m_value to *value
+
+        ld4     r28 = [r29] ;;          // load m_readCount
+        addl    r28 = 01h, r28 ;;       // calculate m_readCount + 1
+        st4     [r29] = r28 ;;          // store updated m_readCount
+
+        ld4     ret0 = [r30]            // reload m_errno for return value
+
+        br.ret.sptk.many rp             // return
+</pre>
+<p>
+First, we calculate the addresses of our member variables.
+Then we load <code>m_errno</code>, and if there is an error,
+then we return it immediately.
+Otherwise, we
+copy the current value to
+<code>*value</code>,
+load
+<code>m_readCount</code>,
+increment it,
+and
+finally, we return <code>m_errno</code>.
+</p>
+<p>
+The problem here is that we have a deep dependency chain.
+</p>
+<table BORDER=0 CELLPADDING=0 CELLSPACING=0
+       STYLE="text-align: center">
+<tr>
+<td></td>
+<td STYLE="width: 2em"></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">addl r30 = 08h, r32</td>
+<td STYLE="width: 3em"></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">ld4 ret0 = [r30]</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: em; height: 2em">cmp4.eq p6, p7 = ret0, r0</td>
+</tr>
+<tr>
+<td></td>
+<td>&#x2199;</td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">(p7) br.ret.sptk.many rp</td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">ld4 r31 = [r32]</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">st4 [r33] = r31</td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">addl r29 = 04h, r32</td>
+</tr>
+<tr>
+<td COLSPAN=2 ALIGN=right>non-obvious dependency</td>
+<td>&darr;</td>
+<td>&#x2199;</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">ld4 r28 = [r29]</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">addl r28 = 01h, r28</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">st4 [r29] = r28</td>
+</tr>
+<tr>
+<td COLSPAN=2 ALIGN=right>non-obvious dependency</td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">ld4 ret0 = [r30]</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">br.ret.sptk.many rp</td>
+</tr>
+</table>
+<p>
+Pretty much every instruction depends on the result of the previous
+instruction.
+Some of these dependencies are obvious.
+You have to calculate the address of a member variable before you can read it,
+and you have to get the result of a memory access befure you can
+perform arithmetic on it.
+Some of the dependencies are not obvious.
+For example, we cannot access
+<code>m_value</code> or
+<code>m_readCount</code> until after we confirm that
+<code>m_errno</code> is zero
+to avoid a potential access violation if the object straddles a
+page boundary with <code>m_errno</code> on one page
+and <code>m_value</code> on the other (invalid) page.
+(We saw last time how this can be solved with
+speculative loads, but let's not add that to the mix yet.)
+</p>
+<p>
+Returning <code>m_errno</code> is a non-obvious dependency.
+We'll see why later.
+For now,
+note that the return value came from a memory
+access, which means that if the caller of the function tries to
+use the return value, it may stall waiting for the result to arrive
+from the memory controller.
+</p>
+<p>
+When you issue a read on Itanium, the processor merely
+initiates the operation and proceeds to the next instruction before
+the read completes.
+If you try to use the result of the read too soon,
+the processor stalls until the value is received from
+the memory controller.
+Therefore, you want to put as much distance as possible between
+the load of a value from memory and the attempt to use the result.
+</p>
+<p>
+Let's see what we can do to parallelize this function.
+We'll perform the increment of <code>m_readCount</code>
+and the fetch of
+<code>m_value</code>
+simultaneously.
+</p>
+<pre>
+        // we are a leaf function, so no need to use "alloc" or to save rp.
+        // on entry: r32 = this, r33 = value
+
+        addl    r30 = 08h, r32          // calculate &amp;m_errno
+        addl    r29 = 04h, r32 ;;       // calculate &amp;m_readCount
+
+        ld4     ret0 = [r30] ;;         // load m_errno
+
+        cmp4.eq p6, p7 = ret0, r0       // p6 = m_errno == 0, p7 = !p6
+
+(p7)    br.ret.sptk.many rp             // return m_errno if there was an error
+
+        ld4     r31 = [r32]             // load m_value (at offset 0)
+        ld4     r28 = [r29] ;;          // preload m_readCount
+
+        addl    r28 = 01h, r28          // calculate m_readCount + 1
+        st4     [r33] = r31 ;;          // store m_value to *value
+
+        st4     [r29] = r28             // store updated m_readCount
+
+        br.ret.sptk.many rp             // return (answer already in ret0)
+</pre>
+<p>
+We've basically rewritten the function as
+</p>
+<pre>
+int32_t SomeClass::getValue(int32_t *value)
+{
+ int32_t local_errno = m_errno;
+ if (!local_errno) {
+  int32_t local_readCount = m_readCount;
+  int32_t local_value = m_value;
+  local_readCount = local_readCount + 1;
+  *value = local_value;
+  m_readCount = local_readCount;
+ }
+ return local_errno;
+}
+</pre>
+<p>
+This time we loaded the return value from <code>m_errno</code> long before
+the function ends,
+so when the caller tries to use the return value,
+it will definitely be ready and not incur a memory stall.
+(If a stall were needed, it would have occurred at the
+<code>cmp4</code>.)
+And we've also shortened the dependency chain significantly
+in the second half of the function.
+</p>
+<table BORDER=0 CELLPADDING=0 CELLSPACING=0
+       STYLE="text-align: center">
+<tr>
+<td STYLE="width: 11em"></td>
+<td STYLE="width: 2em"></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">addl r30 = 08h, r32</td>
+<td STYLE="width: 3em"></td>
+<td STYLE="width: 11em"></td>
+<td STYLE="width: 3em"></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">ld4 ret0 = [r30]</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">cmp4.eq p6, p7 = ret0, r0</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">addl r29 = 04h, r32</td>
+</tr>
+<tr>
+<td></td>
+<td>&#x2199;</td>
+<td>&darr;</td>
+<td>&#x2198;</td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td STYLE="border: solid black 1px; height: 2em">(p7) br.ret.sptk.many rp</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">ld4 r31 = [r32]</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">ld4 r28 = [r29]</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">st4 [r33] = r31</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">addl r28 = 01h, r28</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">st4 [r29] = r28</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td COLSPAN=3 STYLE="border: solid black 1px; height: 2em">br.ret.sptk.many rp</td>
+</tr>
+</table>
+<p>
+This works great until somebody does this:
+</p>
+<pre>
+int32_t SomeClass::Haha()
+{
+  return this-&gt;tryGetValue(&amp;m_readCount);
+}
+</pre>
+<p>
+or even this:
+</p>
+<pre>
+int32_t SomeClass::Hoho()
+{
+  return this-&gt;tryGetValue(&amp;m_errno);
+}
+</pre>
+<p>
+Oops.
+</p>
+<p>
+Let's look at <code>Haha</code>.
+Suppose that our initial conditions are
+<code>m_errno = 0</code>,
+<code>m_value = 42</code>,
+and
+<code>m_readCount = 0</code>.
+</p>
+<table CELLPADDING=3 CELLSPACING=0>
+<tr>
+<th COLSPAN=2>Original</th>
+<td ROWSPAN=20 STYLE="width: 1px; padding: 0px; background-color: black"></td>
+<th COLSPAN=2>Optimized</th>
+</tr>
+<tr>
+<th COLSPAN=5 STYLE="height: 1px; padding: 0px; background-color: black"></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>local_errno = m_errno;</td>
+<td>// true</td>
+<td></td>
+</tr>
+<tr>
+<td>if (!m_errno)</td>
+<td>// true</td>
+<td>if (!m_errno)</td>
+<td>// true</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td>readCount = m_readCount;</td>
+<td>// 0</td>
+<td></td>
+</tr>
+<tr>
+<td>*value = m_value;</td>
+<td>// m_readCount = 42</font></td>
+<td>*value = m_value;</td>
+<td>// m_readCount = 42</font></td>
+</tr>
+<tr>
+<td>m_readCount++;</td>
+<td>// m_readCount = 43</td>
+<td>m_readCount = readCount + 1;</td>
+<td>// <font COLOR=red>m_readCount = 1</font></td>
+</tr>
+<tr>
+<td>return m_errno;</td>
+<td>// 0</td>
+<td>return errno;</td>
+<td>// 0</td>
+</tr>
+</table>
+<p>
+The original code copies the <code>value</code> before incrementing the read
+count.
+This means that if the caller says that
+<code>m_readCount</code> is the output variable,
+the act of copying the value
+<i>modifies <code>m_readCount</code></i>.
+This modified value is then incremented.
+Our optimized version does not take this case into account and sets
+<code>m_readCount</code> to the old value incremented by 1.
+</p>
+<p>
+We were faked out by pointer aliasing!
+</p>
+<p>
+(A similar disaster occurs in <code>Hoho</code>.)
+</p>
+<p>
+Now, whether the behavior described above is intentional or desirable
+is not at issue here.
+The C++ language specification requires that the original code
+result in the specified behavior,
+so the compiler is required to honor it.
+Optimizations cannot alter the behavior of standard-conforming code,
+even if that behavior seems strange to a human being reading it.</p>
+<p>
+But we can still salvage this optimization by handling the
+aliasing case.
+The processor contains support for aliasing detection via
+the <code>ld.a</code> instruction.
+</p>
+<pre>
+        // we are a leaf function, so no need to use "alloc" or to save rp.
+        // on entry: r32 = this, r33 = value
+
+        addl    r30 = 08h, r32          // calculate &amp;m_errno
+        addl    r29 = 04h, r32 ;;       // calculate &amp;m_readCount
+
+        ld4     ret0 = [r30] ;;         // load m_errno
+
+        cmp4.eq p6, p7 = ret0, r0       // p6 = m_errno == 0, p7 = !p6
+
+(p7)    br.ret.sptk.many rp             // return m_errno if there was an error
+
+        ld4     r31 = [r32]             // load m_value (at offset 0)
+        <font COLOR=blue>ld4.a   r28 = [r29] ;;          // preload m_readCount</font>
+
+        addl    r28 = 01h, r28          // calculate m_readCount + 1
+        st4     [r33] = r31             // store m_value to *value
+
+        chk.a.clr r28, recover ;;       // recover from pointer aliasing
+recovered:
+        st4     [r29] = r28 ;;          // store updated m_readCount
+
+        br.ret.sptk.many rp             // return
+
+recover:
+        ld4     r28 = [r29] ;;          // reload m_readCount
+        addl    r28 = 01h, r28          // recalculate m_readCount + 1
+        br      recovered               // recovery complete, resume mainline code
+</pre>
+<p>
+The <code>ld.a</code> instruction is the same as an <code>ld</code>
+instruction, but it also tells the processor that
+this is an <var>advanced load</var>,
+and that the processor should stay on the lookout for any instructions
+that write to any bytes accessed by the load instruction.
+When the value is finally consumed, you perform a
+<code>chk.a.clr</code> to check whether the value you loaded
+is still valid.
+If no instructions have written to the memory in the meantime,
+then great.
+But if the address was written to,
+the processor will jump to the recovery code you provided.
+The recovery code re-executes the load and any other follow-up
+calculations, then returns to the original mainline code path.
+</p>
+<p>
+The <code>.clr</code> completer tells the processor
+to stop monitoring that address.
+It clears the entry from the Advanced Load Address Table,
+freeing it up for somebody else to use.
+</p>
+<p>
+There is also a <code>ld.c</code> instruction which is
+equivalent to a <code>chk.a</code> that jumps to a reload
+and then jumps back.
+In other words,
+</p>
+<pre>
+    ld.c.clr r1 = [r2]
+</pre>
+<p>
+is equivalent to
+</p>
+<pre>
+    chk.a.clr r1, recover
+recovered:
+    ...
+
+recover:
+    ld     r1 = [r2]
+    br     recovered
+</pre>
+<p>
+but is much more compact and doesn't take branch penalties.
+This is used if there is no follow-up computation;
+you merely want to reload the value if it changed.
+</p>
+<p>
+As with recovery from speculative loads,
+we can inline some of the mainline code into the recovery
+code so that we don't have to pad out the mainline code
+to get <code>recovered</code> to sit on a bundle boundary.
+I didn't bother doing it here; you can do it as an exercise.
+</p>
+<p>
+The nice thing about processor support for pointer aliasing
+detection is that it can be done across functions,
+something that cannot easily be done statically.
+Consider this function:
+</p>
+<pre>
+void accumulateTenTimes(void (*something)(int32_t), int32_t *victim)
+{
+ int32_t total = 0;
+ for (int32_t i = 0; i &lt; 10; i++) {
+  total += something(*victim);
+ }
+ *victim = total;
+}
+
+int32_t negate(int32_t a) { return -a; }
+
+int32_t value = 2;
+accumulateTenTimes(negate, &amp;value);
+// result: value = -2 + -2 + -2 + ... + -2 = -20
+
+int32_t sneaky_negate(int32_t a) { value2 /= 2; return -a; }
+int32_t value2 = 2;
+accumulateTenTimes(sneaky_negate, &amp;value2);
+// result: value2 = -2 + -1 + -0 + -0 + ... + -0 = -3
+</pre>
+<p>
+When compiling the <code>accumulate&shy;Ten&shy;Times</code>
+function,
+the compiler has no way of knowing whether the
+<code>something</code> function will modify <code>victim</code>,
+so it must be conservative and assume that it might,
+just in case we are in the <code>sneaky_<wbr>negate</code> case.
+</p>
+<p>
+Let's assume that the compiler has done flow analysis and determined
+that the function pointer passed to <code>accumulate&shy;Ten&shy;Times</code>
+is always within the same module, so it doesn't need to deal with <code>gp</code>.
+Since function descriptors are immutable, it can also enregister the function address.
+</p>
+<pre>
+        // 2 input registers, 6 local registers, 1 output register
+        alloc   r34 = ar.pfs, 2, 6, 1, 0
+        mov     r35 = rp                // save return address
+        mov     r36 = ar.lc             // save loop counter
+        or      r37 = r0, r0            // total = 0
+        ld8     r38 = [r32]             // get the function address
+        or      r31 = 09h, r0 ;;        // r31 = 9
+        mov     ar.lc = r31             // loop nine more times (ten total)
+again:
+        ld4     r39 = [r33]             // load *victim for output
+        mov     b6 = r38                // move to branch register
+        br.call.dptk.many rp = b6 ;;    // call function in b6
+        addl    r37 = ret0, r37         // accumulate total
+        br.cloop.sptk.few again ;;      // loop 9 more times
+
+        st4     [r33] = r37             // save the total
+
+        mov     ar.lc = r36             // restore loop counter
+        mov     rp = r35                // restore return address
+        mov     ar.pfs = r34            // restore stack frame
+        br.ret.sptk.many rp             // return
+</pre>
+<p>
+Note that at each iteration, we read <code>*victim</code> from memory
+because we aren't sure whether the <code>something</code> function
+modifies it.
+But with advanced loads, we can remove the memory access from the loop.
+</p>
+<pre>
+        // 2 input registers, 7 local registers, 1 output register
+        alloc   r34 = ar.pfs, 2, 7, 1, 0
+        mov     r35 = rp                // save return address
+        mov     r36 = ar.lc             // save loop counter
+        or      r37 = r0, r0            // total = 0
+        ld8     r38 = [r32]             // get the function address
+        or      r31 = 09h, r0 ;;        // r31 = 9
+        mov     ar.lc = r31             // loop nine more times (ten total)
+        <font COLOR=blue>ld4.a   r39 = [r33]             // get the value of *victim</font>
+again:
+        <font COLOR=blue>ld4.c.nc r39 = [r33]            // reload *victim if necessary</font>
+        or      r40 = r39, r0           // set *victim as the output parameter
+        mov     b6 = r38                // move to branch register
+        br.call.dptk.many rp = b6 ;;    // call function in b6
+        addl    r37 = ret0, r37         // accumulate total
+        br.cloop.sptk.few again ;;      // loop 9 more times
+
+        <font COLOR=blue>invala.e r39                    // stop tracking r39</font>
+
+        st4     [r33] = r37             // save the total
+
+        mov     ar.lc = r36             // restore loop counter
+        mov     rp = r35                // restore return address
+        mov     ar.pfs = r34            // restore stack frame
+        br.ret.sptk.many rp             // return
+</pre>
+<p>
+We perform an advanced load of
+<code>*value</code> in the hope that the callback function will
+not modify it.
+This is true if the callback function is
+<code>negate</code>,
+but it will trigger reloads if the accumulator function is
+<code>sneaky_<wbr>negate</code>.
+</p>
+<p>
+Note here that we use the <code>.nc</code> completer
+on the <code>ld.c</code> instruction.
+This stands for <var>no clear</var> and tells the processor
+to keep tracking the address because we will be checking it again.
+When the loop is over, we use <code>invala.e</code> to tell
+the processor,
+"Okay, you can stop tracking it now."
+This also shows how handy the <code>ld.c</code> instruction is.
+We can do the reload inline rather than have to write separate
+recovery code and jumping out and back.
+</p>
+<p>
+(Processor trivia: We do not need a stop after the
+<code>ld4.c.nc</code>.
+You are allowed to consume the result of a check load
+in the same instruction group.)
+</p>
+<p>
+In the case where the callback function does not modify <code>value</code>,
+the only memory accesses performed by this function and the callback
+are loading the function address, loading the initial value from
+<code>*value</code>,
+and storing the final value to <code>*value</code>.
+The loop body itself runs without any memory access at all!
+</p>
+<p>
+Going back to our original function,
+I noted that we could also add speculation to the mix.
+So let's do that.
+We're going to speculate an advanced load!
+</p>
+<pre>
+        // we are a leaf function, so no need to use "alloc" or to save rp.
+        // on entry: r32 = this, r33 = value
+
+        <font COLOR=blue>ld4.sa  r31 = [r32]             // speculatively preload m_value (at offset 0)</font>
+        addl    r30 = 08h, r32          // calculate &amp;m_errno
+        addl    r29 = 04h, r32 ;;       // calculate &amp;m_readCount
+
+        <font COLOR=blue>ld4.sa  r28 = [r29]             // speculatively preload m_readCount</font>
+        ld4     ret0 = [r30] ;;         // load m_errno
+
+        cmp4.eq p6, p7 = ret0, r0       // p6 = m_errno == 0, p7 = !p6
+
+<font COLOR=blue>(p7)    invala.e r31                    // abandon the advanced load
+(p7)    invala.e r28                    // abandon the advanced load</font>
+(p7)    br.ret.sptk.many rp             // return false if value not set
+
+        <font COLOR=blue>ld4.c.clr r31 = [r32]           // validate speculation and advanced load of m_value</font>
+        st4     [r33] = r31             // store m_value to *value
+
+        <font COLOR=blue>ld4.c.clr r28 = [r29]           // validate speculation and advanced load of m_readCount</font>
+        addl    r28 = 01h, r28 ;;       // calculate m_readCount + 1
+        st4     [r29] = r28             // store updated m_readCount
+
+        br.ret.sptk.many rp             // return
+</pre>
+<p>
+To validate a speculative advanced load, you just need to do a <code>ld.c</code>.
+If the speculation failed, then the advanced load also fails,
+so all we need to do is check the advanced load.
+and the reload will raise the exception.
+</p>
+<p>
+The dependency chain for this function is even shorter
+now that we were able to speculate the case where there is no error.
+(Since you are allowed to consume an <code>ld4.c</code> in the same instruction group,
+I combined the <code>ld4.c</code> and its consumption in a single box since they
+occur within the same cycle.)
+</p>
+<table BORDER=0 CELLPADDING=0 CELLSPACING=0
+       STYLE="text-align: center">
+<tr>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">ld4.sa r31 = [r32]</td>
+<td STYLE="width: 3em"></td>
+<td STYLE="border: solid black 1px; width: 13em; height: 2em">addl r30 = 08h, r32</td>
+<td STYLE="width: 3em"></td>
+<td STYLE="border: solid black 1px; width: 11em; height: 2em">addl r29 = 04h, r32</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">ld4 ret0 = [r30]</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">ld4.sa r28 = [r29]</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">cmp4.eq p6, p7 = ret0, r0</td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td>&#x2199;</td>
+<td>&darr;</td>
+<td>&#x2198;</td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td STYLE="height: 2em">
+<table STYLE="width: 100%; height: 2em; border-collapse: collapse; text-align: center" CELLPADDING=3 CELLSPACING=0>
+<tr>
+<td STYLE="border: solid black 1px">ld4.c</td>
+<td STYLE="border: solid black 1px">st4 [r33] = r31</td>
+</tr>
+</table>
+</td>
+<td></td>
+<td STYLE="height: 2em">
+<table STYLE="width: 100%; height: 2em; border-collapse: collapse; text-align: center" CELLPADDING=3 CELLSPACING=0>
+<tr>
+<td STYLE="border: solid black 1px">invala.e r31</td>
+<td STYLE="border: solid black 1px">invala.e r28</td>
+<td STYLE="border: solid black 1px">br.ret rp</td>
+</tr>
+</table>
+</td>
+<td></td>
+<td STYLE="height: 2em">
+<table STYLE="width: 100%; height: 2em; border-collapse: collapse; text-align: center" CELLPADDING=3 CELLSPACING=0>
+<tr>
+<td STYLE="border: solid black 1px">ld4.c</td>
+<td STYLE="border: solid black 1px">addl r28 = 01h, r28</td>
+</tr>
+</table>
+</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td></td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td></td>
+<td></td>
+<td STYLE="border: solid black 1px; height: 2em">st4 [r29] = r28</td>
+<td></td>
+</tr>
+<tr>
+<td>&darr;</td>
+<td></td>
+<td></td>
+<td></td>
+<td>&darr;</td>
+</tr>
+<tr>
+<td COLSPAN=5 STYLE="border: solid black 1px; height: 2em">br.ret.sptk.many rp</td>
+</tr>
+</table>
+<p>
+Aw, look at that pretty diagram.
+Control speculation and data speculation allowed us to
+run three different operations in parallel
+even though they might have dependencies on each other.
+The idea here is that if profiling suggests that the
+dependencies are rarely realized
+(pointers are usually not aliased),
+you can use speculation to run the operations as if they
+had no dependencies,
+and then use the check instructions to convert the speculated
+results to real ones.
+</p>
+<p>
+&sup1; Note the absence of a stop between the
+<code>cmp4</code> and the <code>br.ret</code>.
+That's because of a special Itanium rule that says
+that a conditional branch is permitted to use a predicate
+register calculated earlier within the same instruction group.
+(Normally, instructions within an instruction group are not
+allowed to have dependencies among each other.)
+This allows a test and jump to occur within the same cycle.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (14)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1196711">
+				<div id="div-comment-1196711" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196711">
+			August 5, 2015 at 7:36 am</a>		</div>
+
+		<p>All these complicated dependency trickery makes me happy not to be writing a compiler for this processor.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196701">
+				<div id="div-comment-1196701" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scott Brickey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196701">
+			August 5, 2015 at 8:23 am</a>		</div>
+
+		<p>&gt; If profiling suggests [&#8230;] can use speculation</p>
+<p>since profiling occurs during compilation, I assume this only applies when the code contains mixed uses of the aliased pointers&#8230; I would assume that if profiling identifies no such pointers, other optimizations would be made instead (negating the need for speculation and advanced loading, while still maintaining the wider/shorter dependency chain)?</p>
+<p>Also, given the amount of additional effort/complexity when compiling on IA64, how much extra work/time is spent by the compiler as compared to x86?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196691">
+				<div id="div-comment-1196691" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196691">
+			August 5, 2015 at 8:42 am</a>		</div>
+
+		<p>@henke37: Yet, the x86 family tries to do a lot of this (speculative read, speculative execution, recovery) *in hardware*. &nbsp;I guess the micro-ops decoder is more or less a x86-&gt;IA64 recompiler. &nbsp;Just consider how much more complicated that is to debug (and how much more difficult to issue a patch!) and how wasteful of power because the dataflow analysis has to rerun on each execution.</p>
+<p>Doing it in the compiler is definitely a more efficient approach. &nbsp;The downside is that the binary now is specific to a particular implementation architecture (to distinguish from Instruction Set Architecture). &nbsp;While x86 just-in-time speculation decisions are specific to the CPU generation &#8212; the same code can transparently take advantage of newer processors. &nbsp;The benefits of ahead-of-time scheduling depend on the expected ratio of executions to hardware upgrades&#8230;. for server workloads that ratio is astronomical and the ahead-of-time approach pays dividends.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196681">
+				<div id="div-comment-1196681" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196681">
+			August 5, 2015 at 9:30 am</a>		</div>
+
+		<p>Ben Voigt: Doing it in the compiler may be more efficient for an ahead-of-time compiler, but what about a just-in-time compiler? When your web server compiles a whole web site the first time it is accessed, you want that compilation to be as fast as possible.</p>
+<p>Plus, you really want to have your instruction stream take as few bytes as possible so that you spend your time executing instructions rather than waiting to fetch them. If you think of the x86 instruction set as a compression scheme, it makes a lot of sense.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196671">
+				<div id="div-comment-1196671" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zack</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196671">
+			August 5, 2015 at 10:11 am</a>		</div>
+
+		<p>There&#39;s another reason OOO hardware beats ahead-of-time scheduling: it has *more information* available to it. &nbsp;Specifically, it has adaptive branch prediction and accurate information about memory access latency.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196661">
+				<div id="div-comment-1196661" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196661">
+			August 5, 2015 at 11:45 am</a>		</div>
+
+		<p>@henke37: Yeah, especially given RyuJIT&#39;s problems. I&#39;d be darn pissed off facing that in the system compiler.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196641">
+				<div id="div-comment-1196641" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196641">
+			August 5, 2015 at 1:20 pm</a>		</div>
+
+		<p>Zack: Yes, it&#39;s amazing what you can do if you have 100,000,000 extra transistors in your budget!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196631">
+				<div id="div-comment-1196631" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196631">
+			August 5, 2015 at 1:45 pm</a>		</div>
+
+		<p>@Zack: Ahead of time scheduling doesn&#39;t exclude adaptive branch prediction. &nbsp;In fact, ahead-of-time scheduling leaves more of your transistor budget for leveraging runtime information.</p>
+<p>@Gabe: Just-in-time compilation is great for web development, but horrible for production scales (for the same reasons).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196621">
+				<div id="div-comment-1196621" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196621">
+			August 5, 2015 at 2:01 pm</a>		</div>
+
+		<p>@Scott Brickey</p>
+<p>The profiler can stick hints into the code that the compiler can consume (for example, saying which branch should be considered the primary branch to optimize). &nbsp;I&#39;ve use this tooling once, but forgot what it&#39;s called. &nbsp;Basically, you write the code, compile it, run it through the profiler with several &quot;typical cases&quot;, and then use the profiler output to instrument the code. &nbsp;Once the instrumentation is complete, you recompile and let the optimizer do its magic.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196611">
+				<div id="div-comment-1196611" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Malcolm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196611">
+			August 5, 2015 at 2:59 pm</a>		</div>
+
+		<p>Now I begin to see why the Itanium took so long to deliver!</p>
+<p>It is an incredibly complex architecture, but I begin to see what its advantages are. I guess the development effort wasn&#39;t wasted, as modern processors use a lot of the same optimising logic internally, while appearing to be x86/x64 processors on the outside&#8230; although yes, admittedly, doing it at compilation time is more efficient.</p>
+<p>Raymond, I look forward to the proposed overview of the Alpha, if you choose to do it. I spent many years looking after Alpha NT and VMS systems (and also a NetApp cluster &#8211; they used to use Alpha chips). Alpha was another great chip architecture which stagnated and then eventually died out, but its technology lives on in modern products :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196601">
+				<div id="div-comment-1196601" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196601">
+			August 5, 2015 at 9:02 pm</a>		</div>
+
+		<p>reversed?</p>
+<p>m_errno at offset 4, and m_readCount at offset 8.</p>
+<p>vs</p>
+<p>addl &nbsp; &nbsp;r30 = 08h, r32 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;// calculate &amp;m_errno</p>
+<p>addl &nbsp; &nbsp;r29 = 04h, r32 ;; &nbsp; &nbsp; &nbsp; // calculate &amp;m_readCount</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196581">
+				<div id="div-comment-1196581" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scott Brickey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196581">
+			August 6, 2015 at 8:33 am</a>		</div>
+
+		<p>@Brian,</p>
+<p>so &quot;profiler&quot; doesn&#39;t *just* mean code analysis, it can also mean &quot;average use case&quot; (in the case of optimizing the ASM for IA64). Cool :) Thx for response.</p>
+<p>Raymond: a brief look at the tools, as it relates to stuff like this, would be another great article topic (probably after completing the ASM aspects).. also, as mentioned, a brief performance comparison of the build tools/times: how much time is spent on the more complex ASM features, in profile optimizations, etc.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1196571">
+				<div id="div-comment-1196571" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196571">
+			August 6, 2015 at 8:59 am</a>		</div>
+
+		<p>@Brian: You&#39;re probably thinking of the term &quot;Profile Guided Optimization&quot;. &nbsp;Interestingly enough, some of the hot path optimizations (which are the focus of PGO, but not exclusive to it) can actually affect correctness in weird ways. &nbsp;The basic idea is for basic blocks in the hot path to be placed consecutively in as few code pages as possible (maximizing effectiveness of instruction cache) while infrequently executed code (usually error recovery) is moved out of the working set. &nbsp;The result is that error handling is likely to incur page faults in addition to the original fault, and if the cache manager encounters an I/O error while trying to map the page containing the slow path&#8230;. well, your failure may escalate in ways that a less optimized binary wouldn&#39;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1196531">
+				<div id="div-comment-1196531" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150805-00/?p=91171#comment-1196531">
+			August 6, 2015 at 12:45 pm</a>		</div>
+
+		<p>That is silly. You don&#39;t optimize your software for the &#39;the backing store for my pagefile is dying&#39; case. If that is happening the system has a foot in the grave already.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

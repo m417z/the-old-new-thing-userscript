@@ -1,0 +1,843 @@
+<html>
+<head>
+<title>Counting array elements which are below a particular limit value using SSE</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Counting array elements which are below a particular limit value using SSE</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 1, 2014 / year-entry #279</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>12</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Some time ago, we looked at how doing something can be faster than not doing it. That is, we observed the non-classical effect of the branch predictor. I took the branch out of the inner loop, but let's see how much further I can push it. The trick I'll employ today is using SIMD in...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Some time ago, we looked at
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/06/13/10533875.aspx">
+how doing something can be faster than not doing it</a>.
+That is, we observed the non-classical effect of the branch predictor.
+I took the branch out of the inner loop,
+but let's see how much further I can push it.
+</p>
+<p>
+The trick I'll employ today is using SIMD in order to
+operate on multiple pieces of data simultaneously.
+Take the original program and replace the
+<code>count&shy;them</code>
+function with this one:
+</p>
+<pre>
+int countthem(int boundary)
+{
+ __m128i xboundary = _mm_cvtsi32_si128(boundary);
+ __m128i count = _mm_setzero_si128();
+ for (int i = 0; i &lt; 10000; i++) {
+  __m128i value =  _mm_cvtsi32_si128(array[i]);
+  __m128i test = _mm_cmplt_epi32(value, xboundary);
+  count = _mm_sub_epi32(count, test);
+ }
+ return _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+Now, this program doesn't actually use any parallel operations,
+but it's our starting point.
+For each 32-bit value,
+we load it,
+compare it agains the boundary value,
+and accumulate the result.
+The <code>_mm_cmplt_epi32</code> function
+compares the four 32-bit integers in the first parameter
+against the four 32-bit integers in the second parameter,
+producing four new 32-bit integers.
+Each of the new 32-bit integers is <code>0xFFFFFFFF</code>
+if the corresponding first parameter is less than the second,
+or it is <code>0x00000000</cODE> if it is greater than or equal.
+</p>
+<p>
+In this case, we loaded up the value we care about,
+then compare it against the boundary value.
+The result of the comparison is either 32 bits of 0 (for false)
+or 32 bits of 1 (for true),
+so this merely sets <code>test</code> equal to
+<code>0xFFFFFFFF</code> if the value is less than the boundary;
+otherwise
+<code>0x0000000</code>.
+Since <code>0xFFFFFFFF</code> is the same as a 32-bit <code>-1</code>,
+we subtract the value so that the count goes up by 1 if the
+value is less than the boundary.
+</p>
+<p>
+Finally, we convert back to a 32-bit integer
+and return it.
+</p>
+<p>
+With this change, the running time drops from 2938 time units
+to 2709, an improvement of 8%.
+</p>
+<p>
+So far,
+we have been using only the bottom 32 bits of the 128-bit XMM registers.
+Let's turn on the parallelism.
+</p>
+<pre>
+int countthem(int boundary)
+{
+ <font COLOR=blue>__m128i *xarray = (__m128i*)array;</font>
+ __m128i xboundary = <font COLOR=blue>_mm_set1_epi32</font>(boundary);
+ __m128i count = _mm_setzero_si128();
+ for (int i = 0; i &lt; <font COLOR=blue>10000 / 4</font>; i++) {
+  __m128i value = <font COLOR=blue>_mm_loadu_si128(&amp;xarray[i])</font>;
+  __m128i test = _mm_cmplt_epi32(value, xboundary);
+  count = _mm_sub_epi32(count, test);
+ }
+ <font COLOR=blue>__m128i shuffle1 = _mm_shuffle_epi32(count, _MM_SHUFFLE(1, 0, 3, 2));
+ count = _mm_add_epi32(count, shuffle1);
+ __m128i shuffle2 = _mm_shuffle_epi32(count, _MM_SHUFFLE(2, 3, 0, 1));
+ count = _mm_add_epi32(count, shuffle2);</font>
+ return _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+We take our 32-bit integers and put them in groups of four,
+so instead of thinking of them as 10000 32-bit integers,
+we think of them as 2500 128-bit blocks,
+each block containing four <i>lanes</i>,
+with each lane holding one 32-bit integers.
+</p>
+<table BORDER=0 CELLPADDING=3
+    STYLE="border-collapse: collapse; text-align: center">
+<tr>
+<td></td>
+<td STYLE="width: 1em"></td>
+<td>Lane 3</td>
+<td>Lane 2</td>
+<td>Lane 1</td>
+<td>Lane 0</td>
+</tr>
+<tr>
+<td><code>xarray[0]</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>array[3]</code></td>
+<td STYLE="border: solid 1px black"><code>array[2]</code></td>
+<td STYLE="border: solid 1px black"><code>array[1]</code></td>
+<td STYLE="border: solid 1px black"><code>array[0]</code></td>
+</tr>
+<tr>
+<td><code>xarray[1]</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>array[7]</code></td>
+<td STYLE="border: solid 1px black"><code>array[6]</code></td>
+<td STYLE="border: solid 1px black"><code>array[5]</code></td>
+<td STYLE="border: solid 1px black"><code>array[4]</code></td>
+</tr>
+<tr>
+<td>&#x22EE;</td>
+<td></td>
+<td>&#x22EE;</td>
+<td>&#x22EE;</td>
+<td>&#x22EE;</td>
+<td>&#x22EE;</td>
+</tr>
+<tr>
+<td><code>xarray[2499]</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>array[9999]</code></td>
+<td STYLE="border: solid 1px black"><code>array[9998]</code></td>
+<td STYLE="border: solid 1px black"><code>array[9997]</code></td>
+<td STYLE="border: solid 1px black"><code>array[9996]</code></td>
+</tr>
+</table>
+<p>
+Now we can run our previous algorithm in parallel on each lane.
+</p>
+<table BORDER=0 CELLPADDING=3
+    STYLE="border-collapse: collapse; text-align: center">
+<tr>
+<td></td>
+<td STYLE="width: 1em"></td>
+<td>Lane 3</td>
+<td>Lane 2</td>
+<td>Lane 1</td>
+<td>Lane 0</td>
+</tr>
+<tr>
+<td><code>xboundary</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>boundary</code></td>
+<td STYLE="border: solid 1px black"><code>boundary</code></td>
+<td STYLE="border: solid 1px black"><code>boundary</code></td>
+<td STYLE="border: solid 1px black"><code>boundary</code></td>
+</tr>
+<tr>
+<td COLSPAN=6>&nbsp;</td>
+</tr>
+<tr>
+<td><code>test</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>array[3] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[2] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[1] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[0] &lt; boundary</code></td>
+</tr>
+<tr>
+<td><code>test</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>array[7] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[6] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[5] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[4] &lt; boundary</code></td>
+</tr>
+<tr>
+<td>&#x22EE;</td>
+<td></td>
+<td>&#x22EE;</td>
+<td>&#x22EE;</td>
+<td>&#x22EE;</td>
+<td>&#x22EE;</td>
+</tr>
+<tr>
+<td><code>test</code></td>
+<td></td>
+<td STYLE="border: solid 1px black"><code>array[9999] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[9998] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[9997] &lt; boundary</code></td>
+<td STYLE="border: solid 1px black"><code>array[9996] &lt; boundary</code></td>
+</tr>
+<tr>
+<td COLSPAN=6>&nbsp;</td>
+</tr>
+<tr>
+<td><code>count</code> = <var STYLE="font-style: normal">&Sigma;</var> &minus;<code>test</code></td>
+<td></td>
+<td STYLE="border: solid 1px black">Lane 3 totals</td>
+<td STYLE="border: solid 1px black">Lane 2 totals</td>
+<td STYLE="border: solid 1px black">Lane 1 totals</td>
+<td STYLE="border: solid 1px black">Lane 0 totals</td>
+</tr>
+</table>
+<p>
+The <code>xboundary</code> variable contains
+a copy of the boundary in each of the four 32-bit lanes.
+We load the values from the array four at a time&sup1;
+and compare them (in parallel) against the boundary,
+then we tally them (in parallel).
+The result of the loop is that each lane of <code>count</code>
+performs a count of values for its lane.
+</p>
+<p>
+After we complete the loop, we combine the parallel results
+by adding the lanes together. We do this by shuffling the values
+around and performing more parallel adds.
+The
+<code>_mm_shuffle_epi32</code> function lets you rearrange the
+lanes of an XMM register.
+The <code>_MM_SHUFFLE</code> macro lets you specify how you
+want the shuffle to occur.
+For example,
+<code>_MM_SHUFFLE(1, 0, 3, 2)</code>
+says that we want lanes 1, 0, 3 then 2 of the original value.
+(You can shuffle a value into multiple destination lanes;
+for example,
+<code>_MM_SHUFFLE(0, 0, 0, 0)</code>
+says that you want four copies of lane 0.
+That's how we created <code>xboundary</code>.)
+</p>
+<table BORDER=0 CELLPADDING=3
+    STYLE="border-collapse: collapse; text-align: center">
+<tr>
+<td></td>
+<td STYLE="width: 1em"></td>
+<td>Lane 3</td>
+<td>Lane 2</td>
+<td>Lane 1</td>
+<td>Lane 0</td>
+</tr>
+<tr>
+<td><code>count</code></td>
+<td></td>
+<td STYLE="border: solid 1px black">Lane 3 totals</td>
+<td STYLE="border: solid 1px black">Lane 2 totals</td>
+<td STYLE="border: solid 1px black">Lane 1 totals</td>
+<td STYLE="border: solid 1px black">Lane 0 totals</td>
+</tr>
+<tr>
+<td><code>shuffle1</code></td>
+<td></td>
+<td STYLE="border: solid 1px black">Lane 1 totals</td>
+<td STYLE="border: solid 1px black">Lane 0 totals</td>
+<td STYLE="border: solid 1px black">Lane 3 totals</td>
+<td STYLE="border: solid 1px black">Lane 2 totals</td>
+</tr>
+<tr>
+<td COLSPAN=6>&nbsp;</td>
+</tr>
+<tr>
+<td><code>count += shuffle1</code></td>
+<td></td>
+<td STYLE="border: solid 1px black">Lane 3 + Lane 1</td>
+<td STYLE="border: solid 1px black">Lane 2 + Lane 0</td>
+<td STYLE="border: solid 1px black">Lane 1 + Lane 3</td>
+<td STYLE="border: solid 1px black">Lane 0 + Lane 2</td>
+</tr>
+<tr>
+<td><code>shuffle2</code></td>
+<td></td>
+<td STYLE="border: solid 1px black">Lane 2 + Lane 0</td>
+<td STYLE="border: solid 1px black">Lane 3 + Lane 1</td>
+<td STYLE="border: solid 1px black">Lane 0 + Lane 2</td>
+<td STYLE="border: solid 1px black">Lane 1 + Lane 3</td>
+</tr>
+<tr>
+<td COLSPAN=6>&nbsp;</td>
+</tr>
+<tr>
+<td><code>count += shuffle2</code></td>
+<td></td>
+<td STYLE="border: solid 1px black" ALIGN=left>Lane 3 + Lane 1 +<br>
+                                        Lane 2 + Lane 0</td>
+<td STYLE="border: solid 1px black" ALIGN=left>Lane 2 + Lane 0 +<br>
+                                        Lane 3 + Lane 1</td>
+<td STYLE="border: solid 1px black" ALIGN=left>Lane 1 + Lane 3 +<br>
+                                        Lane 0 + Lane 2</td>
+<td STYLE="border: solid 1px black" ALIGN=left>Lane 0 + Lane 2 +<br>
+                                        Lane 1 + Lane 3</td>
+</tr>
+</table>
+<p>
+At the end of the shuffling and adding,
+we have calculated the sum of all
+four lanes.
+(For
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2012/11/13/10367904.aspx">
+style points</a>, I put the answer in all the lanes.)
+</p>
+<p>
+This new version runs in 688 time units,
+or 3.9 times faster than the previous one.
+This makes sense because we are counting four
+values at each iteration.
+The overall improvement is 4.3&times;.
+</p>
+<p>
+Let's see if we can reduce the loop overhead by
+doing some unrolling.
+</p>
+<pre>
+<font COLOR=blue>#define GETVALUE(n) __m128i value##n = _mm_loadu_si128(&amp;xarray[i+n])
+#define GETTEST(n) __m128i test##n = _mm_cmplt_epi32(value##n, xboundary)
+#define GETCOUNT(n)  count = _mm_sub_epi32(count, test##n)</font>
+
+int countthem(int boundary)
+{
+ __m128i *xarray = (__m128i*)array;
+ __m128i xboundary = _mm_set1_epi32(boundary);
+ __m128i count = _mm_setzero_si128();
+ for (int i = 0; i &lt; 10000 / 4; i += <font COLOR=blue>4</font>) {
+  <font COLOR=blue>GETVALUE(0); GETVALUE(1); GETVALUE(2); GETVALUE(3);
+   GETTEST(0);  GETTEST(1);  GETTEST(2);  GETTEST(3);
+  GETCOUNT(0); GETCOUNT(1); GETCOUNT(2); GETCOUNT(3);</font>
+ }
+ __m128i shuffle1 = _mm_shuffle_epi32(count, _MM_SHUFFLE(1, 0, 3, 2));
+ count = _mm_add_epi32(count, shuffle1);
+ __m128i shuffle2 = _mm_shuffle_epi32(count, _MM_SHUFFLE(2, 3, 0, 1));
+ count = _mm_add_epi32(count, shuffle2);
+ return _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+We unroll the loop fourfold.
+At each iteration, we load 16 values from memory,
+and then accumulate the totals.
+We fetch all the memory values first,
+then do the comparisons,
+then accumulate the results.
+If we had written it as
+<code>GETVALUE</code> immediately followed
+by <code>GETTEST</code>,
+then the <code>_mm_cmplt_epi32</code>
+would have stalled waiting for the result
+to arrive from memory.
+By interleaving the operations,
+we get some work done instead of stalling.
+</p>
+<p>
+This version runs in 514 time units,
+an improvement of 33% over the previous version
+and an overall improvement of 5.7&times;.
+</p>
+<p>
+Can we unroll even further?
+Let's try fivefold.
+</p>
+<pre>
+int countthem(int boundary)
+{
+ __m128i *xarray = (__m128i*)array;
+ __m128i xboundary = _mm_set1_epi32(boundary);
+ __m128i count = _mm_setzero_si128();
+ for (int i = 0; i &lt; 10000 / 4; i += <font COLOR=blue>5</font>) {
+  GETVALUE(0); GETVALUE(1); GETVALUE(2); GETVALUE(3); <font COLOR=blue>GETVALUE(4);</font>
+   GETTEST(0);  GETTEST(1);  GETTEST(2);  GETTEST(3);  <font COLOR=blue>GETTEST(4);</font>
+  GETCOUNT(0); GETCOUNT(1); GETCOUNT(2); GETCOUNT(3); <font COLOR=blue>GETCOUNT(4);</font>
+ }
+ __m128i shuffle1 = _mm_shuffle_epi32(count, _MM_SHUFFLE(1, 0, 3, 2));
+ count = _mm_add_epi32(count, shuffle1);
+ __m128i shuffle2 = _mm_shuffle_epi32(count, _MM_SHUFFLE(2, 3, 0, 1));
+ count = _mm_add_epi32(count, shuffle2);
+ return _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+Huh?
+This version runs marginally <i>slower</i>,
+at 528 time units.
+So I guess further unrolling won't help any more.
+(For example, if you unroll a loop so much that
+you have more live variables than registers,
+the compiler will need to spill registers to memory.
+The x86 has eight XMM registers available,
+so you can easily cross that limit.)
+</p>
+<p>
+But wait, there's still room for tweaking.
+We have been using
+<code>_mm_cmplt_epi32</code> to perform the comparison,
+expecting the compiler to generate code like this:
+</p>
+<pre>
+    ; suppose xboundary is in xmm0 and count is in xmm1
+    movdqu   xmm2, xarray[i] ; xmm2 = value
+    pcmpltd  xmm2, xmm0      ; xmm2 = test
+    psubd    xmm1, xmm2
+</pre>
+<p>
+If you crack open your Intel manual,
+you'll see that there is no
+<code>PCMPLTD</code> instruction.
+The compiler intrinsic is emulating the instruction by
+flipping the parameters and using <code>PCMPGTD</code>.
+</p>
+<pre>
+_mm_cmplt_epi32(x, y) &harr; _mm_cmpgt_epi32(y, x)
+</pre>
+<p>
+But the <code>PCMPGTD</code> instruction writes the result
+back into the first parameter.
+In other words, it always takes the form
+</p>
+<pre>
+y = _mm_cmpgt_epi32(y, x);
+</pre>
+<p>
+In our case, <code>y</code> is <code>xboundary</code>,
+but we don't want to modify <code>xboundary</code>.
+As a result, the compiler needs to introduce a temporary register:
+</p>
+<pre>
+    movdqu   xmm2, xarray[i] ; xmm2 = value
+    movdqa   xmm3, xmm0      ; xmm3 = copy of xboundary
+    pcmpgtd  xmm3, xmm2      ; xmm3 = test
+    psubd    xmm1, xmm3
+</pre>
+<p>
+We can take an instruction out of the sequence by switching to
+<code>_mm_cmpgt_epi32</code> and adjusting our logic accordingly,
+taking advantage of the fact that</p>
+<pre>
+x &lt; y &hArr; &not;(x &ge; y) &hArr; &not;(x &gt; y &minus; 1)
+</pre>
+<p>
+assuming the subtraction does not underflow.
+Fortunately, it doesn't in our case since <code>boundary</code>
+ranges from 0 to 10, and subtracting 1 does not put us in any danger
+of integer underflow.
+</p>
+<p>
+With this rewrite, we can switch to using
+<code>_mm_cmpgt_epi32</code>,
+which is more efficient for our particular scenario.
+Since we are now counting the values which <i>don't</i>
+meet our criteria,
+we need to take our final result and subtract it from 10000.
+</p>
+<pre>
+#define GETTEST(n) __m128i test##n = _mm_<font COLOR=blue>cmpgt</font>_epi32(value##n, <font COLOR=blue>xboundary1</font>)
+
+int countthem(int boundary)
+{
+ __m128i *xarray = (__m128i*)array;
+ <font COLOR=blue>__m128i xboundary1 = _mm_set1_epi32(boundary - 1);</font>
+ __m128i count = _mm_setzero_si128();
+ for (int i = 0; i &lt; 10000 / 4; i += <font COLOR=blue>5</font>) {
+  GETVALUE(0); GETVALUE(1); GETVALUE(2); GETVALUE(3); GETVALUE(4);
+   GETTEST(0);  GETTEST(1);  GETTEST(2);  GETTEST(3);  GETTEST(4);
+  GETCOUNT(0); GETCOUNT(1); GETCOUNT(2); GETCOUNT(3); GETCOUNT(4);
+ }
+ __m128i shuffle1 = _mm_shuffle_epi32(count, _MM_SHUFFLE(1, 0, 3, 2));
+ count = _mm_add_epi32(count, shuffle1);
+ __m128i shuffle2 = _mm_shuffle_epi32(count, _MM_SHUFFLE(2, 3, 0, 1));
+ count = _mm_add_epi32(count, shuffle2);
+ return <font COLOR=blue>10000 -</font> _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+Notice that we have two subtractions which cancel out.
+We are subtracting the result of the comparison, and then
+we subtract the total from 10000.
+The two signs cancel out, and we can use addition for both.
+This saves an instruction in the <code>return</code> because
+subtraction is not commutative, but addition is.
+</p>
+<pre>
+#define GETCOUNT(n) count = _mm_<font COLOR=blue>add</font>_epi32(count, test##n)
+
+int countthem(int boundary)
+{
+ __m128i *xarray = (__m128i*)array;
+ __m128i xboundary1 = _mm_set1_epi32(boundary - 1);
+ __m128i count = _mm_setzero_si128();
+ for (int i = 0; i &lt; 10000 / 4; i += 5) {
+  GETVALUE(0); GETVALUE(1); GETVALUE(2); GETVALUE(3); GETVALUE(4);
+   GETTEST(0);  GETTEST(1);  GETTEST(2);  GETTEST(3);  GETTEST(4);
+  GETCOUNT(0); GETCOUNT(1); GETCOUNT(2); GETCOUNT(3); GETCOUNT(4);
+ }
+ __m128i shuffle1 = _mm_shuffle_epi32(count, _MM_SHUFFLE(1, 0, 3, 2));
+ count = _mm_add_epi32(count, shuffle1);
+ __m128i shuffle2 = _mm_shuffle_epi32(count, _MM_SHUFFLE(2, 3, 0, 1));
+ count = _mm_add_epi32(count, shuffle2);
+ return <font COLOR=blue>10000 +</font> _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+You can look at the transformation this way:
+The old code considered the glass half empty.
+It started with zero and added 1 each time it found an entry
+that passed the test.
+The new code considers the glass half full.
+It assumes each entry passes the test,
+and it subtracts one each time it finds an element that fails the test.
+</p>
+<p>
+This version runs in 453 time units,
+an improvement of 13% over the fourfold unrolled version
+and an improvement of 6.5&times; overall.
+</p>
+<p>
+Okay, let's unroll sixfold, just for fun.
+</p>
+<pre>
+int countthem(int boundary)
+{
+ __m128i *xarray = (__m128i*)array;
+ __m128i xboundary = _mm_set1_epi32(boundary - 1);
+ __m128i count = _mm_setzero_si128();
+ <font COLOR=blue>int i = 0;
+ {
+    GETVALUE(0); GETVALUE(1); GETVALUE(2); GETVALUE(3);
+     GETTEST(0);  GETTEST(1);  GETTEST(2);  GETTEST(3);
+    GETCOUNT(0); GETCOUNT(1); GETCOUNT(2); GETCOUNT(3);
+ }
+ i += 4;</font>
+ for (; i &lt; 10000 / 4; i += <font COLOR=blue>6)</font> {
+  GETVALUE(0); GETVALUE(1); GETVALUE(2);
+  GETVALUE(3); GETVALUE(4); <font COLOR=blue>GETVALUE(5);</font>
+   GETTEST(0);  GETTEST(1);  GETTEST(2);
+   GETTEST(3);  GETTEST(4);  <font COLOR=blue>GETTEST(5);</font>
+  GETCOUNT(0); GETCOUNT(1); GETCOUNT(2);
+  GETCOUNT(3); GETCOUNT(4); <font COLOR=blue>GETCOUNT(5);</font>
+ }
+ __m128i shuffle1 = _mm_shuffle_epi32(count, _MM_SHUFFLE(1, 0, 3, 2));
+ count = _mm_add_epi32(count, shuffle1);
+ __m128i shuffle2 = _mm_shuffle_epi32(count, _MM_SHUFFLE(2, 3, 0, 1));
+ count = _mm_add_epi32(count, shuffle2);
+ return 10000 + _mm_cvtsi128_si32(count);
+}
+</pre>
+<p>
+Since <code>10000 / 4 % 6 = 4</code>,
+we have four values that don't fit in the loop.
+We deal with those values up front,
+and then enter the loop to get the rest.
+</p>
+<p>
+This version runs in 467 time units,
+which is 3% slower than the previous version.
+So I guess it's time to stop unrolling.
+Let's go back to the previous version which ran faster.
+</p>
+<p>
+The total improvement we got after all this tweaking
+is speedup of 6.5&times; over the original jumpless version.
+And most of that improvement (5.7&times;) came from
+unrolling the loop fourfold.
+</p>
+<p>
+Anyway, no real moral of the story today.
+I just felt like tinkering.
+</p>
+<p>
+<b>Notes</b>
+</p>
+<p>
+&sup1; The
+<code>_mm_loadu_si128</code>
+intrinsic is kind of weird.
+Its formal argument is a
+<code>__m128i*</code>,
+but since it is for loading unaligned data,
+the formal argument really should be
+<code>__m128i __unaligned*</code>.
+The problem is that the <code>__unaligned</code> keyword
+doesn't exist on x86 because prior to the introduction of MMX and SSE,
+x86 allowed arbitrary misaligned data.
+Therefore, you are in this weird situation where you have to
+use an aligned pointer to access unaligned data.
+</p>
+<p>
+<b>Bonus chatter</b>: Clang at optimization level 3 does autovectorization.
+It doesn't know some of the other tricks, like converting
+<code>x + 1</code>
+to
+<code>x - (-1)</code>, thereby saving an instruction and a register.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (12)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1164413">
+				<div id="div-comment-1164413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164413">
+			December 1, 2014 at 7:31 am</a>		</div>
+
+		<p>What&#39;s with the alignment? Using &quot;normal&quot; library calls (like new) in 32-bit programs, we get things aligned to 8 bytes and to nicely use SSE things I guess it&#39;s preferable having them aligned to 16.</p>
+<p><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/ycsb6wwf.aspx">msdn.microsoft.com/&#8230;/ycsb6wwf.aspx</a></p>
+<p>And here we have static &quot;int array[10000];&quot; I don&#39;t believe we can expect it to be 16-bytes aligned either? I guess if we assume we target only 64-bits we&#39;re safe?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1164423">
+				<div id="div-comment-1164423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">RCG</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164423">
+			December 1, 2014 at 7:49 am</a>		</div>
+
+		<p>Raymond,</p>
+<p>This made my Monday morning so much better. &nbsp;The stuff on lock free programming was nice too. &nbsp;I miss working on challenging stuff like this. &nbsp;Thanks for reminding me why I used to like programming so much. &nbsp;It&#39;s time to start hacking on something fun after hours.</p>
+<p>RCG</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1164433">
+				<div id="div-comment-1164433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Douglas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164433">
+			December 1, 2014 at 7:51 am</a>		</div>
+
+		<p>@acq</p>
+<p>Well, as the page you linked to mentions, there&#39;s _aligned_malloc, although I think that&#39;s nonportable.</p>
+<p>If you&#39;re willing to restrict yourself to newer versions of C and C++, there&#39;re aligned_alloc (in C11), and std::align (in C++11). aligned_alloc looks to be pretty convenient, basically just malloc with an alignment argument. I know from experience that std::align is a total pain to use.</p>
+<p>As for the static array, you could use unaligned loads (which are always safe (I think)), or you could make it larger than necessary and use something like std::align which does the arithmetic to find an aligned subset for you.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1164463">
+				<div id="div-comment-1164463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lars</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164463">
+			December 1, 2014 at 9:42 am</a>		</div>
+
+		<p>@Douglas</p>
+<p>In C++, it&#39;s easy to make a wrapper class for malloc/new. Given how often one needs custom memory allocation anyway, you won&#39;t notice the difference &#8211; and it does not require C++11.</p>
+<p>An inconspicuous wrapper could be written in C as well.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1164493">
+				<div id="div-comment-1164493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Vine [MSFT]</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164493">
+			December 1, 2014 at 12:34 pm</a>		</div>
+
+		<p>The intel intrinsics guide at <a rel="nofollow" target="_new" href="https://software.intel.com/sites/landingpage/IntrinsicsGuide/">software.intel.com/&#8230;/IntrinsicsGuide</a> is a really good reference for looking up and searching for SIMD and related instructions</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1164503">
+				<div id="div-comment-1164503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Darran Rowe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164503">
+			December 1, 2014 at 3:27 pm</a>		</div>
+
+		<p>@acq:</p>
+<p>The reason for alignment is that newer SSE calls do mostly require alignment if they access memory. I was playing around with some x64 assembly, and I messed up the stack alignment requirement due to miscounting the stack usage. I ended up calling into a CRT function and the function ended up causing the program to crash. After stepping through, I tracked down the problem to the CRT function using an SSE2 instruction. It was trying to use an instruction on an unaligned memory address and failing due to the stricter alignment requirements. These instructions do trigger a general protection fault when they are used unaligned.</p>
+<p>Obviously, after I noticed that it was unaligned, I went straight back to my ASM and checked the alignment there. After fixing things it worked perfectly fine. So it is not just preferable, most of the time it is required.</p>
+<p>For the ones which allow unaligned access, there is a difference in performance. I would imagine that the processor does two memory accesses, one aligned one for the first part, shifts it down and put it into the lower bits of the register, then the second one for the higher part shifting it up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1164543">
+				<div id="div-comment-1164543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Azarien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164543">
+			December 2, 2014 at 3:20 am</a>		</div>
+
+		<p>@acq: in MSVC one can do</p>
+<p> &nbsp; &nbsp;__declspec(align(16)) int array[10000];</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1164553">
+				<div id="div-comment-1164553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">doynax</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164553">
+			December 2, 2014 at 3:56 am</a>		</div>
+
+		<p>If the boundary is 0 &lt;= n &lt;= 10 then I suppose one might try using the (saturated) packing instructions to squeeze 16 elements into a single register to shave off a couple of instructions</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1164573">
+				<div id="div-comment-1164573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marcel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164573">
+			December 2, 2014 at 7:04 am</a>		</div>
+
+		<p>That was a complete joy to read, thanks a lot :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1164723">
+				<div id="div-comment-1164723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164723">
+			December 2, 2014 at 4:25 pm</a>		</div>
+
+		<p>The code as posted uses _mm_loadu_si128() which will happily load from addresses which aren&#39;t 16-byte aligned. On a modern CPU there&#39;s no performance penalty for using that instruction as long as the data is actually aligned. Try comparing with _mm_load_si128() which will cause a crash if you try and load from a misaligned address.</p>
+<p>However if the array is actually misaligned e.g. &quot;__m128i *xarray = (__m128i*)(array + 1);&quot; then there&#39;s a significant performance hit from _mm_loadu_si128() &#8211; about 33% on my PC. For that reason it&#39;s probably best to go with the aligned instruction where possible, to avoid accidentally throwing away performance.</p>
+<p>One way to fix the alignment is to replace global operator new and delete (and all their variants).</p>
+<p>I also noticed that some of the less optimized versions of the code benefit from /arch:AVX and also from switching to x64, without changing the code. AVX gives you three operand instructions to help avoid copies, and x64 gives the compiler more registers to play with.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1164943">
+				<div id="div-comment-1164943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Manodeep</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1164943">
+			December 3, 2014 at 8:55 am</a>		</div>
+
+		<p>Thanks for the fantastic article. </p>
+<p>I got carried away a bit and created a gist with all the functions in them : <a rel="nofollow" target="_new" href="https://gist.github.com/manodeep/05c65432cddf34dc11ea">gist.github.com/&#8230;/05c65432cddf34dc11ea</a></p>
+<p>I run the benchmarks with both gcc4.8 and clang6 on my 2012 Macbook air &#8212; seems that clang does that best job with the -O3 flag. Max. improvements are 25% or so &#8212; compared to gcc where max. improvements are ~7x.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1165163">
+				<div id="div-comment-1165163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141201-00/?p=43503#comment-1165163">
+			December 4, 2014 at 6:20 am</a>		</div>
+
+		<p>Any reason for using shuffle+add to sum the lanes rather than a pair of horizontal adds? (_mm_hadd_epi32)</p>
+<p>Ok, in this example it is outside of the loop so not really performance critical but is one faster/better than the other assuming you have SSE3?</p>
+<div class="post">[<em>Unless it would be a significant hardship, I stick to SSE2 because <a href="http://windows.microsoft.com/en-US/windows-8/system-requirements">Windows minimum system requirements</a> are only SSE2. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

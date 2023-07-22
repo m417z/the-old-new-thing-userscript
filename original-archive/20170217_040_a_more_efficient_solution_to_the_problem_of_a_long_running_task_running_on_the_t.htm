@@ -1,0 +1,258 @@
+<html>
+<head>
+<title>A more efficient solution to the problem of a long-running task running on the thread pool persistent thread</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A more efficient solution to the problem of a long-running task running on the thread pool persistent thread</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 17, 2017 / year-entry #41</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170217-00/?p=95465</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>3</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Break it up a little more.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20170216-00/?p=95455">
+Last time</a>,
+we found one solution to the problem of the
+long-running task on the persistent thread:
+Namely, put the long-running task on a regular thread.
+But that's not the best solution,
+because it still burns a thread.
+</p>
+<p>
+The better solution is to let the thread pool manage
+the wait.
+Instead of dedicating a task pool thread to waiting
+around for a specific type of work to do,
+the thread pool can merge the wait with all the other
+thread pool wait operations onto a single thread.
+This keeps all task pool threads available for
+doing actual work.
+</p>
+<pre>
+// Error checking elided for expository purposes.
+
+void WidgetMonitor::RegisterNotificationWait(
+ WidgetNotificationContext* context)
+{
+ RegisterWaitForSingleObject(&amp;context->waitHandle,
+  context-&gt;registryEvent,
+  WidgetNotificationWaitCallback,
+  context,
+  INFINITE,
+  WT_EXECUTEONLYONCE | WT_EXECUTEINPERSISTENTTHREAD);
+ RegNotifyChangeKeyValue(context-&gt;hkey, false,
+                         REG_NOTIFY_CHANGE_LAST_SET,
+                         context-&gt;registryEvent, TRUE);
+}
+
+void WidgetMonitor::WidgetNotificationStartCallback(void* parameter)
+{
+ WidgetNotificationContext* context =
+   reinterpret_cast&lt;WidgetNotificationContext*&gt;(parameter);
+
+ context-&gt;hkey = ...;
+ context-&gt;registryEvent = ...;
+ RegisterNotificationWait(context);
+}
+
+void WidgetMonitor::WidgetNotificationWaitCallback(
+    void* parameter, BOOLEAN /* TimerOrWaitFired */)
+{
+ WidgetNotificationContext* context =
+   reinterpret_cast&lt;WidgetNotificationContext*&gt;(parameter);
+
+ ... process the change ...
+
+ RegisterNotificationWait(context);
+}
+
+void WidgetMonitor::StartMonitoring()
+{
+ auto context = new WidgetNotificationContext();
+ QueueUserWorkItem(WidgetNotificationStartCallback,
+                   context,
+                   WT_EXECUTEINPERSISTENTTHREAD);
+}
+
+void WidgetMonitor::StopMonitoring(
+    WidgetNotificationContext* context)
+{
+ // WARNING! Massive race conditions here need to be addressed.
+
+ if (context-&gt;waitHandle) {
+  UnregisterWait(context-&gt;waitHandle);
+  context-&gt;waitHandle = nullptr;
+ }
+ ... clean up other resources ...
+ delete context;
+}
+</pre>
+<p>
+The basic idea is that you start the ball rolling by queueing
+<code>Widget&shy;Notification&shy;Start&shy;Callback</code>
+onto the persistent thread.
+This task opens the registry key and registers the notification.
+The registration must take place on a persistent thread,
+and we use the thread pool persistent thread for this purpose,
+since we are not going to keep a thread captive for the duration
+of the registration.
+</p>
+<p>
+When the change occurs,
+we process it (quickly, since we're on the persistent thread),
+then register another wait.
+We use one-time waits because we don't want two sets of changes
+to be processed simultaneously.
+</p>
+<p>
+When the client wants to stop receiving notifications,
+we unregister the wait,
+which prevents us from reacting to any future changes.
+And we clean up any other resources before deleting the
+context.
+(Of course, you probably would put all of this code into
+the <code>Widget&shy;Notification&shy;Context</code>
+destructor, but I'm putting it here for explicitness.)
+</p>
+<p>
+Now, this code has race conditions galore.
+For example, what if a change is being processed at the
+moment the client deides to stop notifications?
+I'll leave closing all the race windows (and adding proper
+error handling) as an exercise.
+You may find that the error handling is a lot easier
+if you switch to functions like
+<code>Create&shy;Thread&shy;Pool&shy;Wait</code>,
+which let you preallocate all the resources that will be
+used by a future wait operation,
+thereby removing an error scenario.
+</p>
+<p>
+If processing the change notification is slow
+(for example, because it waits for the client to respond),
+then we cannot do that work on the persistent thread.
+Instead, we should queue the wait callback to a regular
+thread pool thread,
+and then queue another
+<code>Widget&shy;Notification&shy;Start&shy;Callback</code>
+back to the persistent thread to request the next
+registry notification.
+While you're at it,
+move all the code that initializes the <code>context</code>
+into the
+<code>Start&shy;Monitoring</code> method.
+This solves two problems:
+First, it lets you handle errors more easily, since you can
+report them to the code that valled
+<code>Start&shy;Monitoring</code>.
+But more important, it avoids double-initializing the <code>context</code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (3)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1285566">
+				<div id="div-comment-1285566" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170217-00/?p=95465#comment-1285566">
+			February 21, 2017 at 2:28 am</a>		</div>
+
+		<p>Surely WT_EXECUTEINPERSISTENTTHREAD is a backward step? Why not allow the work to be queued to any thread?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1285586">
+				<div id="div-comment-1285586" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170217-00/?p=95465#comment-1285586">
+			February 21, 2017 at 6:36 am</a>		</div>
+
+		<p>Queueing the work to an arbitrary thread leads to <a href="https://blogs.msdn.microsoft.com/oldnewthing/20150226-00/?p=44583">an infinite loop</a>. But stay tuned for more discussion.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1285716">
+				<div id="div-comment-1285716" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170217-00/?p=95465#comment-1285716">
+			February 22, 2017 at 3:18 am</a>		</div>
+
+		<p>Sorry, my question was unclear, because I hadn&#8217;t specified which work. What I meant to ask was, why not allow the wait callback to be queued to any thread?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

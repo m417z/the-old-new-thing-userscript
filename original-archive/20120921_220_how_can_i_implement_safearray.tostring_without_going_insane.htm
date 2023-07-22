@@ -1,0 +1,523 @@
+<html>
+<head>
+<title>How can I implement SAFEARRAY.ToString() without going insane?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I implement SAFEARRAY.ToString() without going insane?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 21, 2012 / year-entry #221</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A colleague needed some help with manipulating SAFEARRAYs. I have some generic code to execute WMI queries and store the result as strings. Normally, Variant­Change­Type(VT_BSTR) does the work, but Variant­Change­Type doesn't know how to convert arrays (e.g. VT_ARRAY | VT_INT). And there doesn't seem to be an easy way to convert the array element-by-element because Safe­Array­Get­Element...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A colleague needed some help with manipulating <code>SAFEARRAY</code>s.
+</p>
+<blockquote class=q><p>
+I have some generic code to execute WMI queries and store the
+result as strings.
+Normally,
+<code>Variant&shy;Change&shy;Type(VT_BSTR)</code> does the work,
+but
+<code>Variant&shy;Change&shy;Type</code> doesn't know how to
+convert arrays (e.g. <code>VT_ARRAY&nbsp;| VT_INT</code>).
+And there doesn't seem to be an easy way to convert the array
+element-by-element because <code>Safe&shy;Array&shy;Get&shy;Element</code>
+expects a pointer to an object of the
+underlying type, so I'd have to write a switch statement
+for each variant type.
+Surely there's an easier way?
+</p>
+</blockquote>
+<p>
+One suggestion was to use
+the ATL <code>CComSafeArray</code> template,
+but since it's a template, the underlying type of the array
+needs to be known at compile time,
+but we don't know the underlying type until run time,
+which is exactly the problem.
+</p>
+<p>
+Let's start with the big switch statement and then do some
+optimization.
+All before we start typing,
+because after all the goal of this exercise is to avoid having
+to type out the massive switch statement.
+(Except that I have to actually type it so you have something to read.)
+</p>
+<p>
+Here's the version we're trying to avoid having to type:
+</p>
+<pre>
+HRESULT SafeArrayGetElementAsString(
+    SAFEARRAY *psa,
+    long *rgIndices,
+    LCID lcid, // controls conversion to string
+    unsigned short wFlags, // controls conversion to string
+    BSTR *pbstrOut)
+{
+  *pbstrOut = nullptr;
+  VARTYPE vt;
+  HRESULT hr = SafeArrayGetVartype(psa, &amp;vt);
+  if (SUCCEEDED(hr)) {
+    switch (vt) {
+    case VT_I2:
+      {
+        SHORT iVal;
+        hr = SafeArrayGetElement(psa, rgIndices, &amp;iVal);
+        if (SUCCEEDED(hr)) {
+          hr = VarBstrFromI2(iVal, lcid, wFlags, pbstrOut);
+        }
+      }
+      break;
+    case VT_I4:
+      {
+        LONG lVal;
+        hr = SafeArrayGetElement(psa, rgIndices, &amp;lVal);
+        if (SUCCEEDED(hr)) {
+          hr = VarBstrFromI4(lVal, lcid, wFlags, pbstrOut);
+        }
+      }
+      break;
+    ... etc for another dozen or so cases ...
+    ... and then special cases for things that need special handling ...
+    case VT_VARIANT:
+      {
+        VARIANT varVal;
+        hr = SafeArrayGetElement(psa, rgIndices, &amp;varVal);
+        if (SUCCEEDED(hr)) {
+          hr = VariantChangeTypeEx(&amp;varVal, &amp;varVal,
+                                   lcid, wFlags, VT_BSTR);
+          if (SUCCEEDED(hr)) {
+            *pbstrOut = varVal.bstrVal;
+          } else {
+            VariantClear(&amp;varVal);
+          }
+        }
+      }
+      break;
+    case VT_UNKNOWN:
+    case VT_DISPATCH:
+    case VT_BSTR: // other cases where we need to release the object
+      ... more special cases ...
+    }
+  }
+  return hr;
+}
+</pre>
+<p>
+The first observation is that you can make
+<code>Variant&shy;Change&shy;Type</code> do the heavy lifting.
+Just read everything (whatever it is) into a variant, and then let
+<code>Variant&shy;Change&shy;Type</code> do the string conversion.
+</p>
+<pre>
+HRESULT SafeArrayGetElementAsString(
+    SAFEARRAY *psa,
+    long *rgIndices,
+    LCID lcid, // controls conversion to string
+    unsigned short wFlags, // controls conversion to string
+    BSTR *pbstrOut)
+{
+  *pbstrOut = nullptr;
+  VARTYPE vt;
+  HRESULT hr = SafeArrayGetVartype(psa, &amp;vt);
+  if (SUCCEEDED(hr)) {
+    VARIANT var;
+    switch (vt) {
+    case VT_I2:
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var.iVal);
+      if (SUCCEEDED(hr)) {
+        var.vt = vt;
+      }
+      break;
+    case VT_I4:
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var.lVal);
+      if (SUCCEEDED(hr)) {
+        var.vt = vt;
+      }
+      break;
+    case VT_R4:
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var.fltVal);
+      if (SUCCEEDED(hr)) {
+        var.vt = vt;
+      }
+      break;
+    ... etc for another dozen or so cases ...
+    ... there is just one special case now ...
+    case VT_VARIANT:
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var);
+      break;
+    default:
+      // an invalid array base type somehow snuck through
+      hr = E_INVALIDARG;
+      break;
+    }
+    if (SUCCEEDED(hr)) {
+      hr = VariantChangeTypeEx(&amp;var, &amp;var,
+                               lcid, wFlags, VT_BSTR);
+      if (SUCCEEDED(hr)) {
+        *pbstrOut = var.bstrVal;
+      } else {
+        VariantClear(&amp;var);
+      }
+    }
+  }
+  return hr;
+}
+</pre>
+<p>
+We can get rid of the special cases for
+<code>VT_UNKNOWN</code>,
+<code>VT_DISPATCH</code>,
+<code>VT_RECORDINFO</code>,
+and
+<code>VT_BSTR</code>,
+since <code>Variant&shy;Clear</code> will do the appropriate
+cleanup for us.
+</p>
+<p>
+You can actually stop there, since the compiler will perform
+the next optimization for us.
+But since the goal is to save typing, we can perform the optimization
+manually to save us from having to write out all those
+<code>Safe&shy;Array&shy;Get&shy;Element</code> calls.
+</p>
+<p>
+Observe that all the <code>var.iVal</code>,
+<code>var.lVal</code>,
+<code>var.fltVal</code>, etc., members
+are all unioned on top of each other.
+In other words, the address of all the members is the same.
+We can therefore merge all the cases together.
+(As noted, this is something the compiler will already do,
+so the goal here is not to create more efficient code but
+just to reduce typing.)</p>
+<p>
+<pre>
+HRESULT SafeArrayGetElementAsString(
+    SAFEARRAY *psa,
+    long *rgIndices,
+    LCID lcid, // controls conversion to string
+    unsigned short wFlags, // controls conversion to string
+    BSTR *pbstrOut)
+{
+  *pbstrOut = nullptr;
+  VARTYPE vt;
+  HRESULT hr = SafeArrayGetVartype(psa, &amp;vt);
+  if (SUCCEEDED(hr)) {
+    VARIANT var;
+    switch (vt) {
+    case VT_I2:
+    case VT_I4:
+    case VT_R4:
+    case ... etc ...:
+      // All of the above cases store their data in the same place
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var.iVal);
+      if (SUCCEEDED(hr)) {
+        var.vt = vt;
+      }
+      break;
+    case VT_DECIMAL:
+      // Decimals are stored in a funny place.
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var.decVal);
+      if (SUCCEEDED(hr)) {
+        var.vt = vt;
+      }
+      break;
+    case VT_VARIANT:
+      // Variants too, because it obvious isn't a member of itself.
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;var);
+      break;
+    default:
+      // an invalid array base type somehow snuck through
+      hr = E_INVALIDARG;
+      break;
+    }
+    if (SUCCEEDED(hr)) {
+      hr = VariantChangeTypeEx(&amp;var, &amp;var,
+                               lcid, wFlags, VT_BSTR);
+      if (SUCCEEDED(hr)) {
+        *pbstrOut = var.bstrVal;
+      } else {
+        VariantClear(&amp;var);
+      }
+    }
+  }
+  return hr;
+}
+</pre>
+<p>
+And then you can generalize this function so it returns
+a <code>VARIANT</code>,
+so that it becomes the caller's responsibility to do the
+<code>Variant&shy;Change&shy;Type(VT_BSTR)</code>.
+This also allows the caller to figure out how to deal
+with things like <code>VT_UNKNOWN</code>, which
+<code>Variant&shy;Change&shy;Type</code> doesn't know
+how to handle.
+(Perhaps it should be converted to the string <code>"[object]"</code>.)
+Or maybe the caller might want to use this function to convert
+all <code>SAFEARRAY</code>s to
+<code>VT_ARRAY | VT_FIXEDBASETYPE</code>.
+</p>
+<pre>
+HRESULT SafeArrayGetElementAsVariant(
+    SAFEARRAY *psa,
+    long *rgIndices,
+    VARIANT *pvarOut)
+{
+  VariantInit(pvarOut);
+  VARTYPE vt;
+  HRESULT hr = SafeArrayGetVartype(psa, &amp;vt);
+  if (SUCCEEDED(hr)) {
+    switch (vt) {
+    case VT_I2:
+    case VT_I4:
+    case VT_R4:
+    case ...:
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;pvarOut-&gt;iVal);
+      if (SUCCEEDED(hr)) {
+        pvarOut-&gt;vt = vt;
+      }
+      break;
+    case VT_DECIMAL:
+      // Decimals are stored in a funny place.
+      hr = SafeArrayGetElement(psa, rgIndices, &amp;pvarOut-&gt;decVal);
+      if (SUCCEEDED(hr)) {
+        pvarOut-&gt;vt = vt;
+      }
+      break;
+    case VT_VARIANT:
+      // Variants too, because it obvious isn't a member of itself.
+      hr = SafeArrayGetElement(psa, rgIndices, pvarOut);
+      break;
+    default:
+      // an invalid array base type somehow snuck through
+      hr = E_INVALIDARG;
+      break;
+    }
+  }
+  return hr;
+}
+</pre>
+<p>
+<b>Exercise</b>:
+Since <code>decVal</code> is unioned against the <code>tagVARIANT</code>,
+can we also collapse the <code>VT_DECIMAL</code> and <code>VT_VARIANT</code>
+cases together?
+</p>
+<p>
+<b>Exercise</b>:
+Why is the final typing-saver (collapsing the case statements)
+valid?
+Don't we have to worry about the
+possibility that the <code>VARIANT</code> type may change in the future?
+</p>
+<p>
+<b>Exercise</b>: What defensive actions could be taken to protect
+against that possibility raised by the previous exercise?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1012163">
+				<div id="div-comment-1012163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012163">
+			September 21, 2012 at 8:07 am</a>		</div>
+
+		<p>Even easier way: don&#39;t call WMI. Use wrapper libraries for the few pieces of functionality that have no Win32 API equivalents.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1012183">
+				<div id="div-comment-1012183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012183">
+			September 21, 2012 at 9:00 am</a>		</div>
+
+		<p>Nitpick; in some code examples you declare a VARIANT var; and then eventually call VariantClear(&#8230;) without ever having called VariantInit, which can result in strange effects.</p>
+<p>I&#39;ve gotten into the habit of using VariantInit on the same line as the declaration so I know I didn&#39;t miss it:</p>
+<p>VARIANT var; VariantInit(&amp;var);</p>
+<p>&#8230;</p>
+<p>VariantClear(&amp;var);</p>
+<p>(Well, actually I usually use a smart RAII object.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-1012193">
+				<div id="div-comment-1012193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012193">
+			September 21, 2012 at 9:12 am</a>		</div>
+
+		<p>Never mind, I take that back; I see you only call VariantChangeTypeEx/VariantClear if hr was successful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1012213">
+				<div id="div-comment-1012213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Random832</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012213">
+			September 21, 2012 at 9:31 am</a>		</div>
+
+		<p>Out of curiosity, if the definition on <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/ms221627(v=vs.85).aspx" target="_new" rel="nofollow">msdn.microsoft.com/&#8230;/ms221627(v=vs.85).aspx</a> is correct, how do you get around having to type var.__VARIANT_NAME1.__VARIANT_NAME_2.__VARIANT_NAME_3.iVal? Or am I misunderstanding something fundamental about how structs work, or is the definition incorrect?</p>
+<div class="post">[<i>Read oaidl.h and find out. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1012223">
+				<div id="div-comment-1012223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Random832</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012223">
+			September 21, 2012 at 10:01 am</a>		</div>
+
+		<p>Ah. The definition listed there doesn&#39;t show the macros that define them to be empty. If one were going to use this code under the circumstances that could cause the alternate form to be used, presumably one would use the macros in OleAuto.h &#8211; I don&#39;t think that V_DECIMAL is correctly defined in that case, though, since decVal is not a member of n2.n3.</p>
+<p>And a short test case confirms I&#39;m right &#8211; a funny place, indeed. I guess this shows how little this case is exercised.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1012233">
+				<div id="div-comment-1012233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivan K</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012233">
+			September 21, 2012 at 9:09 pm</a>		</div>
+
+		<p>Guessing. And probably missing some fine point about compiler optimisations or &#39;memory&#39; boundaries, but I think the cases could be combined as long as the caller was trusted not to do something like SafeArrayGetElementAsVariant(psa, rgIndices, (LPVARIANT)p_decimal_Out), and then pass in an array that&#39;s actually full of variants (maybe the clever caller gets to reuse a decimal variable lying around and assumes the two structs are the same, which they kind of are on win32).</p>
+<p>The alignment of both a decimal and a variant is 8 bytes (at least on my windows/x64 machine), and as mentioned offsetof decVal in a variant is zero. A variant is 24 bytes on win64 (thanks to the unnamed &quot;record&quot; struct), whereas a decimal stays at 16, so the individual safearray elements are possibly packed into in different memory locations depending on the array type, but I don&#39;t think that&#39;s any different than the VT_I1, etc case since an variant is big enough to hold the result.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1012243">
+				<div id="div-comment-1012243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012243">
+			September 22, 2012 at 12:32 am</a>		</div>
+
+		<p>I dont know why you assume that the decimal value is stored inside a VARIANT, occupying all of its memory. How could the vt member be stored that is needed for each and every valid VARIANT? It seems very clear that the value is stored where pdecValpoints to , outside of the VARIANT.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1012253">
+				<div id="div-comment-1012253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harald</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012253">
+			September 22, 2012 at 2:25 am</a>		</div>
+
+		<p>@Someone &quot;How could the vt member be stored that is needed for each and every valid VARIANT?&quot; It overlaps the unused bits of the DECIMAL structure, which are listed as a wReserved field at <a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/windows/desktop/ms221061%28v=vs.85%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/ms221061%28v=vs.85%29.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1012273">
+				<div id="div-comment-1012273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">wtfadf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012273">
+			September 23, 2012 at 9:14 am</a>		</div>
+
+		<p>@someone. Yea, I&#39;m not sure how to deal with VT_BYREF types.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1012363">
+				<div id="div-comment-1012363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120921-00/?p=6543#comment-1012363">
+			September 24, 2012 at 6:36 am</a>		</div>
+
+		<p>@Harald: Thanks. I didn&#39;t expectt the DECIMAL struct to have a reserved field as the first one. I thought the handling is similar to BSTR values.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

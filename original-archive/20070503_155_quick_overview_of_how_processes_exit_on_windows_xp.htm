@@ -1,0 +1,665 @@
+<html>
+<head>
+<title>Quick overview of how processes exit on Windows XP</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Quick overview of how processes exit on Windows XP</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 3, 2007 / year-entry #156</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>37</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Exiting is one of the scariest moments in the lifetime of a process. (Sort of how landing is one of the scariest moments of air travel.) Many of the details of how processes exit are left unspecified in Win32, so different Win32 implementations can follow different mechanisms. For example, Win32s, Windows�95, and Windows�NT all shut...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Exiting is one of the scariest moments in the lifetime of a process. (Sort of how landing is one of the scariest moments of air travel.)</p>
+<p> Many of the details of how processes exit are left unspecified in Win32, so different Win32 implementations can follow different mechanisms. For example, Win32s, Windows&nbsp;95, and Windows&nbsp;NT all shut down processes differently. (I wouldn't be surprised if Windows&nbsp;CE uses yet another different mechanism.) Therefore, bear in mind that what I write in this mini-series is implementation detail and <i>can change at any time without warning</i>. I'm writing about it because these details can highlight bugs lurking in your code. In particular, I'm going to discuss the way processes exit on Windows&nbsp;XP. </p>
+<p> I should say up front that I do not agree with many steps in the way processes exit on Windows&nbsp;XP. The purpose of this mini-series is not to justify the way processes exit but merely to fill you in on some of the behind-the-scenes activities so you are better-armed when you have to investigate into a mysterious crash or hang during exit. (Note that I just refer to it as the <i>way</i> processes exit on Windows&nbsp;XP rather than saying that it is how process exit is <i>designed</i>. As one of my colleagues put it, "Using the word <i>design</i> to describe this is like using the term <i>swimming pool</i> to refer to a puddle in your garden.") </p>
+<p> When your program calls <code>ExitProcess</code> a whole lot of machinery springs into action. First, all the threads in the process (except the one calling <code>ExitProcess</code>) are forcibly terminated. This dates back to the old-fashioned theory on how processes should exit: Under the old-fashioned theory, when your process decides that it's time to exit, it should already have cleaned up all its threads. The termination of threads, therefore, is just a safety net to catch the stuff you may have missed. <a href="http://blogs.msdn.com/oldnewthing/archive/2007/05/02/2365433.aspx#2375204"> It doesn't even wait two seconds first</a>. </p>
+<p> Now, we're not talking happy termination like <code>ExitThread</code>; that's not possible since the thread could be in the middle of doing something. Injecting a call to <code>ExitThread</code> would result in <code>DLL_THREAD_DETACH</code> notifications being sent at times the thread was not prepared for. Nope, these threads are terminated in the style of <code>TerminateThread</code>: Just yank the rug out from under it. Buh-bye. This is an ex-thread. </p>
+<p> Well, that was a pretty drastic move, now, wasn't it. And all this after the scary warnings in MSDN that <code>TerminateThread</code> is a bad function that should be avoided! </p>
+<p> Wait, it gets worse. </p>
+<p> Some of those threads that got forcibly terminated may have owned critical sections, mutexes, home-grown synchronization primitives (such as spin-locks), all those things that the one remaining thread might need access to during its <code>DLL_PROCESS_DETACH</code> handling. Well, mutexes are sort of covered; if you try to enter that mutex, you'll get the mysterious <a href="http://blogs.msdn.com/oldnewthing/archive/2005/09/12/463977.aspx"> <code>WAIT_ABANDONED</code> return code</a> which tells you that "Uh-oh, things are kind of messed up." </p>
+<p> What about critical sections? There is no "Uh-oh" return value for critical sections; <code>EnterCriticalSection</code> doesn't have a return value. Instead, the kernel just says "Open season on critical sections!" I get the mental image of all the gates in a parking garage just opening up and letting anybody in and out. [See <a href="http://blogs.msdn.com/oldnewthing/archive/2010/01/22/9951750.aspx"> correction</a>.] </p>
+<p> As for the home-grown stuff, well, you're on your own. </p>
+<p> This means that if your code happened to have owned a critical section at the time somebody called <code>ExitProcess</code>, the data structure the critical section is protecting has a good chance of being in an inconsistent state. (Afer all, if it were consistent, you probably would have exited the critical section! Well, assuming you entered the critical section because you were updating the structure as opposed to reading it.) Your <code>DLL_PROCESS_DETACH</code> code runs, enters the critical section, and it <i>succeeds</i> because "all the gates are up". Now your <code>DLL_PROCESS_DETACH</code> code starts behaving erratically because the values in that data structure are inconsistent. </p>
+<p> Oh dear, now you have a pretty ugly mess on your hands. </p>
+<p> And if your thread was terminated while it owned a spin-lock or some other home-grown synchronization object, your <code>DLL_PROCESS_DETACH</code> will most likely simply hang indefinitely waiting patiently for that terminated thread to release the spin-lock (which it never will do). </p>
+<p> But wait, it gets worse. That critical section might have been the one that protects the process heap! If one of the threads that got terminated happened to be in the middle of a heap function like <code>HeapAllocate</code> or <code>LocalFree</code>, then the process heap may very well be inconsistent. If your <code>DLL_PROCESS_DETACH</code> tries to allocate or free memory, it may crash due to a corrupted heap. </p>
+<p> Moral of the story: If you're getting a <code>DLL_PROCESS_DETACH</code> due to process termination,&dagger; don't try anything clever. Just return without doing anything and let the normal process clean-up happen. The kernel will close all your open handles to kernel objects. Any memory you allocated will be freed automatically when the process's address space is torn down. Just let the process die a quiet death. </p>
+<p> Note that if you were a good boy and cleaned up all the threads in the process before calling <code>ExitThread</code>, then you've escaped all this craziness, since there is nothing to clean up. </p>
+<p> Note also that if you're getting a <code>DLL_PROCESS_DETACH</code> due to dynamic unloading, then you do need to clean up your kernel objects and allocated memory because the process is going to continue running. But on the other hand, in the case of dynamic unloading, no other threads should be executing code in your DLL anyway (since you're about to be unloaded), so&mdash;assuming you coded up your DLL correctly&mdash;none of your critical sections should be held and your data structures should be consistent. </p>
+<p> Hang on, this disaster isn't over yet. Even though the kernel went around terminating all but one thread in the process, that doesn't mean that the creation of new threads is blocked. If somebody calls <code>CreateThread</code> in their <code>DLL_PROCESS_DETACH</code> (as crazy as it sounds), the thread will indeed be created and start running! But remember, "all the gates are up", so your critical sections are just window dressing to make you feel good. </p>
+<p> (The ability to create threads after process termination has begun is not a mistake; it's intentional and necessary. Thread injection is how the debugger breaks into a process. If thread injection were not permitted, you wouldn't be able to debug process termination!) </p>
+<p> Next time, we'll see how the way process termination takes place on Windows&nbsp;XP caused not one but two problems. </p>
+<p> <b>Footnotes</b> </p>
+<p> &dagger;Everybody reading this article should already know how to determine whether this is the case. I'm assuming you're smart. Don't disappoint me. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (37)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-498853">
+				<div id="div-comment-498853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rob H</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498853">
+			May 3, 2007 at 10:40 am</a>		</div>
+
+		<p>Of course I already knew how to determine whether DLL_PROCESS_DETACH was due to process termination&#8230;</p>
+<p>But a &quot;friend&quot; who sits &quot;near&quot; my desk wasn&#8217;t. He was pretty worried about it at first but he told me that the first Google hit for DLL_PROCESS_DETACH was helpful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-498873">
+				<div id="div-comment-498873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sohail</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498873">
+			May 3, 2007 at 10:54 am</a>		</div>
+
+		<p>At some point will you explain specifically what you don&#8217;t like and what you would do differently? It might be instructive.</p>
+<div class="post">[<i>I don&#8217;t need that kind of grief. Besides, I don&#8217;t have a time machine. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-498893">
+				<div id="div-comment-498893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498893">
+			May 3, 2007 at 11:16 am</a>		</div>
+
+		<p>OK, so thread injection is how you debug processes.</p>
+<p>But in this world of not expecting DLLs to clear up after themselves properly, a process should just terminate all the threads it finds in its own process before it shuts down. Even if it doesn&#8217;t, the call to ExitProcess() will forcibly terminate all threads apart from the caller.</p>
+<p>So, if you&#8217;re trying to debug process termination you start the debugger, attach it to the process, and shut down the program.</p>
+<p>At which point, the thread the debugger is using to debug the process gets terminated. Um, so how does that debugging situation work?</p>
+<p>Or are you supposed to attach the debugger to the process between the point where ExitProcess() has terminated stray threads and the point where things start to go wrong? On a multi-GHz machine?</p>
+<p>More confused than ever&#8230;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-498913">
+				<div id="div-comment-498913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498913">
+			May 3, 2007 at 11:30 am</a>		</div>
+
+		<p>What improvements or changes have been made to process termination on Vista?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-498923">
+				<div id="div-comment-498923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skywing</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498923">
+			May 3, 2007 at 11:36 am</a>		</div>
+
+		<p>ws2_32.dll is a good example of a DLL that detects a detach due to process exit and skips the usual cleanup.</p>
+<p>In order to do this, you should check the lpReserved parameter to DllMain; it&#8217;ll be nonzero for DLL_PROCESS_DETACH if you are exiting as part of process rundown, otherwise, the DLL is being unloaded &quot;on-the-fly&quot; a-la FreeLibrary (and in that case, you -should- still perform the usual cleanup, as an &quot;on-the-fly&quot; unload doesn&#8217;t imply the weird state of a process that is in the middle of &quot;clean&quot; termination).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-498933">
+				<div id="div-comment-498933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pierre B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498933">
+			May 3, 2007 at 11:56 am</a>		</div>
+
+		<p>One of the problem you are likely to encounter in the &quot;do nothing&quot; case is that</p>
+<p>of global variables in C++. Those have their destructor called automatically and</p>
+<p>those destructors are called after DllMain() returns (unless you implemented your</p>
+<p>own &quot;true&quot; DllMain, but then you have the reverse problem that the global constructors</p>
+<p>might not be called&#8230; (Yes, the DllMain() is not the &quot;true&quot; DLL main, the C/C++ runtime</p>
+<p>has the real entry point for C/C++ DLLs.)</p>
+<p>Moral (which you should obey anyway in all situations for many reasons): never</p>
+<p>use global variables that have a constructor or destructor. Only use simply</p>
+<p>types like int or pointers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-498943">
+				<div id="div-comment-498943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ksurvell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498943">
+			May 3, 2007 at 11:58 am</a>		</div>
+
+		<p>I laughed when I read:</p>
+<p>Instead, the kernel just says &quot;Open season on critical sections!&quot;</p>
+<p>I had a mental image of an Elmer-fudd type figure with a shotgun inside my computer, firing away.</p>
+<p>Still, a fascinating article, nonetheless. I eagerly await part 2&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-498953">
+				<div id="div-comment-498953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bramster</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498953">
+			May 3, 2007 at 12:06 pm</a>		</div>
+
+		<p>Okay, I&#8217;m not very smart, but I&#8217;ll certainly agree that &quot;Exiting is one of the scariest moments in the lifetime &quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-498973">
+				<div id="div-comment-498973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Disco Stu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-498973">
+			May 3, 2007 at 12:45 pm</a>		</div>
+
+		<p>Hey Raymond,</p>
+<p>I&#8217;ve been reading your blog for years, despite never writing a lick of windows code in my life. I&#8217;ve never bothered to commment before &#8217;cause I never have anything constructive to add. &nbsp;With that out of the way&#8230;</p>
+<p>I just wanted to thank you for continuing to post interesting stuff like this in spite of all the flak you get from griefers, nitpickers, etc about every&#8230; little&#8230; miniscule detail.</p>
+<p>so, Thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499003">
+				<div id="div-comment-499003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SirCut</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499003">
+			May 3, 2007 at 12:53 pm</a>		</div>
+
+		<blockquote><p>
+  Sort of how landing is one of the scariest moments of air travel.
+</p></blockquote>
+<p>Actually according to pilots the take-off is when you should be scared. &nbsp;Flight being one of the safest forms of travel, you should not be scared. &nbsp;Still if you want to be scared do it on take-off. &nbsp;Now the OS may be scared when staring a process, but that is a whole other ball of wax.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499083">
+				<div id="div-comment-499083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pavel Lebedinsky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499083">
+			May 3, 2007 at 1:21 pm</a>		</div>
+
+		<p>Behavior with regard to orphaned critical sections during shutdown has changed in Vista:</p>
+<p><a rel="nofollow" target="_new" href="http://www.bluebytesoftware.com/blog/CommentView,guid,2838487a-be93-4f6e-afe0-a8acd9de2e11.aspx" rel="nofollow">http://www.bluebytesoftware.com/blog/CommentView,guid,2838487a-be93-4f6e-afe0-a8acd9de2e11.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499093">
+				<div id="div-comment-499093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://ramblings.aaronballman.com' rel='external nofollow' class='url'>aaron@aaronballman.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499093">
+			May 3, 2007 at 1:35 pm</a>		</div>
+
+		<blockquote><p>
+  In order to do this, you should check the lpReserved parameter to DllMain; it&#8217;ll be nonzero for DLL_PROCESS_DETACH
+</p></blockquote>
+<p>What part of &quot;reserved&quot; don&#8217;t you understand?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499103">
+				<div id="div-comment-499103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim Lyon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499103">
+			May 3, 2007 at 1:37 pm</a>		</div>
+
+		<p>My favorite way to shut down my process is TerminateProcess(). The kernel handles get closed, but you get absolutely none of this other mess.</p>
+<p>This is part of the pattern &quot;every shutdown is a crash; every startup is a recovery&quot;. Assuming your crash recovery code works properly, you don&#8217;t have anything to lose (and you don&#8217;t have to rely on the author of every DLL in your process having understood the shutdown weirdness).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499163">
+				<div id="div-comment-499163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bramz.org/2007/05/03/how-processes-exit-on-winxp/' rel='external nofollow' class='url'>Bramz&#8217; warehouse // how processes exit on WinXP</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499163">
+			May 3, 2007 at 2:34 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.bramz.org/2007/05/03/how-processes-exit-on-winxp/" rel="nofollow">http://www.bramz.org/2007/05/03/how-processes-exit-on-winxp/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499173">
+				<div id="div-comment-499173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.tungware.com' rel='external nofollow' class='url'>Henry Skoglund</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499173">
+			May 3, 2007 at 2:35 pm</a>		</div>
+
+		<p>I remember when writing DirectX/DirectShow apps before, everything was fine and dandy until exit time. That was the scary part, no matter how much you fiddled with the IGraphBuilder, IMediaControl etc. COM-pointers, e.g. calling Release() or not, changing the order, calling CoUninitialize() or not, you couldn&#8217;t make the app exit cleanly on all required OS platforms.</p>
+<p>So you&#8217;re right, calling ExitProcess() is very much like an airplane landing!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499233">
+				<div id="div-comment-499233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom_</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499233">
+			May 3, 2007 at 3:07 pm</a>		</div>
+
+		<p>The story behind lpvReserved is surely very simple: it&#8217;s doing what it&#8217;s reserved for :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499263">
+				<div id="div-comment-499263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wang-Lo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499263">
+			May 3, 2007 at 4:02 pm</a>		</div>
+
+		<p>&quot;It doesn&#8217;t even wait two seconds first.&quot;</p>
+<p>Thanks for making me laugh today.</p>
+<p>-Wang-Lo.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499283">
+				<div id="div-comment-499283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dustin Long</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499283">
+			May 3, 2007 at 4:13 pm</a>		</div>
+
+		<p>This post reads like the zombie film version of process exiting.</p>
+<p>Awesome.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499293">
+				<div id="div-comment-499293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499293">
+			May 3, 2007 at 4:26 pm</a>		</div>
+
+		<p>The nice thing about landing is if there is a problem, you can throttle up and try again (assuming the engines are still working). &nbsp;The problem with take-off is when there&#8217;s a problem, you&#8217;re normally out of runway (ie the disaster in Lexington, KY last year).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499303">
+				<div id="div-comment-499303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anony Moose</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499303">
+			May 3, 2007 at 5:06 pm</a>		</div>
+
+		<p>&gt; I had a mental image of an Elmer-fudd type figure with a shotgun inside my computer, firing away.</p>
+<p>I love the &#8220;Doom&#8221; sys admin &#8220;tool&#8221; on Linux. Every player runs their own instance of the game. Every running process on the system is represented as a monster in each game. When you shoot a monster, the process gets killed. If it&#8217;s another player&#8217;s instance they get dumped out. If it&#8217;s your own instance, you get dumped out. If it&#8217;s a random system process, well, you&#8217;ld better not be running on an important server.</p>
+<p>&gt; My favorite way to shut down my process is TerminateProcess(). The kernel handles get closed, but you get absolutely none of this other mess.</p>
+<p>Complete and total inane pathetic nonsense. If you have a thread that&#8217;s in a tight loop allocating and releasing memory, there&#8217;s a high probability that the thread will be holding a lock while manipulating the heap. Therefore if you terminate that thread by absolutely any means then you will not cause that thread to complete its cleanup process. If the thread has locked the heap and adjusted a pointer and then porcessing switches back to the thread that calls TerminateProcess() then the thread that was manipulating the heap has caused corruption.</p>
+<p>If a thread holds a lock then any application shutdown absolutely and without question must wait until that thread releases the lock. (Modifying shared data without suitable locking is, I assume, so obviously wrong that even you wouldn&#8217;t do it.)</p>
+<p>You&#8217;re the type of person who writes code that virtually always works, but every now and again some random customer has their entire machine crash after they exit your application. But of course you couldn&#8217;t possibly be at fault, could you?</p>
+<div class=post>[<i>Um, you can&#8217;t &#8220;switch back to the thread that calls TerminateProcess&#8221; since the process has been terminated. There is no thread to switch back to. It&#8217;s really not that crazy an idea. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499323">
+				<div id="div-comment-499323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim Lyon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499323">
+			May 3, 2007 at 5:29 pm</a>		</div>
+
+		<p>Anony Moose&#8217;s comment about terminated threads leaving things corrupt is a very good demonstration of why TerminateThread() is an abomination.</p>
+<p>But the concern doesn&#8217;t apply to TerminateProcess(). It doesn&#8217;t matter how corrupt you&#8217;ve left the process heap (or other structures) if there&#8217;s a guarantee that these structures will never again be used. Having stopped your threads, TerminateProcess() then throws away your entire address space, including your process heap and everything else.</p>
+<p>If Anony Moose&#8217;s arguement were correct, consider what would happen if you accidently had a thread that took a lock and then entered an infinite loop. You would not be able to safely kill it using Ctrl-C or TaskManager. (These guys effectively inject a thread into your process that calls TerminateProcess().)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499373">
+				<div id="div-comment-499373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Steward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499373">
+			May 3, 2007 at 7:58 pm</a>		</div>
+
+		<p>Really fantastic post, IMHO.</p>
+<p>If TerminateProcess doesn&#8217;t work, try tskill (WinStationTerminateProcess). &nbsp;Somehow, it reaches places other TerminateProcesses can&#8217;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499383">
+				<div id="div-comment-499383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.pretentiousname.com' rel='external nofollow' class='url'>Leo Davidson</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499383">
+			May 3, 2007 at 8:54 pm</a>		</div>
+
+		<p>In my opinion, calls to ExitProcess, TerminateThread, etc. are like calls to Sleep: In almost every case they indicate you&#8217;re doing something extremely wrong.</p>
+<p>I would not argue for the APIs to be removed, because there are exceptions where they are the least-worst option, but I would be in favour of a tax on calls to the functions in question or a change to the compiler so that it requires an extra argument, consisting of a 500 word essay justifying the call, for each function call.</p>
+<p>A bit like Chris Rock&#8217;s idea of making bullets cost $5000 each.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499433">
+				<div id="div-comment-499433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DriverDude</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499433">
+			May 3, 2007 at 9:16 pm</a>		</div>
+
+		<p>If DirectInput will not be able to re-enable hot-tracking if the process isn&#8217;t exited cleanly, isn&#8217;t that a DirectInput bug?</p>
+<p>After all, games and apps will exit or crash for any number of reasons. Why can&#8217;t DirectInput handle that properly?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499213">
+				<div id="div-comment-499213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499213">
+			May 3, 2007 at 2:51 pm</a>		</div>
+
+		<p>&gt;&gt;In order to do this, you should check the</p>
+<p>&gt;&gt;lpReserved parameter to DllMain; </p>
+<p>&gt;&gt;it&#8217;ll be nonzero for DLL_PROCESS_DETACH</p>
+<p>Aaron Ballman:</p>
+<p>&gt;What part of &quot;reserved&quot; don&#8217;t you understand?</p>
+<p>The part of reserved that *I* don&#8217;t understand is where the documentation calls the parameter &#8216;reserved&#8217; and then tells you what the normal and documented behaviour of this reserved parameter might be.</p>
+<p>Quoth the docset:</p>
+<p>lpvReserved </p>
+<p>[in] If fdwReason is DLL_PROCESS_ATTACH, lpvReserved is NULL for dynamic loads and non-NULL for static loads. </p>
+<p>If fdwReason is DLL_PROCESS_DETACH, lpvReserved is NULL if DllMain has been called by using FreeLibrary and non-NULL if DllMain has been called during process termination.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499483">
+				<div id="div-comment-499483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499483">
+			May 4, 2007 at 2:23 am</a>		</div>
+
+		<blockquote><p>
+  I should say up front that I do not agree</p>
+<p>  with many steps in the way processes exit on</p>
+<p>  Windows XP.
+</p></blockquote>
+<p>Thank you very much for pointing things out like that, it really helps. &nbsp;Notice how few flames are in the comments, so I&#8217;m not the only one who understood &nbsp;^_^ &nbsp;I&#8217;ll try to avoid wondering if you agree with Win32s or 95 or NT since they all did things differently. &nbsp;Or if the unwanted thought pops up anyway, I won&#8217;t post a question about them.</p>
+<blockquote><p>
+  If you&#8217;re getting a DLL_PROCESS_DETACH due to</p>
+<p>  process termination, don&#8217;t try anything</p>
+<p>  clever. Just return without doing anything</p>
+<p>  and let the normal process clean-up happen.</p>
+<p>  The kernel will close all your open handles</p>
+<p>  to kernel objects.
+</p></blockquote>
+<p>Are you sure that the kernel really closes all those handles? &nbsp;Are you sure that they don&#8217;t get rudely terminated with less cleanup of resources than a normal CloseHandle does? &nbsp;A few minutes ago in response to your other article I mentioned I didn&#8217;t blame Windows for a particular resource leak, but now I wonder.</p>
+<blockquote><p>
+  Thread injection is how the debugger breaks</p>
+<p>  into a process.
+</p></blockquote>
+<p>Somehow I think it would still be possible for CreateThread to reject a call from within its own process.</p>
+<p>Thursday, May 03, 2007 7:58 PM by KJK::Hyperion</p>
+<blockquote><p>
+  an unhandled CTRL-C calls ExitProcess
+</p></blockquote>
+<p>I thought I read that it injects a thread to do exactly that?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-kjkhyperion even thread-even depth-1" id="comment-499363">
+				<div id="div-comment-499363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499363">
+			May 3, 2007 at 7:58 pm</a>		</div>
+
+		<p>Jim Lyon: an unhandled CTRL-C calls ExitProcess, and Task Manager never injects threads, a TerminateProcess suffices. On the other hand, I wish it had a &quot;softer&quot; kill where it does inject a thread, that calls *ExitProcess* instead (which cannot otherwise be called remotely, for obvious reasons); a harmless example is how DirectInput will not be able to re-enable hot-tracking if the process isn&#8217;t exited cleanly, so you lose hover behavior on standard menu bars until you log off and back on</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499583">
+				<div id="div-comment-499583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.knocks-solutions.com' rel='external nofollow' class='url'>KNOCKS</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499583">
+			May 4, 2007 at 10:22 am</a>		</div>
+
+		<p>very good read! Thanks a ton for a very informative article</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499643">
+				<div id="div-comment-499643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skywing</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499643">
+			May 4, 2007 at 11:14 am</a>		</div>
+
+		<p>Dave: The parameter does actually have meaning other than as a boolean flag (at least on NT), but that meaning is not documented. &nbsp;Hence the `reserved&#8217; part.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499763">
+				<div id="div-comment-499763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Reuven Lax</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499763">
+			May 4, 2007 at 3:19 pm</a>		</div>
+
+		<p>Ahhh, but you left out one little detail. &nbsp;IIRC correctly open season is declared on all critical sections except for one &#8212; the loader lock. &nbsp;This means you can still have nasty hangs involving that lock if you&#8217;re not careful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-499793">
+				<div id="div-comment-499793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499793">
+			May 4, 2007 at 3:48 pm</a>		</div>
+
+		<p>DriverDude: because DirectInput is a regular DLL, hot-tracking is a per-session UI setting that outlives processes and cannot be &quot;undone&quot;, because it&#8217;s just a global boolean that processes set on and off?</p>
+<p>The problem is not limited to DirectInput, but shared by any similar library that has to temporarily mess with global UI settings. Haven&#8217;t you ever had an old game crash on you and leave your display in 320&#215;200, 16 colors?</p>
+<p>UI tricks is the only scenario where you should <em>really</em> use ExitProcess</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-499813">
+				<div id="div-comment-499813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-499813">
+			May 4, 2007 at 3:53 pm</a>		</div>
+
+		<p>Norman Diamond: process termination closes handles. That is a basic fact of life. No shortcuts are taken &#8211; unfortunately! as a stuck CloseHandle might be one thing, a stuck process termination is significantly worse. Also ExitProcess cannot be called on another process, so your other question doesn&#8217;t even make sense</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-500203">
+				<div id="div-comment-500203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.levicki.net/' rel='external nofollow' class='url'>Igor</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-500203">
+			May 5, 2007 at 1:26 am</a>		</div>
+
+		<p>You can always CreateRemoteThread() and ExitProcess() :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-502613">
+				<div id="div-comment-502613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/jmstall/archive/2007/05/09/trivia-about-managed-debugging-and-exit-process.aspx' rel='external nofollow' class='url'>Mike Stall's .NET Debugging Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-502613">
+			May 9, 2007 at 11:52 pm</a>		</div>
+
+		<p>Process Shutdown is evil , as Raymond Chen recently blogged about in wonderful detail. This prompts me</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-503943">
+				<div id="div-comment-503943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ChrisG</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-503943">
+			May 13, 2007 at 6:16 pm</a>		</div>
+
+		<p>Process refs let apps and the components that create threads within them negotiate a coordinated process exit, enabling everyone that participates the ability to cleanup before ExitProcess() is called. Using this avoids the difficulty that will occur &nbsp;if you try to do complex stuff in DLL entry points on process shutdown (as your article explains is very problematic).</p>
+<p>•   The main thread, the one that will call ExitProcess() enables other threads to extend its lifetime using SHSetInstanceExplorer() with an object that extends its lifetime. This thread will delay its call to ExitProcess() until the ref falls to zero.</p>
+<p>•   Threads created in such processes get a reference to the main thread used to extend its lifetime using SHGetInstanceExplorer().</p>
+<p>•   SHCreateThread(…,CTF_PROCESS_REF, …) takes a process ref for you (calling SHGetInstanceExplorer()) making it easy for threads to participate in this system.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-527473">
+				<div id="div-comment-527473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.not-a-kernel-guy.com/2007/07/18/212' rel='external nofollow' class='url'>Not a kernel guy : Blog Archive : ?????????????????????? ?????????????? ?????? ExitProcess.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-527473">
+			July 19, 2007 at 2:21 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://blog.not-a-kernel-guy.com/2007/07/18/212" rel="nofollow">http://blog.not-a-kernel-guy.com/2007/07/18/212</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-640813">
+				<div id="div-comment-640813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/michkap/archive/2008/06/23/8639629.aspx' rel='external nofollow' class='url'>Sorting it all Out</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003#comment-640813">
+			June 23, 2008 at 9:59 am</a>		</div>
+
+		<p>There was a mail thread that happened recently on one of those &quot;if you aren&#8217;t a fulltime employee then</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

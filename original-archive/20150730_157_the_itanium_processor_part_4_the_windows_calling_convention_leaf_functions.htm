@@ -1,0 +1,469 @@
+<html>
+<head>
+<title>The Itanium processor, part 4: The Windows calling convention, leaf functions</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Itanium processor, part 4: The Windows calling convention, leaf functions</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 30, 2015 / year-entry #158</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Just use what you've got.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150729-00/?p=90801">
+Last time</a>,
+we looked at the general rules for parameter passing
+on the Itanium.
+But those rules are relaxed for leaf functions
+(functions which call no other functions).
+</p>
+<p>
+Before we start, I need to correct some of the explanation I had given
+when introducing the calling convention.
+I used that explanation because it makes for an easier conceptual model,
+but the reality is slightly different.
+</p>
+<p>
+First of all, I said that the <code>alloc</code> function
+shuffles the registers around and lays out the new local region
+and output registers.
+In reality, it is the <code>br.call</code> instruction that moves
+the registers
+and the <code>alloc</code> which sets up the register frame.
+Since the first instruction of a function is
+<code>alloc</code>,
+it doesn't make much difference how the work is distributed between the
+<code>br.call</code> and the <code>alloc</code> since they
+come right after each other.
+The only time you notice the
+difference is if you happen to break into the
+debugger immediately between those two instructions.
+</p>
+<p>
+More precisely, here's what the <code>br.call</code> instruction does:
+</p>
+<ul>
+<li>Copy the current register frame state (and some other stuff)
+    to the <code>pfs</code> register.</li>
+<li>Rotate the registers so that the first output register is now
+    <var>r32</var>.</li>
+<li>Create a new register frame as follows:</li>
+<ul>
+<li>input registers = caller's output registers</li>
+<li>no local registers</li>
+<li>no output registers</li>
+<li>no rotating registers</li>
+</ul>
+<li>Set the <var>rp</var> register to the return address.</li>
+<li>Transfer control to the target.</li>
+</ul>
+<p>
+In other words, the register stack changes like this:
+</p>
+<table BORDER=0 CELLPADDING=3
+       STYLE="border-collapse: collapse; text-align: center">
+<tr>
+<td>r32</td>
+<td>r33</td>
+<td>r34</td>
+<td>r35</td>
+<td>r36</td>
+<td>r37</td>
+<td>r38</td>
+<td>r39</td>
+<td>r40</td>
+<td>r41</td>
+<td>r42</td>
+<td>r43</td>
+<td COLSPAN=8></td>
+</tr>
+<tr>
+<td COLSPAN=4 BGCOLOR=#ffbbff STYLE="border: solid 1px black"><var>f</var>'s Input</td>
+<td COLSPAN=5 BGCOLOR=#C0FF97 STYLE="border: solid 1px black"><var>f</var>'s Local</td>
+<td COLSPAN=3 BGCOLOR=#FFBBBB STYLE="border: solid 1px black"><var>f</var>'s Output</td>
+<td COLSPAN=8>&emsp;Before <var>f</var> does a <code>br.call</code></td>
+</tr>
+<tr>
+<td COLSPAN=20>&nbsp;</td>
+</tr>
+<tr>
+<td COLSPAN=9></td>
+<td>r32</td>
+<td>r33</td>
+<td>r34</td>
+</tr>
+<tr>
+<td COLSPAN=9>On entry to <var>g</var>&emsp;</td>
+<td COLSPAN=3 BGCOLOR=#FFBBBB STYLE="border: solid 1px black"><var>g</var>'s Input</td>
+</tr>
+<tr>
+<td COLSPAN=20>&nbsp;</td>
+</tr>
+<tr>
+<td COLSPAN=9></td>
+<td>r32</td>
+<td>r33</td>
+<td>r34</td>
+<td>r35</td>
+<td>r36</td>
+<td>r37</td>
+<td>r38</td>
+<td>r39</td>
+<td>r40</td>
+<td>r41</td>
+<td>r42</td>
+</tr>
+<tr>
+<td COLSPAN=9>After <var>g</var> does an <code>alloc</code>&emsp;</td>
+<td COLSPAN=3 BGCOLOR=#FFBBBB STYLE="border: solid 1px black"><var>g</var>'s Input</td>
+<td COLSPAN=4 BGCOLOR=#FFFF99 STYLE="border: solid 1px black"><var>g</var>'s Local</td>
+<td COLSPAN=4 BGCOLOR=#ACF3FD STYLE="border: solid 1px black"><var>g</var>'s Output</td>
+</tr>
+</table>
+<p>
+A consequence of this division of labor
+between <code>br.call</code> and
+<code>alloc</code>
+is that
+leaf functions can take advantage of this default register frame:
+If a leaf function can do all its work with just
+</p>
+<ul>
+<li>its input registers</li>
+<li>scratch registers</li>
+<li>the
+    <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/01/13/58199.aspx">red zone</a></li>
+</ul>
+<p>
+then it doesn't need to perform an <code>alloc</code> at all!
+It can use the default register allocation of
+"Caller's output registers become my input registers,
+and I have no local registers or output registers."
+When finished, the function just does a
+<code>br.ret rp</code> to return to the caller.
+</p>
+<p>
+Note that this optimization is available only to leaf functions.
+If the function calls another function,
+then the <code>br.call</code> will overwrite the
+<code>pfs</code> and <code>rp</code> registers,
+which will make it hard to return to your caller
+when you're done.
+</p>
+<p>
+The red zone is officially known as the <i>scratch area</i>.
+The first 16 bytes on the stack are available for use by the
+currently executed function.
+If you want values to be preserved across a function call,
+you need to move them out of the scratch area,
+because they become the scratch area for the function being called!
+In other words, the scratch area is not preserved across
+function calls.
+</p>
+<p>
+A more obscure
+consequence of this division of labor
+between <code>br.call</code> and
+<code>alloc</code>
+is that a function
+could in principle
+perform <code>alloc</code> more than once
+in order to change the size of its local region or the number
+of output registers.
+For example, a function might start by saying,
+"I have five local registers and two output registers,"
+and then later realize,
+"Oh, wait, I need to call a function with six parameters.
+I will issue a new <code>alloc</code> instruction that requests
+five local registers and <i>six</i> output registers."
+Although technically legal, it doesn't often occur in practice
+because it's usually easier just to set up your register state once and
+stick with it for the duration of the function.
+</p>
+<p>
+A more common case where this occurs is when a function has an early
+exit that can be determined using only leaf-available resources.
+</p>
+<pre>
+extern HANDLE LogFile;
+
+void Log(char *message, char *file, int line)
+{
+ if (!LogFile) return;
+ ... complicated logging code goes here ...
+}
+</pre>
+<p>
+If profiling feedback indicates that logging is rarely enabled,
+then the compiler can avoid setting up all the registers and stack
+for the complicated logging code,
+at least until it knows that logging is enabled.
+</p>
+<pre>
+.Log:
+      addl    r30, -205584, gp ;; // get address of LogFile variable
+      ld8     r30, [r30] ;;       // fetch the value
+      cmp.eq  p6, p0 = r30, r0    // is it zero?
+(p6)  br.ret  rp                  // return if so
+
+  // Okay, we are really logging. Set up our stack.
+      alloc   r35 = ar.pfs, 3, 5, 6, 0 // set up register frame
+      sub     sp = sp, 0x240      // set up stack buffers
+      mov     r36 = ra            // save return address
+
+      ... do complicated logging ...
+
+      mov     rp = r36            // return address
+      mov.i   ar.pfs = r34        // restore pfs
+      br.ret.sptk.many  rp ;;     // return to caller
+</pre>
+<p>
+The first instruction calculates the effective address of
+the <code>Log&shy;File</code> variable.
+We'll learn more about the <var>gp</var> register later.
+</p>
+<p>
+The second instruction loads an 8-byte value from that address,
+thereby retrieving the value of <code>Log&shy;File</code>.
+</p>
+<p>
+The third instruction compares the value against <var>r0</var>,
+which is a hard-coded zero register.
+It asks for an equality comparison, putting the answer in the
+predicate variable <var>p6</var> (and putting the complement of
+the answer in <var>p0</var>, which effectively throws it away).
+</p>
+<p>
+The fourth instruction conditionally returns from the function
+if the comparison was true.
+In the common case where logging is not enabled,
+the function returns at this point.
+Only if logging is enabled do the <code>alloc</code>
+and related instructions execute to set up the stack frame
+and then perform the complicated logging.
+</p>
+<p>
+This is an example of an optimization known as
+<i>shrink-wrapping</i>.
+Shrink-wrapping occurs when a function does some work
+with a temporary stack frame,
+and then expands to a full stack frame only if it is needed.
+(Shrink-wrapping entails a few extra entries in the unwind
+exception table because the unwinding needs to take
+place differently depending
+on where in the function the exception occurred.
+I'll spare you the details.)
+</p>
+<p>
+Okay, that's all for leaf functions and getting to the bottom
+of the whole <code>br.call</code> / <code>alloc</code> dance.
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20150731-00/?p=90771">
+Next time</a>, we'll look at function pointers and the funky
+<var>gp</var> register.
+Here's something to whet your appetite:
+On ia64, a function pointer is not the address of the first
+instruction in the function's code.
+In fact, it's nowhere near the function's code.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-mngoldeneagle even thread-even depth-1" id="comment-1234466">
+				<div id="div-comment-1234466" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234466">
+			July 30, 2015 at 7:45 am</a>		</div>
+
+		<p>Maybe I&#39;m missing something here, but what enforces a program from writing to registers that aren&#39;t within it&#39;s local region or output? &nbsp;Couldn&#39;t a malicious function manipulate values in earlier registers and then unwind?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234446">
+				<div id="div-comment-1234446" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234446">
+			July 30, 2015 at 7:53 am</a>		</div>
+
+		<p>Something about an airtight hatchway&#8230;</p>
+<p>A malicious function could do /anything it wants to/.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234396">
+				<div id="div-comment-1234396" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234396">
+			July 30, 2015 at 10:36 am</a>		</div>
+
+		<p>I suppose in principal a function could not use alloc and still call a function. All it has to do is push pfs and rp. Good luck unwinding that though.</p>
+<p>[In fact, it&#39;s nowhere near the function&#39;s code.]</p>
+<p>That would make trampolines ugly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234386">
+				<div id="div-comment-1234386" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234386">
+			July 30, 2015 at 10:39 am</a>		</div>
+
+		<p>If you want hardware-enforced security across function calls, you need something like the iAPX 432. It was a huge failure &#8211; much more so than Itanium.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234376">
+				<div id="div-comment-1234376" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234376">
+			July 30, 2015 at 10:52 am</a>		</div>
+
+		<p>Maybe I&#39;m missing something, but I cannot see where br.call might have to spill anything ever.</p>
+<p>Did you perhaps fail to separate it cleanly from the alloc instruction?</p>
+<div class="post">[<em>Oops, you&#39;re right. The spilling occurs at the alloc. Fixed. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234336">
+				<div id="div-comment-1234336" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234336">
+			July 30, 2015 at 7:59 pm</a>		</div>
+
+		<p>I have to imagine that in the event of a tail call optimization, a new alloc would need to take place. Or does the caller undo its alloc before doing the optimized tail call? I couldn&#39;t find any information on what it takes to eliminate a tail call on IA64.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234326">
+				<div id="div-comment-1234326" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234326">
+			July 31, 2015 at 12:51 am</a>		</div>
+
+		<p>Joshua: Itanium function pointers point to a small object with two fields. One field is the actual code pointer, the other is the global pointer for that function. Calling a function through a pointer involves loading the global pointer in the gp register, and branching to the code pointer. So everything works pretty much the same, except with an extra level of indirection. I forget if it was MIPS or PowerPC that had a similar ABI</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter odd alt thread-odd thread-alt depth-1" id="comment-1234316">
+				<div id="div-comment-1234316" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234316">
+			July 31, 2015 at 5:51 am</a>		</div>
+
+		<p>Gabe: A tail call doesn&#39;t necessarily have to jump to the entry point of a function. I&#39;d have thought a jump to the instruction just after the usual prolog would be correct &#8211; e.g. in Raymond&#39;s example, if logging is (for some reason) using a tail call, the jump would be to the first instruction of &#8230;do complicated logging&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1234206">
+				<div id="div-comment-1234206" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymouscommenter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1234206">
+			July 31, 2015 at 5:08 pm</a>		</div>
+
+		<p>AMD64 also has a red zone, at least in AMD&#39;s original ABI. I don&#39;t recall if Microsoft&#39;s AMD64 ABI kept it.</p>
+<div class="post">[<em>Yup, still there. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197061">
+				<div id="div-comment-1197061" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150730-00/?p=90791#comment-1197061">
+			August 2, 2015 at 5:09 pm</a>		</div>
+
+		<p>It seems to me that in that particular example, it would be more efficient to inline the if command, so the function call only occurs if necessary. &nbsp;But I guess that would be difficult to do across module boundaries.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

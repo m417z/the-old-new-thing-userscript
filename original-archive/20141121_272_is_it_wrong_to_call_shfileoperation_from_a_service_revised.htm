@@ -1,0 +1,493 @@
+<html>
+<head>
+<title>Is it wrong to call SHFileOperation from a service? Revised</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Is it wrong to call SHFileOperation from a service? Revised</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 21, 2014 / year-entry #273</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>28</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">My initial reaction to this question was to say, "I don't know if I'd call it wrong, but I'd call it highly inadvisable." I'd like to revise my guidance. It's flat-out wrong, at least in the case where you call it while impersonating. The registry key HKEY_CURRENT_USER is bound to the current user at the...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>My initial reaction to this question was to say, "<a href="http://blogs.msdn.com/b/oldnewthing/archive/2013/12/06/10474322.aspx">I don't know if I'd call it wrong, but I'd call it highly inadvisable</a>."</p>
+<p> I'd like to revise my guidance. </p>
+<p> It's flat-out wrong, at least in the case where you call it while impersonating. </p>
+<p> The registry key <code>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></code> is <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/ms724836(v=vs.85).aspx"> bound to the current user at the time the key is first accessed by a process</a>: </p>
+<blockquote class="q"><p> The mapping between <b>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></b> and <b>HKEY_<wbr>USERS</wbr></b> is per process and is established the first time the process references <b>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></b>. The mapping is based on the security context of the first thread to reference <b>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></b>. If this security context does not have a registry hive loaded in <b>HKEY_<wbr>USERS</wbr></b>, the mapping is established with <b>HKEY_<wbr>USERS\<wbr>.Default</wbr></wbr></b>. After this mapping is established it persists, <u>even if the security context of the thread changes</u>. </p>
+</blockquote>
+<p> Emphasis mine. </p>
+<p> This means that if you impersonate a user, and then access <code>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></code>, then that binds <code>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></code> to the impersonated user. Even if you stop impersonating, future references to <code>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></code> will still refer to that user. </p>
+<p> This is probably not what you expected. </p>
+<p> The shell takes a lot of settings from the current user. If you impersonate a user and then call into the shell, your service is now using that user's settings, which is effectively an elevation of privilege: An unprivileged user is now modifying settings for a service. For example, if the user has customized the Print verb for text files, and you use <code>Shell&shy;Execute</code> to invoke the <code>print</code> verb on a text document, you are at the mercy of whatever the user's <code>print</code> verb is bound to. Maybe it runs Notepad, but maybe it runs pwnz0rd.exe. You don't know. </p>
+<p> Similarly, the user might have a per-user registered <a href="http://msdn.microsoft.com/library/cc144063"> copy hook</a> or namespace extension, and now you just loaded a user-controlled COM object into your service. </p>
+<p> In both cases, this is known to insiders as <i>hitting the jackpot</i>. </p>
+<p> Okay, so what about if you call <code>Shell&shy;Execute</code> or some other shell function while not impersonating? You might say, "That's okay, because the current user's registry is the service user, not the untrusted attacker user." But look at that sentence I highlighted up there. Once <code>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></code> get bound to a particular user, it remains bound to that user <i>even after impersonation ends</i>. If somebody else inadvisedly called a shell function while impersonating, and that shell function happens to be the first one to access <code>HKEY_<wbr>CURRENT_<wbr>USER</wbr></wbr></code>, then your call to a shell function while not impersonating will still use that impersonated user's registry. Congratulations, you are now running untrusted code, and you're not even impersonating any more! </p>
+<p> So my recommendation is <i>don't do it</i>. Don't call shell functions while impersonating unless the function is explicitly documented as supporting impersonation. (The only ones I'm aware of that fall into this category are functions like <code>SHGet&shy;Folder&shy;Path</code> which accept an explicit token handle.) Otherwise, you may have created (or in the case of copy hooks, definitely created) a code injection security vulnerability in your service. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (28)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1163193">
+				<div id="div-comment-1163193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163193">
+			November 21, 2014 at 7:07 am</a>		</div>
+
+		<p>Ouch. Does this also affect &quot;normal&quot; (ie non-service) programs? Cause then I really need to add code accessing HKCU in all my &#39;main&#39; functions to make sure no external code gets around to do that before me.</p>
+<div class="post">[<em>&quot;Normal&quot; programs cannot impersonate, so the issue does not exist. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163203">
+				<div id="div-comment-1163203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163203">
+			November 21, 2014 at 7:08 am</a>		</div>
+
+		<p>This sounds like a thing which needs to be blocked, given that the behaviour is not only inconsistent, but in the best case counter-intuitive and in the worst case places the machine&#39;s security into a completely unknown state.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1163213">
+				<div id="div-comment-1163213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163213">
+			November 21, 2014 at 7:11 am</a>		</div>
+
+		<p>Most applications access HKCU on startup (to read settings, etc), so this will not be a problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163223">
+				<div id="div-comment-1163223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163223">
+			November 21, 2014 at 7:20 am</a>		</div>
+
+		<p>@alegr1</p>
+<p>If this is indeed an issue I&#39;d rather add explicit code accessing HKCU (and comment it appropriately) than relying on the implicit access from loading settings or other stuff. At least for the code I write myself, I prefer to keep it safe by design instead of &#39;safe by luck&#39; ;)</p>
+<p>Also I worry that accessing environment variables does not need HKCU so I could get (for example) into the current users %AppData% without freezing HKCU on that user.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163233">
+				<div id="div-comment-1163233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wyatt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163233">
+			November 21, 2014 at 7:23 am</a>		</div>
+
+		<p>@alger1 -&gt; Most SERVICE applications do not access HKCU, ever.</p>
+<p>So, if I&#39;m writing a Service application (I have a few), should just intentionally access HKCU on service start, just to make sure some third party component (or other future developer) doesn&#39;t accidentally reference HKCU under impersonation?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163243">
+				<div id="div-comment-1163243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163243">
+			November 21, 2014 at 7:36 am</a>		</div>
+
+		<p>Never mind my comment about environment variables, I was thinking too much about what could go wrong. Relying on environment variables representing the current user is in itself probably not a good idea from a security POV.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163253">
+				<div id="div-comment-1163253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cherry</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163253">
+			November 21, 2014 at 7:56 am</a>		</div>
+
+		<p>Why doesn&#39;t Windows establish the link on process creation instead of waiting for the first access? I can&#39;t imagine it being that expensive.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163263">
+				<div id="div-comment-1163263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163263">
+			November 21, 2014 at 8:15 am</a>		</div>
+
+		<p>@Cherry: Meh. If you think you&#39;re going to hit the problem, you can do it yourself at process startup time.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163273">
+				<div id="div-comment-1163273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163273">
+			November 21, 2014 at 8:17 am</a>		</div>
+
+		<p>There should be a DisableProcessHkeyCurrentUser() which makes your program abort and dump core if anything on your process ever tries to establish that mapping. Impersonating services could call that function as the first thing on their wWinMain and not have to worry about this issue anymore.</p>
+<p>(In before someone reports that one of these crazy inject-into-everything DLLs calls into the shell for some inane reason.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163283">
+				<div id="div-comment-1163283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cherry</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163283">
+			November 21, 2014 at 8:17 am</a>		</div>
+
+		<p>I understand that. I wasn&#39;t compaining, I was asking &quot;why&quot;, that is, asking for the reasoning. After all, the reason I enjoy reading this block is that many &quot;why&quot; questions are being answered here.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163293">
+				<div id="div-comment-1163293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cherry</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163293">
+			November 21, 2014 at 8:19 am</a>		</div>
+
+		<p>(The last comment was directed to Joshua. And it should have been &quot;blog&quot;, not &quot;block&quot;, of course.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163303">
+				<div id="div-comment-1163303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JamesJohnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163303">
+			November 21, 2014 at 8:31 am</a>		</div>
+
+		<p>It would be useful if Microsoft provided a tool to audit compiled services for statically-linked calls to unapproved / unsupported Windows API calls from a service. Obviously, this wouldn&#39;t catch anyone intentionally dodging this tool (e.g. via LoadLibrary/GetProcAddress), but would help catch many cases.</p>
+<p>In this case, it would be trivial for me to load the compiled EXE in Dependency Walker and see that it is statically linked to SHFileOperation in shell32.dll. An automated tool could flag this any many other questionable API calls, including ones like CreateWindow(Ex), simply by checking these links. Any linked 3rd-party DLLs would also be checked.</p>
+<p>A problematic case would be unapproved COM objects: CoCreateInstance itself isn&#39;t bad; some COM objects are OK to use from a service. Perhaps a dynamic mode of this verification tool could be used to shim the COM APIs and check class/interface IDs against a blacklist or whitelist. (And also perform the above linkage checks on any dynamically-loaded DLL. While you&#39;re at it, you could shim GetProcAddress as well.)</p>
+<p>Or maybe I can pose a different question: how does Microsoft ensure no dangerous API calls creep into any of their own services? (Surely they don&#39;t depend on a 100% manual process of code reviews?)</p>
+<div class="post">[<em>Such a tool would kick way too many false positives: Your EXE links to a DLL, and that DLL links to SHFileOperation. But the EXE doesn&#39;t use the DLL in a way that leads to SHFileOperation. The tool doesn&#39;t know that, though. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick even thread-even depth-1" id="comment-1163313">
+				<div id="div-comment-1163313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163313">
+			November 21, 2014 at 10:05 am</a>		</div>
+
+		<p>Cesar: Windows does allow you to substitute a key for one of the root keys using the RegOverridePredefKey function. This function is really designed to allow installers to put a self-registering library into a sandbox and detect what it did, but you could certainly use it to put your own canary HKEY_CURRENT_USER key in place. If you want code to fail you just need to deny all rights to create subkeys of the key you substitute.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163323">
+				<div id="div-comment-1163323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scott Brickey</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163323">
+			November 21, 2014 at 10:22 am</a>		</div>
+
+		<p>experienced a similar problem with a Windows service that hosted a WCF service (which was called with impersonation)&#8230; the WCF methods would use a logging framework defined in the app.config.</p>
+<p>it was reported that the service would occasionally stop working, and after some investigation, it was identified that this only occurred after windows updates caused a reboot. When it had happened previously, it was always restarted and then troubleshot by a local admin (thus the &quot;first call&quot; was by someone who had access to the app.config file). This would work until the next reboot.</p>
+<p>quick change that it would log on app startup (under the service account), and it never happened again.</p>
+<p>TL;DR: not just the registery, but potentially also config files (app.config/etc)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163333">
+				<div id="div-comment-1163333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163333">
+			November 21, 2014 at 10:26 am</a>		</div>
+
+		<p>[Such a tool would kick way too many false positives: Your EXE links to a DLL, and that DLL links to SHFileOperation. But the EXE doesn&#39;t use the DLL in a way that leads to SHFileOperation. The tool doesn&#39;t know that, though. -Raymond]</p>
+<p>Unless the tool requires symbols so it can study the call fan-out. Then you only get a handful of false positives.</p>
+<p>@James Johnston: CreateWindowEx is normal/fine for a service (message-only window). I&#39;ve never done that one, but I&#39;ve done GDI to HBITMAP a few times.</p>
+<p>@Mike Dimmick: Oh my that use of RegOverridePredefKey is genius.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jtippet odd alt thread-odd thread-alt depth-1" id="comment-1163373">
+				<div id="div-comment-1163373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Jeffrey+Tippet+%5BMSFT%5D' rel='external nofollow' class='url'>Jeffrey Tippet [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163373">
+			November 21, 2014 at 6:12 pm</a>		</div>
+
+		<p>The hkey binding issue can be mitigated if your service calls RegDisablePredefinedCacheEx first thing upon startup. &nbsp;(Since the API toggles a process-wide setting, don&#39;t use the API if you don&#39;t own the entire process.)</p>
+<p>That of course doesn&#39;t change Raymond&#39;s guidance; don&#39;t use the shell in a service.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163383">
+				<div id="div-comment-1163383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163383">
+			November 21, 2014 at 9:34 pm</a>		</div>
+
+		<p>Jeffrey Tippet: It looks like RegDisablePredefinedCache is more appropriate for this situation because it only affects HKCU. RegDisablePredefinedCacheEx is overkill because it affects all predefined keys.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163393">
+				<div id="div-comment-1163393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163393">
+			November 22, 2014 at 12:08 pm</a>		</div>
+
+		<p>@Gabe: RegDisablePredefinedCache is less appropriate because it fails to affect HKEY_CLASSES_ROOT and HKEY_CURRENT_USER_LOCAL_SETTINGS.</p>
+<p>The documentation specifically says &quot;Services that use impersonation should call RegDisablePredefinedCacheEx before using predefined registry handles.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1163403">
+				<div id="div-comment-1163403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163403">
+			November 23, 2014 at 6:10 pm</a>		</div>
+
+		<p>@Cherry: Like Wyatt said above, most service do not need HKCU at all, and for good reason.</p>
+<p>Imagine if your service needs HKCU hive and it is somehow running as a user that is on roaming profile. If the service is not started as &quot;Automatic (Delayed)&quot; the boot time would have been lengthened while waiting for the HKCU hive to load.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1" id="comment-1163413">
+				<div id="div-comment-1163413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163413">
+			November 23, 2014 at 6:17 pm</a>		</div>
+
+		<p>I do hope the windows header file can change impersonation related APIs ( <a href="http://msdn.microsoft.com/en-us/library/cc246062.aspx" rel="nofollow" target="_new">msdn.microsoft.com/&#8230;/cc246062.aspx</a> ) into macro that sets some flags before calling them, then make some &quot;unsafe to call within impersonation context&quot; APIs generate compiler warnings when seeing the flag.</p>
+<p>Never mind&#8230; on a second thought it would be too much work and possibly result in incomplete list (say, what if new API that&#39;s not safe from impersonation is introduced but forgotten to add the warning directive? The users could simply assume there&#39;s no problem calling that function).</p>
+<div class="post">[<em>It wouldn&#39;t help if the impersonation and the unsafe call are in separate functions. Or if they are in the same function, but the impersonation and unsafe calls are in separate &quot;if&quot; blocks that happen never to be both true at the same time due to external factors not visible to the compiler. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-1163423">
+				<div id="div-comment-1163423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163423">
+			November 23, 2014 at 10:40 pm</a>		</div>
+
+		<p>[It wouldn&#39;t help if the impersonation and the unsafe call are in separate functions. Or if they are in the same function, but the impersonation and unsafe calls are in separate &quot;if&quot; blocks that happen never to be both true at the same time due to external factors not visible to the compiler. -Raymond]</p>
+<p>For the first case, I wonder if C++ would introduce function to relay warning directive metadata to callers, so people use those libraries can see the warnings while writing.</p>
+<p>Maybe it has little use for 3rd party libraries (as they&#39;ll probably just suppress all warnings to avoid looking ugly), but could be good for internal built shared libraries. (In my old company, the shared library that contains most non-customizable business logic is maintained by a core team. The other teams just get the compiled libraries only. Those teams can see the comments in XML doc, but warnings written there were not verbose enough and could be unintentionally ignored)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aadsso-1live-com0003400180b2af1b odd alt thread-odd thread-alt depth-1" id="comment-1163433">
+				<div id="div-comment-1163433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Cube+8' rel='external nofollow' class='url'>Cube 8</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163433">
+			November 24, 2014 at 12:00 am</a>		</div>
+
+		<p>@JamesJohnston</p>
+<p>How would you catch a LoadLibrary call for shell32 and then the call to SHFileOperation through GetProcAddress?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-davebacher even thread-even depth-1" id="comment-1163603">
+				<div id="div-comment-1163603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dave+Bacher' rel='external nofollow' class='url'>Dave Bacher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163603">
+			November 24, 2014 at 4:22 pm</a>		</div>
+
+		<p>Really, ultimately, everyone wants bug-free, crash proof programs.</p>
+<p>This isn&#39;t Pokémon, we don&#39;t need to catch them all.</p>
+<p>There is a subset of Windows.h that is valid (supported) from services. &nbsp;By having a #define for that, and limiting down to the subset, you&#39;d create an actionable red-squiggle. &nbsp;The third party libraries aren&#39;t helped, but nobody cares. &nbsp;The third party libraries can be broken.</p>
+<p>There is a subset of Windows.h that is valid (supported) from an impersonated context. &nbsp;By having a separate #define for that, and limiting down to the subset, you&#39;d create actionable red-squiggles. &nbsp;Again, third party libraries wouldn&#39;t be flagged, and again nobody cares.</p>
+<p>I can&#39;t act on a third party library being broken, and that library can be changed out from under me by another app. &nbsp;Even if I have a private copy, all I can do is report the bug. &nbsp;I can&#39;t act on it.</p>
+<p>And so they don&#39;t matter &#8212; similarly GetProcAddr doesn&#39;t matter.</p>
+<p>Basically, it&#39;s the same as the argument for #define STRICT. &nbsp;#define STRICT can&#39;t catch problems in third party libraries, either. &nbsp;But it gives you the red squiggles in your own code, so that you can correct your own code. &nbsp;You can&#39;t be sure everyone else&#39;s code is correct, but at least you can know your own code is.</p>
+<p>I think that&#39;s the goal here &#8212; to report the issue, and make sure it is adequately communicated to the developer, at build time, in the code that the developer directly controls. &nbsp;Opt-in (so it doesn&#39;t break existing code).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1" id="comment-1163643">
+				<div id="div-comment-1163643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163643">
+			November 24, 2014 at 5:29 pm</a>		</div>
+
+		<p>@Dave Bacher: I think Raymond&#39;s argument is that when false positive is too high, everyone would just ignore the warning. And I agree with that.</p>
+<p>While the compiler could help detecting (like what they do to detect unused variables, but perhaps in more complicated way), this opens up a new category of &quot;detective works&quot; for compiler to do. And of the list of &quot;function properties&quot; to consider have context validation on, I think the check on &quot;thread safe functions&quot; are on higher priority.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1163683">
+				<div id="div-comment-1163683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JamesJohnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163683">
+			November 25, 2014 at 7:37 am</a>		</div>
+
+		<p>@Cube 8: You could have a dynamic version of the tool hook those APIs. &nbsp;But the main reason for the tool would not be to detect explicit attempts to avoid said tool. &nbsp;If you are trying to work around the tool, you are probably not going to use it in the first place.</p>
+<p>Personally, most of the API calls I make are statically linked, and I only use LoadLibrary/GetProcAddress for newer APIs where I&#39;m also maintaining a fall-back option for Windows XP. &nbsp;This isn&#39;t the majority of calls. &nbsp;A simple &quot;grep&quot; of the code for GetProcAddress would yield a manageable list and could be inspected by hand.</p>
+<p>I really like the idea that @Dave Bacher proposes of having a #define to eliminate the APIs unsupported from services. &nbsp;It&#39;s probably a better solution than I propose and would be easy to use &#8211; not requiring a special tool. &nbsp;Selection of 3rd-party libraries by the developer can be limited to those that also use the #define.</p>
+<p>I don&#39;t think I agree with the &quot;why bother? too many false positives&quot; perspective. &nbsp;You could make the same argument against compiler warnings. &nbsp;Sure &#8211; maybe what you were doing was safe in that particular case &#8211; but the compiler wasn&#39;t sure, and the fix is easy. &nbsp;Some developers fall into the trap of ignoring compiler warnings, and suddenly we have &quot;too many false positives.&quot; &nbsp;Professional developers will go in and fix the warnings &#8211; even the &quot;false positive&quot; warnings &#8211; so that we have zero warnings.</p>
+<p>Eliminating the problematic imports in your own binary should be easy and essential. &nbsp;If you link with a 3rd-party DLL that is kicking too many false positives, maybe you should contact your vendor and make sure they are really false positives&#8230; &nbsp;To me, excessive false positives would be a sign of some badly-needed refactoring and shouldn&#39;t be used as an excuse to ignore the problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1163883">
+				<div id="div-comment-1163883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1163883">
+			November 26, 2014 at 2:53 am</a>		</div>
+
+		<p>@JamesJohnston: &quot;You could have a dynamic version of the tool&#8230;&quot;</p>
+<p>Like &#39;Application Verifier&#39;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aaron-margosis even thread-even depth-1" id="comment-1164173">
+				<div id="div-comment-1164173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Aaron+Margosis' rel='external nofollow' class='url'>Aaron Margosis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1164173">
+			November 26, 2014 at 9:33 pm</a>		</div>
+
+		<p>I just searched a bunch of my source code for the past few years. &nbsp;Found an instance of SHFileOperation that does run in a service context, but I&#39;m &gt;99% certain there&#39;s no impersonation. &nbsp;The reason I called it was that I needed to delete a directory hierarchy. &nbsp;The MSDN doc for RemoveDirectory recommends SHFileOperation for that purpose. &nbsp;Using SHFileOperation seemed better than writing custom code to recursively delete files and directories, or to shell out to &quot;rd /s /q dirname&quot;&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1164333">
+				<div id="div-comment-1164333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jonathancd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141121-00/?p=43563#comment-1164333">
+			November 28, 2014 at 1:57 am</a>		</div>
+
+		<p>We had some surprising bugs caused by this for some time, luckily it hadn&#39;t manifested as a security issue &#8211; but I wasted weeks until I stumbled into RegDisablePredefinedCacheEx.</p>
+<p>Definitely something that should be documented better. E.g. In the .Net or WINAPI docs, inlined into any documentation about writing a service. Not only would that mitigate security issues, but also headaches.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

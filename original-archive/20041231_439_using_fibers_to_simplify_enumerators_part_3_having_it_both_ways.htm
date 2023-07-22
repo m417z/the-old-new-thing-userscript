@@ -1,0 +1,1035 @@
+<html>
+<head>
+<title>Using fibers to simplify enumerators, part 3: Having it both ways</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using fibers to simplify enumerators, part 3: Having it both ways</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 31, 2004 / year-entry #440</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>28</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">As we discovered in the previous two entries [second], the problem with enumeration is that somebody always loses. Now we will use fibers to fight back. Before you decide to use fibers in your programs, make sure to read the dire warnings at the end of this article. My goal here is to show one...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>As we discovered in the
+<a HREF="/oldnewthing/archive/2004/12/29/343664.aspx">
+previous two entries</a>
+[<a HREF="/oldnewthing/archive/2004/12/30/344281.aspx">second</a>],
+the problem with enumeration is that somebody always loses.</p>
+<p>
+Now we will use fibers to fight back.
+Before you decide to use fibers in your programs,
+make sure to read the
+<strong>dire warnings</strong> at the end of this article.
+My goal here is to show one use of fibers,
+not to say that fibers are the answer to all your problems.
+Fibers can create more problems than they solve.
+We'll come back to all the dire warnings later.
+</p>
+<p>
+As with most clever ideas, it has a simple kernel:
+Use a fiber to run both the caller and the enumerator
+each on their own stack.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;shlwapi.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;strsafe.h&gt;
+
+enum FEFOUND {
+ FEF_FILE,          // found a file
+ FEF_DIR,           // found a directory
+ FEF_LEAVEDIR,      // leaving a directory
+ FEF_DONE,          // finished
+};
+
+enum FERESULT {
+ FER_CONTINUE,      // continue enumerating
+                    // (if directory: recurse into it)
+ FER_SKIP,          // skip directory (do not recurse)
+};
+
+class __declspec(novtable) FiberEnumerator {
+public:
+ FiberEnumerator();
+ ~FiberEnumerator();
+
+ FEFOUND Next();
+ void SetResult(FERESULT fer) { m_fer = fer; }
+ void Skip() { SetResult(FER_SKIP); }
+
+ virtual LPCTSTR GetCurDir() = 0;
+ virtual LPCTSTR GetCurPath() = 0;
+ virtual const WIN32_FIND_DATA* GetCurFindData() = 0;
+
+protected:
+ virtual void FiberProc() = 0;
+
+ static void DECLSPEC_NORETURN WINAPI
+    s_FiberProc(void* pvContext);
+
+ FERESULT Produce(FEFOUND fef);
+
+protected:
+ void* m_hfibCaller;
+ void* m_hfibEnumerator;
+ FEFOUND  m_fef;
+ FERESULT m_fer;
+};
+
+FiberEnumerator::FiberEnumerator()
+ : m_fer(FER_CONTINUE)
+{
+ m_hfibEnumerator = CreateFiber(0, s_FiberProc, this);
+}
+
+FiberEnumerator::~FiberEnumerator()
+{
+ DeleteFiber(m_hfibEnumerator);
+}
+
+void DECLSPEC_NORETURN FiberEnumerator::
+    s_FiberProc(void *pvContext)
+{
+ FiberEnumerator* self =
+    reinterpret_cast&lt;FiberEnumerator*&gt;(pvContext);
+ self-&gt;FiberProc();
+
+ // Theoretically, we need only produce Done once,
+ // but keep looping in case a consumer gets
+ // confused and asks for the Next() item even
+ // though we're Done.
+ for (;;) self-&gt;Produce(FEF_DONE);
+}
+</pre>
+<p>
+This helper class does the basic bookkeeping
+of fiber-based enumeration.  At construction, it
+remembers the fiber that is consuming the enumeration,
+as well as creating a fiber that will produce the
+enumeration.  At destruction, it cleans up the fiber.
+The derived class is expected to implement the
+<code>FiberProc</code> method and call <code>Produce()</code>
+every so often.
+</p>
+<p>
+The real magic happens in the (somewhat anticlimactic)
+<code>Produce()</code>
+and <code>Next()</code> methods:
+</p>
+<pre>
+FERESULT FiberEnumerator::Produce(FEFOUND fef)
+{
+ m_fef = fef; // for Next() to retrieve
+ m_fer = FER_CONTINUE; // default
+ SwitchToFiber(m_hfibCaller);
+ return m_fer;
+}
+
+FEFOUND FiberEnumerator::Next()
+{
+ m_hfibCaller = GetCurrentFiber();
+ SwitchToFiber(m_hfibEnumerator);
+ return m_fef;
+}
+</pre>
+<p>
+To <code>Produce()</code> something, we remember the production code,
+pre-set the enumeration result to its default of
+<code>FER_CONTINUE</code>, and switch to the consumer
+fiber.  When the consumer fiber comes back with an answer,
+we return it from <code>Produce()</code>.
+</p>
+<p>
+To get the next item, we
+remember the identity of the calling fiber, then
+switch to the enumerator fiber.
+This runs the enumerator until it decides to <code>Produce()</code>
+something, at which point we take the production code and
+return it.
+</p>
+<p>
+That's all there is to it.  The <code>m_fef</code> and
+<code>m_fer</code> members are for passing the parameters and
+results back and forth across the fiber boundary.
+</p>
+<p>
+Okay, with that groundwork out of the way, writing the
+producer itself is rather anticlimactic.
+</p>
+<p>
+Since we want to make things easy for the consumer,
+we use
+<a HREF="/oldnewthing/archive/2004/12/30/344281.aspx">
+the interface the consumer would have designed</a>,
+with some assistance from the helper class.
+</p>
+<pre>
+class DirectoryTreeEnumerator : public FiberEnumerator {
+public:
+ DirectoryTreeEnumerator(LPCTSTR pszDir);
+ ~DirectoryTreeEnumerator();
+
+ LPCTSTR GetCurDir() { return m_pseCur-&gt;m_szDir; }
+ LPCTSTR GetCurPath() { return m_szPath; }
+ const WIN32_FIND_DATA* GetCurFindData()
+    { return &amp;m_pseCur-&gt;m_wfd; }
+
+private:
+ void FiberProc();
+ void Enum();
+
+ struct StackEntry {
+   StackEntry* m_pseNext;
+   HANDLE m_hfind;
+   WIN32_FIND_DATA m_wfd;
+   TCHAR m_szDir[MAX_PATH];
+ };
+ bool Push(StackEntry* pse);
+ void Pop();
+
+private:
+ StackEntry *m_pseCur;
+ TCHAR m_szPath[MAX_PATH];
+};
+
+DirectoryTreeEnumerator::
+ DirectoryTreeEnumerator(LPCTSTR pszDir)
+ : m_pseCur(NULL)
+{
+ StringCchCopy(m_szPath, MAX_PATH, pszDir);
+}
+
+DirectoryTreeEnumerator::~DirectoryTreeEnumerator()
+{
+ while (m_pseCur) {
+   Pop();
+ }
+}
+
+bool DirectoryTreeEnumerator::
+      Push(StackEntry* pse)
+{
+ pse-&gt;m_pseNext = m_pseCur;
+ m_pseCur = pse;
+ return
+  SUCCEEDED(StringCchCopy(pse-&gt;m_szDir,
+                 MAX_PATH, m_szPath)) &amp;&amp;
+  PathCombine(m_szPath, pse-&gt;m_szDir, TEXT("*.*")) &amp;&amp;
+  (pse-&gt;m_hfind = FindFirstFile(m_szPath,
+       &amp;pse-&gt;m_wfd)) != INVALID_HANDLE_VALUE;
+}
+
+void DirectoryTreeEnumerator::Pop()
+{
+ StackEntry* pse = m_pseCur;
+ if (pse-&gt;m_hfind != INVALID_HANDLE_VALUE) {
+  FindClose(pse-&gt;m_hfind);
+ }
+ m_pseCur = pse-&gt;m_pseNext;
+}
+
+void DirectoryTreeEnumerator::FiberProc()
+{
+ Enum();
+}
+
+void DirectoryTreeEnumerator::Enum()
+{
+ StackEntry se;
+ if (Push(&amp;se)) {
+  do {
+   if (lstrcmp(se.m_wfd.cFileName, TEXT(".")) != 0 &amp;&amp;
+       lstrcmp(se.m_wfd.cFileName, TEXT("..")) != 0 &amp;&amp;
+       PathCombine(m_szPath, se.m_szDir, se.m_wfd.cFileName)) {
+    FEFOUND fef = (se.m_wfd.dwFileAttributes &amp;
+                    FILE_ATTRIBUTE_DIRECTORY) ?
+                    FEF_DIR : FEF_FILE;
+    if (Produce(fef) == FER_CONTINUE &amp;&amp; fef == FEF_DIR) {
+     Enum(); // recurse into the subdirectory we just produced
+    }
+   }
+  } while (FindNextFile(se.m_hfind, &amp;se.m_wfd));
+ }
+ Produce(FEF_LEAVEDIR);
+ Pop();
+}
+</pre>
+<p>
+As you can see, this class is a mix of the two previous
+classes.  Like the consumer-based class, information about
+the item being enumerated is obtained by calling methods
+on the enumerator object.  But like the callback-based
+version, the loop that generates the objects themselves is
+a very simple recursive function, with a call to
+<code>Produce</code> in place of a callback.
+</p>
+<p>
+In fact, it's even simpler than the callback-based version,
+since we don't have to worry about the FER_STOP code.
+If the consumer wants to stop enumeration, the consumer simply
+stops calling <code>Next()</code>.
+</p>
+<p>
+Most of the complexity in the class
+is just bookkeeping to permit
+abandoning the enumeration prematurely.
+</p>
+<p>
+Okay, let's take this fiber out for a spin.  You can use
+the same <code>TestWalk</code> function as last time,
+but for added generality, change the first parameter
+from <code>DirectoryTreeEnumerator*</code> to
+<code>FiberEnumerator*</code>. 
+(The significance of this will become apparent next time.)
+</p>
+<p>
+A little tweak needs to be made to the main function, though.
+</p>
+<pre>
+int __cdecl main(int argc, char **argv)
+{
+ <font COLOR=blue>ConvertThreadToFiber(NULL);</font>
+ DirectoryTreeEnumerator e(TEXT("."));
+ TestWalk(&e);
+ <font COLOR=blue>ConvertFiberToThread();</font>
+ return 0;
+}
+</pre>
+<p>
+Since the enumerator is going to switch between fibers,
+we'd better convert the thread to a fiber so it'll have
+something to switch back to!
+</p>
+<p>
+Here's a schematic of what happens when you run this
+fiber-based enumerator:
+</p>
+<table CELLSPACING=0 CELLPADDING=3>
+<tr>
+<td><code>ConvertThreadToFiber</code></p>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<th STYLE="border: solid .75pt black; border-bottom: none">Main fiber</th>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">construct <code>DirectoryTreeEnumerator</code></td>
+<td></td>
+<th>Enumerator fiber</th>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>CreateFiber</code></td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-bottom: none">(not running)</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">initialize variables</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Next(CONTINUE)</code></td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>SwitchToFiber()</code></td>
+<td>&rarr;</td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">starts running</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>FindFirstFile</code> etc</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Produce(FILE)</code></td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Next(CONTINUE)</code> "returns" FILE</td>
+<td>&larr;</td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>SwitchToFiber()</code></td>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">use the result</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Next(CONTINUE)</code></td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>SwitchToFiber()</code></td>
+<td>&rarr;</td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Produce(FILE)</code> "returns" CONTINUE</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>FindNextFile</code> etc</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Produce(DIR)</code></td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Next(CONTINUE)</code> "returns" DIR</td>
+<td>&larr;</td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>SwitchToFiber()</code></td>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">use the result</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Next(CONTINUE)</code></td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>SwitchToFiber()</code></td>
+<td>&rarr;</td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Produce(DIR)</code> "returns" CONTINUE</td>
+</tr>
+<tr>
+<td ALIGN=center COLSPAN=3>and so on... until...</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Produce(DONE)</code></td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>Next(CONTINUE)</code> "returns" DONE</td>
+<td>&larr;</td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>SwitchToFiber()</code></td>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">cleanup</td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none; border-bottom: none"><code>DeleteFiber</code></td>
+<td></td>
+<td STYLE="border: solid .75pt black; border-top: none">&nbsp;</td>
+</tr>
+<tr>
+<td STYLE="border: solid .75pt black; border-top: none">destruct <code>DirectoryTreeEnumerator</code></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><code>ConvertFiberToThread</code></p>
+<td></td>
+<td></td>
+</tr>
+</table>
+<p>
+Observe that from each fiber's point of view, the other fiber
+is just a subroutine!
+</p>
+<p>
+Coding subtlety: Why do we capture the caller's fiber each time
+the <code>Next()</code> method is called?
+Why not capture it when the <code>FiberEnumerator</code> is constructed?
+</p>
+<p>
+Next time, we'll see how this fiber-based enumerator easily
+admits higher-order operations such as filtering and composition.
+</p>
+<p>
+<strong>Dire warnings about fibers</strong>
+</p>
+<p>
+Fibers are like dynamite. Mishandle them and your process explodes.
+</p>
+<p>The first dire warning is that
+fibers are expensive in terms of address space,
+since each one gets its own stack (typically a megabyte).
+</p>
+<p>
+And since each fiber has its own stack, it also has its own exception chain.
+This means that if a fiber throws an exception, only that fiber can
+catch it.  (Same as threads.)
+That's a strong argument against using an
+STL std::stack object to maintain our state:
+STL is based on an exception-throwing model, but you can't catch
+exceptions raised by another fiber.
+(You also can't throw exceptions past a COM boundary, which
+severely limits how much you can use STL in a COM object.)
+</p>
+<p>
+One of the big problems with fibers is that
+<a HREF="/greggm/archive/2004/06/07/150298.aspx">
+everybody has to be in cahoots</a>.
+You need to decide on one person who will
+call
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/convertthreadtofiber.asp">
+the <code>ConvertThreadToFiber</code> function</a>
+since fiber/thread conversion is not reference-counted.
+If two people call ConvertThreadToFiber on the same
+thread, the first will convert it, and so will the second!
+This results in two fibers for the same thread,
+and things can only get worse from there.
+</p>
+<p>
+You might think, "Well, wouldn't
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/getcurrentfiber.asp">
+the <code>GetCurrentFiber</code> function</a>
+return NULL if the thread hasn't been converted to a fiber?"
+Try it: It returns garbage.
+(It's amazing how many people ask questions without taking
+even the slightest steps towards figuring out the answer themselves.
+<a HREF="/oldnewthing/archive/2004/07/27/198410.aspx#198429">
+Try writing</a>
+<a HREF="/oldnewthing/archive/2004/07/20/188696.aspx#188816">
+a test program</a>.)
+</p>
+<p>
+But even if GetCurrentFiber told you whether or not the thread
+had been converted to a fiber, that still won't help.
+Suppose two people want to do fibrous activity on the thread.
+The first converts, the second notices that the thread
+is already a fiber (somehow) and skips the conversion.
+Now the first operation completes and calls
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/convertfibertothread.asp">
+the <code>ConvertFiberToThread</code> function</a>.
+Oh great, now the second operation is stranded doing
+fibrous activity without a fiber!
+</p>
+<p>
+Therefore, you can use fibers safely only if you control
+the thread and can get all your code to agree on who
+controls the fiber/thread conversion.
+</p>
+<p>
+An important consequence of the "in cahoots" rule is that
+you have to make sure all the code you use on a fiber
+is "fiber-safe" - a level of safety even beyond thread-safety.
+The C runtime library keeps
+information in per-thread state:  There's
+<a HREF="http://msdn.microsoft.com/library/en-us/vccore98/html/_crt__doserrno.2c_.errno.2c_._sys_errlist.2c_.and__sys_nerr.asp">
+errno</a>,
+all sorts of bonus bookkeeping when you
+<a HREF="http://msdn.microsoft.com/library/en-us/vclib/html/_crt__beginthread.2c_._beginthreadex.asp">
+create a thread</a>,
+or call various functions that maintain state in per-thread data
+(such as
+<a HREF="http://msdn.microsoft.com/library/en-us/vccore98/html/_crt_strerror.2c_._strerror.asp">strerror</a>,
+<a HREF="http://msdn.microsoft.com/library/en-us/vccore98/html/_crt__fcvt.asp">
+_fcvt</a>,
+and
+<a HREF="http://msdn.microsoft.com/library/en-us/vccore98/html/_crt_strtok.2c_.wcstok.2c_._mbstok.asp">
+strtok</a>).
+</p>
+<p>
+In particular, <strong>C++ exception handling
+is managed by the runtime</strong>,
+and the runtime tracks this data in per-thread state (rather than
+per-fiber state).  Therefore, if you throw a C++ exception from
+a fiber, <strong>strange things happen</strong>.
+</p>
+<p>
+(Note: Things may have changed in the C runtime lately;
+I'm operating from information that's a few years old.)
+</p>
+<p>
+Even if you carefully avoid the C runtime library,
+you still have to worry about any other libraries you use
+that use per-thread data.  None of them will work with fibers.
+If you see a call to
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/tlsalloc.asp">
+the <code>TlsAlloc</code> function</a>,
+then there's a good chance that the library is not fiber-safe.
+(The fiber-safe version is
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/flsalloc.asp">
+the <code>FlsAlloc</code> function</a>.)
+</p>
+<p>
+Another category of things that are not fiber-safe are windows.
+Windows have thread affinity, not fiber affinity.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (28)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-238783">
+				<div id="div-comment-238783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.wieser-software.com' rel='external nofollow' class='url'>Anthony Wieser</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238783">
+			December 31, 2004 at 7:47 am</a>		</div>
+
+		<p>Thanks for this Raymond.</p>
+<p>I&#8217;ve always wanted to see a real use of fibers shown somewhere.  Do newer versions of windows make much use of them?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238793">
+				<div id="div-comment-238793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Memet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238793">
+			December 31, 2004 at 8:10 am</a>		</div>
+
+		<p>Thanks Raymond,</p>
+<p>btw, did the Windows team introduce fibers for any reason? (e.g. MS SQL?) Since from previous conversations, I get the impression that only Win32 has such an explicitly defined Fiber API, and also because Fibers are a relatively obscure thing that most people probably wouldn&#8217;t ask for, let alone know about.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238813">
+				<div id="div-comment-238813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/grantri' rel='external nofollow' class='url'>Grant</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238813">
+			December 31, 2004 at 9:06 am</a>		</div>
+
+		<p>Just FYI, C# iterators (new in v2.0) allow this same feat without using fibers.  Instead the compiler transforms the producers&#8217; preferred code into the consumers&#8217; perferred interface.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238823">
+				<div id="div-comment-238823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe Game Developer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238823">
+			December 31, 2004 at 9:11 am</a>		</div>
+
+		<p>Very cool example!</p>
+<p>As a point of information, some games use fibers. You give each object in the game world its own fiber.</p>
+<p>You could use threads (or even processes) instead, but then you have much more overhead because of having to lock to avoid potential race conditions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238833">
+				<div id="div-comment-238833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sven G. Ali</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238833">
+			December 31, 2004 at 9:34 am</a>		</div>
+
+		<p>Yes, this is incredibly cool.</p>
+<p>When I started reading this series I was immediately reminded of my own struggles creating a game engine some time ago.</p>
+<p>In a perfect world each game entity would be on its own thread running its own script. The renderer would be on another thread, getting samples of the game world as necessary.</p>
+<p>The problem of course is that threads are expensive, locks are required, and the thread scheduler doesn&#8217;t provide enough control.</p>
+<p>The only way to make it work was, as Raymond says, to make life difficult for one side or the other. In my case, and I believe in most game engines, life was made easy for the renderer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238843">
+				<div id="div-comment-238843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/mgrier' rel='external nofollow' class='url'>Michael Grier [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238843">
+			December 31, 2004 at 10:39 am</a>		</div>
+
+		<p>Fibers are definitely designed to help applications which really understand their data sets, their I/O patterns and don&#8217;t have a big plug-in/extensibility mechanism.  At some point large applications like this become CPU bound since they&#8217;re actually used by enterprises who do insanely expensive things like buy large storage arrays that let the number of concurrent I/Os scale as far as the CPU and operating system can push them.</p>
+<p>So then they need to start optimizing CPU usage and they can&#8217;t afford the statistical goodness of things like thread scheduling and I/O completion ports.</p>
+<p>I bet you can figure out which applications really take advantage of fibers and therefore which bugs around using fibers have gotten fixed.  They&#8217;re enterprise applications which do a lot of I/O but are run by large enough physical systems that the real limiting factor is CPU use.</p>
+<p>Caveat emptor.  To solve the easy enumerators problem you really want to have smaller things like  closures/continuations without having to keep the entire stack around.  This is hard without compiler support and even then managing the lifetime of the storage that the closure references is hard without GC.  This is effectively how iterators/&quot;yield&quot; works in C#.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238853">
+				<div id="div-comment-238853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">RJ</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238853">
+			December 31, 2004 at 11:00 am</a>		</div>
+
+		<p>It seems that SwitchToFiber would invalidate all CPU predictions and stall the pipeline.  If that is true, another warning for CPU bound apps would be to not call it in a tight loop.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238863">
+				<div id="div-comment-238863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238863">
+			December 31, 2004 at 11:24 am</a>		</div>
+
+		<p>I co-wrote a simple game engine some time ago which used coroutines, which fibers seem to be an implementation of, to allow objects to independently operate.</p>
+<p>In my case, each &quot;object&quot; in the game was able to register one or more coroutines which would be resumed each frame. Each time the coroutine was resumed the current tick count was passed in so that the coroutine would know how much to adjust its associated object by, depending on what it was supposed to be doing.</p>
+<p>This wasn&#8217;t done with Win32 Fibers, though. Indeed, Raymond&#8217;s series here was the first I&#8217;ve ever heard of them. My co-author had implemented a simple scripting system, so my coroutine implementation just played with the stack kept inside the script interpreter. The coroutines didn&#8217;t exist outside the script context.</p>
+<p>The nice thing about coroutines vs. threads is that it&#8217;s up to each routine when it yields, so things like locking become less important. If a coroutine is going to do something unsafe, it must just make sure it leaves everything in a sensible state before yeilding.</p>
+<p>In practice, most applications other than &quot;real-time&quot; games are better off with threads, of course.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238873">
+				<div id="div-comment-238873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/earhart' rel='external nofollow' class='url'>Rob Earhart</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238873">
+			December 31, 2004 at 1:00 pm</a>		</div>
+
+		<p>One nitpick: ConvertThreadToFiber() should fail with GetLastError() == ERROR_ALREADY_FIBER if the thread&#8217;s already a fiber.  So try it; if it fails for that reason, keep going, but skip the call to ConvertFiberToThread() at the end, and you can work with components which called yours on a fiber.</p>
+<p>In Longhorn, there&#8217;s also IsThreadAFiber(), which should always work.</p>
+<p>GetCurrentFiber() and GetFiberData() don&#8217;t return garbage; they just don&#8217;t return what you&#8217;re expecting (the field in the TEB is overloaded with OS2 information).  If you file a bug against me, I&#8217;ll look into fixing them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238883">
+				<div id="div-comment-238883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238883">
+			December 31, 2004 at 1:14 pm</a>		</div>
+
+		<p>ERROR_ALREADY_FIBER is returned only on Windows Server 2003. For Windows 98, 2000, and XP, converting a thread to a fiber twice results in random behavior.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238893">
+				<div id="div-comment-238893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://spaces.msn.com/members/mpll' rel='external nofollow' class='url'>Pavel Lebedinsky</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238893">
+			December 31, 2004 at 1:34 pm</a>		</div>
+
+		<p>Given all the dire warnings about fibers, has anyone actually measured how much slower the equivalent version using threads would be?</p>
+<p>I suspect that switching back and forth between two fiber stacks for each produced element is also not very good for performance. </p>
+<p>If threads are used instead then for large collections you could batch the elements by putting a producer-consumer queue between the enumerator thread and the main thread. Then the overhead of thread switching will be amortized over a large number of elements, and you will not have to worry about fiber-safety.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238903">
+				<div id="div-comment-238903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bug Hunter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238903">
+			December 31, 2004 at 1:37 pm</a>		</div>
+
+		<p>&quot;ERROR_ALREADY_FIBER is returned only on Windows Server 2003. For Windows 98, 2000, and XP, converting a thread to a fiber twice results in random behavior.&quot;</p>
+<p>How did this ever get designed this way?!?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238913">
+				<div id="div-comment-238913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238913">
+			December 31, 2004 at 1:44 pm</a>		</div>
+
+		<p>Because fibers are a brain-the-size-of-a-planet feature. You are expected to have already worked through all the difficulties yourself &#8211; like deciding who will do the thread-to-fiber conversion. In the same way you don&#8217;t get an error if you free memory twice; you&#8217;re expected simply not to do that in the first place.</p>
+<p>Remember, the ENTIRE PROGRAM must coordinate fiber management &#8211; see all the dire warnings &#8211; if you&#8217;re coordinating fibers on a program-wide basis surely you can decide who will be responsible for the thread-to-fiber conversion; that&#8217;s the least of your problems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238923">
+				<div id="div-comment-238923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">M Knight</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238923">
+			January 1, 2005 at 1:49 am</a>		</div>
+
+		<p>Pavel Lebedinsky, switching between fibers is *cheap* compared to switching between threads.</p>
+<p>A switch between fibers involves; saving the registers state, and then loading the new register state from the new fiber. This will also switch the stack too. You are looking at a few dozen bytes which need to be moved about.</p>
+<p>With a thread; it involves a trip to kernel land, saving the registers state, loading the new registers state, and then a trip back to user-land.</p>
+<p>The timesaver is the removal of the trips between user-mode and kernel-mode todo a context switch. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-238943">
+				<div id="div-comment-238943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/mgrier' rel='external nofollow' class='url'>Michael Grier [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238943">
+			January 1, 2005 at 10:11 am</a>		</div>
+
+		<p>If memory serves, SQL Server gets something like a 5-10% boost when running in fiber mode.  However I believe that it then can&#8217;t use XSPs (the DLL-based plug-in mechanism) because, in general, code can&#8217;t deal with fibers / shifting across threads.  (This is why it&#8217;s not the default; it does break some code that may be running in-process with SQL.)</p>
+<p>Maybe they&#8217;ve done the work so that XSP invocations are remoted to run on threads that aren&#8217;t fibrous; it&#8217;s been too many years since I&#8217;ve paid deep attention to SQL server, so please research the details here (XSPs) yourself.</p>
+<p>Re: cost:</p>
+<p>I may be wrong here, but I believe that a context switch forces reloading the PCR (on x86) which is a very expensive operation for the CPU.  Fiber switches switch a lot less state, don&#8217;t go into kernel mode and don&#8217;t change the PCR.</p>
+<p>Mike<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-238963">
+				<div id="div-comment-238963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://spaces.msn.com/members/mpll' rel='external nofollow' class='url'>Pavel Lebedinsky</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-238963">
+			January 1, 2005 at 4:17 pm</a>		</div>
+
+		<p>&gt; switching between fibers is *cheap* compared to switching between threads.</p>
+<p>My point was that any context switching (thread or fiber) has additional costs because of poor locality of reference. These costs may dominate everything else (things like saving the registers, transition to KM and back, running the scheduler code etc). If that&#8217;s the case then using fibers doesn&#8217;t really buy you anything, except all the bugs you&#8217;re going to discover because most code has never been tested with fibers and probably is not fiber-safe.</p>
+<p>Now I&#8217;m not an expert on this to be able to say one way or another. But when I googled for [&quot;context switch&quot; &quot;cache miss&quot; cost] the first hit was this article:</p>
+<p>The Effect of Context Switches on Cache Performance<br />
+<br /><a target="_new" href="http://www.eecs.harvard.edu/cs245/papers/Shieyuan.html" rel="nofollow">http://www.eecs.harvard.edu/cs245/papers/Shieyuan.html</a></p>
+<p>They say that at least in some cases, cache-performance dominates the cost of a context switch. Note that this was back in 1991, and by all accounts the situation has only become worse in recent years because CPU speeds grew much faster than memory speeds.</p>
+<p>So it seems to me that unless you&#8217;ve actually *measured* the performance of both solutions and found fibers significantly faster, you&#8217;re better off staying with threads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-239013">
+				<div id="div-comment-239013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/ryanmy/' rel='external nofollow' class='url'>Ryan Myers [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-239013">
+			January 2, 2005 at 11:52 am</a>		</div>
+
+		<p>Any kind of context switch &#8212; whether an explicit one made in fibers, or a true thread change, is painful in terms of cache swap.  It&#8217;s still true, though, that SwitchToFiber() is cheaper than a normal thread context switch, as fiber switching can be done almost entirely in non-priviledged (usermode) code.</p>
+<p>And yes, it is still true today that context switches kill the cache.  Those of us in the performance team have been on several crusades to reduce the number of switches needed in an &quot;idle&quot; system over the last few years &#8212; pushing for fewer services, fewer ISRs/DPCs, etc.  In my particular case, my rallying cry has been high-definition video playback; we&#8217;ve found that having a high number of ISRs/DPCs per second will absolutely sink decoding, even if every single interrupt executes quickly, because they kill the cache.  (This is in addition, of course, to the problem of ISRs/DPCs that take too long and lock up the CPU for extended periods of time, such as long NDIS chains or non-conformant ATAPI drives.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-239083">
+				<div id="div-comment-239083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frank</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-239083">
+			January 3, 2005 at 4:18 pm</a>		</div>
+
+		<p>Just a thought &#8211; couldn&#8217;t you do something similar with &quot;good-old&quot; POSIX setjmp()/longjmp()? Not sure though, I guess it lacks the &#8216;double stack&#8217;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-239143">
+				<div id="div-comment-239143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://Fiber~=jmp_buf' rel='external nofollow' class='url'>Michael Grier [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-239143">
+			January 4, 2005 at 11:06 am</a>		</div>
+
+		<p>Yes, a fiber is very similar to a jmp_buf.  The thing is that setjmp/longjmp explicitly only are enabled for jumping up the stack, not across between stacks.  There&#8217;s no defined way to allocate a new stack, get code running on it and save its context into a jmp_buf in standard C etc.</p>
+<p>Note also that since a jmp_buf is a struct, its size can&#8217;t really vary and depends on the version of the C runtime (regardless of platform) that you are built with.  Fibers are provided by the OS on windows and therefore if someone discovers that some critical piece of state wasn&#8217;t captured/switched, it can be added.</p>
+<p>Unfortunately those additions do tend to break apps who were depending on that piece of context not being switched.  Luckily most people have heeded the warning and aren&#8217;t using fibers except for people who think they already understand their per-fiber context pretty well.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-239433">
+				<div id="div-comment-239433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">lukaszg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-239433">
+			January 5, 2005 at 1:48 pm</a>		</div>
+
+		<blockquote><p>
+  &gt;<br />
+  <br /> (It&#8217;s amazing how many people ask questions without taking even the slightest steps towards figuring out the answer themselves. Try writing a test program.)<br />
+  <br />&lt;&lt;</p>
+<p>Isn&#8217;t that exactly how people come to rely on undocumented behavior? Just because a test program behaves in a certain way on your machine doesn&#8217;t mean it will on others. Answers to questions like this should be in the docs (don&#8217;t know if this one is, just making a general point). Of course, sometimes writing a test program is the only way, but it shouldn&#8217;t be the first one tried.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-239473">
+				<div id="div-comment-239473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/larryosterman/archive/2005/01/05/347314.aspx' rel='external nofollow' class='url'>Larry Osterman's WebLog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-239473">
+			January 5, 2005 at 6:58 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-239443">
+				<div id="div-comment-239443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-239443">
+			January 5, 2005 at 2:03 pm</a>		</div>
+
+		<p>The test program is *one step* towards figuring out the answer. A test program can&#8217;t tell you that you&#8217;re right, but it can tell you that you&#8217;re wrong.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-247853">
+				<div id="div-comment-247853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.wisniewski-online.com/cs/blogs/wizzys_world/archive/2005/01/20/4.aspx' rel='external nofollow' class='url'>Wizzy's World</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-247853">
+			January 20, 2005 at 6:33 pm</a>		</div>
+
+		<p>A while back there was an article in MSDN magazine about wrapping up the unmaged fibers API to implement&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-249953">
+				<div id="div-comment-249953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kannan Goundan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-249953">
+			January 27, 2005 at 3:10 pm</a>		</div>
+
+		<p>While C# iterators cover a good chunk of what you&#8217;d normally want to do, they don&#8217;t use separate stacks and so you can&#8217;t do everything fibres can.  The main restriction is that all your &quot;yield&quot;s have to be in the top function instance.</p>
+<p>IEnumerator&lt;X&gt; InOrder(Tree&lt;X&gt; t) {<br />
+<br />   if (t != null) {<br />
+<br />      InOrder(t.left);<br />
+<br />      yield return t.value;<br />
+<br />      InOrder(t.right);<br />
+<br />   }<br />
+<br />}</p>
+<p>At the least, you&#8217;d have to put a for loop around the recursive calls and &quot;re-yield&quot; the values to the top.  This is pretty inefficient.</p>
+<p>Full continuation support would fix this.  Unfortunately (AFAIK), adding continuation support causes a significant performance hit (even if you don&#8217;t use them).<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-253933">
+				<div id="div-comment-253933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://excastle.com/blog/archive/2005/02/08/712.aspx' rel='external nofollow' class='url'>Joe White's Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-253933">
+			February 8, 2005 at 6:43 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-460363">
+				<div id="div-comment-460363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://excastle.com/blog/archive/2007/01/11/10280.aspx' rel='external nofollow' class='url'>Joe White's Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-460363">
+			January 11, 2007 at 10:19 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-460393">
+				<div id="div-comment-460393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://excastle.com/blog/archive/0001/01/01/10280.aspx' rel='external nofollow' class='url'>Joe White's Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-460393">
+			January 11, 2007 at 10:21 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-630593">
+				<div id="div-comment-630593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/ericeil/archive/2008/05/18/when-does-it-make-sense-to-use-win32-fibers.aspx' rel='external nofollow' class='url'>Eric Eilebrecht's blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041231-00/?p=36833#comment-630593">
+			May 18, 2008 at 11:29 am</a>		</div>
+
+		<p>This has been discussed fairly frequently on the Web. Chris Brumme discusses this here: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/cbrumme/archive/2003/04/15/51351.aspx" rel="nofollow">http://blogs.msdn.com/cbrumme/archive/2003/04/15/51351.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

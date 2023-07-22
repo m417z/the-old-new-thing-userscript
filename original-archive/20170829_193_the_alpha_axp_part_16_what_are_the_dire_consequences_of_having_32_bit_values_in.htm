@@ -1,0 +1,364 @@
+<html>
+<head>
+<title>The Alpha AXP, part 16: What are the dire consequences of having 32-bit values in non-canonical form?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The Alpha AXP, part 16: What are the dire consequences of having 32-bit values in non-canonical form?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 29, 2017 / year-entry #194</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It depends on what the next calculation is.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+On the Alpha AXP,
+32-bit values are typically represented in so-called canonical form.
+But what happens if you use a non-canonical representation?
+</p>
+<p>
+Well, it depends on what instruction consumes the non-canonical
+representation.
+</p>
+<p>
+If the consuming instruction is an explicit 32-bit instruction,
+such as <code>ADDL</code>
+or
+<code>STL</code>,
+then the upper 32 bits are ignored,
+and the operation proceeds with the lower 32 bits.
+In that case, the non-canonical representation causes no harm.
+For example, consider this calculation:
+</p>
+<pre>
+    ; Calculate Rc = Ra + Rb + 0x1234 (32-bit result)
+    LDA     Rc, 0x1234(zero)    ; Rc = 0x00000000`00001234
+    ADDL    Rc, Rb, Rc          ; Rc = Rb + 0x1234
+    ADDL    Rc, Ra, Rc          ; Rc = Ra + Rb + 0x1234
+</pre>
+<p>
+If we are willing to use a non-canonical form temporarily,
+we could simplify this to
+</p>
+<pre>
+    ; Calculate Rc = Ra + Rb + 0x1234 (32-bit result)
+    LDA     Rc, 0x1234(Rb)      ; Rc = Rb + 0x1234 (64-bit intermediate)
+    ADDL    Rc, Ra, Rc          ; Rc = Ra + Rb + 0x1234 (32-bit result)
+</pre>
+<p>
+The <code>LDA</code> will put <var>Rc</var>
+into non-canonical 32-bit form if <var>Rb</var> is in the
+range
+<code>0x7FFFEDCC</code> to
+<code>0x7FFFFFFF</code>
+because the <code>LDA</code> instruction is 64-bit only,
+and the result would be in the range
+<code>0x00000000`80000000</code> through
+<code>0x00000000`80001233</code>, which are non-canonical.
+But all is forgiven at the <code>ADDL</code> instruction,
+since it considers only the 32-bit portion of the 
+addends (ignoring the non-canonical part)
+and generates a 32-bit result in canonical form.
+</p>
+<p>
+On the other hand, if the instruction that consumes the non-canonical
+32-bit value is a 64-bit instruction,
+then the non-canonical value will cause trouble.
+</p>
+<p>
+Consider this simple function:
+</p>
+<pre>
+void f(int x)
+{
+    if (x == 0) DoSomething();
+}
+</pre>
+<p>
+The Windows ABI for Alpha AXP requires that all 32-bit values
+be passed and returned in canonical form.
+You are welcome to use non-canonical values inside your function,
+but all communication with the outside world must use
+canonical form for 32-bit values.
+</p>
+<p>
+This function might assemble to something like this:
+</p>
+<pre>
+    BEQ     a0, DoSomething ; tail call optimization
+    RET     zero, (ra), 1   ; return without doing anything
+</pre>
+<p>
+The first instruction checks whether <var>x</var> is zero.
+If so, then it jumps directly to the <code>Do&shy;Something</code>
+function, leaving the return address unchanged, so that
+when <code>Do&shy;Something</code> returns, it returns to the
+caller of <code>f</code>.
+(This is a tail call optimization.)
+</p>
+<p>
+If the value is not zero, then it returns to the caller.
+</p>
+<p>
+There is no 32-bit version of the <code>BEQ</code> instruction;
+it always tests the full 64 bits.
+</p>
+<p>
+If the value of <var>x</var> were not canonical, then the
+branch instruction could suffer false negatives:
+Even though the lower 32 bits are zero,
+there may be nonzero bits set in the upper half.
+That cause the <code>BEQ</code> to report "sorry, not zero"
+even though the 32-bit part of <var>a0</var> was zero.
+</p>
+<p>
+There are a number of instructions which do not have a 32-bit version
+and which always operate on the full 64-bit register value.
+Another example:
+</p>
+<pre>
+void f(int x, int y)
+{
+    if (x &lt; y) DoSomething();
+}
+</pre>
+<p>
+This function might assemble to something like this:
+</p>
+<pre>
+    CMPLT   a0, a1, t0      ; t0 = 1 if a0 &lt; a1
+    BNE     t0, DoSomething ; tail call optimization
+    RET     zero, (ra), 1   ; return without doing anything
+</pre>
+<p>
+In this version, the compiler performs a signed less-than operation
+and branches based on the result.
+The <code>CMPLT</code> instruction always operates on the
+full 64-bit register value; there is no 32-bit version.
+Consequently, passing a non-canonical value can result in the
+debugger reporting strange things like
+"Well, even though you passed <var>x</var> = 1 and
+<var>y</var> = 2, the less-than comparison returned false
+because <var>x</var> was passed in the non-canonical form of
+<code>0xFFFFFFFF`00000001</code>.
+</p>
+<p>
+Using sign-extended values for
+canonical form for 32-bit values has the nice property
+that
+signed and unsigned comparisons of 32-bit values have the same
+results as signed and unsigned comparisons of their corresponding
+canonical forms.</p>
+<p>
+If zero-extension had been used for canonical form, then unsigned
+comparisons would be preserved,
+but signed comparisons would not agree:
+The 32-bit signed comparison of
+<code>0x00000000</code> with <code>0xFFFFFFFF</code>
+would report that the first value is larger
+(0 &gt; &minus;1)
+but the 64-bit signed comparison
+<code>0x00000000`00000000</code> with <code>0x00000000`FFFFFFFF</code>
+of the corresponding zero-extended values
+would report that the second value is larger
+(0 &lt; 4,294,967,295).
+</p>
+<p>I'm pretty sure this was not a coincidence.
+</p>
+<p>
+<b>Bonus chatter</b>:
+Non-canonical values introduce another
+case where
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20040119-00/?p=41003">
+uninitialized variables can result
+in strange behavior</a>.
+Consider:
+</p>
+<pre>
+int f()
+{
+    int v;
+    ... a bunch of code that somehow forgot to set v ...
+    ... but in a complicated way that eluded code flow analysis ...
+    return (v &lt; 0) ? -1 : 0;
+}
+</pre>
+<p>
+This might get compiled to the following:
+</p>
+<pre>
+    ; compiler chooses t0 to represent v
+    ...
+    SRA     t0, #32, v0     ; v0 = 0xFFFFFFFF`FFFFFFFF if t0 was negative
+                            ; v0 = 0x00000000`00000000 if t0 was nonnegative
+    RET     zero, (ra), 1   ; return the result
+</pre>
+<p>
+If the code forgets to assign a value to <var>v</var>,
+then it will have whatever value was left over from whatever
+code ran earlier.
+Suppose that leftover value
+happened to be the non-canonical value
+<code>0x12345678`12345678</code>.
+In that case,
+the result of the <code>SRA</code> would be
+<code>0x00000000`12345678</code>,
+and the function <code>f</code> ends up returning some value that
+seems to be impossible from reading the code:
+According to the code, the function always returns either
+<code>-1</code> or <code>0</code>,
+yet sometimes we crash because it returned the crazy value
+<code>0x12345678</code>!</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1307566">
+				<div id="div-comment-1307566" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897#comment-1307566">
+			August 29, 2017 at 7:19 am</a>		</div>
+
+		<p>Then, I suppose 0x12345678 means FileNotFound (see <a href="https://thedailywtf.com/articles/What_Is_Truth_0x3f_" rel="nofollow">https://thedailywtf.com/articles/What_Is_Truth_0x3f_</a> ).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1307635">
+				<div id="div-comment-1307635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897#comment-1307635">
+			August 30, 2017 at 7:40 am</a>		</div>
+
+		<p>No, it’s a possible representation of a nasal demon.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1307575">
+				<div id="div-comment-1307575" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897#comment-1307575">
+			August 29, 2017 at 7:25 am</a>		</div>
+
+		<p>Sign extending for canonical values also has the nice side-effect that if you do what NT did, and use &#8220;positive&#8221; addresses for user space, &#8220;negative&#8221; addresses for OS space, you can (relatively) simply extend to larger virtual address spaces keeping the same convention (which is why x86-64 canonical addresses have the N topmost bits set to the same value).</p>
+<p>Had Alpha survived long enough to make it worth releasing 64-bit Windows for it, it would almost certainly have kept the convention that &#8220;positive&#8221; addresses are user space, &#8220;negative&#8221; addresses are OS space, making porting apps simpler for Alpha users.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1307705">
+				<div id="div-comment-1307705" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Julien Oster</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897#comment-1307705">
+			August 30, 2017 at 11:04 pm</a>		</div>
+
+		<p>It seems like Windows on Alpha already did that: <a href="https://blogs.msdn.microsoft.com/oldnewthing/20170823-00/?p=96875" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20170823-00/?p=96875</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1307975">
+				<div id="div-comment-1307975" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.farnz.org.uk/' rel='external nofollow' class='url'>Simon Farnsworth</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897#comment-1307975">
+			September 4, 2017 at 8:44 am</a>		</div>
+
+		<p>Not quite &#8211; that&#8217;s a 32-bit NT allowing a 64-bit aware application to use large addresses.</p>
+<p>I was thinking about a (now hypothetical) 64-bit NT for Alpha, where you could pass 64-bit pointers to the Windows API; this would make it very easy to thunk between the &#8220;old&#8221; 32-bit API and the &#8220;new&#8221; 64-bit API, and would also making porting between the two APIs trivial.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1309145">
+				<div id="div-comment-1309145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170829-00/?p=96897#comment-1309145">
+			September 11, 2017 at 2:16 pm</a>		</div>
+
+		<p>Too many pointers in structures for that to work. Linux only pulled it off because X was already network transparent and very few syscalls take pointers in structures (namely a handful of IOCTLs).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

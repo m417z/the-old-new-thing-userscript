@@ -1,0 +1,848 @@
+<html>
+<head>
+<title>Taxes: Remote Desktop Connection and painting</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Taxes: Remote Desktop Connection and painting</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 3, 2006 / year-entry #7</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>40</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">An increasingly important developer tax is supporting Remote Desktop Connection properly. When the user is connected via a Remote Desktop Connection, video operations are transferred over the network connection to the client for display. Since networks have high latency and nowhere near the bandwidth of a local PCI or AGP bus, you need to adapt...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+An increasingly important developer tax is supporting
+Remote Desktop Connection properly.
+When the user is connected via a Remote Desktop Connection,
+video operations are transferred over the network connection
+to the client for display.
+Since networks have high latency and nowhere near the bandwidth
+of a local PCI or AGP bus,
+you need to adapt to the changing cost of drawing to the screen.
+</p>
+<p>
+If you draw a line on the screen, the "draw line" command is
+sent over the network to the client.
+If you draw text, a "draw text" command is sent (along with the
+text to draw).
+So far so good.
+But if you copy a bitmap to the screen, the entire
+bitmap needs to be transferred over the network.
+</p>
+<p>
+Let's write a sample program that illustrates this point.
+Start with our
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2005/04/22/410773.aspx">
+new scratch program</a>
+and make the following changes:
+</p>
+<pre>
+void Window::Register()
+{
+    WNDCLASS wc;
+    wc.style         = <font COLOR=blue>CS_VREDRAW | CS_HREDRAW</font>;
+    wc.lpfnWndProc   = Window::s_WndProc;
+    ...
+}
+
+class RootWindow : public Window
+{
+public:
+ virtual LPCTSTR ClassName() { return TEXT("Scratch"); }
+ static RootWindow *Create();
+protected:
+ LRESULT HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam);
+ LRESULT OnCreate();
+ <font COLOR=blue>void PaintContent(PAINTSTRUCT *pps);
+ void Draw(HDC hdc, PAINTSTRUCT *pps);</font>
+private:
+ HWND m_hwndChild;
+};
+
+<font COLOR=blue>void RootWindow::Draw(HDC hdc, PAINTSTRUCT *pps)
+{
+ FillRect(hdc, &amp;pps-&gt;rcPaint, (HBRUSH)(COLOR_WINDOW + 1));
+ RECT rc;
+ GetClientRect(m_hwnd, &amp;rc);
+ for (int i = -10; i < 10; i++) {
+  TextOut(hdc, 0, i * 15 + rc.bottom / 2, TEXT("Blah blah"), 9);
+ }
+}
+
+void RootWindow::PaintContent(PAINTSTRUCT *pps)
+{
+ Draw(pps-&gt;hdc, pps);
+}</font>
+
+LRESULT RootWindow::HandleMessage(
+                          UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+ switch (uMsg) {
+ ...
+ <font COLOR=blue>case WM_ERASEBKGND: return 1;</font>
+ ...
+}
+</pre>
+<p>
+There is an odd division of labor here;
+the <code>PaintContent</code> method doesn't actually do
+anything aside from handing the work off to the <code>Draw</code>
+method to do the actual drawing.
+(You'll see why soon.)
+Make sure "Show window contents while dragging" is enabled and
+run this program and resize it vertically.
+Ugh, what ugly flicker.
+We fix this by the traditional technique of double-buffering.
+</p>
+<pre>
+void RootWindow::PaintContent(PAINTSTRUCT *pps)
+{
+ <font COLOR=blue>if (!IsRectEmpty(&amp;pps-&gt;rcPaint)) {
+  HDC hdc = CreateCompatibleDC(pps-&gt;hdc);
+  if (hdc) {
+   int x = pps-&gt;rcPaint.left;
+   int y = pps-&gt;rcPaint.top;
+   int cx = pps-&gt;rcPaint.right - pps-&gt;rcPaint.left;
+   int cy = pps-&gt;rcPaint.bottom - pps-&gt;rcPaint.top;
+   HBITMAP hbm = CreateCompatibleBitmap(pps-&gt;hdc, cx, cy);
+   if (hbm) {
+    HBITMAP hbmPrev = SelectBitmap(hdc, hbm);
+    SetWindowOrgEx(hdc, x, y, NULL);
+
+    Draw(hdc, pps);
+
+    BitBlt(pps-&gt;hdc, x, y, cx, cy, hdc, x, y, SRCCOPY);
+
+    SelectObject(hdc, hbmPrev);
+    DeleteObject(hbm);
+   }
+   DeleteDC(hdc);
+  }
+ }</font>
+}
+</pre>
+<p>
+Our new <code>PaintContent</code> method creates an offscreen bitmap
+and asks the <code>Draw</code> method to draw into it.
+Once that's done, the results are copied to the screen at one go,
+thereby avoiding flicker.
+If you run this program, you'll see that it resizes nice and smooth.
+</p>
+<p>
+Now connect to the computer via a Remote Desktop Connection
+and run it again.
+Since Remote Desktop Connection disables "Show window contents
+while dragging", you can't use resizing to trigger redraws,
+so instead maximize the program and restore it a few times.
+Notice the long delay before the window is resized when you
+maximize it.
+That's because we are pumping a huge bitmap across the
+Remote Desktop Connection as part of that <code>BitBlt</code>
+call.
+</p>
+<p>
+Go back to the old version of the <code>PaintContent</code>
+method, the one that just calls <code>Draw</code>,
+and run it over Remote Desktop Connection.
+Ah, this one is fast.
+That's because the simpler version doesn't transfer a huge
+bitmap over the Remote Desktop Connection;
+it just sends twenty <code>TextOut</code> calls on a pretty
+short string of text.
+These take up much less bandwidth than a 1024x768 bitmap.
+</p>
+<p>
+We have one method that is faster over a Remote Desktop Connection,
+and another method that is faster when run locally.
+Which should we use?
+</p>
+<p>
+We use both,
+choosing our drawing method based on whether the program
+is running over a Remote Desktop Connection.
+</p>
+<pre>
+void RootWindow::PaintContent(PAINTSTRUCT *pps)
+{
+ <font COLOR=blue>if (GetSystemMetrics(SM_REMOTESESSION)) {
+  Draw(pps-&gt;hdc, pps);
+ } else</font> if (!IsRectEmpty(&amp;pps-&gt;rcPaint)) {
+  ... as before ...
+ }
+}
+</pre>
+<p>
+Now we get the best of both worlds.
+When run locally, we use the double-buffered drawing which
+draws without flickering,
+but when run over a Remote Desktop Connection, we use the simple
+<code>Draw</code> method that draws directly to the screen
+rather than to an offscreen bitmap.
+</p>
+<p>
+This is a rather simple example of adapting to Remote Desktop
+Connection.
+In a more complex world, you may have more complicated data
+structures associated with the two styles of drawing,
+or you may have background activities related to drawing that
+you may want to turn on and off based on whether the program
+is running over a Remote Desktop Connection.
+Since the user can dynamically connect and disconnect,
+you can't just assume that the state of the Remote Desktop
+Connection when your program starts
+will be the state for the lifetime of the program.
+We'll see next time how we can adapt to a changing world.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (40)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-333423">
+				<div id="div-comment-333423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard Gadsden</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333423">
+			January 3, 2006 at 4:31 am</a>		</div>
+
+		<p>Applications that don&#8217;t support Remote Desktop well: Media Player.</p>
+<p>If it&#8217;s playing and I connect over RDC, then Media Player pauses.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333433">
+				<div id="div-comment-333433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://zr40.nl/' rel='external nofollow' class='url'>Matthijs van der Vleuten</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333433">
+			January 3, 2006 at 4:32 am</a>		</div>
+
+		<blockquote><p>
+  Now connect to the computer via a Remote<br />
+  <br />&gt; Desktop Connection and run it again. Since<br />
+  <br />&gt; Remote Desktop Connection disables &quot;Show<br />
+  <br />&gt; window contents while dragging&quot;, you can&#8217;t<br />
+  <br />&gt; use resizing to trigger redraws, so instead<br />
+  <br />&gt; maximize the program and restore it a few<br />
+  <br />&gt; times.</p>
+<p>If you go open Remote Desktop Connection&#8217;s options and select the Experience tab, you can enable various options, like &#8216;Show contents of window while dragging&#8217;.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-333573">
+				<div id="div-comment-333573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hayden Clark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333573">
+			January 3, 2006 at 7:59 am</a>		</div>
+
+		<p>Am I alone in thinking that this is a bit hokey? The whole point of a UI system is to abstract you from the hardware. I no more should care about running over a RDC link as I should care if the video card is Nvidia, AIT, etc. When I saw the start of the article, I assumed that there would be a description of how to &quot;properly&quot; manage repainting so as to work correctly under all circumstances. But &quot;if (display_is_rdc) DrawRDCWay() else DrawNormal()&quot; is just ludicrous. Does this mean that the local display is flickery, while the remote one is clean?<br />
+<br />The ideal is to move the double-buffering to the OS, and then have it done on the machine with the physical display, rather than the machine with the application running.<br />
+<br />Sounds like RDC is a nasty hack to me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333583">
+				<div id="div-comment-333583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Steve Loughran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333583">
+			January 3, 2006 at 8:05 am</a>		</div>
+
+		<p>I&#8217;m going to be ruthless, Remote Desktop (or to be precise, XP user switching) does invoke taxes, but this one is pretty minimal. If its just painting performance, then skip it. Apps that try and do fancy scrolling graphics where you have to select moving things, that is where the effort is justified, because they are unusable. The example above offers a lower experience but is still workable.</p>
+<p>Making your app work properly when there is &gt;1 user simultaneously online can be a lot harder if there is any shared resource that you all need. And its hard to test. worry about that, not painting games.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-333593">
+				<div id="div-comment-333593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333593">
+			January 3, 2006 at 8:25 am</a>		</div>
+
+		<p>Abstracting it away only works if the things you&#8217;re abstracting are sufficiently equal. In this case there is a massive difference in the data rate of the local bus vs. the remote link, so abstracting them to be the same doesn&#8217;t quite work so well. It&#8217;s like considering a poor guy and a rich guy to be the same and expecting both to be able to pony up a million bucks in a day.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333633">
+				<div id="div-comment-333633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Thomas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333633">
+			January 3, 2006 at 9:09 am</a>		</div>
+
+		<p>Why not just repaint the regions that really need to be updated instead of repainting the entire window? Of course this would mean you only call ie. DrawText for text that is in or overlaps the update region. This not only fixes the flickering but also works fine over RDP.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-universalis even thread-even depth-1" id="comment-333643">
+				<div id="div-comment-333643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Universalis</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333643">
+			January 3, 2006 at 9:50 am</a>		</div>
+
+		<p>In the days of CP/M I handled display by having a 24&#215;80 array of characters that ought to be on the screen and a 24&#215;80 array of characters that actually were on the terminal screen. Then a subroutine compared the two and sent a minimal set of commands to transmit to the terminal so that its screen corresponded with what I wanted.</p>
+<p>This meant that my program could &quot;draw&quot; as little or as much as it liked, because useless redraws were optimised away.</p>
+<p>There must be a good reason why Remote Desktop doesn&#8217;t do this. What is it?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-333683">
+				<div id="div-comment-333683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333683">
+			January 3, 2006 at 10:02 am</a>		</div>
+
+		<p>Universalis: Because pixels are less efficient than characters. Suppose you type &quot;a&quot;. Which is faster, transmitting &quot;draw an &#8216;a&#8217; at coordinates x,y&quot; or &quot;draw the following 23 pixels at these 23 coordinates&quot;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-333693">
+				<div id="div-comment-333693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hayden Clark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333693">
+			January 3, 2006 at 10:02 am</a>		</div>
+
+		<p>As little or as much? You want VNC then :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333723">
+				<div id="div-comment-333723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333723">
+			January 3, 2006 at 10:37 am</a>		</div>
+
+		<p>Here&#8217;s a question which I really should just look up and answer for myself, but someone might know anyway: How does RDP deal with drawing with fonts that aren&#8217;t on the client machine?</p>
+<p>We&#8217;ve established that RDP just forwards something resembling the &quot;draw this text at x,y&quot; GDI call over the network, but in order to carry that out it needs the font definition. Does RDP transparently send the font over just as it does for bitmaps? Does it detect which fonts are already present on the client and not transmit those? Is any allowance made for font licencing forbidding the transmission of the font?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-drpizza even thread-even depth-1" id="comment-333743">
+				<div id="div-comment-333743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dr+Pizza' rel='external nofollow' class='url'>Dr Pizza</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333743">
+			January 3, 2006 at 11:16 am</a>		</div>
+
+		<p>For some reason I find RDP an order of magnitude faster than the ATI Rage 128 (I think) in my server.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333403">
+				<div id="div-comment-333403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://mindon.net/~ayhal' rel='external nofollow' class='url'>atyk</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333403">
+			January 3, 2006 at 3:54 am</a>		</div>
+
+		<p>This example gets the point across, but it&#8217;s a bit contrived. To avoid the nasty flicker, it&#8217;s really better to dispense with CS_xREDRAW and be more intelligent about *what* to redraw on resize, and where to paint the background. Then the paint will boil down to ExtTextOut and FillRect, and we will have killed two birds with one stone :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even thread-even depth-1" id="comment-333783">
+				<div id="div-comment-333783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333783">
+			January 3, 2006 at 12:15 pm</a>		</div>
+
+		<p>atyk: The CS_VREDRAW is necessary since a resize forces a complete repaint due to the centering. Yes, in this simple example, one could get away with being more clever in the PaintContent but you can imagine how in more complicated scenarios (e.g. metafile playback) this is not practical.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333803">
+				<div id="div-comment-333803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James Schend</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333803">
+			January 3, 2006 at 12:18 pm</a>		</div>
+
+		<p>Another application that doesn&#8217;t support Remote Desktop well: Firefox.</p>
+<p>Images on websites appear all garbled and ugly if you&#8217;re running Firefox over Remote Desktop.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-patriotb even thread-even depth-1" id="comment-333873">
+				<div id="div-comment-333873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PatriotB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333873">
+			January 3, 2006 at 2:15 pm</a>		</div>
+
+		<p>Hayden: Re: UI system abstraction.  Keep in mind that GDI is 20 years old and was designed way before remote desktop.  WPF (aka Avalon) should be much better in this regard.  Or, &quot;ought to be&quot;, since I haven&#8217;t played around with it to know for sure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333913">
+				<div id="div-comment-333913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333913">
+			January 3, 2006 at 3:55 pm</a>		</div>
+
+		<p>James Schend:  Is that maybe because your RDP connection is running at a low color depth?  I&#8217;m not sure how else images would &quot;appear all garbled and ugly&quot;.</p>
+<p>As far as abstracting away the network: It sort of works, in some cases.  X does it fairly well (the programmer doesn&#8217;t have to care whether the display is local or remote), but you still have programmers assuming that everything runs locally.  And then remotely displaying a complicated X program (for instance, my installation of Thunderbird, which uses Gtk2) over a low-bandwidth connection (128-256kbit/sec) is really, really slow.  (Not ugly, mind you, just really slow.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-333923">
+				<div id="div-comment-333923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333923">
+			January 3, 2006 at 4:00 pm</a>		</div>
+
+		<p>Dang, forgot about this:</p>
+<p>There&#8217;s also lbxproxy (low-bandwidth X proxy), which compresses the X stream and merges some requests, so it to works better over slow connections.  I&#8217;m not sure how well Thunderbird (or Gtk2 in general) works through it, because I&#8217;m tunneling the X traffic through ssh2 already.  (Which does some compression on its own, so maybe it would still be just as slow, I&#8217;m not sure.  I don&#8217;t know if ssh&#8217;s X tunnel merges anything.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-333943">
+				<div id="div-comment-333943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333943">
+			January 3, 2006 at 4:03 pm</a>		</div>
+
+		<p>RDC abstracts awy the network &#8211; notice that progams written to local video still run over RDC. They just run poorly due to the huge difference in display bandwidth. That was my point here: Don&#8217;t run poorly. Your users deserve better.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-333603">
+				<div id="div-comment-333603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333603">
+			January 3, 2006 at 8:39 am</a>		</div>
+
+		<p>As someone who uses Remote Desktop to work from home with some regularlity, I can tell you that this can get very frustrating.</p>
+<p>Having said that though, I&#8217;ve never really had much bother with double buffering. What *really* gets up my nose is apps which needlessly &quot;fade in&quot; dialog boxes, menus or tooltips despite the relevant effects being disabled. Also, apps that try to implement &quot;scrolling&quot; by continually repainting their entire window over and over don&#8217;t work too well. Fortunately I&#8217;ve only ever seen one of the latter. I see the former all the time.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333963">
+				<div id="div-comment-333963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333963">
+			January 3, 2006 at 5:02 pm</a>		</div>
+
+		<p>This is useful to know. Does anyone here know how to make similar optimizations using Avalon/WPF under Remote Desktop? Or a web site that discusses it? I guess my main question is, how does WPF handle rendering under the hood in a terminal environment? Does it render everything as bitmaps or does it still render lines, text, etc. that can be optimized across the wire?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-333983">
+				<div id="div-comment-333983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333983">
+			January 3, 2006 at 5:34 pm</a>		</div>
+
+		<p>Tell the Money team to work with remote desktop.  None of their charts draw with RDC (they just say &quot;Loading&#8230;&quot;) and they use lots of really huge bitmaps as backgrounds even on Remote Desktop connections.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-333993">
+				<div id="div-comment-333993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-333993">
+			January 3, 2006 at 5:42 pm</a>		</div>
+
+		<p>Having reverse engineered RDP in the past, I can answer how it works under the hood.  The original version (&#8216;Hydra Alpha&#8217;) followed the T.128 series of standards to the letter (they covered video conferencing type stuff).</p>
+<p>Performance sucked.  Not suprising as there were around 70 companies involved in the standards effort, and it was one of those standards that 70 ways to say hello, 70 ways to draw a line etc.</p>
+<p>From that point on Microsoft diverged (and rightly so) in the interest of performance.  The largest bitmap that gets transferred is 64&#215;64 pixels.  Generally that is what is transferred most of the time for most screen updates, using multiples where necessary.</p>
+<p>Glyphs are also sent down and can be placed on the screen.  This is how some text is drawn.  There are also commands for drawing lines etc.  However the vast majority of applications do stunts as mentioned in this article and comments, and so all that gets transferred are huge numbers of 64&#215;64 pixel bitmaps to be drawn onscreen.</p>
+<p>The protocol also has encryption and licensing.  The former proved to be similar to SSL but it was like someone had ignored the intro to each chapter in crypto book that said &quot;do not do things this way&quot;.  The crypto was improved in RDP 5.  The licensing has the client telling the server what OS version it is, providing an optional license token and the server chooses to allow it or supply a new one.</p>
+<p>One thing that took ages was a field that seemed to be a redundant length field.  Ultimately it turned out to be garbage that wasn&#8217;t filled in with anything by the client and ignored by the server.  However it seemed meaningful at the time &#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334013">
+				<div id="div-comment-334013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mirobin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334013">
+			January 3, 2006 at 6:21 pm</a>		</div>
+
+		<p>Jack, I would hope that the Money team works on a lot of other stuff before Remote Desktop performance &#8230; Money is the most insanely frustrating piece of software I&#8217;ve ever used; it is a classic case of coding and testing to a spec and ignoring the user experience.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334033">
+				<div id="div-comment-334033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KJK::Hyperion</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334033">
+			January 3, 2006 at 7:07 pm</a>		</div>
+
+		<p>I disagree with whoever says this kind of things should be abstracted away. No way. You have never used RDP if you say that. Never mind the bandwidth, think about the latency, neither is remotely comparable with an AGP bus and monopolizing the &quot;bus&quot; with large bitmaps totally kills the user experience. Don&#8217;t double-buffer, disable animations, disable backgrounds, forget the eye-candy</p>
+<p>And please don&#8217;t abuse SM_REMOTESESSION like too many Microsoft applications do&#8230; Windows Movie Maker, you liar, you can work just fine on a remote connection</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334043">
+				<div id="div-comment-334043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334043">
+			January 3, 2006 at 7:51 pm</a>		</div>
+
+		<p>mirobin, that&#8217;s exactly how I feel about LRM-519 DVR LG and MS recently put out. </p>
+<p>Hayden Clark, the current state of D3D requires you to know a lot more than simply the vendor of your graphics card. Beside the vendor you&#8217;ll need to know the card model, and most probable the driver revision. And if that weren&#8217;t enough you&#8217;ll have to juggle the various CAPS (capabilities) exposed by each of the cards. Or you can always design for the minimum spec system &#8211; how boring!</p>
+<p>Back on topic. I&#8217;d recommend ensuring your application works over RDC &#8211; that&#8217;s it.</p>
+<p>As with all optimization efforts make sure the resulting optimization is true. I would not implement the purposed solution without performance testing, that is certain. Take for instance running publisher, or some other layout based application. Most likely there will be several images within the layout of varying size. Occasionally there will be overlap, images spanning the view, and other cases. When working with these types of applications I can imagine scenarios where the sum of the components making up the composition is greater than the composition. Don&#8217;t be blind, measure.</p>
+<p>There are two vectors of speed to consider when optimizing. The first is execution speed, everyone knows this, you use profiling tools to measure it. The second is user perception of speed. Surprisingly the two are not equivalent. Back in 98 I did some testing of a layout application I was working on. I profiled drawing several different types of layouts directly to a client DC verse drawing them to a memory DC and then blitting the result. Drawing directly to the client DC was faster in all cases, but users perceived double buffering to be faster. Why was this the case? Because users don&#8217;t know when drawing begins in the double buffered case, they only see the result which appears &#8216;instantaneously&#8217;. This compared to seeing each element composed onto the DC when drawing to the client directly. </p>
+<p>There are two competing strategies for optimization; do what is fast and do what appears fast. Both scenarios require testing.</p>
+<p>James</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334083">
+				<div id="div-comment-334083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334083">
+			January 3, 2006 at 10:33 pm</a>		</div>
+
+		<p>Ok, to improve on this example, what&#8217;s the way to detect if the HDC is doing some form of buffering for you (i.e. when running on longhorn or drawing to the printer)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334103">
+				<div id="div-comment-334103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.virtualdub.org/' rel='external nofollow' class='url'>Phaeron</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334103">
+			January 3, 2006 at 11:19 pm</a>		</div>
+
+		<p>Does RDP transfer primitives drawn by GDI+ as well? I&#8217;m a bit worried that increasing usage of .NET&#8217;s GDI+-based System.Drawing means more software rendering and thus correspondingly poor performance over slow links. The increased visual fluff in the Visual Studio .NET UI makes it quite a bit slower than the old Win32-based VC6 UI over remote connections.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334123">
+				<div id="div-comment-334123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334123">
+			January 4, 2006 at 1:46 am</a>		</div>
+
+		<p>RDP does have support for some graphics primitives, but they don&#8217;t get too complicated.  Go to <a rel="nofollow" target="_new" href="http://www.rdesktop.org/#docs" rel="nofollow">http://www.rdesktop.org/#docs</a> and get the T.128 spec.  Section 18 lists what can happen which mostly is lines, rectangles, glyphs and bitmaps.  It does do raster ops the Windows way which is what makes this quite fun to implement in an X windows environment.  I guess it is a bit late to report it now, but Microsoft also misimplemented the bitmap encoding :-)</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2005/05/24/421440.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2005/05/24/421440.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334143">
+				<div id="div-comment-334143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Steward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334143">
+			January 4, 2006 at 2:09 am</a>		</div>
+
+		<p>Oh, and RDP 6.0 will allegedly support WinFX primitives, which can presumably be accelerated by the client.  So there&#8217;s another thing to plan for&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334233">
+				<div id="div-comment-334233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hayden Clark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334233">
+			January 4, 2006 at 8:36 am</a>		</div>
+
+		<p>James: Yes, of course 3D and graphic programs which use the hardware accelleration need to do more device-specific things (but, hang on, what&#8217;s DirectX and Direct3D for&#8230;.). But it seems to me that we are playing games with even a basic simple program that just draws stuff.</p>
+<p>I think my main issue is that of asdf &#8211; are there cases where double-buffering is supported in the GDI, rather than having to do it by hand in the app? Then RDP could announce double-buffer support, and we are back to transferring GDI instructions over the link instead of vast bitmaps.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334253">
+				<div id="div-comment-334253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.smackfu.com' rel='external nofollow' class='url'>Scott</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334253">
+			January 4, 2006 at 9:52 am</a>		</div>
+
+		<p>I think the reality of this kind of code branching is that you&#8217;ll have bugs that break the UI over RDC, rather than just being slow.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334133">
+				<div id="div-comment-334133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Steward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334133">
+			January 4, 2006 at 1:59 am</a>		</div>
+
+		<p>Ben Cooke: In addition to Anonymous Coward&#8217;s excellent comment, I should add that the glyphs are cached, as well as bitmaps, text, cursors, etc.</p>
+<p>And there&#8217;s a way for the client to list known fonts, so that even the glyphs don&#8217;t need to be sent over the wire.  However, this isn&#8217;t done even by the latest client.  And I don&#8217;t know whether the server could cope with it.</p>
+<p>As for Raymond&#8217;s argument here, I wholly agree that the tax should be paid in low-bandwidth situations.  However, I think there should be a decent measure of display bandwidth available for programs to use, for faster as well as slower.</p>
+<p>The Movie Maker designers presumably reckoned it would be too slow over RDP, but it works well enough &#8211; you don&#8217;t *watch* videos in Movie Maker!  I use RDP over a fast network at home, often for hours, and I hate not having ClearType so much that I&#8217;ve patched the kernel to allow it.  What happens when we all have gigabit connections?</p>
+<p>Perhaps this is already included in Vista&#8217;s new benchmark API,  but I can&#8217;t find any information on that at the moment&#8230;</p>
+<p>Mark</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334313">
+				<div id="div-comment-334313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James Schend</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334313">
+			January 4, 2006 at 12:21 pm</a>		</div>
+
+		<blockquote><p>
+  James Schend: Is that maybe because your RDP<br />
+  <br />&gt;connection is running at a low color depth? I&#8217;m<br />
+  <br />&gt;not sure how else images would &quot;appear all<br />
+  <br />&gt;garbled and ugly&quot;.</p>
+<p>I dunno.  I&#8217;m not a programming whiz, at least not on Windows.  Here&#8217;s some screenshots of Fark viewed over Remote Desktop.</p>
+<p>IE:</p>
+<p><a rel="nofollow" target="_new" href="http://schend.net/images/screenshots/ie.png" rel="nofollow">http://schend.net/images/screenshots/ie.png</a></p>
+<p>Notice how you can tell that it&#8217;s been downscaled into (what looks like) 256-color mode, but the images are still recognizable.</p>
+<p>Here&#8217;s the same shot in Firefox:</p>
+<p><a rel="nofollow" target="_new" href="http://schend.net/images/screenshots/firefox.png" rel="nofollow">http://schend.net/images/screenshots/firefox.png</a></p>
+<p>Notice how it&#8217;s an ugly piece of crap.  It&#8217;s somehow gained a dark background, the images look inverted, the toolbars have turned blue.  (Notice also that the Flash player in the browser still looks perfectly fine.)
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334323">
+				<div id="div-comment-334323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James Schend</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334323">
+			January 4, 2006 at 12:24 pm</a>		</div>
+
+		<p>Er.  Somethingawful.com, not Fark&#8230; but the point still applies.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334333">
+				<div id="div-comment-334333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334333">
+			January 4, 2006 at 12:32 pm</a>		</div>
+
+		<p>Yikes, that is broken.</p>
+<p>It almost looks like a palette issue &#8212; like the palette that they think they&#8217;re using to display the image is different than the one that&#8217;s active on the system.  Or something.</p>
+<p>If you set the target machine&#8217;s desktop (the real one, not the RDP one) to 8-bit, does it fix the issue?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334393">
+				<div id="div-comment-334393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334393">
+			January 4, 2006 at 1:49 pm</a>		</div>
+
+		<p>Yeah, that&#8217;s probably what it is. I saw the same thing with X11 on an 8bit display</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334303">
+				<div id="div-comment-334303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kinda trollish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334303">
+			January 4, 2006 at 11:11 am</a>		</div>
+
+		<p>Same thing as always&#8230; The &quot;solution&quot; included within Windows is useless; and third party, usually opensource apps come to the rescue.</p>
+<p>&quot;Windows File Sharing&quot;? Bleh, using a decent FTP server is much more easier (both to set up as you want it, and for the client). Not to mention no 10 user limit, and no choosing between &quot;simple file sharing&quot; (and you can&#8217;t set permissions on your own computer) or &quot;having to create user accounts just for that&quot; (and people wanting to connect having to enter username and password).</p>
+<p>&quot;Remore Desktop&quot;? Bleh, almost any VNC implementation (specially UltraVNC with the mirror video driver) defeats it in responsiveness and efficiency &#8211; by an order of magnitude. (Though it doesn&#8217;t serve the same purpose, I&#8217;m talking about using remotely single-user machine). Also, no &quot;applications workarounding stuff and crippling themselves&quot; b.s. Framebuffer with decent compression algorithms &gt; anything that transfers draw calls.</p>
+<p>&quot;NTFS&quot;? Bleh, an experimental Linux EXT2 filesystem driver runs EXTREMELY faster (specially with large numbers of small files), and doesn&#8217;t have any &quot;fragmentation bullshit&quot; (*) (Microsoft lies to you: fragmentation is the result of the filesystem code sucking, not a fact of life &#8211; I have batch files that copy stuff around that will destroy a newly created NTFS partition fragmentation-wise, but an EXT2  partition of the same size survives with no trouble at all). The problem is that said driver crashes too often :)</p>
+<p>&quot;Notepad&quot;? Heck, even MS-DOS &quot;EDIT&quot; was better: it handled UNIX-style files (LF only; not CR LF) and binary files (hex editor). Yet another app to replace if you want to use it past the very basic stuff. By the way, my localized version changed some keyboard shortcuts, so Find is no longer CTRL+F. Retarded.</p>
+<p>&quot;Sound recorder&quot;? Nice 60 second limit per record button click you have there.</p>
+<p>&quot;Paint&quot;? Well, at least now it can save to non-retarded file formats. Kinda OK for screenshots, I guess.</p>
+<p>&quot;CMD.EXE&quot;? Ha. Hahaha. Time to download cygwin and use bash.</p>
+<p>&quot;Worpad&quot;? Regressions from Windows 98. It has a Word 6.0/95 plugin (&quot;mswrd6.wpc&quot;) but it refuses to read such files. Also, I can get it to write files that no Microsoft app will open, but which OpenOffice will. A bit ironic.</p>
+<p>&quot;Windows Media Player&quot;? The fact that &quot;mplayer2.exe&quot; is still included should tell you something&#8230;</p>
+<p>&quot;Zip file support&quot;? Ha. Hahaha. Oh, and thanks for treating them like folders even if I use another program. I really enjoy the 10 second pause when I open a folder with thousands of ZIP files on it, and I enjoy the status bar not showing total size when multiple ZIP files are selected. I have to create a 0 byte file of another type and select it too for the sum to be displayed.</p>
+<p>Want to upgrade any of them (to path holes, that is)? Prepare to reboot. Compare with &quot;just download the latest version and unzip it&quot;.</p>
+<p>I could go on and on&#8230; The situation sucks, because if any of this apps became useful, MS would get sued :'(</p>
+<p>(*) Also, NTFS has one decision that is high on my list of &quot;incredibly retarded stuff&quot;, up there with the disk cache having the same or more priority than apps: the 1/8 disk space reservation for the MFT. At 1K per entry, that assumes the average file size will be about 8K, and that an 80 gig drive will have 10 million files. Yeah right. And sometimes, when you fill more than 7/8 of the disk, it &quot;gives up&quot; and your MFT ends up in 50+ little pieces. To workaround this, the first thing I have to do is creating 300K files to make the MFT grow to 300 megs and survive fragmentation later on.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-334653">
+				<div id="div-comment-334653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">fschwiet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334653">
+			January 5, 2006 at 3:19 am</a>		</div>
+
+		<p>Wouldn&#8217;t it be a great feature if somethingawful.com couldn&#8217;t render well? harharhar</p>
+<p>I don&#8217;t believe Scott&#8217;s comment, but I am similarly cynical.  Raymond points out the developer tax here, but thats a one time cost per write or fix.  There is a more significant tax here in terms of test.</p>
+<p>For this reason, optimizations like this might make a lot of sense for objects in the shell (ie the Start button) that are renderred a bazillion times on any particular day.  But for a typical UI element, especially given the infrequency of automated UI testing, this sort of optimization is probably not a net gain.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-334833">
+				<div id="div-comment-334833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Keff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-334833">
+			January 5, 2006 at 2:57 pm</a>		</div>
+
+		<p>Kinda Folish: Go wank elsewhere. And fix your grammar on the way, nothing in the world is &#8216;EXTREMELY faster&#8217;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-692273">
+				<div id="div-comment-692273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogsitos.com/linux/2006/01/06/network-graphics-can-be-expensive/' rel='external nofollow' class='url'>Network graphics can be expensive | Mundo Linux</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060103-12/?p=32793#comment-692273">
+			December 12, 2008 at 11:58 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://blogsitos.com/linux/2006/01/06/network-graphics-can-be-expensive/" rel="nofollow">http://blogsitos.com/linux/2006/01/06/network-graphics-can-be-expensive/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

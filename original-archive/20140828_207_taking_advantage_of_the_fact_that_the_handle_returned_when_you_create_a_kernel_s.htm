@@ -1,0 +1,302 @@
+<html>
+<head>
+<title>Taking advantage of the fact that the handle returned when you create a kernel synchronization object has full access regardless of the actual ACL</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Taking advantage of the fact that the handle returned when you create a kernel synchronization object has full access regardless of the actual ACL</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 28, 2014 / year-entry #208</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer wanted some help deciding what security attributes to place on an event object intended to be used by multiple security contexts. We have two processes, call them A and B, running in different security contexts. I have an event that process A creates and shares with process B. The only thing process A...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer wanted some help deciding what security attributes to place
+on an event object intended to be used by multiple security contexts.
+</p>
+<blockquote CLASS=q><p>
+We have two processes, call them A and B, running in different
+security contexts.
+I have an event that process A creates and shares with process B.
+The only thing process A does with the event is signal it,
+and the only thing process B does with the event is wait on it.
+Our question is what ACLs you recommend for the event.
+For now, we're using O:BAD:(A;;GR;;;WD)(A;;GA;;;LS)(A;;GA;;;BA).
+(In case it matters, process A is usually running as a service
+with Local System privileges,
+though for testing purposes it may be running as local administrator.
+Process B runs as a service with Local Service privileges.)
+</p>
+</blockquote>
+<p>
+For those who don't speak
+<a HREF="http://msdn.microsoft.com/library/aa379570">
+SDDL</a>, that weird line noise is shorthand for
+</p>
+<ul>
+<li><u>O</u>wner:
+    <u>B</u>uiltin
+    <u>A</u>dministrators</p>
+<li><u>D</u>ACL:
+<ul>
+<li><u>A</u>llow
+        <u>G</u>eneric <u>R</u>ead
+        to
+        Everyone (aka <u>W</u>orl<u>d</u>).</p>
+<li><u>A</u>llow
+        <u>G</u>eneric <u>A</u>ll
+        to
+        <u>L</u>ocal <u>S</u>ervice.</p>
+<li><u>A</u>llow
+        <u>G</u>eneric <u>A</u>ll
+        to
+        <u>B</u>uiltin <u>A</u>dministrators.
+    </ul>
+</ul>
+<p>
+Given the requirements, there is no need to grant Everyone
+any access at all, so we can delete the (A;;GR;;;WD) ACE.
+</p>
+<p>
+Since process&nbsp;B needs only to wait on the object,
+granting it Generic All access is far too broad.
+That would allow process&nbsp;B to signal the event or even change its ACL!
+To wait on an object, all you need is Synchronize,
+so the second ACE can be tightened to
+(A;;0x00100000;;;LS).
+(There is no shorthand for Synchronize, so we use its hex value.)
+</p>
+<p>
+The intention of the third ACE is to allow process&nbsp;A to
+signal the event,
+but for that all it needs is <code>EVENT_<wbr>MODIFY_<wbr>STATE</code>,
+not Generic All.
+But we can do better:
+We can delete the ACE entirely.
+</p>
+<p>
+"But Mister Wizard,
+if you delete the third ACE,
+then process&nbsp;A won't be able to signal the event!"
+</p>
+<p>
+Ah yes it can, thanks to a special feature of
+<a HREF="http://msdn.microsoft.com/library/ms682396">
+the <code>Create&shy;Event</code> function</a>:
+</p>
+<blockquote CLASS=m><p>
+The handle returned by <b>Create&shy;Event</b>
+has the <b>EVENT_<wbr>ALL_<wbr>ACCESS</b> access right.
+</p>
+</blockquote>
+<p>
+If you created the event, you get full access to the event
+regardless of what the ACLs on the event would normally say.
+</p>
+<p>
+Therefore, the event can be ACL'd with simply
+O:BAD:(A;;0x00100000;;;LS).
+When process&nbsp;A creates the event, it needs to hold on tight
+to that event handle, since that is the process's only way of
+setting the event!
+(If it loses the handle, it won't be able to get it back because
+the attempt to reacquire the handle will be blocked by the ACL.)
+</p>
+<p>
+Here's a quick program that demonstrates the behavior.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;sddl.h&gt;
+#include &lt;tchar.h&gt;
+
+// This is a demonstration, so there is no error checking
+// and we leak memory.
+
+int __cdecl _tmain(int, TCHAR **)
+{
+ ULONG cb;
+ SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+
+ // Create a security descriptor that grants access to no one.
+ ConvertStringSecurityDescriptorToSecurityDescriptor(TEXT("D:"),
+    SDDL_REVISION_1, &amp;sa.lpSecurityDescriptor, &amp;cb);
+
+ // Create a handle with that security descriptor
+ HANDLE h = CreateEvent(&amp;sa, TRUE, TRUE,
+             TEXT("<a HREF="http://en.wikipedia.org/wiki/Everybody_Loves_My_Baby">NobodyCanAccessMeButMe</a>"));
+
+ // Even though nobody has access to the object, we can still
+ // signal it using the handle returned by CreateEvent.
+ SetEvent(h); // succeeds
+
+ // But nobody else can obtain the handle via the object name.
+ HANDLE h2 = OpenEvent(EVENT_MODIFY_STATE, FALSE,
+                       TEXT("NobodyCanAccessMeButMe")); // fails
+
+ return 0;
+}
+</pre>
+<p>
+The customer wrote back,
+"This worked perfectly. Thanks!"
+</p>
+<p>
+For bonus points, you can be even more specific and grant
+Synchronize access only to process&nbsp;B's
+<a HREF="http://blogs.technet.com/b/voy/archive/2007/03/22/per-service-sid.aspx">
+service SID</a>
+(<code>NT SERVICE\<i>Service&shy;Name</i></code>)
+rather than to all local services.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1146713">
+				<div id="div-comment-1146713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123#comment-1146713">
+			August 28, 2014 at 7:52 am</a>		</div>
+
+		<p>&quot;For bonus points, you can be even more specific and grant Synchronize access only to process B&#39;s service SID (NT SERVICEService­Name) rather than to all local services.&quot;</p>
+<p>Or A and B can communicate via e-mail :P</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1146723">
+				<div id="div-comment-1146723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neyah</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123#comment-1146723">
+			August 28, 2014 at 9:37 am</a>		</div>
+
+		<p>Based on prior stories about customers, I think the most surprising part of this story is that they wrote back. :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1146733">
+				<div id="div-comment-1146733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark (The Other Mark)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123#comment-1146733">
+			August 28, 2014 at 11:22 am</a>		</div>
+
+		<p>What a clear and concise way to explain a SDDL string. Usually when I try (or see others try) to explain SDDL, folks fall asleep before the second &quot;D&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1146743">
+				<div id="div-comment-1146743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123#comment-1146743">
+			August 28, 2014 at 2:48 pm</a>		</div>
+
+		<p>Not only does the returned handle have all access, but BUILTINAdministrators, as the object&#39;s owner, can change the DACL regardless of the DACL.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1146793">
+				<div id="div-comment-1146793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joker_vD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123#comment-1146793">
+			August 29, 2014 at 5:11 am</a>		</div>
+
+		<p>@Ben: You can stop the process B, and that will make the event&#39;s handle count drop to zero, so the kernel will destroy it and you can restart A and B.</p>
+<p>That&#39;s because &quot;The system closes the handle automatically when the process terminates. The [whatever kernel] object is destroyed when its last handle has been closed.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1146783">
+				<div id="div-comment-1146783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140828-00/?p=123#comment-1146783">
+			August 29, 2014 at 2:57 am</a>		</div>
+
+		<p>Hmm, but if process A crashes,</p>
+<p>* it cannot destroy the event,</p>
+<p>* it cannot reacquire a handle to the event and</p>
+<p>* it cannot create a new event with the same name, and</p>
+<p>* nor can anyone else&#8230;</p>
+<p>So LS/BA need to have DELETE rights to the event in the ACL to recover from this case, no? Otherwise the only way to recover is to reboot the server.</p>
+<div class="post">[<em>I believe in the original scenario, the handle was unnamed anyway, so the there was no way to reacquire it originally either. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

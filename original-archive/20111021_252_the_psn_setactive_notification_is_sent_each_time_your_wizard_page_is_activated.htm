@@ -1,0 +1,330 @@
+<html>
+<head>
+<title>The PSN_SETACTIVE notification is sent each time your wizard page is activated</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The PSN_SETACTIVE notification is sent each time your wizard page is activated</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 21, 2011 / year-entry #253</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20111021-00/?p=9323</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer had received a number of crashes via Windows Error Reporting and believed that they had found a bug in the tree view common control. In our UI, we have a tree view with checkboxes. The tree view displays a fixed item at the top, followed by a variable number of dynamic items. When...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had received a number of crashes via
+<a HREF="http://www.microsoft.com/whdc/maintain/StartWER.mspx">
+Windows Error Reporting</a>
+and believed that they had found a bug in the tree view common control.
+</p>
+<blockquote CLASS=q>
+<p>
+In our UI, we have a tree view with checkboxes.
+The tree view displays a fixed item at the top,
+followed by a variable number of dynamic items.
+When the user clicks <i>Next</i>,
+we look at the tree view to determine what the user selected.
+The code goes like this (pseudo):
+</p>
+<pre>
+htiRoot = GetTreeRoot();
+
+// First process the fixed item
+htiFixed = GetChild(htiRoot);
+if (IsTreeViewItemChecked(htiFixed)) {
+    .. add the fixed item ...
+}
+
+// Now process the dynamic items
+hti = GetNextSibling(htiFixed);
+while (hti != NULL) {
+  if (IsTreeViewItemChecked(hti)) {
+    ... add the dynamic item ...
+  }
+  hti = GetNextSibling(hti);
+}
+</pre>
+<p>
+In the crashes we receive, other variables in the
+program indicate that there should be only one dynamic item,
+but our loop iterates multiple times.
+Furthermore, the first time through the loop,
+the <code>hItem</code> is not the handle to the first
+dynamic item but is in fact the handle to the fixed item.
+This naturally results in a crash when we try to treat the fixed item
+as if it were a dynamic item.
+</p>
+<p>
+Another thing we noticed is that at the time of the crash,
+all three variables <code>htiRoot</code>
+<code>htiFixed</code>,
+and
+<code>hti</code> have the same value.
+</p>
+<p>
+Our attempts to reproduce the problem in-house have been
+unsuccessful.
+From our analysis, we believe that the tree view APIs used to
+obtain handles to children and sibling nodes are misbehaving.
+</p>
+</blockquote>
+<p>
+The customer included the crash bucket number,
+so we were able to connect to the same crash dumps that the customer
+was looking at.
+</p>
+<p>
+The first thing to dismiss was the remark that all three of
+the local variables had the same value.
+This is to be expected since they have non-overlapping lifetimes,
+and the compiler decided to alias them all to each other to save
+memory.
+</p>
+<pre>
+...
+        lea     eax,[ebp+8]         ; htiRoot
+        push    eax
+        push    1                   ; some flag
+        push    ebx                 ; some parameter
+        call    00965fb9            ; GetTreeRoot
+        mov     [ebp-2Ch],eax
+        test    eax, eax
+        jl      00971a49            ; failed - exit
+
+        mov     edi, [_imp__SendMessageW]
+        push    4                   ; TVGN_CHILD
+        push    110Ah               ; TVM_GETNEXTITEM
+        push    dword ptr [ebx+10h] ; window handle
+        call    edi                 ; SendMessage
+        mov     [ebp+8],eax         ; htiFixed
+
+    ... eliding if (IsTreeViewItemChecked(...)) ...
+        jmp     00971a1c            ; enter loop
+
+00971931:
+    ... eliding if (IsTreeViewItemChecked(...)) ...
+
+00971a1c:
+        push    dword ptr [ebp+8]   ; hti
+        push    1                   ; TVGN_NEXT
+        push    110Ah               ; TVM_GETNEXTITEM
+        push    dword ptr [ebx+10h] ; window handle
+        call    edi                 ; SendMessage
+        mov     [ebp+8],eax         ; update hti
+        test    eax, eax            ; hti == NULL?
+        jne     00971931            ; N: continue loop
+</pre>
+<p>
+I've removed code not directly relevant to the discussion.
+The point to see here is that the compiler combined all three
+variables into one physical memory location at
+<code>[ebp+8]</code>
+since there is no
+point in the program where more than one of the values is needed
+at a time.
+In other words, the compiler rewrote your code like this:
+</p>
+<pre>
+hti = GetTreeRoot();
+
+hti = GetChild(hti);
+if (IsTreeViewItemChecked(hti)) {
+    .. add the fixed item ...
+}
+
+while ((hti = GetNextSibling(hti)) != NULL) {
+  if (IsTreeViewItemChecked(hti)) {
+    ... add the dynamic item ...
+  }
+}
+</pre>
+<p>
+Not only did the compiler merge all your <code>hti</code>
+variables into one, it realized that once it did that,
+the two calls to <code>Get&shy;Next&shy;Sibling</code>
+could be folded together as well.
+</p>
+<p>
+Okay, one mystery solved.
+What about the others?
+</p>
+<p>
+From studying the crash dump, the shell team determined that
+the reason the first dynamic item appears to be the fixed item
+is that the tree view actually has <i>two</i> fixed items:
+</p>
+<pre>
+003d06d8 Root
++ 003d0a38 "Configuration settings"
++ 003d0888 "Configuration settings"
++ 003d07b0 "Saved game from May 27, 2009 at 2:42 PM (playing as Thor)"
++ 003d0600 "Saved game from May 27, 2009 at 2:42 PM (playing as Thor)"
+</pre>
+<p>
+"Configuration settings" is the fixed item, and the saved
+games are the dynamic items.
+(This isn't the actual scenario from the customer, but it
+gets the point across.)
+The customer was wrong to use the definite article when referring
+to <i>the</i> handle to
+<i>the</i> fixed item, since there are two fixed items here.
+In a sense, the customer's understanding that there is only
+one fixed item clouded their ability to debug the problem:
+When they saw another fixed item, they assumed not that they
+received another item that was fixed,
+but rather that they were getting the same fixed item twice.
+</p>
+<p>
+Seeing that the tree view was being populated twice
+directed the next step of the investigation: Why?
+</p>
+<p>
+The code that populates the tree view is called from
+the wizard page's <code>PSN_<wbr>SET&shy;ACTIVE</code> notification,
+and that one piece of information was the last piece of the
+puzzle.
+</p>
+<p>
+The <code>PSN_<wbr>SET&shy;ACTIVE</code> notification is sent each time
+the wizard or property sheet page is selected as the current page.
+If the page is activated twice, then you will get two
+<code>PSN_<wbr>SET&shy;ACTIVE</code> notifications.
+The solution was to populate the tree view only the first
+time the page was activated.
+</p>
+<p>
+<b>Exercise</b>: What was missing from the customer's testing
+that prevented them from reproducing the problem in their labs?</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-941933">
+				<div id="div-comment-941933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111021-00/?p=9323#comment-941933">
+			October 21, 2011 at 7:07 am</a>		</div>
+
+		<p>They never pressed the Back button?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-941943">
+				<div id="div-comment-941943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Bugglin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111021-00/?p=9323#comment-941943">
+			October 21, 2011 at 7:53 am</a>		</div>
+
+		<p>@Damien To be more precise, they never visited each wizard page multiple times during the same run.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-941953">
+				<div id="div-comment-941953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Bugglin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111021-00/?p=9323#comment-941953">
+			October 21, 2011 at 7:56 am</a>		</div>
+
+		<p>And in my attempt to be more precise I just reiterated what Raymond already said, whoops.</p>
+<p>Anyway they might have assumed features of the wizard system that simply don&#39;t exist (automatic cleanup) and only focused on testing each page individually and assumed that testing Back/Forward wasn&#39;t necessary since that&#39;s the wizard&#39;s job to make sure that works&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-942013">
+				<div id="div-comment-942013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mvadu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111021-00/?p=9323#comment-942013">
+			October 21, 2011 at 10:06 am</a>		</div>
+
+		<p>&quot;Testing Back/Forward wasn&#39;t necessary since that&#39;s the wizard&#39;s job to make sure that works&#8230;&quot;</p>
+<p>As a tester myself, I think that assumptions (what to test/not to test) are very bad for testers to make. But i also understand practical challenges, managers always wants to make some decisions on your behalf, &quot;why are you testing that control, its Microsoft&#39;s, and they have already tested it, Just make sure our code (UI) works fine with it)&quot;. If the tester doesn&#39;t know how to raise concerns or convince managers then they will just test individual pages, and we get this output.</p>
+<p>Also with new development methodologies (like in Agile) testers may end up getting the code in chunks (one wizard page at a time), and if the regression test suite is not updated/designed back/forward may never be covered in the test cases.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-942163">
+				<div id="div-comment-942163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20111021-00/?p=9323#comment-942163">
+			October 24, 2011 at 1:10 am</a>		</div>
+
+		<p>You only need back if you do something wrong. I&#39;ve even seen wizards which didn&#39;t have a consistent order of steps, the buttons worked more like a random web. It has happened enough times for me to not trust back buttons in wizards. Though the most irritating wizard I&#39;ve seen is the old Telephone cpl applet, which you have to kill with task manager to quit if you don&#39;t want to finish it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

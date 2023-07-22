@@ -1,0 +1,425 @@
+<html>
+<head>
+<title>Using GetLogicalProcessorInformationEx to see the relationship between logical and physical processors</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using GetLogicalProcessorInformationEx to see the relationship between logical and physical processors</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 28, 2013 / year-entry #286</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today's Little Program uses the Get­Logical­Processor­Information­Ex function to print the mapping of logical processors to physical processors, as well as the mapping of logical processors to packages. (A dual-core processor is a single package with two cores. If those cores are themselves dual-hyperthreaded, then you have four logical processors total.) #define STRICT #include <windows.h> #include...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today's Little Program uses the
+<code>Get&shy;Logical&shy;Processor&shy;Information&shy;Ex</code>
+function to print the mapping of logical processors to
+physical processors,
+as well as the mapping of logical processors to packages.
+(A dual-core processor is a single package with two cores.
+If those cores are themselves dual-hyperthreaded, then you have
+four logical processors total.)
+</p>
+<pre>
+#define STRICT
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt;
+
+template&lt;typename T&gt;
+T *AdvanceBytes(T *p, SIZE_T cb)
+{
+ return reinterpret_cast&lt;T*&gt;(reinterpret_cast&lt;BYTE *&gt;(p) + cb);
+}
+</pre>
+<p>
+The <code>Advance&shy;Bytes</code> helper function takes
+a typed pointer and adds a byte offset to it.
+This is just a typing-saver function.
+</p>
+<p>
+<pre>
+class EnumLogicalProcessorInformation
+{
+public:
+ EnumLogicalProcessorInformation(LOGICAL_PROCESSOR_RELATIONSHIP Relationship)
+  : m_pinfoBase(nullptr), m_pinfoCurrent(nullptr), m_cbRemaining(0)
+ {
+  DWORD cb = 0;
+  if (GetLogicalProcessorInformationEx(Relationship,
+                                       nullptr, &amp;cb)) return;
+  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return;
+
+  m_pinfoBase =
+   reinterpret_cast&lt;SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *&gt;
+                                     (LocalAlloc(LMEM_FIXED, cb));
+  if (!m_pinfoBase) return;
+
+  if (!GetLogicalProcessorInformationEx(Relationship, 
+                                        m_pinfoBase, &amp;cb)) return;
+
+  m_pinfoCurrent = m_pinfoBase;
+  m_cbRemaining = cb;
+ }
+
+ ~EnumLogicalProcessorInformation() { LocalFree(m_pinfoBase); }
+
+ void MoveNext()
+ {
+  if (m_pinfoCurrent) {
+   m_cbRemaining -= m_pinfoCurrent-&gt;Size;
+   if (m_cbRemaining) {
+    m_pinfoCurrent = AdvanceBytes(m_pinfoCurrent,
+                                  m_pinfoCurrent-&gt;Size);
+   } else {
+    m_pinfoCurrent = nullptr;
+   }
+  }
+ }
+
+ SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *Current()
+                                         { return m_pinfoCurrent; }
+
+private:
+ SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *m_pinfoBase;
+ SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *m_pinfoCurrent;
+ DWORD m_cbRemaining;
+};
+</pre>
+<p>
+Enumerating logical processor information is complicated due
+to the variable-size structures, so I wrap it inside this helper
+enumerator class.
+</p>
+<p>
+Construct it with the relationship you are interested in,
+then use <code>Current()</code> to see the current item
+and <code>Move&shy;Next()</code> to move to the next item.
+When there are no more items,
+<code>Current()</code> returns <code>nullptr</code>.
+</p>
+<p>
+The constructor does the standard two-step query we've seen
+before:
+Ask for the required buffer size, then allocate a buffer,
+then ask for the buffer to be filled in.
+There is a TOCTTOU race condition if
+<a HREF="http://msdn.microsoft.com/en-us/library/ff562404(v=VS.85).aspx">
+a processor is added dynamically</a>,
+but I'm going to ignore that case
+because this is a Little Program.
+</p>
+<p>
+Since the
+<code>SYSTEM_<wbr>LOGICAL_<wbr>PROCESSOR_<wbr>INFORMATION_<wbr>EX</code>
+structure is variable-sized,
+walking the packed array is not a simple array indexing operation.
+Instead, you have to bump the pointer by the <code>Size</code> of the
+current element to find the next element.
+</p>
+<p>
+Next comes a helper function to print processor affinity bitmasks.
+</p>
+<pre>
+void PrintMask(KAFFINITY Mask)
+{
+ printf(" [");
+ for (int i = 0; i &lt; sizeof(Mask) * 8; i++) {
+  if (Mask &amp; (static_cast&lt;KAFFINITY&gt;(1) &lt;&lt; i)) {
+   printf(" %d", i);
+  }
+ }
+ printf(" ]");
+}
+</pre>
+<p>
+Nothing exciting there.
+</p>
+<p>
+Finally, we wrap it up inside a sample program that enumerates
+the cores and then, just for fun, enumerates the packages.
+</p>
+<pre>
+int __cdecl main(int argc, char **argv)
+{
+ for (EnumLogicalProcessorInformation enumInfo(RelationProcessorCore);
+      auto pinfo = enumInfo.Current(); enumInfo.MoveNext()) {
+   PrintMask(pinfo-&gt;Processor.GroupMask[0].Mask);
+   printf("\n");
+ }
+
+ for (EnumLogicalProcessorInformation enumInfo(RelationProcessorPackage);
+      auto pinfo = enumInfo.Current(); enumInfo.MoveNext()) {
+   printf("[");
+   for (UINT GroupIndex = 0; GroupIndex &lt; pinfo-&gt;Processor.GroupCount; GroupIndex++) {
+    PrintMask(pinfo-&gt;Processor.GroupMask[GroupIndex].Mask);
+   }
+   printf(" ]\n");
+ }
+
+ return 0;
+}
+</pre>
+<p>
+Enumerating processor cores produces a bunch of
+<code>PROCESSOR_<wbr>RELATIONSHIP</code> structures,
+each with a single group that describes the logical processors
+assigned to the core.
+</p>
+<p>
+Enumerating processor packages produces a bunch of
+<code>PROCESSOR_<wbr>RELATIONSHIP</code> structures,
+and each one contains as many groups as there are cores in the package.
+</p>
+<p>
+<b>Bonus chatter</b>:
+The 
+<a HREF="http://technet.microsoft.com/en-us/sysinternals/cc835722.aspx">
+CoreInfo</a> utility from Sysinternals
+is a command-line tool that is a fancier version of this Little Program.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1085233">
+				<div id="div-comment-1085233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chuck</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085233">
+			October 28, 2013 at 7:22 am</a>		</div>
+
+		<p>Raymond, you read my mind, I was studying this exact thing a few weeks ago and decided to settle with using the CoreInfo utility. Thank you for your post!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1085253">
+				<div id="div-comment-1085253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jonwil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085253">
+			October 28, 2013 at 8:03 am</a>		</div>
+
+		<p>Why would windows (and apps for that matter) need to care about cores vs packages? How is a dual core CPU different from 2 single core CPUs?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1085263">
+				<div id="div-comment-1085263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark Sowul</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085263">
+			October 28, 2013 at 8:14 am</a>		</div>
+
+		<p>@jonwil &#8211; two examples off the top of my head:</p>
+<p>1) NUMA (there are other APIs for this, but it is an extreme case of dual-core being different from two single cores)</p>
+<p>2) Licensing (per-core vs. per-package)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1085273">
+				<div id="div-comment-1085273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085273">
+			October 28, 2013 at 8:17 am</a>		</div>
+
+		<p>The processors in a dual core chip often share caches, making it cheaper to move a process from one to another on the same chip, rather than move it to another one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1085293">
+				<div id="div-comment-1085293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085293">
+			October 28, 2013 at 8:33 am</a>		</div>
+
+		<p>@jonvil:</p>
+<p>You want to keep a process within one package (node), to reduce cache coherency traffic between sockets. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1085353">
+				<div id="div-comment-1085353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085353">
+			October 28, 2013 at 11:48 am</a>		</div>
+
+		<p>I don&#39;t think I&#39;ve ever seen code before that declared a variable in the condition of a for loop like this, though it&#39;s perfectly valid:</p>
+<p>for ( &#8230;; auto pinfo = enumInfo.Current(); &#8230;) { &#8230; }</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1085363">
+				<div id="div-comment-1085363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085363">
+			October 28, 2013 at 11:53 am</a>		</div>
+
+		<p>@Adam Rosenfeld:</p>
+<p>Same as in while() condition.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt thread-odd thread-alt depth-1" id="comment-1085403">
+				<div id="div-comment-1085403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085403">
+			October 28, 2013 at 12:35 pm</a>		</div>
+
+		<p>Thanks a lot. Wikipedia could certainly use this post.</p>
+<p>Although the &quot;Little Program&quot; with capital L and capital P scares me a little.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1085463">
+				<div id="div-comment-1085463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">saveddijon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085463">
+			October 28, 2013 at 4:51 pm</a>		</div>
+
+		<p>@alegr1:</p>
+<p>Keeping all processes in one node doesn&#39;t always help you &#8211; unless you can keep their memory on that node as well.</p>
+<p>On an AMD dual-socket system (or single-socket MCM such as Magny-Cours) each die has its own DDR controller, and the cache coherency controller to go with it. If you have processes on one die executing against memory hosted by the other die then you will still have lots of inter-die traffic simply managing the cache probes, even if no data ever moves around.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1085523">
+				<div id="div-comment-1085523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085523">
+			October 29, 2013 at 3:35 am</a>		</div>
+
+		<p>I once had to deal with a network provider which wouldn&#39;t bother to calculate the total buffer size, instead it just told you how much it tried to allocate when it found you hadn&#39;t provided enough. So if you provided no buffer, it would say you didn&#39;t even have enough for the basic structure, and only when you provided that did it admit that you needed a bigger buffer to cover the optional fields.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1085663">
+				<div id="div-comment-1085663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mal DeMer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085663">
+			October 29, 2013 at 8:20 am</a>		</div>
+
+		<p>@Adam Rosenfield: You need to get out more. :) This is perfectly legit, and nice because it limits the scope of the loop variable to that of the loop.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1085733">
+				<div id="div-comment-1085733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085733">
+			October 29, 2013 at 10:12 am</a>		</div>
+
+		<p>@saveddijon:</p>
+<p>Memory affinity doesn&#39;t have anything to do with cache coherency.</p>
+<p>&quot;Near&quot; and &quot;far&quot; memory only matters when you need to fetch data not in the local cache. But even with the &quot;near&quot; memory, the requesting CPU still needs to broadcast a request to all nodes, to see if it&#39;s in other socket&#39;s cache. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1085923">
+				<div id="div-comment-1085923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">saveddijon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20131028-00/?p=2823#comment-1085923">
+			October 29, 2013 at 5:42 pm</a>		</div>
+
+		<p>@alegr1:</p>
+<p>Not fully true. If the coherency controller supports a cache directory (AMD calls it &quot;probe filter&quot;) then you do not necessarily need to broadcast to all nodes. The coherency controller already knows who has the data, and if the coherency controller for the memory is local to &quot;your&quot; die then you save a bit of I/O.</p>
+<p>This is a big win for precisely the multi-die case, where you want to avoid all unnecessary inter-die communication.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

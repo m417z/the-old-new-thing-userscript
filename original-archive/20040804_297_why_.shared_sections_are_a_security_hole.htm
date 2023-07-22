@@ -1,0 +1,660 @@
+<html>
+<head>
+<title>Why .shared sections are a security hole</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why .shared sections are a security hole</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 4, 2004 / year-entry #298</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>30</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Many people will recommend using shared data sections as a way to share data between multiple instances of an application. This sounds like a great idea, but in fact it's a security hole. Proper shared memory objects created by the CreateFileMapping function can be secured. They have security descriptors that let you specify which users...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Many people will recommend using shared data sections as a way
+to share data between multiple instances of an application.
+This sounds like a great idea, but in fact it's a security hole.
+</p>
+<p>
+Proper shared memory objects created by
+<a HREF="http://msdn.microsoft.com/library/en-us/fileio/base/createfilemapping.asp">
+the CreateFileMapping function</a>
+can be secured.
+They have security descriptors that let you specify which users
+are allowed to have what level of access.
+By contrast, anybody who loads your EXE or DLL gets access to your
+shared memory section.
+</p>
+<p>
+Allow me to demonstrate with an intentionally insecure program.
+</p>
+<p>
+Take
+<a href="http://weblogs.asp.net/oldnewthing/archive/2003/07/23/54576.aspx">
+the scratch program</a> and make the following changes:
+</p>
+<pre>
+<font COLOR=blue>#pragma comment(linker, "/SECTION:.shared,RWS")
+#pragma data_seg(".shared")
+int g_iShared = 0;
+#pragma data_seg()
+
+void CALLBACK TimerProc(HWND hwnd, UINT, UINT_PTR, DWORD)
+{
+  int iNew = g_iShared + 1;
+  if (iNew == 10) iNew = 0;
+  g_iShared = iNew;
+  InvalidateRect(hwnd, NULL, TRUE);
+}</font>
+
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+    <font COLOR=blue>SetTimer(hwnd, 1, 1000, TimerProc);</font>
+    return TRUE;
+}
+
+void
+PaintContent(HWND hwnd, PAINTSTRUCT *pps)
+{
+  <font COLOR=blue>TCHAR sz[2];
+  wsprintf(sz, TEXT("%d"), g_iShared);
+  TextOut(pps-&gt;hdc, 0, 0, sz, 1);</font>
+}
+</pre>
+<p>
+Go ahead and run this program.  It counts from 0 to 9 over and over
+again.  Since the TimerProc function never lets g_iShared go above 9,
+the wsprintf is safe from buffer overflow.
+</p>
+<p>
+Or is it?
+</p>
+<p>
+Run this program.  Then use the runas utility to run a second copy
+of this program under a different user.  For extra fun, make one of
+the users an administrator and another a non-administrator.
+</p>
+<p>
+Notice that the counter counts up at double speed.  That's to be
+expected since the counter is shared.
+</p>
+<p>
+Okay, now close one of the copies and relaunch it under a debugger.
+(It's more fun if you let the administrator's copy run free and
+run the non-administrator's copy run under a debugger.)
+Let both programs run, then break into the debugger and change the
+value of the variable g_iShared to something really big, say, 1000000.
+</p>
+<p>
+Now, depending on how intrusive your debugger is, you might or might
+not see the crash.  Some debuggers are "helpful" and "unshare" shared
+memory sections when you change their values from the debugger.
+Helpful for debugging (maybe), bad for my demonstration (definitely).
+</p>
+<p>
+Here's how I did it with the built-in ntsd debugger.
+I opened a command prompt, which runs as myself (and I am not an
+administrator).
+I then used the runas utility to run the scratch program as
+administrator.
+It is the administrator's copy of the scratch program that I'm going
+to cause to crash even though I am just a boring normal non-administrative
+user.
+</p>
+<p>
+From the normal command prompt, I typed
+"ntsd scratch" to run the scratch program under the debugger.
+From the debugger prompt, I typed "u TimerProc" to disassemble the
+TimerProc function, looking for</p>
+<pre>
+01001143 a300300001       mov     [scratch!g_iShared (01003000)],eax
+</pre>
+<p>(note: your numbers may differ).
+I then typed "g 1001143" to instruct the debugger to
+execute normally until that instruction is reached.
+When the debugger broke, I typed
+"r eax=12341234;t" to change the value of the eax register
+to 0x12341324 and then trace one instruction.
+That one-instruction trace wrote the out-of-range value into
+shared memory, and one second later, the administrator version
+of the program crashed with a buffer overflow.
+</p>
+<p>
+What happened?
+</p>
+<p>
+Since the memory is shared, all running copies of the scratch
+program have access to it.  ALl I did was use the debugger
+to run a copy of the scratch program and change the value of
+the shared memory variable.  Since the variable is shared,
+the value also changes in the administrator's copy of the program,
+which then causes the wsprintf buffer to overflow,
+thereby crashing the administrator's copy of the program.
+</p>
+<p>
+A denial of service is bad enough, but you can really do fun
+things if a program keeps anything of value in shared memory.
+If there is a pointer, you can corrupt the pointer.
+If there is a string, you can remove the null terminator and
+cause it to become "impossibly" long, resulting in a potential
+buffer overflow if somebody copies it without checking the length.
+</p>
+<p>
+And if there is a C++ object with a vtable, then you have just hit
+the mother lode!  What you do is redirect the vtable to a
+bogus vtable (which you construct in the shared memory section),
+and put a function pointer entry in that vtable that points into
+some code that you generated (also into the shared memory section)
+that takes over the machine.  (If NX is enabled, then the attack
+is much harder but still possible in principle.)
+</p>
+<p>
+Even if you can't trigger a buffer overflow by messing with variables
+in shared memory, you can still cause the program to behave erratically.
+Just scribbling random numbers all over the shared memory section will
+certainly induce "interesting" behavior in the program under attack.
+</p>
+<p>
+Moral of the story: Avoid shared memory sections.
+Since you can't attach an ACL to the section, anybody who
+can load your EXE or DLL can modify your variables and cause
+havoc in another instance of the program that is running at a
+higher security level.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (30)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-200873">
+				<div id="div-comment-200873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.vbbox.com/blog/' rel='external nofollow' class='url'>Klaus H. Probst</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-200873">
+			August 4, 2004 at 9:14 am</a>		</div>
+
+		<p>Could this be prevented through some compiler cleverness? Maybe some switch that does something to the section? Not an ACL certainly, but something else?</p>
+<p>I&#8217;d wager there&#8217;s a lot of this going on out there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-200923">
+				<div id="div-comment-200923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Chris Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-200923">
+			August 4, 2004 at 10:57 am</a>		</div>
+
+		<p>It used to be fairly common for DLLs to share memory across processes this way under Win31 and Win9x.  For compatibility reasons, this is still allowed, but there are much better ways to do interprocess communications under Windows NT/2000/XP/Server 2003.</p>
+<p>Easy enough to find these using the linker to dump out the headers and look for the shared sections.  These sections are invisible to the objdir or winobj program, so these tools won&#8217;t help you. </p>
+<p>I once saw a service that exposed a shared section like this with a function pointer in it.  Most of the page was completely unused which allowed for all sorts of exploit code to be added.</p>
+<p>Even if you use named memory sections you will probably have a hard time parsing the data correctly because the memory can change out from under you (assume a hacker is changing it).  Most code I&#8217;ve seen even if they are doing parameter checking never think the values will change.  The program has to capture the data and validate the captured version to be safe.</p>
+<p></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-200943">
+				<div id="div-comment-200943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-200943">
+			August 4, 2004 at 11:42 am</a>		</div>
+
+		<p>Do shared memory sections work through Terminal Services session boundaries as well?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-200953">
+				<div id="div-comment-200953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.dcc.ufrj.br/~cesarb/' rel='external nofollow' class='url'>Cesar Eduardo Barros</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-200953">
+			August 4, 2004 at 11:47 am</a>		</div>
+
+		<blockquote><p>
+  Since you can&#8217;t attach an ACL to the section, anybody who can load your EXE or DLL can modify your variables</p>
+<p>But surely you can just attach an ACL to the EXE or DLL (on disk), can&#8217;t you?
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-200983">
+				<div id="div-comment-200983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-200983">
+			August 4, 2004 at 12:14 pm</a>		</div>
+
+		<p>Cesar:<br />
+<br />But surely you can just attach an ACL to the EXE or DLL (on disk), can&#8217;t you?</p>
+<p>Sure can. Of course, that means that you need a different executable for each user (and a different name, too. This doesn&#8217;t scale, so why not just use the right method.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201013">
+				<div id="div-comment-201013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201013">
+			August 4, 2004 at 12:45 pm</a>		</div>
+
+		<p>Of course, use of shared sections can&#8217;t be disabled due to backwards compatibility concerns.</p>
+<p>Why can&#8217;t the platform load separate shared sections for separate users, or if that&#8217;s impossible, fail to load an image containing a shared section if another user has it in memory already?</p>
+<p>I&#8217;d wager that nearly all applications using the technique were written without consideration for the security implications, and say that the remainder are worth breaking.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201033">
+				<div id="div-comment-201033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201033">
+			August 4, 2004 at 1:06 pm</a>		</div>
+
+		<p>&quot;Could this be prevented through some compiler cleverness?&quot;</p>
+<p>Please elaborate. What compiler cleverness are you proposing?</p>
+<p>James: &quot;Why can&#8217;t the platform load separate shared sections for separate users&#8230;&quot; &#8211; that would be changing the rules after the game has already begun. Whenever you do this there are serious compatibility issues.</p>
+<p>&quot;&#8230; the remainder are worth breaking.&quot; Tell that to the company whose order tracking system stops working. Tell them that they are losing hundreds of thousands of dollars a day because they &quot;deserved to be broken.&quot; See if you make it out of that room alive.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201073">
+				<div id="div-comment-201073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tony Cox [MS]</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201073">
+			August 4, 2004 at 4:25 pm</a>		</div>
+
+		<p>Raymond, I thought security fixes were one area where we had decided that it was okay to break apps (especially old busted ones) in order to fix problems.</p>
+<p>Backwards compat is a fine thing, and for most cases I&#8217;m definitely on the side of maintaining compatibility, for all the good reasons you&#8217;ve talked about in your blogs. However, I think security fixes are one of the things that can trump that.</p>
+<p>I&#8217;m not saying that this particular issue necessarily qualifies, but I also don&#8217;t think you can automatically exclude possible security improvements on compat grounds.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201123">
+				<div id="div-comment-201123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://flurf.net/' rel='external nofollow' class='url'>Eric TF Bat</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201123">
+			August 4, 2004 at 6:00 pm</a>		</div>
+
+		<p>&quot;Tell that to the company whose order tracking system stops working. Tell them that they are losing hundreds of thousands of dollars a day because they &quot;deserved to be broken.&quot; See if you make it out of that room alive.&quot;</p>
+<p>James, you&#8217;re too nice.  Raymond, you&#8217;re too optimistic.  The solution is simple: use the security hole in the tracking system and get the company to deliver you a thousand iPods.  Send them on to a thousand random journalists, but first store a message on them as follows: &quot;These iPods are delivered free-of-charge courtesy of a security hole in [company]&#8217;s software that Microsoft has already fixed for them.  If you want more goodies, just don&#8217;t tell [company] that they have a problem.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201133">
+				<div id="div-comment-201133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Carlos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201133">
+			August 4, 2004 at 6:05 pm</a>		</div>
+
+		<p>Ah Tony, but Raymond just likes to complain for complaining&#8217;s sake. Maybe no one&#8217;s told him about XP SP2 yet and all the horrible breaking of apps that will bring which will cause many a sleepless nights for our favorite blogger.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201173">
+				<div id="div-comment-201173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.foxyshadis.com' rel='external nofollow' class='url'>foxyshadis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201173">
+			August 4, 2004 at 10:35 pm</a>		</div>
+
+		<p>I remember that UPX had a fit when you tried to pack writable shared sections, though I was never clear on why. My understanding was that the executable&#8217;s shared memory section pointers couldn&#8217;t be rewritten though the rest could be. What tended to happen in this case was formerly shared dlls would run in their own process.</p>
+<p>A very unexpected behavior came up after forcing a compress on comdlg32.dll in win95. (Yes, yes, but that was actually one of the less bastardized aspects of my system.) The dialogs worked great and all in an app, but as soon as another app used them, they just failed to appear when going back to the previous app. Which necessitated a huge amount of app restarts and copy-pasting. I&#8217;m not sure how, but I actually got used to the behavior. I&#8217;m fairly sure it was due to its writable shared sections, but I have no idea how it interacted between the host apps.</p>
+<p>I know I traced some other funky behavior to using a packed shell32 for a while, but I can&#8217;t remember what, since I replaced it with 98&#8217;s anyway. (Animated scrolling and menus on a 486! Woot.)</p>
+<p>Here there be dragons.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201223">
+				<div id="div-comment-201223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201223">
+			August 5, 2004 at 2:17 am</a>		</div>
+
+		<p>Providing some way to back out the security fix would seem a reasonable compromise there. People can try it, and if it breaks programs for them, they undo it. They then know they have a problem and can start fixing it, while they still have a working system.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201203">
+				<div id="div-comment-201203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201203">
+			August 4, 2004 at 11:28 pm</a>		</div>
+
+		<p>Packing EXEs is typically counter-productive. Sure you reduce disk space but you increase file load time (the entire program needs to be uncompressed) and increases memory use (pages cannot be shared and they get spilled into the pagefile instead of being demand-paged).</p>
+<p>Carlos: I&#8217;ve seen programs break for much smaller reasons than this. Companies get EXTREMELY angry when a security fix halts their day-to-day business. And if you think *I&#8217;m* paranoid I don&#8217;t know what you&#8217;d call some of the other people who are concerned with compatibility. Compared to them, I&#8217;m the crazy one!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201313">
+				<div id="div-comment-201313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Carlos (a different one)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201313">
+			August 5, 2004 at 7:41 am</a>		</div>
+
+		<p>&quot;Do shared memory sections work through Terminal Services session boundaries as well?&quot;</p>
+<p>They don&#8217;t.</p>
+<p>I once had to write a program that communicated across Terminal Server sessions and I tried all kinds of things, including this.  I ended up using a file mapping.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201353">
+				<div id="div-comment-201353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AlisdairM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201353">
+			August 5, 2004 at 8:49 am</a>		</div>
+
+		<p>Raymond: &quot;Why can&#8217;t the platform load separate shared sections for separate users&#8230;&quot; &#8211; that would be changing the rules after the game has already begun. Whenever you do this there are serious compatibility issues. </p>
+<p>OK, changing rules after the event is nasty, but could you not make this an option for &#8216;security enhanced&#8217; accounts, and recommend all admin accounts be &#8216;security enhanced&#8217;.  I suspect there are several other breaking changes you could put in as part of the security enhancement (if not already rolled into XP SP2) and then the user can choose whether they prefer broken apps or security risks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201373">
+				<div id="div-comment-201373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201373">
+			August 5, 2004 at 8:51 am</a>		</div>
+
+		<p>Raymond: Why bend over backwards to maintain bug-compatibility for customers that probably won&#8217;t upgrade anyway? Didn&#8217;t MS just extend workstation/server OS support out to 10 years, acknowledging that many business customers don&#8217;t want upgrades?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201403">
+				<div id="div-comment-201403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201403">
+			August 5, 2004 at 8:57 am</a>		</div>
+
+		<p>Raymond: Re UPX, it seems to be somewhat useful for downloadable installers. When I download stuff from Far Eastern OEMs it&#8217;s usually packaged as self-extracting executables for Windows which I then need to puzzle out how to extract under Linux. Typically I find that it&#8217;s a self-extracting RAR or Zip archive packed with UPX which achieves a little further saving on the code. Thankfully Windows UPX executables can be unpacked by UPX for Linux.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201413">
+				<div id="div-comment-201413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201413">
+			August 5, 2004 at 9:10 am</a>		</div>
+
+		<p>Many companies do upgrade Windows but don&#8217;t (or can&#8217;t) upgrade their applications. Like say the apartment complex that upgraded their OS to Windows XP even though their management software is a DOS app.</p>
+<p><a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/03/01/82103.aspx" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/03/01/82103.aspx</a></p>
+<p>AlisdairM: Yes, a switch to revert to the old behavior is a possibility. Of course, a company first has to realize that that is the reason why their order tracking system stopped working. For something subtle like this, it may go undetected for a long time before a company realizes that, say, when a shipping address is changed from a domestic address to an international one, the order gets deleted from their system. (Because the domestic and international tracking systems communicate through a shared section, and since the shared section is no longer shared, the international system doesn&#8217;t pick up the order.) In the meantime, millions of dollars is lost.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201473">
+				<div id="div-comment-201473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.csc.calpoly.edu/~bfriesen/' rel='external nofollow' class='url'>Brian Friesen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201473">
+			August 5, 2004 at 9:52 am</a>		</div>
+
+		<p>Ah, shared memory versus a secure method like file maps.  Several years back I wrote a program that used Windows hooks and posted it on CodeProject.com/CodeGuru.com.  The common solution at the time for passing the hook handle was a shared memory section, but I went with file maps.  I can&#8217;t tell you how many emails I got from people saying I was making it needlessly complex.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201603">
+				<div id="div-comment-201603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201603">
+			August 5, 2004 at 6:12 pm</a>		</div>
+
+		<p>8/4/2004 11:28 PM Raymond Chen</p>
+<p>&gt; Packing EXEs is typically counter-productive.</p>
+<p>Hmm, I had underestimated the effect of this.  In most of my installations of Windows 2000 or XP, I created the partition with the compression option in the first place.  The installer and/or Windows itself are smart enough to disable compression on pagefile.sys but not on .exe and other .sys files.  I thought the result would be a small waste of time since one uncompression operation would take a small amount of CPU time after achieving no savings in reads from disk (since executables don&#8217;t compress much).  But if there&#8217;s such a big effect, then why don&#8217;t the installer and/or Windows itself also default to omitting .exe and .sys files from the compression option?</p>
+<p>&gt; Companies get EXTREMELY angry when a security<br />
+<br />&gt; fix halts their day-to-day business.</p>
+<p>Something is starting to become clear now.  When one big corporate customer wants to be 0wned by haxxors, then instead of letting that customer get 0wned, ALL customers get 0wned.  In the arguments on security, where some say that Microsoft gets it and some say not, it seems that both sides are right.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201613">
+				<div id="div-comment-201613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201613">
+			August 5, 2004 at 6:41 pm</a>		</div>
+
+		<p>&quot;When one big corporate customer wants to be 0wned by haxxors&quot;.</p>
+<p>No they don&#8217;t want to be 0wned either. They want a solution that protects them while simultaneously allowing their programs to continue running.</p>
+<p>Filesystem compression is different &#8211; in that case the filesystem can decompress on the fly a randomly-selected chunk of the file. The compression isn&#8217;t as good because each 4K chunk must be compressed independently. But it permits random access, which is critical for demand paging.</p>
+<p>This is not the same as packing EXEs, which makes the EXE self-extracting at run time.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201663">
+				<div id="div-comment-201663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AlisdairM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201663">
+			August 6, 2004 at 5:35 am</a>		</div>
+
+		<p>Raymond: Yes, a switch to revert to the old behavior is a possibility. Of course, a company first has to realize that that is the reason why their order tracking system stopped working.</p>
+<p>If we give up the problem as intractible, how will we ever move those customers over to a more secure system?  Microsoft has clearly acknowledged this as a concern with the huge focus on security in applications over the last 12 months or so.  IIUC, it is now one of the main driver behind the move to .NET.</p>
+<p>By adding such a switch, the more alert and technically knowledgable firms can &#8216;opt-in&#8217; and get the benefit.  They actively need to turn the switch on, but experience is built up and MS get useful feedback.  Next OS down the line &#8216;Secure accounts&#8217; become the default, and it is an option you can switch off.  By now the interactions are much better known, and there is a great deal of material published and easily available, on MSDN and elsewhere, about what symptoms to look for, and how to recognise this kind of security problem.</p>
+<p>In the meantime, a lot of the 3rd party vendors these folks are rely on for the building blocks for their systems will in turn have already caught up with the game, as there will be commercial pressure on them to do so from their customers wanting to build secure systems.  Likewise, those that adopt early have the commercial advantage of demonstrably improved technology, rather than theoretical.  &quot;Look, we can run in secure accounts too.&quot;</p>
+<p>In the ideal world we would be able to take the big-bang approach and just say &#8216;you all have to be secure now&#8217;.  MS clearly has such a large customer base this attitude cannot work.  Oh the perils of success [g]</p>
+<p>I&#8217;m still not clear why the phased transition cannot work though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-201853">
+				<div id="div-comment-201853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201853">
+			August 7, 2004 at 2:44 pm</a>		</div>
+
+		<p>&quot;Tell that to the company whose order tracking system stops working.&quot;</p>
+<p>Raymond, I think you have it backwards. Tell 300 million users that you&#8217;re not going to make the OS secure, because it would break some company&#8217;s order tracking system. Tell them that they are losing hundreds of thousands of pounds a day because a worm has a way to utilise the shared section of Microsoft IntelliPoint&#8217;s point32.dll in doing bad things. See if you make it out of that room alive.</p>
+<p>(Okay, point32 was just a guess: it probably uses a windows hook in every process, which means a dll, which means some form of shared data. dumpbin seems to confirm that the DLL has a shared section, but I&#8217;ll just trust you that it&#8217;s secure. Maybe you can get someone to explain the precautions MS took in this case?)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-201863">
+				<div id="div-comment-201863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-201863">
+			August 7, 2004 at 4:52 pm</a>		</div>
+
+		<p>James: Precisely. The challenge is to get out of *both* rooms alive. That&#8217;s one of the reasons why security patches take so long to develop. It&#8217;s quite a tricky task to close the hole while simultaneously managing to get out of both rooms.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-203103">
+				<div id="div-comment-203103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">IPv6</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-203103">
+			August 13, 2004 at 3:02 am</a>		</div>
+
+		<p>What about XP SP2?<br />
+<br />Will this SP apply additional restrictions for shared sections breaking existing apps or not?<br />
+<br />that is the question :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-204963">
+				<div id="div-comment-204963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/stephen_griffin/archive/2004/08/20/217919.aspx' rel='external nofollow' class='url'>SGriffin's [MSFT] WebLog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-204963">
+			August 20, 2004 at 4:05 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-205163">
+				<div id="div-comment-205163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/stephen_griffin/archive/0001/01/01/217919.aspx' rel='external nofollow' class='url'>SGriffin's [MSFT] WebLog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-205163">
+			August 22, 2004 at 8:10 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-255643">
+				<div id="div-comment-255643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/2005/02/15/372995.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-255643">
+			February 15, 2005 at 10:00 am</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-295363">
+				<div id="div-comment-295363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/stephen_griffin/archive/2004/08/20/217919.aspx' rel='external nofollow' class='url'>SGriffin's [MSFT] WebLog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-295363">
+			August 8, 2005 at 3:18 pm</a>		</div>
+
+		<p>This post was inspired by a case I worked recently. In this case, the customer was using the 5.5 Event&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-541333">
+				<div id="div-comment-541333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/stephen_griffin/archive/2004/08/20/when-is-a-deleted-profile-not-deleted.aspx' rel='external nofollow' class='url'>SGriffin's [MSFT] WebLog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040804-00/?p=38253#comment-541333">
+			August 22, 2007 at 3:59 pm</a>		</div>
+
+		<p>This post was inspired by a case I worked recently. In this case, the customer was using the 5.5 Event</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

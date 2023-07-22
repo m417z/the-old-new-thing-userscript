@@ -1,0 +1,353 @@
+<html>
+<head>
+<title>How do I enumerate remembered connections that are not currently connected?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I enumerate remembered connections that are not currently connected?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 31, 2015 / year-entry #182</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Harry Johnston wanted to know how to get a list of remembered (but not currently connected) drive mappings.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/307138/ProfileUrlRedirect.ashx">
+Harry Johnston</a> wanted to know
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/11/17/10573408.aspx#10573696">
+how to get a list of remembered (but not currently connected)
+drive mappings</a>.
+<span id="more-91701"></span>
+</p>
+<p>
+The idea here is to make a tweak
+to the Little Program.
+Start with
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/11/17/10573408.aspx">
+what we had</a>
+and make these changes:
+</p>
+<pre>
+int __cdecl main(int, char **)
+{
+ HANDLE hEnum;
+ WNetOpenEnum(<font COLOR=blue>RESOURCE_REMEMBERED</font>,
+              RESOURCETYPE_DISK,
+              0,
+              NULL,
+              &amp;hEnum);
+
+ ...
+}
+</pre>
+<p>
+This changes the program from enumerating connected
+resources to enumerating remembered resources.
+</p>
+<p>
+The last step is to skip the remembered resources
+that are also connected.
+But this part is not Win32 programming;
+it's just programming,
+For each remembered resource,
+check if the
+<code>lpLocal&shy;Name</code> is non-null and
+matches an
+<code>lpLocal&shy;Name</code> that came out of an
+enumeration of connected resources.
+</p>
+<p>
+So let's do it.
+We start with the header files:
+</p>
+<pre>
+#define UNICODE
+#define _UNICODE
+#define STRICT
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt; // horrors! Mixing C and C++ I/O!
+#include &lt;string&gt;
+#include &lt;set&gt;
+#include &lt;memory&gt;
+#include &lt;winnetwk.h&gt;
+</pre>
+<p>
+Since we are using classes like
+<code>std::set</code> which throw exceptions,
+we need to wrap our resources inside RAII classes.
+Here's one for network resource enumeration:
+</p>
+<pre>
+class CNetEnumerator
+{
+public:
+ CNetEnumerator() = default;
+ ~CNetEnumerator() { if (m_hEnum) WNetCloseEnum(m_hEnum); }
+ operator HANDLE() { return m_hEnum; }
+ HANDLE* operator&amp;() { return &amp;m_hEnum; }
+private:
+ HANDLE m_hEnum = nullptr;
+};
+</pre>
+<p>
+Here is our function to enumerate all network resources.
+It uses a callback because
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/11/17/10573408.aspx#10573690">
+arghhhhhhhhhhh wishes it were so</a>.
+</p>
+<pre>
+template&lt;typename Callback&gt;
+void for_each_network_resource(
+    DWORD dwScope,
+    DWORD dwType,
+    DWORD dwUsage,
+    LPNETRESOURCE pnrIn,
+    Callback callback)
+{
+ CNetEnumerator hEnum;
+ WNetOpenEnum(dwScope, dwType, dwUsage, pnrIn, &amp;hEnum);
+
+ const DWORD elements = 65536 / sizeof(NETRESOURCE);
+ static_assert(elements &gt; 1, "Must have room for data");
+ std::unique_ptr&lt;NETRESOURCE&gt; buffer(new NETRESOURCE[elements]);
+
+ DWORD err;
+ do {
+  DWORD cEntries = INFINITE;
+  DWORD cb = elements * sizeof(NETRESOURCE);
+  err = WNetEnumResource(hEnum, &amp;cEntries, buffer.get(), &amp;cb);
+  if (err == NO_ERROR || err == ERROR_MORE_DATA) {
+   for (DWORD i = 0; i &lt; cEntries; i++) {
+    callback(&amp;buffer[i]);
+   }
+  }
+ } while (err == ERROR_MORE_DATA);
+}
+</pre>
+<p>
+There is a bit of trickery to get the enumeration buffer into
+a form that C++ likes.
+We had previously used
+<code>Local&shy;Alloc</code>, which is guaranteed to return
+memory suitably aligned for <code>NETRESOURCE</code>.
+However, we can't do it for <code>new BYTE[]</code>, since that
+returns only byte-aligned data.
+We solve this problem by explicitly allocating
+<code>NETRESOURCE</code> objects, but choosing a number so that
+the result is close to our desired buffer size.&sup1;
+</p>
+<p>
+We need another helper class so we can create a case-insensitive set.
+</p>
+<pre>
+struct CaseInsensitiveWstring
+{
+ bool operator()(const std::wstring&amp; a, const std::wstring&amp; b) const {
+  return CompareStringOrdinal(a.c_str(), a.length(),
+                              b.c_str(), b.length(), TRUE) == CSTR_LESS_THAN;
+ }
+};
+</pre>
+<p>
+Okay, now we can start doing actual work:
+</p>
+<pre>
+void report(PCWSTR pszLabel, PCWSTR pszValue)
+{
+ printf("%ls = %ls\n", pszLabel, pszValue ? pszValue : L"(null)");
+}
+
+int __cdecl wmain(int, wchar_t **)
+{
+ std::set&lt;std::wstring, CaseInsensitiveWstring&gt; connected;
+
+ // Collect the local resources which are already connected.
+ for_each_network_resource(RESOURCE_CONNECTED,
+  RESOURCETYPE_DISK, 0, nullptr, [&amp;](LPNETRESOURCE pnr) {
+   if (pnr-&gt;lpLocalName != nullptr) {
+    connected.emplace(pnr-&gt;lpLocalName);
+   }
+  });
+
+ // Now look for remembered resources that are not connected.
+ for_each_network_resource(RESOURCE_REMEMBERED,
+  RESOURCETYPE_DISK, 0, nullptr, [&amp;](LPNETRESOURCE pnr) {
+   if (pnr-&gt;lpLocalName == nullptr ||
+       connected.find(pnr-&gt;lpLocalName) == connected.end()) {
+    report(L"localName", pnr-&gt;lpLocalName);
+    report(L"remoteName", pnr-&gt;lpRemoteName);
+    report(L"provider", pnr-&gt;lpProvider);
+    printf("\n");
+   }
+  });
+
+ return 0;
+}
+</pre>
+<p>
+Not exciting. Mostly consists of boring typing.
+But hey, that's what programming is like most of the time.</p>
+<p>
+&sup1;
+If we were being super-weenies about the buffer size, we could
+have written
+</p>
+<pre>
+ union EnumBuffer {
+  BYTE bytes[65536];
+  NETRESOURCE nr;
+ };
+
+ std::unique_ptr&lt;EnumBuffer&gt; buffer(new EnumBuffer());
+ LPNETRESOURCE pnr = &amp;buffer->nr;
+ ...
+  DWORD cb = sizeof(EnumBuffer);
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1206621">
+				<div id="div-comment-1206621" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701#comment-1206621">
+			August 31, 2015 at 7:47 am</a>		</div>
+
+		<p>The super-weenies method is ugly (IMHO), requires inventing/naming a type and might waste a couple of bytes but I still appreciate you adding it to your post.</p>
+<p>I&#39;m not a fan of callbacks that lack a caller defined void* parameter but I guess it does not matter when using fancy pants c++11. I&#39;m sure the Windows team already knows this because the few enum functions in Win95 that lacked the parameter got a Ex version later on&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206601">
+				<div id="div-comment-1206601" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pmbAustin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701#comment-1206601">
+			August 31, 2015 at 8:27 am</a>		</div>
+
+		<p>So, I have a related question on this topic that has always irked me. &nbsp;I had a &quot;remembered network drive mapping&quot; to a share on a USB drive. &nbsp;The USB drive died suddenly. &nbsp;I could find no way through the Windows UI anywhere to make it &quot;forget&quot; that mapping&#8230; it insisted that it couldn&#39;t forget it unless it could access it first. &nbsp;Chicken-and-egg problem. &nbsp;I don&#39;t even remember how I managed to get it to finally forget it (I think I managed to get the drive limping along just long enough to plug it in and forget the mapping before it crapped out again). &nbsp;Very frustrating. &nbsp;Surely I&#39;m missing something?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206591">
+				<div id="div-comment-1206591" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701#comment-1206591">
+			August 31, 2015 at 9:05 am</a>		</div>
+
+		<p>There is a memory leak in the sample; the unique_ptr to the buffer should be templated on an array of NETRESOURCE structs:</p>
+<p>std::unique_ptr&lt;NETRESOURCE&gt; buffer(new NETRESOURCE[elements]);</p>
+<p>should be:</p>
+<p>std::unique_ptr&lt;NETRESOURCE[]&gt; buffer(new NETRESOURCE[elements]);</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206551">
+				<div id="div-comment-1206551" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NoP</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701#comment-1206551">
+			August 31, 2015 at 10:36 pm</a>		</div>
+
+		<p>@pmbAustin: have a look at fsmgmt.msc!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1206471">
+				<div id="div-comment-1206471" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701#comment-1206471">
+			September 1, 2015 at 12:13 pm</a>		</div>
+
+		<p>I just reported this via Windows Feedback, but disconnected drives in Windows 10 have a bug. &nbsp;If a disconnected network connection is associated with a drive letter, and you mount an .iso file, the .iso file might be assigned the same drive letter. &nbsp;This confuses Explorer &#8211; it shows Disconnect instead of Eject on the context menu, and Disconnect does nothing. &nbsp;Unless you know Windows well enough to use alternate means, you can&#39;t unmount the .iso.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1206441">
+				<div id="div-comment-1206441" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20150831-00/?p=91701#comment-1206441">
+			September 1, 2015 at 7:37 pm</a>		</div>
+
+		<p>Woo hoo! &#8211; famous for a day. &nbsp;Well an hour. &nbsp;Ten minutes at least. :-)</p>
+<p>Plus the code will be useful. &nbsp;Thanks. &nbsp;(Though I&#39;m embarrassed to realize that if I&#39;d just thought to look up the documentation for the function you were using in the linked post, I&#39;d have figured it out myself!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

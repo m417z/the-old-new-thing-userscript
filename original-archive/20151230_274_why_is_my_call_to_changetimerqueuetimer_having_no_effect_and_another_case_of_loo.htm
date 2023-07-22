@@ -1,0 +1,339 @@
+<html>
+<head>
+<title>Why is my call to ChangeTimerQueueTimer having no effect? (And another case of looking past the question to solve the problem.)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why is my call to ChangeTimerQueueTimer having no effect? (And another case of looking past the question to solve the problem.)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 30, 2015 / year-entry #275</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151230-00/?p=92741</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Because it's too late.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had a question about
+the
+<code>Change&shy;Timer&shy;Queue&shy;Timer</code> function,
+and they shared
+a sample program that demonstrated the issue.
+(Hooray for
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2013/10/18/10457796.aspx">
+reduction</a>.)
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;iostream&gt;
+
+VOID CALLBACK WaitOrTimerCallback(
+       PVOID lpParameter,
+       BOOLEAN TimerOrWaitFired
+    )
+{
+   std::cout &lt;&lt; &quot;tick&quot; &lt;&lt; std::endl;
+}
+
+
+int main(int argc, char* argv[])
+{      
+    HANDLE timer;
+    if (!CreateTimerQueueTimer(&amp;timer, nullptr,
+             WaitOrTimerCallback, nullptr, 0, 0, 0)) abort();
+
+   // This prints &quot;tick&quot; once, and then stops.
+   Sleep(1000);
+
+   if (!ChangeTimerQueueTimer(nullptr, timer, 0, 1000)) abort();
+
+   // We expect to print &quot;tick&quot; once every second,
+   // but we get nothing.
+   Sleep(5000);
+   return 0;
+}
+</pre>
+<p>
+The customer asked,
+"Why aren't we getting the ticks after calling
+<code>Change&shy;Timer&shy;Queue&shy;Timer</code>?"
+</p>
+<p>
+This is explained down in
+<a HREF="https://msdn.microsoft.com/en-us/library/ms682004">
+the documentation for the
+<code>Change&shy;Timer&shy;Queue&shy;Timer</code> function</a>:
+</p>
+<blockquote CLASS="q"><p>
+If you call
+<b>Change&shy;Timer&shy;Queue&shy;Timer</b>
+on a one-shot timer (its period is zero)
+that has already expired, the timer is not updated.
+</p>
+</blockquote>
+<p>
+"Aha," they replied.
+"What we should do is instead of creating a one-shot timer
+that has already expired,
+we should create a one-shot timer that has an <code>INFINITE</code>
+due time."
+The customer explained that they want to create a dormant
+periodic timer that they could activate later.
+Their idea was to create a one-shot timer and ignore its first
+tick.
+Then later, when they want to activate the periodic timer,
+they change the one-shot timer to a periodic timer,
+and then the money starts flowing in.
+</p>
+<p>
+If your goal is to create a dormant timer that you can turn on and
+off later,
+then this is the wrong way to do it.
+</p>
+<p>
+The
+<code>Create&shy;Timer&shy;Queue&shy;Timer</code> and
+<code>Change&shy;Timer&shy;Queue&shy;Timer</code> functions
+belong to the old Windows 2000 thread pool functions.
+Windows Vista introduced a new thread pool that
+is significantly more flexible,
+and all the old thread pool functions turned into wrappers
+around the new thread pool.
+</p>
+<p>
+In the new model, scheduling tasks on the thread pool is done
+in two steps:
+First, you create an object to represent the thread pool task.
+Second, you activate the object.
+The task can be deactivated and reactivated as many times as
+you like, up until the point where you close it.
+</p>
+<p>
+One nice feature of the two-step model is that all memory allocations
+take place during object creation.
+Once the task is created, activating and deactivating it will always
+succeed.
+This saves you from writing a bunch of complicated rollback code if
+you need to create a bunch of things that are dependent on each other.
+Under the old model, to launch a process and schedule a function to be
+called when the process exits,
+you would have to write something like this:
+</p>
+<pre>
+ PROCESS_INFORMATION pi;
+ if (!CreateProcess(...,CREATE_SUSPENDED, ..., &amp;pi)) return ERROR;
+ if (!RegisterWaitForSingleObject(&amp;wait, pi.hProcess, ...)) {
+  // roll back the CreateProcess
+  TerminateProcess(pi.hProcess, ...);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  return ERROR;
+ }
+
+ // success: The process may start running now.
+ ResumeThread(pi.hThread);
+
+ // The wait handler will close the handles.
+</pre>
+<p>
+Under the new model, you can do all the things that can fail up front,
+before you commit to anything that will be difficult to roll back.
+</p>
+<pre>
+ wait = CreateThreadpoolWait(...);
+ if (!wait) return ERROR;
+
+ // We have everything we need - now go create the process.
+ // (Don't need to create suspended now.)
+ PROCESS_INFORMATION pi;
+ if (!CreateProcess(...,, &amp;pi)) {
+  CloseThreadpoolWait(wait); // not using it after all
+  return ERROR;
+ }
+
+ // Activate the wait now that we know what the handle is.
+ // This cannot fail.
+ SetThreadpoolWait(wait, pi.hProcess, ...);
+</pre>
+<p>
+And we are lucky that it's possible to create a process suspended
+in the first place, so that rolling back process creation is possible
+at all.
+If it were not possible to create a process suspended, then we would
+be stuck,
+because we end up in a situation where a process has already started,
+but we are unable to wait for it,
+and we are unable to recall the process to say,
+"No, don't do that thing I asked you to do because it turns out
+that I can't... oh rats."
+</p>
+<p>
+Two-phase initialization also avoids race conditions:
+You can prepare a timer without activating it,
+then activate it only after the other prerequisites are met.
+</p>
+<p>
+Anyway, for our customer, the plan would be to write the code
+like this:
+</p>
+<pre>
+VOID CALLBACK TimerCallback(
+    PTP_CALLBACK_INSTANCE Instance,
+    PVOID Context,
+    PTP_TIMER Timer
+    )
+{
+   std::cout &lt;&lt; &quot;tick&quot; &lt;&lt; std::endl;
+}
+
+int main(int argc, char* argv[])
+{      
+    PTP_TIMER timer = CreateThreadpoolTimer(
+       TimerProc, nullptr, nullptr);
+    if (!timer) abort();
+
+   // This prints nothing.
+   Sleep(1000);
+
+   // Activate the timer.
+   FILETIME dueTime = { 0, 0 }; // due immediately
+   SetThreadpoolTimer(timer, &amp;dueTime, 1000, 100);
+
+   // This prints &quot;tick&quot; every second.
+   Sleep(5000);
+
+   // Deactivate the timer.
+   SetThreadpoolTimer(timer, nullptr, 0, 0);
+
+   // Nothing gets printed.
+   Sleep(5000);
+
+   // Reactivate it.
+   SetThreadpoolTimer(timer, &amp;dueTime, 1000, 100);
+
+   // This prints &quot;tick&quot; every second.
+   Sleep(5000);
+
+   // All done. (Note race condition mentioned in documentation.)
+   CloseThreadpoolTimer(timer);
+
+   return 0;
+}
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1220591">
+				<div id="div-comment-1220591" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151230-00/?p=92741#comment-1220591">
+			December 30, 2015 at 1:27 pm</a>		</div>
+
+		<p>I&#8217;m a little surprised the customer didn&#8217;t reply with, &#8220;Thanks, but we can&#8217;t use that, we need to support XP.&#8221;  Or maybe they did.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1220672">
+				<div id="div-comment-1220672" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151230-00/?p=92741#comment-1220672">
+			January 2, 2016 at 8:41 am</a>		</div>
+
+		<p>My solution was to arrange for the child process to exit when its standard input handle was closed (Yes you can spawn Win32 GUI process with open standard input &amp; output handles). This can&#8217;t always be done, but when it can be done, it makes cleanup far more reliable as it works correctly even if the parent process crashes or is terminated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1220741">
+				<div id="div-comment-1220741" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">D-Coder</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151230-00/?p=92741#comment-1220741">
+			January 4, 2016 at 8:24 am</a>		</div>
+
+		<p>&#8220;then the money starts flowing in&#8221; &#8212; can we have some more detail on this bit?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1220772">
+				<div id="div-comment-1220772" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151230-00/?p=92741#comment-1220772">
+			January 4, 2016 at 10:38 am</a>		</div>
+
+		<p>&#8220;Then the timer callbacks start arriving.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

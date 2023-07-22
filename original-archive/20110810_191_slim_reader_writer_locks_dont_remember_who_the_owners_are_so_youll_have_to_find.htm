@@ -1,0 +1,201 @@
+<html>
+<head>
+<title>Slim reader/writer locks don't remember who the owners are, so you'll have to find them some other way</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Slim reader/writer locks don&#8217;t remember who the owners are, so you&#8217;ll have to find them some other way</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 10, 2011 / year-entry #192</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110810-00/?p=9933</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The slim reader/writer lock is a very convenient synchronization facility, but one of the downsides is that it doesn't keep track of who the current owners are. When your thread is stuck waiting to acquire a slim reader/writer lock, a natural thing to want to know is which threads own the resource your stuck thread...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The
+<a HREF="http://msdn.microsoft.com/aa904937.aspx">
+slim reader/writer lock</a>
+is a very convenient synchronization facility,
+but one of the downsides is that it doesn't keep track of who
+the current owners are.
+When your thread is stuck waiting to acquire a slim
+reader/writer lock,
+a natural thing to want to know is which threads own the resource
+your stuck thread waiting for.
+</p>
+<p>
+Since there's not facility for going from the waiting thread
+to the owning threads,
+you'll just have to find the owning threads some other way.
+Here's the thread that is waiting for the lock in shared mode:
+</p>
+<pre>
+ntdll!ZwWaitForKeyedEvent+0xc
+ntdll!RtlAcquireSRWLockShared+0x126
+dbquery!CSearchSpace::Validate+0x10b
+dbquery!CSearchSpace::DecomposeSearchSpace+0x3c
+dbquery!CQuery::AddConfigs+0xdc
+dbquery!CQuery::ResolveProviders+0x89
+dbquery!CResults::CreateProviders+0x85
+dbquery!CResults::GetProviders+0x61
+dbquery!CResults::CreateResults+0x11c
+</pre>
+<p>
+Okay, how do you find the thread that owns the lock?
+</p>
+<p>
+First, slim reader/writer locks are usable only within a process,
+so the candidate threads are the one within the process.
+</p>
+<p>
+Second, the usage pattern for locks is nearly always something like
+</p>
+<pre>
+    enter lock
+    do something
+    exit lock
+</pre>
+<p>
+It is highly unusual for a function to take a lock and exit to
+external code with the lock held.
+(It might exit to other code within the same component,
+transferring the obligation to exit the lock to that other code.)
+Therefore, you want to look for threads that are still inside
+<code>dbquery.dll</code>,
+possibly even still inside
+<code>CSearch&shy;Space</code> (if the lock is a per-object lock
+rather than a global one).
+</p>
+<p>
+Of course, the possibility might be that the code that entered
+the lock messed up and forgot to release it,
+but if that's the case,
+no amount of searching for it will find anything since the culprit
+is long gone.
+Since
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/04/26/2277346.aspx">
+debugging is an exercise in optimism</a>,
+we may as well proceed on the assumption that we're not in the case.
+If it fails to find the lock owner, then we may have to revisit
+the assumption.
+</p>
+<p>
+Finally, the last trick is knowing
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2006/07/10/661389.aspx">
+which threads to ignore</a>.
+For now, you can also ignore the threads that are waiting for the lock,
+since they are the victims not the cause.
+(Again, if we fail to find the lock owner, we can revisit the assumption
+that they are not the cause; for example, they may be attempting to acquire
+the lock recursively.)
+</p>
+<p>
+As it happens,
+there is only one thread in the process that passes all the above filters.
+</p>
+<pre>
+dbquery!CProp::Marshall+0x3b
+dbquery!CRequest::CRequest+0x24c
+dbquery!CQuery::Execute+0x668
+dbquery!CResults::FillParams+0x1c4
+dbquery!CResults::AddProvider+0x4e
+dbquery!CResults::AddConfigs+0x1c5
+dbquery!CResults::CreateResults+0x145
+</pre>
+<p>
+This may not be the source of the problem, but it's a good start.
+(Actually, it looks very promising since the problem is probably
+that the process on the other side of the marshaller is stuck.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-929693">
+				<div id="div-comment-929693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roman Ryltsov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110810-00/?p=9933#comment-929693">
+			August 10, 2011 at 8:42 am</a>		</div>
+
+		<p>As far as I remember there is a specific problem with SRW locks. You cannot re-acquire lock recursively, but you are likely to succeed if you try. Because they are lightweight, there is no error indication on re-acquire. You will only notice the problem when there is a real concurrent thread which is waiting for the lock and the original thread tries to acquire again. In this scenario, the statement &quot;For now, you can also ignore the threads that are waiting for the lock, since they are the victims not the cause.&quot; is not true.</p>
+<div class="post">[<i>That&#39;s why I wrote &quot;For now&quot; and the parenthetical sentence that follows. Hooray for the nitpicker&#39;s corner. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929733">
+				<div id="div-comment-929733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110810-00/?p=9933#comment-929733">
+			August 10, 2011 at 9:51 am</a>		</div>
+
+		<p>I remember deliberately passing slim locks around like cigarettes in a manner that broke lock validators.</p>
+<p>The code was provably deadlock free but the automated routines couldn&#39;t handle it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

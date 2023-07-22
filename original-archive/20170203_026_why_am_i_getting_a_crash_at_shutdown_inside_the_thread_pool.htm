@@ -1,0 +1,375 @@
+<html>
+<head>
+<title>Why am I getting a crash at shutdown inside the thread pool?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why am I getting a crash at shutdown inside the thread pool?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 3, 2017 / year-entry #27</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Stop talking to a dead thread pool.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer reported a crash in WinHTTP when their application shuts down
+a WebSocket.
+Specifically, it occurs when one of their DLL's global objects is being
+destructed.
+</p>
+<p>
+The customer sent us a redacted call stack:
+</p>
+<pre>
+00a5e11c 7753ebbe ntdll!KiFastSystemCallRet
+00a5e120 77581174 ntdll!NtAlpcSendWaitReceivePort+0xa
+00a5e1d0 7758078a ntdll!SendMessageToWERService+0x14d
+00a5ecc0 77580c10 ntdll!ReportExceptionInternal+0xde
+00a5f118 7758085b ntdll!RtlReportExceptionEx+0x379
+00a5f170 775a74dc ntdll!RtlReportException+0x9b
+00a5f180 77541454 ntdll!TppRaiseInvalidParameter+0x51
+00a5f194 77540ddd ntdll!_EH4_CallFilterFunc+0x12
+00a5f1bc 77544d33 ntdll!_except_handler4_common+0x8d
+00a5f1dc 775508d2 ntdll!_except_handler4+0x20
+00a5f200 775508a4 ntdll!ExecuteHandler2+0x26
+00a5f2c8 7753f477 ntdll!ExecuteHandler+0x24
+00a5f2c8 775a74c2 ntdll!KiUserExceptionDispatcher+0xf
+00a5f660 7755ddb0 ntdll!TppRaiseInvalidParameter+0x37
+00a5f66c 774ecdd2 ntdll!TppTimerpValidateTimer+0x6e1a2
+00a5f690 757ddadb ntdll!TpSetTimerEx+0x1b
+00a5f6b8 757c646d WINHTTP!HTTP_THREAD_POOL::SetTimer+0x42
+00a5f6f0 757c6070 WINHTTP!WEB_SOCKET_HANDLE_OBJECT::Close+0x1bb
+00a5f754 69699832 WINHTTP!WinHttpWebSocketClose+0x9c
+...
+ global atexit call being made here
+...
+00a5f814 696d1f7d XXXXXX!_CRT_INIT+0xaa
+00a5f874 7753cd4e XXXXXX!__DllMainCRTStartup+0x1ee
+00a5f894 77505525 ntdll!LdrxCallInitRoutine+0x16
+00a5f8e4 775057cb ntdll!LdrpCallInitRoutine+0x43
+00a5f97c 77518e3f ntdll!LdrShutdownProcess+0x101
+00a5f990 77065736 ntdll!RtlExitUserProcess+0x63
+00a5f99c 77065471 msvcrt!__crtExitProcess+0x17
+00a5f9e0 77065715 msvcrt!doexit+0x10a
+00a5f9f4 00be2369 msvcrt!exit+0x11
+00a5fa2c 7752b2dd contoso!__wmainCRTStartup+0x114
+00a5fa70 7752b2a7 ntdll!__RtlUserThreadStart+0x2f
+00a5fa80 00000000 ntdll!_RtlUserThreadStart+0x1b
+</pre>
+<p>
+The customer concluded,
+"We have some ideas that may work around the issue by using
+<code>WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT</code>
+to avoid the close timeout,
+but we'd like confirmation as to whether this will actually solve the problem."
+</p>
+<p>
+Okay, first let's understand the problem, then we can look at possible solutions.
+</p>
+<p>
+The customer has a DLL with a global object,
+and
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20141017-00/?p=43823">
+as we learned some time ago</a>,
+global objects in DLLs are destructed as part of
+<code>DLL_PROCESS_DETACH</code>.
+The problem is that the thread pool has already shut down by the time this
+DLL gets around to destroying global objects.
+We know this because
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20070503-00/?p=27003">
+one of the first steps in process termination is terminating
+all but one of the threads</a>.
+A thread pool without any threads is not really a thread pool any more.
+</p>
+<p>
+At process termination, the thread pool is electrified.
+Any attempt to schedule new work on the thread pool will result
+in an immediate crash.
+In this case, the problem is that the customer's DLL is closing
+a WinHTTP WebSocket, and one of the things that WinHTTP does when
+it closes a WebSocket is to schedule a thread pool timer so it can
+abort the close handshake if it takes too long.
+</p>
+<p>
+Okay, so the chain of events goes like this:
+Thread pool gets electrified,
+then the DLL starts destructing its objects,
+and one of the objects tries to close a WebSocket,
+and closing the WebSocket creates a thread pool timer,
+but the thread pool is electrified, so the process crashes.
+</p>
+<p>
+Okay, now that we understand the problem, let's look for solutions.
+</p>
+<p>
+The customer's proposed workaround is to use
+<code>WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT</code>
+to set the timeout to <code>INFINITE</code>.
+This tells WinHTTP to let the close operation take as long as it wants,
+which means that it doesn't bother creating a thread pool timer
+to abort a close operation that is taking too long
+(because you said that there's no such thing as "too long").
+</p>
+<p>
+That solves the proximate problem, but really this is just
+playing whack-a-mole.
+You may be able to get rid of this crash caused by closing a
+WinHTTP WebSocket,
+but this may merely expose some other object that is also
+using the thread pool at destruction,
+and you're going to have to go through all this analysis again
+and look for a way to get that other object to avoid the thread
+pool at process termination.
+</p>
+<p>
+The best solution is to try to
+<a HREF="https://google.github.io/styleguide/cppguide.html#Static_and_Global_Variables">
+get rid of the global variables in the first place</a>.
+If you can't do that, then
+you at least want to avoid running the destructors at process
+termination.
+There are a few ways of accomplishing this:
+</p>
+<ul>
+<li>Clean up the global variables explicitly
+    prior to process termination.
+    The destructors will run at
+    <code>DLL_PROCESS_DETACH</code>,
+    but since you already released the resources,
+    the destructors won't do anything.</li>
+<li>Neuter the global variables in
+    <code>DLL_PROCESS_DETACH</code>
+    if the reason for the notification is that the
+    process is terminating.
+    That way, when their destructors run,
+    they won't do anything.</li>
+<li>A special case of the previous item is to set
+    a flag in
+    <code>DLL_PROCESS_DETACH</code>
+    if the reason for the notification is that the
+    process is terminating.
+    Have the destructors check the flag and do nothing
+    if the flag is set.</li>
+</ul>
+<p>
+The point is that you don't want to do any
+cleanup at process termination,
+because the process has already stopped providing
+services,
+and lots of things may be electrified.
+You just want to let the process terminate and stay
+out of its way.
+</p>
+<p>
+<b>Exercise</b>:
+By a startling coincidence, the day I wrote this blog entry,
+this question arrived from another customer.
+Use what you know to diagnose the customer's problem.
+(In particular, why is the problem sporadic?)
+</p>
+<blockquote CLASS="q">
+<p>
+We are using a C++ wrapper around Win32 timers.
+During object destruction, we deactivate the timer
+by following
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/ms686271(v=vs.85).aspx">
+the recommended pattern</a>:
+<code>::Set&shy;Threadpool&shy;Timer(this-&gt;GetHandle(), nullptr, 0, 0);</code>
+This works fine, but in some rare scenarios, we encounter this crash.
+</p>
+<pre>
+ntdll!ZwWaitForMultipleObjects+0xa
+ntdll!RtlReportExceptionEx+0x452
+ntdll!RtlReportException+0xbc
+ntdll!TppReportExceptionFilter+0x16
+ntdll!TppRaiseInvalidParameter$filt$0+0xe
+ntdll!__C_specific_handler+0x96
+ntdll!__GSHandlerCheck_SEH+0x76
+ntdll!RtlpExecuteHandlerForException+0xd
+ntdll!RtlDispatchException+0x197
+ntdll!RtlRaiseException+0x18d
+ntdll!TppRaiseInvalidParameter+0x48
+ntdll!TppTimerpValidateTimer+0x6eb93
+ntdll!TpSetTimerEx+0x33
+contoso!WinAPI::ThreadPool::Timer&lt;...&gt;::Reset+0x12
+contoso!WinAPI::ThreadPool::Timer&lt;...&gt;::{dtor}+0x12
+contoso!std::default_delete&lt;WinAPI::ThreadPool::Timer&lt;...&gt;&gt;::operator()+0x12
+contoso!std::unique_ptr&lt;WinAPI::ThreadPool::Timer&lt;...&gt;, ...&gt;::reset+0x23
+contoso!Contoso::SharedMemoryCache::~SharedMemoryCache+0x57
+contoso!Contoso::SharedMemoryCache::`scalar deleting destructor'+0x14
+contoso!std::_Ref_count_base::_Decref+0x17
+contoso!std::_Ptr_base&lt;...&gt;::_Decref+0x20
+contoso!std::shared_ptr&lt;...&gt;::{dtor}+0x20
+contoso!std::tuple&lt;...&gt;::~tuple&lt;...&gt;+0x49
+contoso!`dynamic atexit destructor for 'Extension::s_extension''+0x23
+ucrtbase!&lt;lambda_275893d493268fdec8709772e3fcec0e&gt;::operator()+0xb7
+ucrtbase!__crt_seh_guarded_call&lt;int&gt;::operator()&lt;...&gt;+0x3b
+ucrtbase!__acrt_lock_and_call+0x1e
+ucrtbase!_execute_onexit_table+0x31
+contoso!dllmain_crt_process_detach+0x4e
+contoso!dllmain_dispatch+0xd3
+ntdll!LdrpCallInitRoutine+0x4c
+ntdll!LdrShutdownProcess+0x142
+ntdll!RtlExitUserProcess+0x98
+kernel32!ExitProcessImplementation+0xa
+contososerver!ControlSignalHandler::HandleControlSignal+0x68
+KERNELBASE!CtrlRoutine+0xb3
+kernel32!BaseThreadInitThunk+0x22
+ntdll!RtlUserThreadStart+0x34
+</pre>
+<p>
+Any pointers would be appreciated.
+</p>
+</blockquote>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1282465">
+				<div id="div-comment-1282465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345#comment-1282465">
+			February 3, 2017 at 8:24 am</a>		</div>
+
+		<p>Well. you managed to pick a case where it doesn&#8217;t matter, but in general closing sockets from DLL_PROCESS_DETACH is a lot better than letting them fall off the process because this generates a graceful shutdown the other side can decide was graceful. In particular, this causes the reader on the other side to get EOF rather than an error condition on read and so know it reached the end and handle likewise.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1282535">
+				<div id="div-comment-1282535" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345#comment-1282535">
+			February 3, 2017 at 11:16 am</a>		</div>
+
+		<p>Network considerations require the other side to handle an error condition gracefully.  The network can go down at any time.  Ergo, it should be reasonably safe (if perhaps a bit impolite) to let the OS close the connection.</p>
+<p>You should probably also have an explicit in-band indication that the connection is about to close (e.g. the Connection header in HTTP).  That way, you don&#8217;t need to depend on the TCP FIN handshake.  But, fundamentally, if the other side is no longer talking to you, there&#8217;s little you can do about it, other than trying to reconnect or going away and finding someone else to talk to.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1282545">
+				<div id="div-comment-1282545" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345#comment-1282545">
+			February 3, 2017 at 1:45 pm</a>		</div>
+
+		<p>Handle error condition gracefully != never have a success condition.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1282525">
+				<div id="div-comment-1282525" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alois Kraus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345#comment-1282525">
+			February 3, 2017 at 10:59 am</a>		</div>
+
+		<p>I guess the customer is not always keeping correctly track of its shared_ptr which on exit may or may not trigger the dtor of the SharedMemoryCache. Another cause might be that the Extension::s_extension is not always loaded but only under specific circumstances which might also be the cause for sporadic crashes in specific process environments.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1282627">
+				<div id="div-comment-1282627" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Haim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345#comment-1282627">
+			February 5, 2017 at 12:00 am</a>		</div>
+
+		<p>Speaking about winhttp and thread pool, why winhttp&#8217;s thread pool opens so many threads for asynchronous requests? I remember when I tried to make about 10,000 asynchronous connection, the thread pool hit the worker count limit (512), and the application pretty much froze down. No matter how much i&#8217;ve tried to optimize the code, it appeared that winhttp didn&#8217;t really think it over before asking new thread from the threadpool. </p>
+<p>Libcurl in this case was magnitude better, and using the &#8220;multi&#8221; interface with just on thread I was able to receive the entire responses without having any of them freeze or die in the middle.</p>
+<p>I would definitely want a winhttp internals guide.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-davebacher odd alt thread-odd thread-alt depth-1" id="comment-1283295">
+				<div id="div-comment-1283295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dave+Bacher' rel='external nofollow' class='url'>Dave Bacher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170203-00/?p=95345#comment-1283295">
+			February 7, 2017 at 10:00 am</a>		</div>
+
+		<p>There&#8217;s some program &#8212; contososerver.  It has loaded an Extension named contoso, which has some tuple based cache.  Some of the tuples reference the same SharedMemoryCache object, and when the last reference goes stale, it is releasing the SharedMemoryCache.  That uses a ThreadPool that is also a static / global object.  The ThreadPool has already been reclaimed by the C runtime.</p>
+<p>Since you can&#8217;t really determine the order here, barring whatever interface contososerver is using to talk to contoso having some explicit destroy call, your best bet may be to actually handle this exception.  Ideally, if you control both (the names imply that), you&#8217;d want to have your extension interface perform the cleanup after WM_CLOSE but before WM_DESTROY (so likely the WM_CLOSE handler after you&#8217;ve made the determination you&#8217;re not going to veto), so that you have a working message pump if your extension or a dependency needs it.</p>
+<p>At any rate, waiting until detach would generally be the wrong thing.  In this specific case, if you didn&#8217;t control the interface (but it looks like they did), it would probably be OK to catch the exception, ignore it and continue.  Probably.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

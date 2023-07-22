@@ -1,0 +1,266 @@
+<html>
+<head>
+<title>We've traced the pipe, and it's coming from inside the process!</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>We&#8217;ve traced the pipe, and it&#8217;s coming from inside the process!</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 8, 2011 / year-entry #165</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110708-00/?p=10203</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">We saw last time one of the deadlocks you can run into when playing with pipes. Today we'll look at another one: Our program runs a helper process with stdin/stdout/stderr redirected. The helper process takes input via stdin and prints the result to stdout. Sometimes we find that the Write­File from the controlling process into...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/07/07/10183884.aspx">
+We saw last time</a>
+one of the deadlocks you can run into when playing with pipes.
+Today we'll look at another one:
+</p>
+<blockquote CLASS=q><p>
+Our program runs a helper process with stdin/stdout/stderr redirected.
+The helper process takes input via stdin and prints the result
+to stdout.
+Sometimes we find that the <code>Write&shy;File</code> from the controlling
+process into the stdin pipe hangs.
+Closer examination reveals that the helper process no longer exists.
+Under these conditions, should the <code>Write&shy;File</code> fail,
+since the reader is no longer available?
+</p>
+</blockquote>
+<p>
+If you attempt to write to a pipe when 
+there is nobody around to
+call <code>Read&shy;File</code> to read the data out the other end,
+the call to <code>Write&shy;File</code> should fail with the error
+<code>ERROR_<wbr>BROKEN_<wbr>PIPE</code>
+(known in Unix-land as <code>EPIPE</code>).
+What does it mean when the write pends?
+It means that there is still somebody around who can read the data
+out of the pipe,
+but the internal pipe buffer is full,
+so the write call waits for the reader to drain the data.
+</p>
+<p>
+But the helper process no longer exists.
+Maybe it crashed or exited prematurely.
+That means that there is nobody around to read the data out of the pipe.
+Why, then, does the call not return immediately with an error?
+</p>
+<p>
+Because there is still somebody around to read the data out of the pipe.
+</p>
+<blockquote CLASS=m><p>
+Did you remember to close the controlling process's copy of the read
+end of the pipe?
+</p>
+</blockquote>
+<p>
+If the controlling process hasn't closed its copy of the read end
+of the pipe, then the pipe is correct in believing that there is
+still somebody around to read the data out of the pipe,
+namely <i>you</i>.
+You have a handle to the read end of the pipe,
+so the pipe manager cannot declare the pipe dead;
+for all it knows,
+you intended for the controlling process to call
+<code>Read&shy;File</code> to read the data out of the pipe.
+As far as the pipe is concerned,
+you simply haven't gotten around to it yet,
+so the pipe waits patiently.
+</p>
+<blockquote CLASS=q>
+<p>
+Yes, our code calls <code>Close&shy;Handle</code> on the controlling
+process's copy of the pipe handles.
+I've highlighted it below.
+(Error checking has been elided for simplicity.)
+</p>
+<pre>
+// create the pipe for stdout/stderr
+CreatePipe(&amp;hReadPipeTmp, &amp;hWritePipeTmp, NULL, 0);
+
+// duplicate the handles with bInheritHandle=FALSE to prevent
+// them from being inherited
+DuplicateHandle(GetCurrentProcess(), hWritePipeTmp,
+                GetCurrentProcess(), &amp;hWritePipe,
+                0, FALSE, DUPLICATE_SAME_ACCESS);
+DuplicateHandle(GetCurrentProcess(), hReadPipeTmp,
+                GetCurrentProcess(), &amp;hReadPipe,
+                0, FALSE, DUPLICATE_SAME_ACCESS);
+
+// create the pipe for stdin
+CreatePipe(&amp;hHelperReadPipe, &amp;hHelperWritePipe,
+           NULL, 0);
+
+// disable inheritance on on the write end of the stdin pipe
+SetHandleInformation(hHelperWritePipe, HANDLE_FLAG_INHERIT, 0);
+
+// prepare to create the process
+... blah blah blah other stuff unrelated to handles ...
+startupInfo.hStdInput = hHelperReadPipe;
+startupInfo.hStdOutput = hWritePipeTmp;
+startupInfo.hStdError = hWritePipeTmp;
+
+CreateProcess(...);
+
+// Here is where we close the handles
+<font COLOR=blue>CloseHandle(hReadPipeTmp);
+CloseHandle(hWritePipeTmp);</font>
+
+// Write the input to the helper process (hangs here sometimes)
+WriteFile(hHelperWritePipe, ...);
+</pre>
+</blockquote>
+<p>
+This is another case of
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/10/14/9906906.aspx">
+getting so excited about doing something
+that you forget to do it</a>.
+(Notice how the comments to that article very quickly descend
+into a discussion of command line quotation marks.)
+</p>
+<p>
+Observe that the handles being closed are <code>hRead&shy;Pipe&shy;Tmp</code>
+and <code>hWrite&shy;Pipe&shy;Tmp</code>, which is a good thing to do,
+but neither has any effect on the
+<code>Write&shy;File</code>.
+The <code>Write&shy;File</code> is writing to
+<code>hHelper&shy;Write&shy;Pipe</code>
+and therefore the handle you need to close is
+<code>hHelper&shy;Read&shy;Pipe</code>.
+Since that handle is still open in the controlling process,
+the pipe manager will not break the pipe,
+because it's waiting for you to read from it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-923533">
+				<div id="div-comment-923533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110708-00/?p=10203#comment-923533">
+			July 8, 2011 at 8:09 am</a>		</div>
+
+		<p>Why are they duplicating the handles? &nbsp;The docs for CreatePipe say that the handle (it should say handles, but I assume that&#39;s a typo) which it returns cannot be inherited when NULL is passed for the security attributes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-923553">
+				<div id="div-comment-923553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110708-00/?p=10203#comment-923553">
+			July 8, 2011 at 11:06 am</a>		</div>
+
+		<p>They are duplicating the handles so as to set the security attributes on the duplicated copy so it can be inherited.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-joshuaganes even thread-even depth-1" id="comment-923593">
+				<div id="div-comment-923593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Joshua+Ganes' rel='external nofollow' class='url'>Joshua Ganes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110708-00/?p=10203#comment-923593">
+			July 8, 2011 at 12:23 pm</a>		</div>
+
+		<p>Ahh&#8230; process spawning and duplicate pipe handles. Those will throw a monkey wrench in your gears. Actually, the analogy is pretty close. The whole thing locks up if you&#39;re not careful about the way you do it. The worst case of this is when you have a rare error case that triggers the lock. The application can run for days before a sudden, seemingly unexplained error grinds it to a halt.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-923603">
+				<div id="div-comment-923603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henning Makholm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110708-00/?p=10203#comment-923603">
+			July 8, 2011 at 2:45 pm</a>		</div>
+
+		<p>Unless I&#39;m misreading something, they&#39;re missing the point even worse than what Adam and Joshua noticed. It looks like the duplicated handles in hWritePipe is never used for anything. It is probably not even closed, meaning that we also get a handle leak going in the other direction.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-923563">
+				<div id="div-comment-923563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110708-00/?p=10203#comment-923563">
+			July 8, 2011 at 11:31 am</a>		</div>
+
+		<p>@Joshua: Huh? &nbsp;The comment before the calls to DuplicateHandle explicitly says that it wants to *prevent* the handles from being inherited, which is pointless if the handles are already non-inheritable. &nbsp;Likewise, the subsequent call to SetHandleInformation to disable inheritance on the stdin pipe is also pointless.</p>
+<p>Why not just call CreatePipe twice (once for the stdin pipe, once for the stdout/stderr pipe), CreateProcess, and then CloseHandle on the read end of the stdin pipe and on the write end of the stdout/stderr pipe?</p>
+<div class="post">[<i>You&#39;re asking how come code that misses the point misses the point worse? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

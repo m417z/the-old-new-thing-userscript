@@ -1,0 +1,300 @@
+<html>
+<head>
+<title>Why does Clipboard.SetData put extra junk in the clipboard data? And how can I get it to stop?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does Clipboard.SetData put extra junk in the clipboard data? And how can I get it to stop?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 30, 2018 / year-entry #271</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20181130-00/?p=100365</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Strings and things, but you need the things.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One of the ways of putting data on the clipboard is with the
+<code>System.<code></code>Windows.<code></code>Forms.<code></code>Clipboard</code>
+object.
+There are methods for putting text on the clipboard in one of
+a few
+<a HREF="https://docs.microsoft.com/en-us/dotnet/api/system.windows.textdataformat">
+the standard text formats</a>.
+And if you use the
+<a HREF="https://msdn.microsoft.com/en-us/library/system.windows.forms.clipboard.setdata(v=vs.110).aspx">
+<code>Clipboard.<code></code>Set&shy;Data</code> method</a>,
+you can place data on the clipboard with a custom format name.
+But when you use
+<code>Clipboard.<code></code>Set&shy;Data</code> to put text
+on the clipboard,
+the actual raw data on the clipboard contains extra stuff.
+</p>
+<pre>
+Clipboard.SetData("customText", "Hello, world!");
+</pre>
+<p>
+The actual raw bytes on the clipboard are
+</p>
+<pre>
+96 A7 9E FD 13 3B 70 43 A6 79 56 10 6B B2 88 FB
+00 01 00 00 00 FF FF FF FF 01 00 00 00 00 00 00
+00 06 01 00 00 00 0D <u>48 65 6C 6C 6F 2C 20 77 6F
+72 6C 64 21</u> 0B
+</pre>
+<p>
+The underlined bytes are the ASCII string
+<tt>Hello, world!</tt>,
+but what's the other junk?
+</p>
+<p>
+The <code>Clipboard.<code></code>Set&shy;Data</code> method
+must serve two masters.
+One master is the Windows clipboard.
+Custom formats on the Windows clipboard are just binary
+blobs of data with no externally-imposed format.
+Any format for the data is by mutual agreement of the
+two parties using that custom format.
+</p>
+<p>
+The other master is the CLR.
+If a C# program puts a serializable object on the clipboard,
+then it should be able to read it back as an object.
+</p>
+<p>
+The <code>Clipboard.<code></code>Set&shy;Data</code> method
+takes two parameters.
+The first, a string, is the custom clipboard format name.
+The second, an object, is the object to put on the clipboard.
+</p>
+<p>
+When putting an object on the clipboard, the CLR uses a
+<code>Binary&shy;Formatter</code> to
+<a HREF="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs#97ce7cbce10929cb">
+serialize the object to a binary blob</a>,
+and puts that binary blob on the clipboard.
+When reading an object from the clipboard, takes the
+binary blob from the clipboard and uses a
+<code>Binary&shy;Formatter</code> to
+<a HREF="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs#e947b692ecde8c3b">
+deserialize the object back into a CLR object</a>.
+</p>
+<p>
+Okay, so that keeps the second master happy.
+But what about the first master?
+Suppose the native clipboard has some arbitrary binary blob.
+How do we recognize that it is an arbitrary binary blob,
+rather than a serialized CLR object?
+Because if we try to deserialize it as a CLR object,
+we'll get garbage.
+</p>
+<p>
+The answer is that the clipboard puts
+<a HREF="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs#8c51bc95917bf024">
+a secret signal</a>
+<a HREF="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs#f13ace5762df124c">
+at the start of the binary blob</a>.
+<a HREF="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs#8788128edebb76a9">
+If the secret signal is present</a>,
+then it assumes that the
+data represents a binary-formatted serialized CLR object.
+Otherwise, it assumes the data represents an arbitrary binary blob.
+</p>
+<p>
+When you read data from the clipboard, and it turns out to be an
+arbitrary binary blob,
+the <code>Clipboard.<code></code>Get&shy;Data</code> method returns
+a <code>Stream</code> containing the raw binary blob.
+</p>
+<p>
+Conversely, if you want to write a raw binary blob,
+you can
+<a HREF="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs#aaeb640db20235c3">
+pass
+a <code>Stream</code></a>
+to the
+the <code>Clipboard.<code></code>Set&shy;Data</code> method.
+</p>
+<p>
+Okay, so now
+with some help from
+<a HREF="https://msdn.microsoft.com/en-us/library/cc236844.aspx">
+[MS-NRBF]: .NET Remoting: Binary Format Data Structure</a>.
+we can parse the raw bytes:
+</p>
+<pre>
+magic prefix:
+    96 A7 9E FD 13 3B 70 43 A6 79 56 10 6B B2 88 FB
+
+SerializationHeaderRecord
+    RecordTypeEnum: 00
+    RootId: 01 00 00 00
+    HeaderId: FF FF FF FF
+    MajorVersion: 01 00 00 00
+    MinorVersion: 00 00 00 00
+
+RecordTypeEnum: 06 (<a HREF="https://referencesource.microsoft.com/#mscorlib/system/runtime/serialization/formatters/binary/binaryenums.cs#ed6b5341ded111db">BinaryObjectString</a>)
+ObjectId: 01 00 00 00
+Length: 0D
+UTF-8 data: 48 65 6C 6C 6F 2C 20 77 6F 72 6C 64 21
+
+End of serialization: 0B
+</pre>
+<p>
+And to wrap things up, a table,
+because people like tables.
+</p>
+<table BORDER=1 CLASS="cp3" CELLPADDING=3 CELLSPACING=0
+    STYLE="border-collapse: collapse">
+<tr>
+<th ROWSPAN=2>Operation with<br>custom format</th>
+<th COLSPAN=2>Format</th>
+</tr>
+<tr>
+<th>Raw binary data</th>
+<th>CLR binary serialized data</th>
+</tr>
+<tr>
+<td><code>SetData</code></td>
+<td>Pass <code>Stream</code></td>
+<td>Pass anything except <code>Stream</code></td>
+</tr>
+<tr>
+<td><code>GetData</code></td>
+<td>Returns <code>Stream</code></td>
+<td>Returns anything except <code>Stream</code></td>
+</tr>
+</table>
+<p>
+That wraps up CLR week for this year.
+The good news is that you made it almost all the way to the end
+of the year before I inflicted it upon you.
+The bad news is that the new year is coming up soon,
+so the threat of another CLR week returns more quickly.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-davebacher even thread-even depth-1" id="comment-1372015">
+				<div id="div-comment-1372015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dave+Bacher' rel='external nofollow' class='url'>Dave Bacher</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181130-00/?p=100365#comment-1372015">
+			November 30, 2018 at 11:56 am</a>		</div>
+
+		<p>It doesn&#8217;t appear DataObject / GetDataObject / SetDataObject have this same behavior?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aadsso-1live-com00034001d01cd865 odd alt thread-odd thread-alt depth-1" id="comment-1372025">
+				<div id="div-comment-1372025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Neil+Rashbrook+%28Copy+1%29' rel='external nofollow' class='url'>Neil Rashbrook (Copy 1)</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181130-00/?p=100365#comment-1372025">
+			December 1, 2018 at 3:23 am</a>		</div>
+
+		<p>Why overload the single API with this behaviour of whether the object is a stream rather than provide two APIs which make it clear whether you&#8217;re dealing with raw or serialised data?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1372035">
+				<div id="div-comment-1372035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181130-00/?p=100365#comment-1372035">
+			December 1, 2018 at 4:57 am</a>		</div>
+
+		(The content was deleted per user request)
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-msn odd alt thread-odd thread-alt depth-1" id="comment-1372045">
+				<div id="div-comment-1372045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/poizan42' rel='external nofollow' class='url'>poizan42</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181130-00/?p=100365#comment-1372045">
+			December 1, 2018 at 4:59 am</a>		</div>
+
+		<p>The magic prefix is ofc. declared as the guid {FD9EA796-3B13-4370-A679-56106BB288FB}: <a href="https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs,68" rel="nofollow">https://referencesource.microsoft.com/#System.Windows.Forms/winforms/Managed/System/WinForms/DataObject.cs,68</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-brantgurga even thread-even depth-1" id="comment-1372055">
+				<div id="div-comment-1372055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brant+Gurganus' rel='external nofollow' class='url'>Brant Gurganus</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181130-00/?p=100365#comment-1372055">
+			December 1, 2018 at 7:52 am</a>		</div>
+
+		<p>I used to have experiences on Windows Phone where I&#8217;d use one program to programmatically set clipboard contents (a password manager) and paste into another program. Some apps pasted fine as expected. Others pasted the correct text plus gibberish. I wonder if this was related to the underlying cause. As I recall, the apps where it pasted okay were native apps but the apps where it pasted bad were Silverlight apps. If I showed password though and manually copied and pasted instead of having the program programmatically set the clipboard, the issue didn&#8217;t occur.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

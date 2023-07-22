@@ -1,0 +1,738 @@
+<html>
+<head>
+<title>The MIPS R4000, part 11: More on branch delay slots</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The MIPS R4000, part 11: More on branch delay slots</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 16, 2018 / year-entry #88</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>11</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">I guess this really confuses people.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+There seems to be a lot of confusion over branch delay slots.
+Instead of addressing each comment, I'll just make a post out of it.
+</p>
+<p>
+The branch delay slot is a dynamic concept.
+An instruction is in a branch's delay slot if
+the runtime-determined
+previously-executed instruction was a branch,
+regardless of whether the branch was taken.&sup1;
+</ul>
+<p>
+In casual conversation,
+however,
+we tend to talk about "is in a branch delay slot"
+as a static concept:
+Would the instruction be in a branch delay slot under
+the expected sequence of execution?
+</p>
+<p>
+Let's look at
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180412-00/?p=98495">
+our first example</a> again:
+</p>
+<pre>
+    B       somewhere           ; unconditional branch
+label:
+    OR      v0, zero, zero      ; v0 = 0
+</pre>
+<p>
+Is the <code>OR</code> instruction in a branch delay slot?
+</p>
+<p>
+It depends.
+</p>
+<p>
+Here's one possibility:
+</p>
+<pre>
+    ;   execution starts here
+    ADDIU   a0, zero, 4         ; a0 = 4
+    B       somewhere           ; unconditional branch
+label:
+    OR      v0, zero, zero      ; v0 = 0
+</pre>
+<p>
+Executing the <code>B</code> instruction
+puts the
+<code>OR</code> instruction is in its branch delay slot.
+</p>
+<p>
+Here's another possibility:
+</p>
+<pre>
+    ;   execution starts here
+    J       label               ; unconditional branch
+    NOP
+
+    B       somewhere           ; unconditional branch
+label:
+    OR      v0, zero, zero      ; v0 = 0
+</pre>
+<p>
+In this case, the <code>B</code> never executed.
+Therefore the <code>OR</code> is not in the branch delay slot
+of the <code>B</code>.
+It is also not in the branch delay slot of the <code>J</code>,
+because the previously executed instruction was the <code>NOP</code>
+(which was itself in the branch delay slot of the <code>J</code>).
+</p>
+<p>
+This means that it is technically legal to write two branch instructions
+back to back,
+provided the first branch is never executed.
+</p>
+<pre>
+    J       somewhere
+label:
+    J       somewhere_else
+    NOP
+</pre>
+<p>
+If execution of the first <code>J</code> never occurs,
+then there is no violation of the "you cannot put a branch
+instruction in a branch delay slot" rule,
+because the second <code>J</code> is never in a branch delay slot.
+</p>
+<p>
+If you think about it, this is how branch delay slots have to be defined
+in order to make programming tractable and to avoid the processor
+making spurious memory accesses just to detect whether it's in a branch
+delay slot.
+</p>
+<p>
+Suppose a branch delay slot had been defined as "An instruction which
+has a branch instruction four bytes earlier in memory
+(whether or not that branch instruction
+was executed)";
+let's call this an <i>alternate-universe branch delay slot</i>.
+You could never start a basic block with a branch
+instruction,
+because you don't know what four bytes will come before it in memory.
+There might be data embedded in the code segment,
+and the last piece of data might just by pure chance happen to
+decode as a branch instruction.
+</p>
+<pre>
+lookup_table:
+    .word   1, 3, 5, 7, 2, 4, 6, 8
+
+trampoline:
+    J       actual_destination
+    NOP
+</pre>
+<p>
+It so happens that the integer 8 is the encoding of the
+<code>JR zero</code> instruction, which is a branch instruction.
+(Not a very useful branch instruction, but the processor doesn't
+care about whether your code is useful.)
+If somebody jumps to the trampoline,
+it will so happen that the four bytes preceding the
+<code>J</code> instruction
+form another jump instruction,
+which would be a violation of the rule that you cannot put
+a branch instruction in an alternate-universe branch delay slot.
+The compiler would have to insert a <code>NOP</code>
+at the start of every trampoline
+to ensure that the <code>J</code> does not lie
+in an alternate-universe branch delay slot.
+</p>
+<p>
+Furthermore, it means that after every branch instruction,
+the processor would have to fetch <i>two</i> instructions from
+memory, one for the instruction being executed,
+and the other (four bytes earlier) to determine whether the
+instruction is in an
+alternate-universe branch delay slot.
+</p>
+<p>
+And if the previous four bytes are
+(heaven forfend)
+on a not-present page,
+the processor would have to raise a page fault
+in order to get the operating system to cough up those four
+preceding bytes.
+(And if the previous page were invalid, then um I don't know
+what you would have to do.)
+</p>
+<p>
+Thankfully, that's not how the rule is written.
+Branch delay slots are determined at run time based on instructions
+actually executed.
+</p>
+<p>
+Okay, so what happens if you put a branch in a branch delay slot?
+</p>
+<p>
+First of all, the primary purpose of this series is to help
+you debug user-mode MIPS assembly code,
+and since no well-formed MIPS assembly code would put a branch
+in a branch delay slot,
+this is not something you would ever encounter when debugging,
+so the question is technically out of scope.
+</p>
+<p>
+But let's try to answer it anyway.
+</p>
+<p>
+The processor architecture officially says that the result of
+putting a branch in a branch delay slot is <b>UNPREDICTABLE</b>,
+which is a technical term that means, basically,
+"Anything can happen, but limited to things that the code
+could already do at its current privilege level."
+So it might scramble all your registers to nonsense values,
+or fill them with the contents of randomly-selected memory addresses,
+provided your privilege level has access to that memory.
+It could jump to an arbitrary location.
+It could raise an exception.
+But it cannot, say, cause user-mode code to
+load data from kernel-only memory space,
+or hang the processor.
+</p>
+<p>
+So the answer to "What happens?" is "I can't answer that
+because it's not defined."
+</p>
+<p>
+But let's try to answer it anyway.
+</p>
+<p>
+On some versions of the MIPS processor, it will raise an
+invalid instruction exception.
+</p>
+<p>
+On other versions of the MIPS processor, it will
+try to execute the branch anyway.
+</p>
+<p>
+So let's pick a specific processor that tries to execute the branch,
+say one of the original MIPS processors with a two-stage pipeline.
+</p>
+<p>
+You can model the processor like this:
+</p>
+<pre>
+int program_counter;
+bool in_branch_delay_slot;
+std::array&lt;pipeline, 2&gt; unit;
+
+while (true) {
+ // Fetch and decode the next instruction.
+ unit[0].fetch_instruction(program_counter);
+
+ program_counter += 4;
+
+ // Execute the previous instruction.
+ if (unit[1].is_branch_instruction()) {
+   program_counter = unit[1].calculate_branch_target();
+ } else {
+   ... handle other types of instructions ...
+ }
+
+ // Remember whether the previous instruction was a branch.
+ in_branch_delay_slot = unit[1].is_branch_instruction();
+
+ // Advance the pipeline
+ std::rotate(unit.first(), unit.last() - 1, unit.last());
+}
+</pre>
+<p>
+In reality, the "Fetch and decode" and the
+"Execute the instruction" steps occur in parallel,
+but we do it sequentially here for expository purposes.
+</p>
+<p>
+Let's step through a normal code sequence that involves
+a branch instruction:
+</p>
+<pre>
+10000000:   B   10000020
+10000004:   LW  v0, 80(t0)
+
+10000020:   ADD v0, v1, v0
+</pre>
+<p>
+We start with <code>program_</code><code>counter = 10000000</code>.
+</p>
+<p>
+We fetch the branch instruction into unit zero,
+advance the instruction pointer to <code>10000004</code>,
+and then finish whatever the previous instruction was.
+Assume that the previous instruction was not a branch instruction,
+so
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+is false.
+Finally, we advance the pipeline, so that the work that
+was previously in unit zero will continue in unit one.
+(That's not really how processors work, but this is a model,
+not the real thing.)
+</p>
+<p>
+At the next cycle, <code>program_</code><code>counter = 10000004</code>.
+</p>
+<p>
+We fetch the <code>LW</code> instruction into unit zero,
+advance the instruction pointer to <code>10000008</code>,
+and then execute the branch instruction in unit one, which means
+that the <code>program_</code><code>counter</code> is changed to
+<code>10000020</code> and
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+is now true.
+That's the end of this cycle, so we advance the pipeline again.
+</p>
+<p>
+At the next cycle, <code>program_</code><code>counter = 10000020</code>.
+</p>
+<p>
+We fetch the <code>ADD</code> instruction into unit zero,
+advance the instruction pointer to <code>10000024</code>,
+and then execute the <code>LW</code> instruction in unit one
+to load some memory into a register.
+This was not a branch instruction, so
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+is now false.
+And then we advance the pipeline.
+</p>
+<p>
+This shows more concretely why the processor has a branch delay slot:
+The instruction after the branch is already in the pipeline,
+so it will finish executing.
+The branch controls what enters the pipeline <i>next</i>.
+Since we have a two-stage pipeline,
+that means that the effect of the branch isn't visible until
+two instructions later.
+</p>
+<p>
+Suppose there is an exception at the <code>LW</code>,
+say,
+because the page was not present.
+</p>
+<p>
+When an exception occurs, the processor captures the address
+of the faulting instruction into a special control
+register called
+<var>EPC</var> (Exception Program Counter),
+and the value of
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+is captured into a special
+control flag called <var>BD</var> (Branch Delay).
+The kernel trap handler copies the values out of these
+control registers so it can resume execution after handling
+the exception.
+</p>
+<p>
+In our case, the kernel receives a TLB Invalid exception
+to say "Hey, somebody tried to access invalid memory."
+The processor is kind enough to provide the address that
+was invalid (in this case <code>80 + t0</code>)
+so the kernel doesn't have to try to parse the faulting instruction
+to figure out the address.
+</p>
+<p>
+The kernel does whatever it needs to do to make the memory present,
+updates the TLB,
+and then it's ready to resume execution.
+</p>
+<p>
+The processor helps you out a little here:
+It does the work of
+backing up the instruction pointer by four bytes if the
+<var>BD</var> flag is set.&sup2;
+In other words,
+if the faulting instruction was in a branch delay slot,
+then the value in <var>EPC</var> is the address of the faulting
+instruction <i>minus four</i>.
+</p>
+<p>
+To resume execution after handling the exception,
+the kernel just needs to restore
+the processor registers, and then jump to <var>EPC</var>.
+</p>
+<p>
+In our case,
+it means that when the exception is raised at the <code>LW</code>,
+the captured values are
+<var>BD</var> = true,
+<var>EPC</var> = <code>10000004 - 4 = 10000000</code>.
+</p>
+<p>
+Okay, so now let's do something crazy:
+Let's put a branch instruction in a branch delay slot.
+</p>
+<pre>
+20000000:   B   20000020
+20000004:   B   20000040
+
+20000020:   LW  v0, 80(t0)
+
+20000040:   ADD v0, v1, v0
+</pre>
+<p>
+We start with <code>program_</code><code>counter = 20000000</code>.
+</p>
+<p>
+We fetch the first branch instruction into unit zero,
+advance the instruction pointer to <code>20000004</code>,
+and then finish whatever the previous instruction was.
+That's the end of this cycle, so we advance the pipeline.
+</p>
+<p>
+At the next cycle, <code>program_</code><code>counter = 20000004</code>.
+</p>
+<p>
+We fetch the second branch instruction into unit zero,
+advance the instruction pointer to <code>20000008</code>,
+and then execute the first branch instruction in unit one, which means
+that the <code>program_</code><code>counter</code> is changed to
+<code>20000020</code>, and
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+is now true.
+That's the end of this cycle, so we advance the pipeline again.
+</p>
+<p>
+At the next cycle, <code>program_</code><code>counter = 20000020</code>.
+</p>
+<p>
+We fetch the <code>LW</code> instruction into unit zero,
+advance the instruction pointer to <code>20000024</code>,
+and then execute the second branch instruction in unit one, which means
+that the <code>program_</code><code>counter</code> is changed to
+<code>20000040</code>,
+and
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+is still true.
+That's the end of this cycle, so we advance the pipeline again.
+</p>
+<p>
+At the next cycle, <code>program_</code><code>counter = 20000040</code>.
+</p>
+<p>
+We fetch the <code>ADD</code> instruction into unit zero,
+advance the instruction pointer to <code>20000044</code>,
+and then execute the <code>LW</code> instruction in unit one.
+Oh no, this instruction takes a page fault!
+</p>
+<p>
+The processor captures the current value of the
+<code>in_</code><code>branch_</code><code>delay_</code><code>slot</code>
+flag (true)
+into the <var>BD</var> special control register,
+and it captures the address of the faulting instruction
+(<code>20000020</code>)
+into the <var>EPC</var> special control register,
+And since the <var>BD</var> flag is set, the processor
+subtracts four from <code>20000020</code>, leaving
+<code>2000001C</code>.
+</p>
+<p>
+The kernel processes the page fault by paging in the
+necessary data, and then it resumes execution at
+<var>EPC</var>,
+which is <code>2000001C</code>.
+It's resuming execution at an instruction that wasn't part
+of the original instruction stream!
+</p>
+<p>
+So that's one possible result of putting a branch instruction
+in a branch delay slot:
+From the user-mode code's point of view, the CPU lost its mind
+and jumped to the wrong address.
+</p>
+<p>
+I reiterate that this is just one possible result.
+The result of putting a branch instruction in a branch delay slot
+is architecturally
+<b>UNPREDICTABLE</b>,
+so what actually happens is anybody's guess.&sup3;
+</p>
+<p>
+Next question: What happens if you jump into your own branch delay slot?
+</p>
+<p>
+The instruction in the branch delay slot executes twice.
+It executes once because it's in the branch delay slot.
+It executes again because it's the destination of the branch.
+</p>
+<p>
+One final note is the case of emulated instructions.
+For example, maybe it was a misaligned memory access,
+or it was a floating point operation on a system with no
+floating point coprocessor.
+In the cases of emulation,
+the kernel wants to step over the emulated instruction and
+resume execution at the next instruction.
+But what if the emulated instruction was in a branch delay slot?
+</p>
+<p>
+The kernel detects that it is in the ugly case by observing that
+the <var>BD</var> flag is set.
+In that case, the kernel must back up and emulate the branch
+instruction, too!
+The kernel determines whether the branch was taken or not-taken
+by inspecting the instruction opcode and the contents of the
+relevant registers,
+and it resumes execution at the appropriate instruction:
+Either the branch target if the branch was taken,
+or the instruction after the delay slot if the branch was not taken.
+As we noted earlier,
+the processor already updated the return address register if applicable,
+so at least
+the kernel doesn't need to emulate that part of the instruction.
+</p>
+<p>
+&sup1;
+Note that the SPIM emulator gets this wrong.
+It
+<a HREF="https://sourceforge.net/p/spimsimulator/code/HEAD/tree/CPU/run.cpp#l107">
+sets the <code>running_in_delay_slot</code> variable to <code>1</code>
+only for taken branches</a>.
+</p>
+<p>
+&sup2;
+The flip side of this behavior is that
+if you want to identify the faulting
+instruction, you have to add four to <var>EPC</var> if the
+<var>BD</var> flag is set.
+</p>
+<p>
+&sup3;
+Indeed, the SPIM emulator does a third thing:
+It executes the instruction that comes sequentially
+after the second branch instruction,
+and then continues execution at
+the destination of the first jump instruction.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (11)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1333185">
+				<div id="div-comment-1333185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephen Oberholtzer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333185">
+			April 16, 2018 at 9:08 am</a>		</div>
+
+		<p>What happens if the delay slot is on the next page, and that page is non-resident?  Does that actually stall the execution of the branch itself?</p>
+<p>This carries with it a very interesting implication: It would be critical to ensure that the OS&#8217;s resident-page eviction code *never* has a situation where it consistently evicts the most recently-loaded page. That could cause an infinite loop (kernel swaps out branch instruction to swap in delay slot; has CPU resume execution at branch instruction which swaps out delay slot and swaps in branch instruction&#8230;)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1333195">
+				<div id="div-comment-1333195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333195">
+			April 16, 2018 at 9:38 am</a>		</div>
+
+		<p>The page fault on the fetch of the instruction in the delay slot triggers the exception, and it will be marked as an exception in a branch delay slot, so the kernel will back up four bytes on resume. You therefore must be able to keep at least three pages present (instruction, delay slot, and memory accessed by delay slot).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1333205">
+				<div id="div-comment-1333205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333205">
+			April 16, 2018 at 2:21 pm</a>		</div>
+
+		<p>&gt; The instruction in the branch delay slot executes twice. It executes once because it&#8217;s in the branch delay slot. It executes again because it&#8217;s the destination of the branch.</p>
+<p>This feels like the sort of ridiculous but useful property that a sufficiently clever compiler might use to e.g. partially unroll a very tight loop.  I imagine it&#8217;s hard enough to get right and niche enough that the Microsoft compiler did not bother, though.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1333215">
+				<div id="div-comment-1333215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333215">
+			April 16, 2018 at 2:48 pm</a>		</div>
+
+		<p>It has the downside of putting an instruction in two basic blocks, which reduces the effectiveness of PGO since the two blocks cannot be separated. (Well, you could, but you&#8217;d have to teach PGO about these weird things called branch delay slots.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1333225">
+				<div id="div-comment-1333225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333225">
+			April 16, 2018 at 5:22 pm</a>		</div>
+
+		<p>I&#8217;m in luck then. I use mass optimize for size as code not loaded (including cache miss) benchmarks as the biggest slowdown the compiler can actually do something about.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1333235">
+				<div id="div-comment-1333235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333235">
+			April 17, 2018 at 7:25 am</a>		</div>
+
+		<p>Why is it called a branch DELAY slot?  What gets delayed?</p>
+<p>It could have been called an always-execute slot.  That might have been clearer.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1333245">
+				<div id="div-comment-1333245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333245">
+			April 17, 2018 at 7:52 am</a>		</div>
+
+		<p>The effect of the branch is delayed for one instruction. &#8220;Always-execute&#8221; is confusing. After all, regular instructions are always executed! Does that mean that all instructions are in always-execute slots?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mngoldeneagle odd alt depth-3 parent" id="comment-1333285">
+				<div id="div-comment-1333285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333285">
+			April 17, 2018 at 1:20 pm</a>		</div>
+
+		<p>Not to mention that instructions in a branch delay slot are not guaranteed to always execute!  See the LIKELY family of branches as an example.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1333315">
+				<div id="div-comment-1333315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333315">
+			April 17, 2018 at 2:11 pm</a>		</div>
+
+		<p>Ooh, that gives me an idea!</p>
+<p>What if you have a likely branch to the branch delay slot?  Then&#8230; wait&#8230; [goes and reads part 8 again]&#8230; you can branch on whether to execute an instruction zero times (not taken) or twice (taken).</p>
+<p>I&#8217;m sure the compiler could use this to devastating optimization effect in TWO whole programs that actual people have written.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1333735">
+				<div id="div-comment-1333735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Julien Oster</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333735">
+			April 19, 2018 at 3:13 pm</a>		</div>
+
+		<p>Delay slots in general are just one of the most confusing things readers of assembly code on unfamiliar architectures can encounter. While I don&#8217;t see any way to alleviate that in the machine code, I wish there had at least been the some mandatory assembly syntax around them. For example something like</p>
+<p>B label | OR v0, zero, zero</p>
+<p>To illustrate that something truly special is going on here, and that both instructions are in an unusual relation to each other. <i>Without</i> any helpfully minded shortcut such as implicitly putting a NOP into the delay slot if you omit the &#8220;| &#8230;&#8221; part, to really enforce instead that a branch is followed by a slot.</p>
+<p>But then, as the series already points out, history has shown that coupling the ISA so strongly to the implementation is the problem here.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1333885">
+				<div id="div-comment-1333885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180416-00/?p=98515#comment-1333885">
+			April 23, 2018 at 3:45 am</a>		</div>
+
+		<p>I&#8217;m not convinced that branch delay slots are even the most confusing thing about MIPS, certainly not when considering what non-x86 architectures have done.</p>
+<p>Coupling the implementation to the ISA was a huge benefit at the time, it just proves that all decisions are wrong when you re-evaluate them in the future. The PlayStation used an ASIC that was based on a MIPS R3000 compatible soft core, there was no way that it could have supported an ISA that was decoupled from the implementation or compromising the implementation because some junior programmers might not cope.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,397 @@
+<html>
+<head>
+<title>Using DIB sections to perform bulk color mapping</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Using DIB sections to perform bulk color mapping</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 16, 2006 / year-entry #387</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">When doing dithering, one operation you have to do for every pixel is map it (more accurately, map a modified version of it) to the nearest color in your available palette. Since this is part of the dithering inner loop, you need this operation to be as fast as possible.¹ A common technique for this...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When doing dithering, one operation you have to do for every
+pixel is map it (more accurately, map a modified version of it)
+to the nearest color in your available palette.
+Since this is part of the dithering inner loop, you need this operation
+to be as fast as possible.&#185;
+A common technique for this is to precompute the nearest palette index
+for a dense sampling of colors.
+Any time you need to convert a pixel,
+you can find a nearby entry in the sampling
+and look up the precomputed nearest palette index.
+This won't give you the absolute best match for colors
+that are very close to the halfway point between two palette colors,
+but error diffusion dithering is an approximation anyway;
+if you choose your dense sampling to be "dense enough", these errors
+are small and are accounted for in the error diffusion algorithm.
+</p>
+<p>
+But how do you build up this table mapping each color in your
+dense sampling to the palette?
+One way is to call
+<code>GetNearestPaletteIndex</code>
+for every pixel in the dense sampling.
+But the dense sampling by its nature has a large number of entries,
+and each call to <code>GetNearestPaletteIndex</code> is a ring transition.
+If only there were a way to do a bulk call to
+<code>GetNearestPaletteIndex</code> where you pass a whole bunch of
+<code>COLORREF</code>s at once.
+</p>
+<p>
+But there is a way to do that,
+and that's the idea kernel for today.
+After all, GDI does it when you do a 24-bit to 8-bit blit.
+You can harness this energy with the aid of DIB sections:
+Create a source bitmap that consists of all the color values
+in your dense sample and a destination bitmap that is an 8bpp DIB
+section with your palette as its color table.
+Blit the source onto the destination, and the result is a
+destination that is exactly the mapping table you need!
+</p>
+<p>
+Let's code this up.
+For the sake of illustration, our dense sampling will consist of
+32768 data points distributed throughout the 555 color space.
+In that way, we can take an RGB value and map it to our 8-bit
+palette by means of the following expression:
+</p>
+<pre>
+extern BYTE table[32][32][32];
+index = table[red &gt;&gt; 3][green &gt;&gt; 3][blue &gt;&gt; 3];
+</pre>
+<p>
+Since bitmaps are two-dimensional, we can't generate a
+three-dimensional table like the one given above.
+Let's view it not as a
+<nobr>32 &times; 32 &times; 32</nobr>
+array but rather as a one-dimensional array with 32768 elements.
+(This is, after all, how it's represented in memory anyway, so
+it's not like we're really changing anything physically.)
+With that minor change of point of view,
+we're ready to generate the desired table:
+</p>
+<pre>
+void CreateMappingTable(HPALETTE hpal)
+{
+ struct {
+  BITMAPINFOHEADER bmiHeader;
+  union {
+   RGBQUAD bmiColors[256]; // when in palette mode
+   DWORD rgMasks[3];       // when in BI_BITFIELDS mode
+  };
+ } bmi;
+
+ PALETTEENTRY rgpe[256];
+ UINT cColors = GetPaletteEntries(hpal, 0, 256, rgpe);
+ if (cColors) {
+  for (UINT i = 0; i &lt; cColors; i++) {
+   bmi.bmiColors[i].rgbRed = rgpe[i].peRed;
+   bmi.bmiColors[i].rgbBlue = rgpe[i].peBlue;
+   bmi.bmiColors[i].rgbGreen = rgpe[i].peGreen;
+   bmi.bmiColors[i].rgbReserved = 0;
+  }
+
+  bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+  bmi.bmiHeader.biWidth = 32768;
+  bmi.bmiHeader.biHeight = 1;
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 8;
+  bmi.bmiHeader.biCompression = BI_RGB;
+  bmi.bmiHeader.biSizeImage = 32768;
+  bmi.bmiHeader.biClrImportant = cColors;
+  bmi.bmiHeader.biClrUsed = 0;
+  bmi.bmiHeader.biXPelsPerMeter = 0;
+  bmi.bmiHeader.biYPelsPerMeter = 0;
+
+  void *pv8bpp;
+  HBITMAP hbmTable = CreateDIBSection(NULL, (BITMAPINFO*)&amp;bmi,
+                          DIB_RGB_COLORS, &amp;pv8bpp, NULL, 0);
+  if (hbmTable) {
+   WORD rgw555[32768];
+   for (int i = 0; i &lt; 32768; i++) {
+       rgw555[i] = (WORD)i;
+   }
+   bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+   bmi.bmiHeader.biWidth = 32768;
+   bmi.bmiHeader.biHeight = 1;
+   bmi.bmiHeader.biPlanes = 1;
+   bmi.bmiHeader.biBitCount = 16;
+   bmi.bmiHeader.biCompression = BI_BITFIELDS;
+   bmi.bmiHeader.biSizeImage = sizeof(rgw555);
+   bmi.bmiHeader.biClrImportant = 0;
+   bmi.bmiHeader.biClrUsed = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.rgMasks[0] = 0x7C00;    // 5 red
+   bmi.rgMasks[1] = 0x03E0;    // 5 green
+   bmi.rgMasks[2] = 0x001F;    // 5 blue
+   if (SetDIBits(NULL, hbmTable, 0, 1, rgw555,
+                 (BITMAPINFO*)&amp;bmi, DIB_RGB_COLORS)) {
+    CopyMemory(table, pv8bpp, 32768);
+   }
+   DeleteObject(hbmTable);
+  }
+ }
+}
+</pre>
+<p>
+Nearly all of this function is just preparation for the actual work
+that happens at the very end.
+</p>
+<p>
+First, we get the colors in the palette and have the annoying job
+of converting them from <code>PALETTEENTRY</code> structures
+(which is what <code>GetPaletteEntries</code> gives you)
+to <code>RGBQUAD</code> entries (which is what
+<code>CreateDIBSection</code> wants).
+Why the two can't use the same format I will never know.
+</p>
+<p>
+Next, we create our destination bitmap,
+an 8bpp bitmap with the palette entries
+as the color table, one pixel tall and 32768 pixels wide.
+Since this is a DIB section, GDI gives us a pointer
+(<code>pv8bpp</code>) to the actual bits in memory.
+Since we specified a <nobr>1 &times; 32768</nobr> bitmap,
+the format of the pixel data is just a sequence of 32768
+bytes, each one corresponding to a palette index.
+Wow, that's exactly the format we want for our final table!
+</p>
+<p>
+Building the source "bitmap" involves a few tricks.
+The naive approach is to have a 32768-element array of <code>RGBQUAD</code>s,
+each one describing one of the pixels in our dense sample set.
+Filling that array would have gone something like this:
+</p>
+<pre>
+for (r = 0; r &lt; 31; r++)
+ for (g = 0; g &lt; 31; g++)
+  for (b = 0; b &lt; 31; b++) {
+   rgrgb[(r &lt;&lt; 10) | (g &lt;&lt; 5) | b].rgbRed = r &lt;&lt; 3;
+   rgrgb[(r &lt;&lt; 10) | (g &lt;&lt; 5) | b].rgbGreen = g &lt;&lt; 3;
+   rgrgb[(r &lt;&lt; 10) | (g &lt;&lt; 5) | b].rgbBlue = b &lt;&lt; 3;
+   rgrgb[(r &lt;&lt; 10) | (g &lt;&lt; 5) | b].rgbReserved = 0;
+  }
+</pre>
+<p>
+The first trick is to realize that we're just manually converting
+our 555 pixel data into RGB, something GDI is perfectly capable
+of doing on its own.
+Why not save ourselves some effort and just give GDI the 555 bitmap
+and let it do the conversion from 555 to RGB itself.
+(Besides, it might not even need to do that conversion;
+who knows, maybe there's a 555-to-8bpp optimized blit code path
+inside GDI we can take advantage of.)
+Using a 555 bitmap gives us this loop instead:
+</p>
+<pre>
+for (r = 0; r &lt; 31; r++)
+ for (g = 0; g &lt; 31; g++)
+  for (b = 0; b &lt; 31; b++)
+   rgw555[(r &lt;&lt; 10) | (g &lt;&lt; 5) | b] = (r &lt;&lt; 10) | (g &lt;&lt; 5) | b;
+</pre>
+<p>
+The second trick is strength-reducing this triple loop to simply
+</p>
+<pre>
+for (i = 0; i &lt; 32768; i++) {
+ rgw555[i] = i;
+}
+</pre>
+<p>
+Now that we have the bitmap data and the <code>BITMAPINFO</code>
+that describes it, we can use <code>SetDIBits</code> to make GDI
+do all the work.
+The function takes our "bitmap"
+(one row of 32768 pixels, each in a different color and
+collectively exhausting our dense sample set)
+and sets it into our DIB section.
+By the magic of <code>BitBlt</code>,
+each pixel is mapped to the nearest matching color in the
+destination palette, and its index is stored as the pixel value.
+</p>
+<p>
+And wow, that's exactly the format we want in our <code>table</code>!
+A little <code>CopyMemory</code> action and we're home free.
+</p>
+<p>
+If you think about it in just the right way, this all becomes obvious.
+You just have to realize that
+<code>BitBlt</code>
+(or here one of its moral equivalents, <code>SetDIBits</code>) 
+does more than just copy bits; it maps colors too.
+And then realize that you can extract the results of that mapping
+via a DIB section.
+Since you're handing in an entire bitmap instead of just a single
+color, you can map all 32768 colors at once.
+</p>
+<p>
+Footnote&nbsp;1:
+You might consider taking the technique in this article
+in another direction and simply blitting the entire 24bpp bitmap
+to a palettized DIB, thereby avoiding the intermediate translation
+table.
+The problem with this technique is that parenthetical "more
+accurately, map a modified version of it".
+The colors that need to be mapped to the palette are typically
+not the ones in the source bitmap but instead have been modified
+in some way by the dithering algorithm.
+In the case of an error-diffusion dither,
+the color values being mapped aren't even known until the preceding
+pixels have already been dithered.
+As a result, you can't blit all the pixels at once since you don't
+even know what color values you need to map until you have the result of
+previous mappings.
+</p>
+<p>
+[Updated 9:30am to fix 6's, 3's, 5's and 10's. -Raymond]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-443133">
+				<div id="div-comment-443133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ac</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983#comment-443133">
+			November 16, 2006 at 12:03 pm</a>		</div>
+
+		<blockquote><p>
+  &nbsp; rgw555[(r &lt;&lt; 6) | (g &lt;&lt; 3) | b]
+</p></blockquote>
+<p>Somehow this doesn&#8217;t fit? when r takes 5 bits, and is shifted 6 bits, we cover up to 11 bits, and we&#8217;re to cover up to 15?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-443153">
+				<div id="div-comment-443153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Trevor D</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983#comment-443153">
+			November 16, 2006 at 12:28 pm</a>		</div>
+
+		<p>That was like reading a John Carmack post on 3D graphics. &nbsp;It all sounded very interesting but i have no idea what the heck you are talking about.</p>
+<p>:)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-443203">
+				<div id="div-comment-443203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">squidbot</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983#comment-443203">
+			November 16, 2006 at 4:38 pm</a>		</div>
+
+		<p>Very clever. Is that BitBlt typically going to be hardware accelerated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-443213">
+				<div id="div-comment-443213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://levicki.blogspot.com/' rel='external nofollow' class='url'>Igor</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983#comment-443213">
+			November 16, 2006 at 5:28 pm</a>		</div>
+
+		<p>Great post Raymond. Too bad most people will take it literally as a 1:1 (problem:solution) guide instead of adopting the principle of &quot;thinking about it in just the right way&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-443263">
+				<div id="div-comment-443263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Robert</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983#comment-443263">
+			November 17, 2006 at 2:44 am</a>		</div>
+
+		<p>According to the SetDIBits documentation, hbmTable should be a handle to a compatible bitmap (DDB). Is it clear that SetDIBits works with a DIB section as well? It would probably be possible to select hbmTable into a memory DC and then call SetDIBitsToDevice instead of SetDIBits but then it isn&#8217;t clear either whether GDI would perform the desired color mapping or whether it would do some intermediate mapping to the color format of the DC.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-443283">
+				<div id="div-comment-443283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20061116-00/?p=28983#comment-443283">
+			November 17, 2006 at 8:37 am</a>		</div>
+
+		<p>I vaguely remember reverse-engineering the Windows 16-colour dithering algorithm. Sadly I optimised the code into unreadability, but basically it looked at the four nearest palette entries. Not only can these can be computed directly without doing computations on the whole palette but they can always be mixed to produce the original colour, although the conversion to a 4&#215;4 dither reduced the accuracy somewhat. Example: the colour (16, 40, 72) = ((0, 0, 0) * 7 + (0, 0, 128) * 4 + (0, 128, 128) * 3 + (128, 128, 128) * 2) / 16 so that a 4&#215;4 block of that colour would have 7 black pixels etc. (The pixels were also chosen in a predictable order).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,433 @@
+<html>
+<head>
+<title>Swamping the thread pool with work faster than it can drain</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Swamping the thread pool with work faster than it can drain</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 3, 2011 / year-entry #135</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>9</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">This scenarios is real, but details have been changed to protect the guilty. Consider a window showing the top of a multi-page document. The developers found that when the user clicks the down-arrow button on the scroll bar, the program locks up for 45 seconds, over a dozen threads are created, and then suddenly everything...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+This scenarios is real,
+but details have been changed to protect the guilty.
+</p>
+<p>
+Consider a window showing the top of a multi-page document.
+The developers found that when the user clicks the down-arrow
+button on the scroll bar,
+the program locks up for 45 seconds,
+over a dozen threads are created,
+and then suddenly everything clears up and the window
+displays the final paragraph of the document
+(i.e., it scrolled all the way to the bottom).
+</p>
+<p>
+The problem was traced to queueing tasks to
+the thread pool faster than they can drain.
+</p>
+<p>
+The document is an object which, unlike a window, has no thread
+affinity.
+(Naturally, there are critical sections around the various document
+methods so you don't have corruption if two threads try to modify
+the document at the same time.)
+The way to display a different portion of
+the document is to call a method which
+changes the viewport location.
+</p>
+<p>
+When the user clicks the down-arrow button on the scroll bar,
+the main thread creates a periodic timer
+at
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/04/23/8417521.aspx">
+four fifths of the double-click speed</a>,
+and each time the timer elapses,
+it does the equivalent of
+<code>document.ScrollDown()</code>.
+The code cancels the timer once the user releases the mouse button.
+</p>
+<p>
+The catch is that the document was so complicated that
+it takes a long time to change the view top and redraw the new view.
+(I don't remember exactly how long, but let's say it was 700ms.
+The important thing is that it takes longer than 400ms.)
+</p>
+<p>
+Given that set-up, you can see what happens when the user clicks
+the scroll down-arrow.
+The initial scroll is initiated,
+and before it can complete,
+another scroll is queued to the thread pool.
+The document view keeps trying to update its position, but the
+periodic timer generates scroll requests faster than the document
+view can keep up.
+</p>
+<p>
+If that description was too terse, here's a longer version.
+</p>
+<p>
+The code for scrolling went something like this:
+</p>
+<pre>
+OnBeginScrollDown()
+{
+ // Start a timer to do the scrolling
+ <a HREF="http://msdn.microsoft.com/en-us/library/ms682485(VS.85).aspx"
+ >CreateTimerQueueTimer</a>(&amp;htimer, NULL, ScrollAgain, NULL,
+     0, GetDoubleClickTime() * 4 / 5, WT_EXECUTEDEFAULT);
+}
+
+OnEndScrollDown()
+{
+ if (htimer != NULL) {
+  DeleteTimerQueueTimer(NULL, htimer, INVALID_HANDLE_VALUE);
+  htimer = NULL;
+ }
+}
+
+ScrollAgain(...)
+{
+ document.ScrollDown();
+}
+</pre>
+<p>
+(In reality, the program didn't use the
+<code>CreateTimerQueueTimer</code> function&mdash;it
+had a custom timer queue and a custom thread pool&mdash;but
+the effect is the same.)
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;0,
+the user clicks on the scroll bar down-arrow.
+The UI thread starts the timer
+with an initial delay of zero and a period of 400ms.
+The timer fires immediately, and a thread pool thread is
+asked to run <code>ScrollAgain</code>.
+The <code>ScrollAgain</code> function calls
+<code>ScrollDown</code>,
+which begins the process of scrolling the document.
+</p>
+<p>At time <i>T</i>&nbsp;=&nbsp;400ms,
+the periodic timer fires, and a new thread pool thread is created
+to service it.
+Pool thread&nbsp;2 calls <code>ScrollDown()</code> and blocks.
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;700ms,
+the <code>ScrollDown</code> call
+on pool thread&nbsp;1 completes,
+and now pool thread&nbsp;2 can begin its call to
+<code>ScrollDown()</code>.
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;800ms,
+the periodic timer fires again,
+and pool thread&nbsp;1 (now idle) is asked to handle it.
+Pool thread&nbsp;1 calls <code>ScrollDown()</code> and blocks.
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;1200ms,
+the periodic timer fires yet again.
+This time,
+there are no idle threads in the thread pool, so the thread
+pool manager creates yet another thread to service the timer.
+Pool thread&nbsp;3 calls <code>ScrollDown()</code> and blocks.
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;1400ms,
+the <code>ScrollDown()</code>
+call issued by pool thread&nbsp;2 completes.
+Pool thread&nbsp;2 now returns to idle.
+Now the call to
+<code>ScrollDown()</code> from pool thread&nbsp;1
+(issued at
+time <i>T</i>&nbsp;=&nbsp;800ms) can start.
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;1600ms,
+the periodic timer fires <i>again</i>,
+and pool thread&nbsp;2 is chosen to service it.
+Pool thread&nbsp;2 calls <code>ScrollDown()</code> and blocks.
+</p>
+<p>
+At time <i>T</i>&nbsp;=&nbsp;2000ms,
+the periodic timer fires again, and a new pool thread is created
+to service it.
+Pool thread&nbsp;4 calls <code>ScrollDown()</code> and blocks.
+</p>
+<p>
+You can see where this is going, I hope.
+Work is being generated by the periodic timer at a rate of one 
+work item per 400ms,
+but it takes 700ms to carry out each work item,
+and the tasks are serialized on the document.
+It's like
+<a HREF="https://www.youtube.com/watch?v=uztA6JCKB4s">
+Lucy in the chocolate factory</a>.
+The document is frantically trying to carry out all the
+work, and it never manages to catch up.
+Eventually, the document scrolls all the way to the bottom,
+and the mass of
+pent-up calls to <code>ScrollDown()</code> all return immediately since
+there is no more scrolling possible.
+</p>
+<p>
+Now that the document is idle,
+it can paint,
+and that's where the user finally sees the document,
+scrolled all the way to the bottom.
+</p>
+<p>
+There are a number of possible solutions here.
+</p>
+<p>
+One way is
+not to queue up another scroll while an old one is still running.
+Instead, just wait for it to finish, and then issue a new scroll that
+accumulates all the scrolling that had taken place while you were waiting
+for the first to complete.
+This results in jerky scrolling, however,
+and it creates a lag of up to 700ms between the user releasing the mouse
+button and scrolling actually stopping.
+</p>
+<p>
+Another approach is to
+disable repainting the entire document when you detect that you are
+in the <i>document is too complex to scroll quickly</i> case
+and just scroll the scrollbar thumb.
+When the user stops scrolling, re-enable painting and <i>boom</i>
+the document appears at the user's chosen location.
+This preserves responsiveness, but you lose the ability to see the
+document as you scroll it.
+</p>
+<p>
+I don't know what solution the customer finally went with.
+I was just there to help with the debugging.
+</p>
+<p>
+<b>Bonus example</b>:
+Larry Osterman describes
+<a HREF="http://blogs.msdn.com/larryosterman/archive/2009/06/25/what-s-wrong-with-this-code-part-26-a-real-world-example.aspx">
+another situation</a>
+with
+<a HREF="http://blogs.msdn.com/larryosterman/archive/2009/06/29/what-s-wrong-with-this-code-part-26-the-answer.aspx">
+the same underlying cause</a>.
+</p>
+<p>
+<b>Hidden take-away</b>:
+Observe that both of these examples illustrate
+one of the subtle consequences of a design which
+moves all processing off the UI thread.
+</p>
+<p>
+<b>Update</b>:
+Note that <code>Set&shy;Timer</code> wouldn't have helped here.
+</p>
+<pre>
+case WM_TIMER:
+  if (wParam == SCROLLTIMER) {
+    QueueUserWorkItem(ScrollAgain, NULL, WT_EXECUTEDEFAULT);
+  }
+  ...
+</pre>
+<p>
+Since the processing has been moved off the UI thread, the
+<code>WM_<wbr>TIMER</code> messages are free to keep flowing in
+and queue up work faster than the background thread can keep up.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (9)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-916973">
+				<div id="div-comment-916973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-916973">
+			June 3, 2011 at 7:18 am</a>		</div>
+
+		<p>Wait, so the callbacks on the same timer object are NOT serialized? That a single reason not to use this abomination. Use old good SetTimer on your own message loop thread instead.</p>
+<p>And why does one need to repaint on every timer? Repaint as you can keep up, but use a new position during WM_PAINT. Also, ScrollWindow(Ex) is there for a reason. There is no need to invalidate and repaint the whole client region. Somebody PLEASE tell WinDbg developpers about this function FAST.</p>
+<div class="post">[<i>(I thought I mentioned in the article that it was a custom timer queue, not a standard one.) And &quot;good old SetTimer&quot; runs on the UI thread, and the goal was to move processing <span style="text-decoration:underline;">off</span> the UI thread. As I recall, painting was fast. It was all the bookkeeping related to moving the viewport (layout) that was slow. Mind you, this story is from over a decade ago, so I don&#39;t remember the details. Of course, moving the viewport shouldn&#39;t trigger layout, but if that bugs you, just change the scenario: The scrollbar controls the magnification of a Mandelbrot set. Which is better, leaving some aspects of the original scenario intact (for realism) or changing the fundamentals of the scenario (so people won&#39;t get distracted by side issues)? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-917003">
+				<div id="div-comment-917003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917003">
+			June 3, 2011 at 8:45 am</a>		</div>
+
+		<p>Hmm&#8230;. &nbsp;When I am connected to another computer using any of the various VNC programs, I often find that a single click in the middle of the right-hand scroll bar of ANY document (where I am trying to page down by one page) results in multiple scroll-one-page-down commands getting executed. &nbsp;I wonder if that&#39;s what is happening here.</p>
+<p>Most of the VNC programs have some code to rate-limit mouse events, but I don&#39;t think multiple mouse clicks are the cause of what I am seeing. &nbsp;What is described here might explain what I am seeing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-917013">
+				<div id="div-comment-917013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917013">
+			June 3, 2011 at 10:18 am</a>		</div>
+
+		<p>@DW:</p>
+<p>VNC-style remote access programs don&#39;t usually work like RDP. They mirror the screen state; a program&#39;s (re)drawing speed is limited by the program&#39;s host.</p>
+<p>RDP, though, is sending actual drawing commands over the wire.</p>
+<p>Also, Shift+Click on the scroll bar position will get you there at once.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-917043">
+				<div id="div-comment-917043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alan B</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917043">
+			June 3, 2011 at 12:58 pm</a>		</div>
+
+		<p>We used to see the same problem when using .NET&#39;s System.Threading.Timer. &nbsp;But, now in our code reviews we treat periodic timers as unsafe until proven otherwise. &nbsp;Using a one-shot timer and making the callback be responsible for rescheduling if and when appropriate forces the developer to think about what solution they want to the problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-917083">
+				<div id="div-comment-917083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henning Makholm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917083">
+			June 4, 2011 at 3:03 pm</a>		</div>
+
+		<p>I must be missing something here. If the heavy work is happening off-thread, then why doesn&#39;t this happen:</p>
+<p>&quot;At T=200 ms, the mouse button is released, so the UI thread cancels the periodic timer, and the whole avalanche is prevented.&quot;</p>
+<div class="post">[<i>I never did figure out that part. My guess is the attempt to cancel the periodic timer itself requires the document critical section. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-917093">
+				<div id="div-comment-917093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/santosh.sampath_4000_live.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>santosh.sampath@live.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917093">
+			June 5, 2011 at 1:47 am</a>		</div>
+
+		<p>The best part of the article was the video. Had a good laugh. Nice analogy.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-917103">
+				<div id="div-comment-917103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Faster code please</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917103">
+			June 5, 2011 at 9:35 am</a>		</div>
+
+		<p>This is again a &quot;can anyone please fix my sloppy code&quot;. Please tell them to write faster code. Even a mandelbrot can render in sub 400ms time if doing it right.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-917193">
+				<div id="div-comment-917193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike D</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917193">
+			June 6, 2011 at 10:52 am</a>		</div>
+
+		<p>@Faster code please</p>
+<p>Okay, so now you&#39;re showing a 500MB document that&#39;s being dynamically streamed from a server on a different continent. Because the file is so huge, you only download the section of the document that you&#39;re currently showing, but because of all the embedded fonts and images and stuff, it still takes 500ms to download a single page.</p>
+<p>Some things are slow. Dealing with it is a real engineering problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-917243">
+				<div id="div-comment-917243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cheong</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110603-00/?p=10503#comment-917243">
+			June 6, 2011 at 8:21 pm</a>		</div>
+
+		<p>@Mike D: Agreed. And let&#39;s not take a document that may not contain page label as an example.</p>
+<p>Writing a good datagrid that can open a table containing millions of row, yet can scroll smoothly is a REAL engineering problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

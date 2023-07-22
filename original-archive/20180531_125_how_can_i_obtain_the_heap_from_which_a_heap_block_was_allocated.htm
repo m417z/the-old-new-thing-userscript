@@ -1,0 +1,833 @@
+<html>
+<head>
+<title>How can I obtain the heap from which a heap block was allocated?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can I obtain the heap from which a heap block was allocated?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 31, 2018 / year-entry #125</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>42</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">You'll have to keep track of that yourself.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Suppose profiling reveals that heap contention is a bottleneck
+in your program.
+Furthermore, suppose that your program's heap usage pattern is that
+most heap blocks are allocated and freed by the same thread.
+One way to address this problem is to create a pool of heaps,
+say <var>N</var> of them.
+Each thread gets assigned one of these heaps pseudo-randomly,
+so that contention is reduced by a factor of <var>N</var>.
+And if you have fewer than <var>N</var> threads,
+then you reduced contention almsot down to zero,
+leaving only the case where
+memory is freed from a thread different from the thread it was
+allocated from.
+</p>
+<p>
+Allocating the memory from the correct heap is easy.
+When the thread wants to allocate memory, you look up the
+heap that was pseudo-randomly assigned to it
+and use that heap to allocate the memory.
+</p>
+<p>
+Freeing the memory from the correct heap is harder.
+Given a heap block, how do you get the heap from which it was allocated?
+Is there some <code>Heap&shy;Find&shy;From&shy;Block</code> function
+that will give me a heap handle given a memory block?
+</p>
+<p>
+Alas, there is no such function from the Windows heap manager.
+You'll have to keep track of the heap handle yourself.
+Typically this is done by over-allocating memory by a small amount
+and putting the handle of the originating heap in the extra memory.
+The code that frees the memory consults this value to know how to free
+the block.
+</p>
+<p>
+Pseudo-code:
+</p>
+<pre>
+struct DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) HeapPrefix
+{
+    HANDLE heap;
+};
+
+void* malloc_thread_affine(size_t size)
+{
+  // Not shown here: Integer overflow detection.
+  size_t actualSize = size + sizeof(HeapPrefix);
+
+  HANDLE heap = GetPreferredHeapForCurrentThread();
+  HeapPrefix* prefix = (HeapPrefix*)HeapAlloc(heap, flags, actualSize);
+  if (!prefix) return NULL;
+
+  prefix-&gt;heap = heap;
+  return prefix + 1;
+}
+
+void free_thread_affine(void* p)
+{
+  if (!p) return;
+
+  HeapPrefix* prefix = (HeapPrefix*)p - 1;
+  HeapFree(p-&gt;heap, flags, prefix);
+}
+</pre>
+<p>
+We define a <code>Heap&shy;Prefix</code> structure that
+goes in front of the memory we return to the client.
+In this structure, we record the heap from which the memory
+was allocated,
+and we consult this structure when freeing the memory to ensure
+that we free it from the proper heap.
+</p>
+<p>
+Note that the <code>Heap&shy;Prefix</code> must be padded
+to ensure proper alignment of the client memory.
+We accomplish this by declaring a structure alignment.
+</p>
+<p>
+<b>Exercise</b>: Why does the bookkeeping go at the front
+of the client memory, instead of at the end?
+</p>
+<p>
+<b>Exercise 2</b>:
+Windows Vista introduced the
+<code>Get&shy;Current&shy;Processor&shy;Number</code> function.
+With it, you can set <var>N</var> equal to the number of processors
+and have each thread allocate from the heap associated with the
+processor it is running on at the moment.
+Discuss whether this is a good idea.</p>
+<p>
+<b>Bonus reading</b>:
+<a HREf="https://blogs.msdn.microsoft.com/ricom/2006/02/02/unmanaged-memory-fragmentation-an-old-story/">
+Unmanaged Memory Fragmentation &mdash; an old story</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (42)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1343645">
+				<div id="div-comment-1343645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343645">
+			May 31, 2018 at 7:20 am</a>		</div>
+
+		<p>I predict that the bookkeeping should go at the front of the allocated area instead of at the end, to lessen the chance that it will be overwritten by erroneous code writing past the end of where it should write.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-koldude odd alt depth-2 parent" id="comment-1343715">
+				<div id="div-comment-1343715" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343715">
+			May 31, 2018 at 7:55 am</a>		</div>
+
+		<p>I suspect it has more to do with page faults, residency, and predictability. If you put it at the beginning then you only fault the first page if the allocation is large enough. You don&#8217;t have to go looking for it later when they call <code>HeapFree</code> which could fault all of the pages and be potentially expensive as well as dangerous if for some reason it does get overwritten in which case the memory manager could find another block of allocated memory and accidentally deallocate that! At least with it at the head you know immediately if there is heap corruption is the structure is damage, at which point you can terminate the process.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1343725">
+				<div id="div-comment-1343725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343725">
+			May 31, 2018 at 8:06 am</a>		</div>
+
+		<p>Exercise: You don&#8217;t know how much was allocated so you don&#8217;t know where the end is.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1343755">
+				<div id="div-comment-1343755" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">R P (MSFT)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343755">
+			May 31, 2018 at 8:22 am</a>		</div>
+
+		<p>I think it&#8217;s simpler than all that: you put the bookkeeping at the front because you don&#8217;t know the size of the object when it&#8217;s being freed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1343765">
+				<div id="div-comment-1343765" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://geelaw.blog/' rel='external nofollow' class='url'>Gee Law</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343765">
+			May 31, 2018 at 8:28 am</a>		</div>
+
+		<p>I would go for the simplest reason that you simply don&#8217;t know where the allocated block ends.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1343885">
+				<div id="div-comment-1343885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343885">
+			May 31, 2018 at 10:19 am</a>		</div>
+
+		<p>Yep, I agree with those answers &#8212; better than mine.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1343665">
+				<div id="div-comment-1343665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">brliron</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343665">
+			May 31, 2018 at 7:23 am</a>		</div>
+
+		<p>Exercise 1 is easy. How do you retrieve the heap handle when you need to free it? Where is the end of the memory block?<br />
+Exercise 2: I wouldn&#8217;t trust the current processor to stay the same. It could change between the GetCurrentProcessorNumber call and the HeapAlloc call or in the middle of the HeapAlloc call, and while this thread is in the HeapAlloc call, another thread could run on your previous processor and try to call HeapAlloc. And of course, the current processor can also change between the HeapAlloc call and the HeapFree call.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1343925">
+				<div id="div-comment-1343925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JAS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343925">
+			May 31, 2018 at 3:08 pm</a>		</div>
+
+		<p>brliron think of it as a hash. You should still lock each heap but optimize for pass-throughs every single time. Just like a hash has bucket collisions, the processor heap selection might get it wrong once in a blue moon. But at the moment in time that the current processor number was retrieved, that&#8217;s the moment when it was &#8220;unique enough&#8221; to have a good shot at an uncontested heap without overhead. Last I checked, Windows tries to keep a thread on the same CPU the whole way through, so the hypothetical should almost never happen. Last I checked, .NET uses per-processor heap for server GC and that might be the fastest heap I ever heard of.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1344015">
+				<div id="div-comment-1344015" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344015">
+			June 1, 2018 at 3:38 am</a>		</div>
+
+		<p>Same core, same hyperthreading unit, same processor cluster. It tries its best to keep things close on several levels.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1344035">
+				<div id="div-comment-1344035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344035">
+			June 1, 2018 at 7:27 am</a>		</div>
+
+		<p>&#8220;Windows tries to keep a thread on the same CPU the whole way through&#8221;</p>
+<p>No it doesn&#8217;t, it tries to spread the load (and therefore heating) across all cores equally.  If all cores are CPU-bound, there&#8217;s no reason to migrate threads, but when any fraction of the cores are left idle, migration will happen.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1344165">
+				<div id="div-comment-1344165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344165">
+			June 2, 2018 at 6:21 pm</a>		</div>
+
+		<p>I&#8217;ve never observed that, not that I&#8217;ve been looking mind you; what sort of time scale are you talking about here?  I&#8217;d imagine this sort of load balancing would be relatively infrequent, maybe on the order of seconds or tens of seconds, because of the performance implications &#8211; and surely it can&#8217;t be good for a core to be powered up and down too frequently?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-jan-ringos odd alt depth-5" id="comment-1344205">
+				<div id="div-comment-1344205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Jan+Ringo%C5%A1' rel='external nofollow' class='url'>Jan Ringoš</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344205">
+			June 3, 2018 at 10:58 pm</a>		</div>
+
+		<p>In my experience it depends on the current power profile. On power savings the workload is kept on as few cores as possible to keep other cores in low power states, and this applies on a balanced profile to a high degree too. On high performance mode, basically, every thread gets it&#8217;s own core (observed on 32-core and larger machines) &#8230;I assume it is expected of high workload app programmers to manage affinities themselves.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1344705">
+				<div id="div-comment-1344705" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344705">
+			June 6, 2018 at 1:37 pm</a>		</div>
+
+		<p>Timescale is perhaps ten times per second.  Of course it&#8217;s a tradeoff between the lost cache and unbalanced heating.</p>
+<p>You should be able to see it easily by running a single CPU-bound thread (e.g. single-threaded SuperPi) and check Task Manager.  If you haven&#8217;t explicitly set affinity, you should see the utilization fairly well balanced across all cores, instead of 100% of one core.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1343675">
+				<div id="div-comment-1343675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343675">
+			May 31, 2018 at 7:25 am</a>		</div>
+
+		<p>For exercise 1, where&#8217;s the end of a block passed in via (void* p).  It&#8217;s easy to find the beginning, but much more difficult to find the end.<br />
+I&#8217;m guessing that the answer to exercise 2 is &#8220;no&#8221;.  Thread affinity makes sense and is common, and it&#8217;s something the programmer knows something about and has some control over.  Processor affinity is completely out of the hands of the programmer.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mngoldeneagle even depth-2" id="comment-1343905">
+				<div id="div-comment-1343905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343905">
+			May 31, 2018 at 12:02 pm</a>		</div>
+
+		<p>I mean, not entirely it&#8217;s not.  If you really wanted to, you could spin up subprocesses and set the affinity mask to a specific core.  Or set the affinity mask on the thread itself.  But it&#8217;s still probably not a <i>good</i> idea.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1343685">
+				<div id="div-comment-1343685" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AdamRowell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343685">
+			May 31, 2018 at 7:35 am</a>		</div>
+
+		<p>I predict that the bookkeeping must go at the front of the allocated area because free_thread_affine needs to have an offset to adjust p by, which you can&#8217;t know until you know what Heap it was allocated on</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1343695">
+				<div id="div-comment-1343695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">miere</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343695">
+			May 31, 2018 at 7:37 am</a>		</div>
+
+		<p>I guess that you cannot put heap handle at the end of allocation because you need to know size of that allocation to access heap handle, but you cannot get allocation size because HeapSize procedure requires heap handle that you store.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1343705">
+				<div id="div-comment-1343705" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343705">
+			May 31, 2018 at 7:45 am</a>		</div>
+
+		<p>Excecise 2: Sounds like a bad idea to me. Its tying two completly unrelated things together.</p>
+<p>1) You lose control of how many heaps you create.</p>
+<p>2) You lose control of which threads get which heap. The thread scheduler is free to assign any thread to any processor as it sees fit. It will also shut cores down to save power.</p>
+<p>You could end up with 24 Heaps but only 3-4 of them being used by any thread at all.</p>
+<p>I suspect a static Heap count and round-robin would give better and more predicable results!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1344135">
+				<div id="div-comment-1344135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344135">
+			June 2, 2018 at 8:40 am</a>		</div>
+
+		<p>So what static number would you pick that would give &#8220;better and more predicable results&#8221; for that server at work with 64 cores, as well as my crusty old laptop with 2? </p>
+<p>The application and problem size itself might have a limit on possible concurrency in which case you want to limit your heaps to the minimum of available concurrency and core count, but using the core count as a heuristic is a very good idea. </p>
+<p>Whether it&#8217;s a good idea to use the processor number as an index is a bit more dubious, but the argument of &#8220;well the processor could change&#8221; doesn&#8217;t strike me as particular relevant. Sure it might in some situations &#8211; although the OS will do its best to minimize such moves &#8211; but then what? You still minimize lock contention quite well.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1343735">
+				<div id="div-comment-1343735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stereo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343735">
+			May 31, 2018 at 8:09 am</a>		</div>
+
+		<p>If we put it at the front, we don&#8217;t have to remember the size of the block.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1343745">
+				<div id="div-comment-1343745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Douglas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343745">
+			May 31, 2018 at 8:11 am</a>		</div>
+
+		<p>Exercise 1) I think it&#8217;s because we don&#8217;t know the length when we do the free, so only know the location of the start, not the end.<br />
+Exercise 2) I think this would be a bad idea, because the thread could be migrated to different core, so different sequential heap requests in a single thread could go on different heaps, reducing cache locality when freeing a number of heap blocks?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1343775">
+				<div id="div-comment-1343775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://adamrosenfield.com' rel='external nofollow' class='url'>Adam Rosenfield</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343775">
+			May 31, 2018 at 8:31 am</a>		</div>
+
+		<p>You don&#8217;t know how big the allocation was on a call to free_thread_affine(), so if you put the heap handle at the end, you won&#8217;t know where to find the end when you go to free it.</p>
+<p>Threads can migrate between processors, so if that happens, you&#8217;ll then have threads from multiple processors using the same heap.  This will make them compete for the L2 cache lines associated with that heap, potentially leading to cache invalidations and bus traffic.  (Or, you could have the threads constantly query GetCurrentProcessorNumber() and update their heap if that changes for new allocations, but you&#8217;d have to still free old allocations on their previous heap, resulting in the same cache problem but to a lesser degree.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1343785">
+				<div id="div-comment-1343785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ChrisR</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343785">
+			May 31, 2018 at 8:34 am</a>		</div>
+
+		<p>The de-allocation function can&#8217;t tell how long the block is, since it doesn&#8217;t take the size.  If the extra data was stored at the end of the block, it would be fairly difficult to find.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-chd1 odd alt thread-even depth-1 parent" id="comment-1343795">
+				<div id="div-comment-1343795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ChDF+T' rel='external nofollow' class='url'>ChDF T</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343795">
+			May 31, 2018 at 8:42 am</a>		</div>
+
+		<p>Exercise 1: free_thread_affine is passed a pointer to the start of the block, therefore the Heap­Prefix can be retrieved using simple pointer arithmetic if it is positioned in front of the memory-block [as seen by the client]. If Heap­Prefix was appended at the end, free_thread_affine would need to find out the blocks size first (I&#8217;m not sure if that is possible using public APIs, but its definitely more complicated than subtracting 1 from p).<br />
+Exercise 2: A thread may be scheduled on many processors during its lifetime. Assuming that most allocations are freed form the same thread they were allocated on, this would increase contention. This is especially a problem if the application uses more threads than the host has processors, since at least 2 threads will be in contention on 1 heap at any given time. In conclusion, making heaps processor affine fails to solve the problem of threads contending on heaps.<br />
+Question: in the line reading <code>return prefix + 1;</code>, why is it safe to assume that <code>sizeof(HeapPrefix)</code> is always 1? (Disclaimer: I&#8217;m at home in the managed world, so this may be a stupid question)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1343825">
+				<div id="div-comment-1343825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Clarkstone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343825">
+			May 31, 2018 at 8:50 am</a>		</div>
+
+		<p>&#8220;pointer + 1&#8221; increases the pointer by the size of whatever type it points to (here, the size of a HeapPrefix). Addition and subtraction on pointers in C all work in units of the size of the object pointed to, which makes array handling with pointers convenient.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1343835">
+				<div id="div-comment-1343835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">PJH</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343835">
+			May 31, 2018 at 8:56 am</a>		</div>
+
+		<p>In pointer arithmetic in C, adding one to a pointer increments the pointer by however many bytes to point to the next object, not by one byte.</p>
+<p>Not posted for ages, so hope this comes out OK&#8230;<br />
+803: pherring@mobile:/tmp$ cat ./foo.c<br />
+#include<br />
+struct object{<br />
+        char x[26];<br />
+};<br />
+int main(void){<br />
+        struct object o[3];<br />
+        printf(&#8220;%p\n%p\n%p\n&#8221;, o, o+1, o+2);<br />
+        printf(&#8220;sizeof: %lu\n&#8221;, sizeof o[0]);<br />
+        printf(&#8220;ptrdiff: %lu\n&#8221;, &amp;o[1]-&amp;o[0]);<br />
+        return 0;<br />
+}</p>
+<p>803: pherring@mobile:/tmp$ ./foo<br />
+0x7fff13009590<br />
+0x7fff130095aa<br />
+0x7fff130095c4<br />
+sizeof: 26<br />
+ptrdiff: 1</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1343855">
+				<div id="div-comment-1343855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343855">
+			May 31, 2018 at 8:58 am</a>		</div>
+
+		<p>&gt; Question: in the line reading return prefix + 1;, why is it safe to assume that sizeof(HeapPrefix) is always 1?</p>
+<p>It’s not safe to assume that, nor is it assumed.</p>
+<p>‘prefix’ is declared as a pointer to HeapPrefix. In C(++), pointer offsets are measured in units of the pointed-to type. Thus, prefix + 1 means “one HeapPrefix past whatever ‘prefix’ is pointing at”.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1344005">
+				<div id="div-comment-1344005" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344005">
+			June 1, 2018 at 3:19 am</a>		</div>
+
+		<p>sizeof(HeapPrefix) is very much not 1, due to the DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1343805">
+				<div id="div-comment-1343805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Clarkstone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343805">
+			May 31, 2018 at 8:44 am</a>		</div>
+
+		<p>Ex1:<br />
+I expect the reason the bookkeeping is placed at the beginning of the block is so you can find it without needing to look up the length of the block.</p>
+<p>Ex2:<br />
+Most objects are freed by the same thread that allocated them. When threads switch between processors a lot, if the heap is per-processor then each heap will end up with a mix of objects from different threads on it, so a mix of threads will be freeing from it, causing contention. Keeping the heaps attached to the thread will result in most of the freeing being by one thread &#8211; the thread that also allocates from that heap.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1343815">
+				<div id="div-comment-1343815" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">R Samuel Klatchko</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343815">
+			May 31, 2018 at 8:44 am</a>		</div>
+
+		<p>Minor bug in the code. The first argument to HeapFree should be prefix-&gt;heap instead of p-&gt;heap.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1343845">
+				<div id="div-comment-1343845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stuart</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343845">
+			May 31, 2018 at 8:57 am</a>		</div>
+
+		<p>My first thought was that if you&#8217;re confident that the alloc and free are always done by the same thread then bookkeeping isn&#8217;t even necessary and the free could just use GetPreferredHeapForCurrentThread() as well, but I realized quickly that it&#8217;s a bad idea to rely on that kind of rule when there&#8217;s no way to enforce it. If it is supposed to be a strict rule for your code, I guess it might be possible to put in an assertion to enforce it in debug builds, and compile away the bookkeeping entirely in the release build. Seems unlikely that there&#8217;d be enough overhead from bookkeeping to be worth it though.</p>
+<p>Exercise 1: For starters, putting the bookkeeping at the front means that you don&#8217;t need to know the size of the allocation to find it.</p>
+<p>Exercise 2: Using the current processor number seems like a bad idea because you can&#8217;t assume that your threads are going to be distributed evenly across all the processors, or distributed to all the processors at all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1343865">
+				<div id="div-comment-1343865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuri Khan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343865">
+			May 31, 2018 at 9:02 am</a>		</div>
+
+		<p>To add to all the answers to Exercise 1: We don’t know where the block ends, so we could reserve a small header at the beginning of the block to store a size or a pointer to the end where the other bookkeeping data is stored… oh wait.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1343875">
+				<div id="div-comment-1343875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343875">
+			May 31, 2018 at 9:04 am</a>		</div>
+
+		<p>Exercise: Because it&#8217;s a lot easier and faster than inserting two calls to HeapSize (one for allocate, one for free) for no benefit.</p>
+<p>Exercise 2: Well you could do that, but it won&#8217;t pay as much as you would like because Get­Current­Processor­Number() is out of date before it finishes returning to you so you can&#8217;t create your heaps with HeapCreate(HEAP_NO_SERIALIZE, &#8230;). It would still reduce contention over the heap because Get­Current­Processor­Number() is almost always right. But I&#8217;ve never seen a program where contention over the heap was a real bottleneck unless it was garbage collected.</p>
+<p>Bonus Content: WhichHeap function</p>
+<p>typedef struct {<br />
+    HANDLE heap;<br />
+    ptrdiff_t offset_from_block;<br />
+    size_t blocksize;<br />
+    BOOL is_allocated; /* for debugging use only; returns spurious TRUE due to memory being reused */<br />
+    BOOL is_in_heap;<br />
+} WHICHHEAPRESULT;</p>
+<p>WHICHHEAPRESULT WhichHeap(void *ptr)<br />
+{<br />
+    DWORD nmh = 0;<br />
+    DWORD ah = 0;<br />
+    HANDLE *heaps = NULL;<br />
+    HANDLE ph = GetProcessHeap();<br />
+    for(;;) {<br />
+        nmh = GetProcessHeaps(ah, heaps);<br />
+        if (nmh &lt;= ah) break;<br />
+        if (heaps) HeapFree(ph, 0, heaps);<br />
+        heaps = HeapAlloc(ph, 0, ah * sizeof(HANDLE));<br />
+    }<br />
+    for (DWORD i = 0; i = phe.lpData &amp;&amp; ptr &lt;= (char *)phe.lpData + phe.cbData + phe.cbOverhead) {<br />
+                 WHICHHEAPRESULT found;<br />
+                 found.heap = heaps[i];<br />
+                 found.allocated = (!(phe.wflags &amp; PROCESS_HEAP_UNCOMMITTED_RANGE) &amp;&amp; ptr &lt;= (char *)phe.lpData + phe.cbdata);<br />
+                 found.blocksize = phd.cbData;<br />
+                 found.offset_from_block = ptr &#8211; phe.lpData;<br />
+                 found.is_in_heap = TRUE;<br />
+                 UnlockHeap(heaps[i]);<br />
+                 HeapFree(ph, 0, heaps);<br />
+                 return found;<br />
+            }<br />
+        }<br />
+        UnlockHeap(heaps[i]);<br />
+    }<br />
+    HeapFree(ph, 0, heaps);<br />
+    WHICHHEAPRESULT zr;<br />
+    zr.heap = NULL;<br />
+    zr.blocksize = 0;<br />
+    zr.offset_from_block = ~(ptrdiff_t)0;<br />
+    zr.is_allocated = FALSE;<br />
+    zr.is_in_heap = FALSE;<br />
+    return zr;<br />
+}</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1343895">
+				<div id="div-comment-1343895" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Bonner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343895">
+			May 31, 2018 at 11:13 am</a>		</div>
+
+		<p>Exercise 1: [Answered many times already]<br />
+Exercise 2: Unlike everyone else, I think it&#8217;s only *probably* a bad idea.  The advantage of using the core number to select a heap is that you&#8217;ll never have two threads trying to allocate from the same heap at the same time.  Of course that doesn&#8217;t allow for the case where one thread is trying allocate and one thread is trying to free from the same heap, or where two threads are trying to free from a heap simultaneously.  *However* if your access pattern is that memory is usually allocated for a short time, and then freed by the same thread, and before the thread has a chance to migrate to a different processor, then it would help.</p>
+<p>As ever with optimization: the only way to really know is to measure.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1343955">
+				<div id="div-comment-1343955" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343955">
+			May 31, 2018 at 5:44 pm</a>		</div>
+
+		<p>Another potential problem is the case where a thread&#8217;s timeslice ends while it is holding the heap lock.  If you assign the heaps randomly, the odds are that the next thread to run won&#8217;t block; if you use per-processor heaps then it definitely will.  So will the next one, and the one after that, until such time as the original thread gets to run again, and you&#8217;ve got a lock convoy.</p>
+<p>I&#8217;m not sure how likely that is to happen.  I guess it depends on the access pattern.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1343915">
+				<div id="div-comment-1343915" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wyatt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343915">
+			May 31, 2018 at 12:11 pm</a>		</div>
+
+		<p>My first thought, this looks a lot like a BSTR.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1344055">
+				<div id="div-comment-1344055" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344055">
+			June 1, 2018 at 8:14 am</a>		</div>
+
+		<p>Me too.  And, I remember being in Developmentor &#8220;Guerilla COM&#8221; class back in the 90s when Tim Ewald introduced BSTR by saying that there was a special place in Hades reserved for the person who put that character count there but made it look &#8220;just like&#8221; a wchar_t*.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1343935">
+				<div id="div-comment-1343935" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JAS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343935">
+			May 31, 2018 at 3:33 pm</a>		</div>
+
+		<p>GetCurrentProcessorNumber() shouldn&#8217;t be a problem unless there are no idle processors, because the kernel bookkeeping will tend to keep a thread consistently glued to a CPU. I don&#8217;t have proof but I doubt this cacophony of random current processor numbers ever happens enough to matter. The blitz of threads allocating from each others&#8217; heap should only be transitory as CPUs go online or offline. It&#8217;s not zero contentions but vastly fewer contentions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1343995">
+				<div id="div-comment-1343995" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joker_vD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1343995">
+			June 1, 2018 at 2:28 am</a>		</div>
+
+		<p>Well, you can write Heap­Find­From­Block() although it&#8217;s probably a bad idea, and it will kill your performance. But it can be done:<br />
+You call GetProcessHeaps(), then walk each of them, using HeapLock()/HeapWalk()/HeapUnlock(), looking for your heap block.</p>
+<p>Exercise (0 points because it&#8217;s 2ez): Discuss why this is a bad idea.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-the-wench odd alt thread-even depth-1 parent" id="comment-1344025">
+				<div id="div-comment-1344025" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Monochrome+Wench' rel='external nofollow' class='url'>Monochrome Wench</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344025">
+			June 1, 2018 at 4:23 am</a>		</div>
+
+		<p>Exercise 2: Sounds like a bad idea. You could have two threads running on the same processor at the same time with Hyperthreading/SMT which sounds like it will defeat the point of having separate heaps per thread</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1344045">
+				<div id="div-comment-1344045" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1344045">
+			June 1, 2018 at 8:10 am</a>		</div>
+
+		<p>The software sees two hyper-threaded processors running on the same &#8220;physical processor&#8221; as two processors.  A two-proc dual-hyper-threaded system is, from the point of view of the software just a four-proc system</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn odd alt thread-odd thread-alt depth-1" id="comment-1345715">
+				<div id="div-comment-1345715" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180531-00/?p=98885#comment-1345715">
+			June 10, 2018 at 11:22 pm</a>		</div>
+
+		<p>Unlike allocations, release requests are usually not urgent, so it might be smart to delegate all free() calls to a separate thread running at lower priority. If each thread handles its separate heap, free() from this &#8220;private&#8221; heap should not be delegated.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

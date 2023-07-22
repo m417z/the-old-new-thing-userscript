@@ -1,0 +1,303 @@
+<html>
+<head>
+<title>How come a duplicated token doesn't behave identically to the original?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How come a duplicated token doesn&#8217;t behave identically to the original?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 12, 2016 / year-entry #100</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>7</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The inside's the same, but the outside is different.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was experimenting with tokens and discovered that
+things fall apart when they have a thread impersonate itself.
+Shouldn't that have no effect?
+Here's what they discovered.
+Error checking and cleanup have been elided for expository purposes.
+</p>
+<pre>
+// This call succeeds
+CComPtr&lt;IUnknown&gt; something;
+CoCreateInstance(CLSID_Something, nullptr,
+                 CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&amp;something));
+
+// Get the current token for the thread.
+// This call also succeeds. (Note that OpenThreadToken
+// <a HREF="http://blogs.msdn.com/b/junfeng/archive/2004/03/16/90279.aspx">fails if the thread is not impersonating</a>.)
+HANDLE token;
+OpenThreadToken(GetCurrentThread(), TOKEN_ALL_ACCESS, TRUE, &amp;token);
+
+// Duplicate the token. This call succeeds.
+HANDLE dupToken;
+DuplicateToken(token, SecurityImpersonation, &amp;dupToken);
+
+// Impersonate the duplicate. This call succeeds.
+ImpersonateLoggedOnUser(dupToken);
+
+// But now, CoCreateInstance fails with E_ACCESSDENIED!
+CComPtr&lt;IUnknown&gt; something2;
+CoCreateInstance(CLSID_Something, nullptr,
+                 CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&amp;something2));
+</pre>
+<p>
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/aa446616(v=vs.85).aspx">
+The <code>Duplicate&shy;Token</code> function</a>
+says that the new token duplicates the original,
+but it does not appear to be a true duplicate because when we swap out the original
+thread token for the duplicate, things stop working.
+What's going on?
+</p>
+<p>
+There are
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/aa374909(v=vs.85).aspx">
+a lot of things in a token</a>.
+But there's something important that's not in the token.
+</p>
+<p>
+One of my colleagues from the kernel team explains:
+When you duplicate a token with the
+<code>Duplicate&shy;Token</code> function,
+it creates a new kernel object, namely the token,
+and the new token is a duplicate of the original.
+But the new token has its own properties,
+and the important one here is the security descriptor.
+</p>
+<p>
+When a new kernel object is created, and you don't provide
+an explicit security descriptor for the new object,
+then the object is given a default security descriptor.
+And that default security descriptor comes from the default DACL
+of the token that is in effect at the point of the call.
+</p>
+<p>
+When you apply this rule to tokens, you find that,
+even though the behavior is consistent with other kernel objects,
+it also means that it is very easy to create a token that
+doesn't have access to itself.
+When you impersonate with that token, bad things happen.
+</p>
+<p>
+It's like going to the FedEx Office store
+and giving them a DHL envelope with the instructions,
+"Please make a copy of this letter."
+They take the letter out of the envelope,
+make a copy,
+and then take the copy and give it to you
+<i>in a FedEx Office envelope</i>.
+They copied the letter, like you instructed,
+but it's in a different envelope.
+</p>
+<p>
+If you also want to duplicate the security descriptor,
+you can get the original token's security descriptor
+with <code>Get&shy;Kernel&shy;Object&shy;Security</code>
+or <code>Get&shy;Security&shy;Info</code>,
+and then pass that security descriptor to
+<code>Duplicate&shy;Token&shy;Ex</code>.
+</p>
+<p>
+The customer confirmed that the recommendation worked.
+</p>
+<pre>
+// This call succeeds
+CComPtr&lt;IUnknown&gt; something;
+CoCreateInstance(CLSID_Something, nullptr,
+                 CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&amp;something));
+
+// Get the current token for the thread.
+// This call also succeeds. (Note that OpenThreadToken
+// fails if the thread is not impersonating.)
+HANDLE token;
+OpenThreadToken(GetCurrentThread(), TOKEN_ALL_ACCESS, TRUE, &amp;token);
+
+<font COLOR=blue>//Get the security descriptor for the token.
+// This call succeeds.
+PACL dacl;
+PSECURITY_DESCRIPTOR sd;
+GetSecurityInfo(token, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+    nullptr, &amp;dacl, &amp;sd);
+
+// Duplicate the token with that security descriptor.
+// This call succeeds.
+SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, TRUE };
+HANDLE dupToken;
+DuplicateTokenEx(token, MAXIMUM_ALLOWED, &amp;sa, SecurityImpersonation,
+    TokenImpersonation, &amp;dupToken);</font>
+
+// Impersonate the duplicate. This call succeeds.
+ImpersonateLoggedOnUser(dupToken);
+
+// CoCreateInstance now succeeds.
+CComPtr&lt;IUnknown&gt; something2;
+CoCreateInstance(CLSID_Something, nullptr,
+                 CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&amp;something2));
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (7)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-hankhein even thread-even depth-1 parent" id="comment-1248565">
+				<div id="div-comment-1248565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Henri+Hein' rel='external nofollow' class='url'>Henri Hein</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248565">
+			May 12, 2016 at 1:56 pm</a>		</div>
+
+		<p>I have mixed feelings about the default security descriptor.  On the one hand, creating an SD is enough work, and would result in enough leaks, that it is probably necessary to accept NULL in all those calls that take an SD.  On the other hand, lots of subtle bugs come up because the default security descriptor is sometimes not the right thing, and they are hard to solve, because only those deeply familiar with the system will naturally look towards it as a source of a problem.  It can also be intimidating for a developer to contemplate creating one from scratch, and there is not always an object at hand from which to retrieve a copy, as in the above instance.  If developers were forced to create an SD more often, they might learn to understand what it is, what it can represent, and when the default one might not be correct.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1248575">
+				<div id="div-comment-1248575" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://harryjohnston.wordpress.com' rel='external nofollow' class='url'>Harry Johnston</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248575">
+			May 12, 2016 at 3:44 pm</a>		</div>
+
+		<p>On the whole I think the balance is firmly on the side of having the defaults.  I&#8217;m prepared to bet that if we didn&#8217;t, 90% of software would use security descriptors consisting of a single ACE granting full access to Everyone, because learning how to do anything else would be too much trouble.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-hankhein even depth-3 parent" id="comment-1248585">
+				<div id="div-comment-1248585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Henri+Hein' rel='external nofollow' class='url'>Henri Hein</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248585">
+			May 12, 2016 at 4:57 pm</a>		</div>
+
+		<p>I absolutely agree.  I do wish there were more material around security descriptors.  Such as examples, utility/helper classes, and blog posts on gotchas, like this one.  The ATL classes are actually decent, but I rarely see them used, or pointed to.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1248595">
+				<div id="div-comment-1248595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://harryjohnston.wordpress.com' rel='external nofollow' class='url'>Harry Johnston</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248595">
+			May 12, 2016 at 5:17 pm</a>		</div>
+
+		<p>Now that I come to think of it, it *would* be pretty neat if every API function that accepted a SECURITY_ATTRIBUTES structure could accept an SDDL instead, perhaps wrapped in a macro that does the cast and adds a magic value at the beginning for disambiguation.  But you know, -100 points and all. :-)</p>
+<p> &#8230; and all too many programmers still wouldn&#8217;t bother to learn how to use the string, and would just use some example code they found somewhere that sets it to Everyone:(F) or equivalent. :-(</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1248695">
+				<div id="div-comment-1248695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://programmerman.net/' rel='external nofollow' class='url'>Nick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248695">
+			May 13, 2016 at 1:04 pm</a>		</div>
+
+		<p>setacl 777 #jackpot</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt depth-2" id="comment-1248596">
+				<div id="div-comment-1248596" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248596">
+			May 12, 2016 at 7:10 pm</a>		</div>
+
+		<p>Except for really simple one, attempt to create new security descriptor instead of copying a security descriptor is bad. In that way you can accidentially erase properties introduced in a new version of Windows. (In similar sense to &#8220;newing a DCB and setting it&#8221; instead of &#8220;calling GetCommState(), copy it and set the desired values&#8221; for serial communication)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1248725">
+				<div id="div-comment-1248725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160512-00/?p=93447#comment-1248725">
+			May 13, 2016 at 3:27 pm</a>		</div>
+
+		<p>Interesting, if pseudohandle returned by GetCurrentThreadToken() will work if thread impersonates token thats inaccessible for open by it?<br />
+Its interesting because same surprise may happen (or happened in some older Windows) with CreateProcessAsUser function if called without proper impersonation &#8211; caused created process/thread do not have access rights to themselves, that subsequently causes something (AFAIR again COM stuff) to behave incorrectly. And pseudohandles returned by GetCurrentThread()/Process() worked fine, so that issue was not very obvious.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

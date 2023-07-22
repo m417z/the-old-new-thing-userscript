@@ -1,0 +1,340 @@
+<html>
+<head>
+<title>Why does CryptDestroyHash crash, but only sometimes?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does CryptDestroyHash crash, but only sometimes?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 27, 2016 / year-entry #20</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Improper destruction leads to undefined behavior, and undefined behavior includes "crashing only sometimes".</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was having a problem with the cryptographic hashing functions.
+They reported that their function ran successfully most of the time,
+but once in a while, it crashed at the call to
+<code>Crypt&shy;Destroy&shy;Hash</code>:
+</p>
+<pre>
+bool SomethingSomething(BYTE *buffer, int bufferSize)
+{
+    bool succeeded = true;
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+
+    if (!CryptAcquireContext(&amp;provider, NULL, NULL,
+                           PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) ||
+        !CryptCreateHash(provider, CALG_MD5, 0, 0, &amp;hash))
+    {
+        succeeded = false;
+        goto Exit;
+    }
+
+    BYTE hashResult[16]; // MD5 hash is 16 bytes
+    DWORD hashResultSize = sizeof(hashResult);
+
+    if (!CryptHashData(hash, buffer, bufferSize, 0) ||
+        !CryptGetHashParam(hash, HP_HASHVAL, hashResult,
+                                          &amp;hashResultSize, 0)) {
+        succeeded = false;
+        goto Exit;
+    }
+
+    DoSomethingWith(hashResult); // some business logic
+
+    if (provider) {
+        CryptReleaseContext(provider, 0);
+    }
+
+    if (hash) {
+        CryptDestroyHash(hash);
+    }
+
+Exit:
+
+    return succeeded;
+}
+</pre>
+<p>
+The reason for the crash is straightforward.
+As noted in the documentation,
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/aa380268(v=vs.85).aspx">
+you must call
+<code>Crypt&shy;Destroy&shy;Hash</code> before
+<code>Crypt&shy;Release&shy;Context</code></a>.
+(The technical reason for this is that each hash has a reference
+back to the context, so if you destroy the context, you leave
+the hash with a dangling pointer.)
+</p>
+<p>
+This was a relatively straightforward consult.
+A simple programming error.
+The customer thanked us for identifying the problem,
+but then followed up with
+"But why is it happening only rarely?
+Shouldn't it crash all the time?"
+</p>
+<p>
+Remember that when you break the rules, the behavior is
+undefined,
+and one valid manifestion of undefined behavior is
+"Everything seems to work okay."
+</p>
+<p>
+You may have noticed some other problems
+with the code provided.
+</p>
+<ul>
+<li>If anything goes wrong, the calls to
+    <code>Crypt&shy;Destroy&shy;Hash</code> and
+    <code>Crypt&shy;Release&shy;Context</code> are skipped,
+    which means that the code leaks a hash and a context.
+    The <code>Exit</code> label should be moved to just
+    in front of the <code>if (provider)</code>.</p>
+<li>Setting <code>succeeded = true</code> and then manually setting
+    it to <code>false</code> when something goes wrong strikes me
+    as a high-risk proposition.
+    If somebody adds code to the function and does a
+    <code>goto Exit;</code> without also setting
+    <code>succeeded = false;</code>, the function will falsely
+    report success.
+    I prefer to fail safe and initialize
+    <code>succeeded = false;</code>, and set it to <code>true</code>
+    only after I am sure that the function succeeded.
+</ul>
+<p>
+Using RAII would have solved both the order-of-destruction problem
+and the memory leaks.
+</p>
+<pre>
+bool SomethingSomething(BYTE *buffer, int bufferSize)
+{
+    // assuming suitable definitions for CryptProv and CryptHash
+    CryptProv provider(NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT);
+    if (!provider) return false;
+    CryptHash hash(provider.get(), CALG_MD5, 0, 0);
+    if (!hash) return false;
+
+    BYTE hashResult[16]; // MD5 hash is 16 bytes
+    DWORD hashResultSize = sizeof(hashResult);
+
+    if (!CryptHashData(hash.get(), buffer, bufferSize, 0) ||
+        !CryptGetHashParam(hash.get(), HP_HASHVAL, hashResult,
+                                          &amp;hashResultSize, 0)) {
+        return false;
+    }
+
+    DoSomethingWith(hashResult); // some business logic
+
+    return true;
+}
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1225041">
+				<div id="div-comment-1225041" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225041">
+			January 27, 2016 at 8:28 am</a>		</div>
+
+		<p>I hadn&#8217;t realized that the order objects were destroyed in was guaranteed by the standard &#8211; thanks for the pointer.  For those curious, this StackOverflow post goes into the details a bit more: <a href="http://stackoverflow.com/questions/14688285/c-local-variable-destruction-order" rel="nofollow">http://stackoverflow.com/questions/14688285/c-local-variable-destruction-order</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1225072">
+				<div id="div-comment-1225072" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225072">
+			January 27, 2016 at 11:08 am</a>		</div>
+
+		<p>Even further, [class.base.init](10) says &#8220;non-static data members [of a class] are initialized in the order they were declared in the class deﬁnition&#8221; (note! not the order of initialization in the constructor!) and [class.dtor](8) says that &#8220;Bases and members are destroyed in the reverse order of the completion of their constructor&#8221; so they destruct in reverse order of declaration.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-maurits even depth-3 parent" id="comment-1225121">
+				<div id="div-comment-1225121" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225121">
+			January 27, 2016 at 3:36 pm</a>		</div>
+
+		<p>Compiler non-standard exception feature request: allow me to enforce that bases/members in the initializer list are in the same order as the class definition.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-gregm odd alt depth-4 parent" id="comment-1225123">
+				<div id="div-comment-1225123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225123">
+			January 27, 2016 at 5:18 pm</a>		</div>
+
+		<p>Clang and GCC already do this.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1225181">
+				<div id="div-comment-1225181" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225181">
+			January 28, 2016 at 5:24 am</a>		</div>
+
+		<p>&gt; Clang and GCC already do this.</p>
+<p>Only if you use -Werror, since it&#8217;s a warning. I&#8217;d expect it to be the same in MSVC (a warning which can be turned into an error in the command line).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1225102">
+				<div id="div-comment-1225102" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225102">
+			January 27, 2016 at 12:22 pm</a>		</div>
+
+		<p>This is a huge feature in C++ and has been for a long time: reliable construction/destruction order of objects is critical to making resource lifetime management (memory, files, handles, whatever) more, well, manageable for us humans. This can make awkward error-handling a lot easier for the programmer, as when you need to use multiple resources in a function, and acquiring them may not be guaranteed, Use classes that acquires in the constructors, and releases in the destructors, and you can make error handling cleanup as simple as returning from the function (or throwing an exception) at the spot where a problem is encountered. I sometimes say that &#8216;}&#8217; is my favorite C++ &#8216;operator&#8217;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ipoverscsi even thread-odd thread-alt depth-1 parent" id="comment-1225044">
+				<div id="div-comment-1225044" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ipoverscsi' rel='external nofollow' class='url'>ipoverscsi</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225044">
+			January 27, 2016 at 8:30 am</a>		</div>
+
+		<p>Raymond: it&#8217;s been some time since I looked at the C++ specification, but is it really guaranteed that objects will be destructed in the opposite order of construction within an activation record? This would have to been the case for the assertion that &#8220;RAII would have solved [&#8230;] the order-of-destruction problem&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1225054">
+				<div id="div-comment-1225054" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225054">
+			January 27, 2016 at 8:42 am</a>		</div>
+
+		<p>It does. How nice!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-archangelpip even depth-2" id="comment-1225071">
+				<div id="div-comment-1225071" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225071">
+			January 27, 2016 at 10:30 am</a>		</div>
+
+		<p>It is in there with the class destructors.<br />
+There is an unconditional statement that bases and members are destroyed in the reverse order of construction. See 12.4 paragraph 8, unless it has changed in the interim.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1225152">
+				<div id="div-comment-1225152" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160127-00/?p=92934#comment-1225152">
+			January 28, 2016 at 2:55 am</a>		</div>
+
+		<p>Although temporaries used in the construction of a variable (or temporary with an extended lifetime) will get constructed before that variable but also destroyed before that variable is destroyed. (You can use this to detect whether a RAII class got assigned to a variable or just created incorrectly as a temporary by mistake.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

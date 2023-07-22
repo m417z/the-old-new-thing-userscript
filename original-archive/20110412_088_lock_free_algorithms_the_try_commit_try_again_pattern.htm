@@ -1,0 +1,715 @@
+<html>
+<head>
+<title>Lock-free algorithms: The try/commit/(try again) pattern</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock-free algorithms: The try/commit/(try again) pattern</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 12, 2011 / year-entry #89</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>31</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The singleton constructor pattern and the Interlocked�Multiply example we saw some time ago are really special cases of the more general pattern which I'll call try/commit/(try again). I don't know if this pattern has a real name, but that's what I'm calling it for today. The general form of this pattern goes like this: for...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The singleton constructor pattern and the
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/09/15/229915.aspx">
+<code>Interlocked&shy;Multiply</code></a> example we saw some time ago
+are really special cases of the more general pattern which I'll call
+try/commit/(try again).
+I don't know if this pattern has a real name,
+but that's what I'm calling it for today.
+</p>
+<p>
+The general form of this pattern goes like this:
+</p>
+<pre>
+for (;;) {
+ // capture the initial value of a shared variable we want to update
+ originalValue = sharedVariable;
+
+ ... capture other values we need to perform the operation ...
+ ... these values must be indepedent of sharedVariable ...
+
+ newValue = ... calculate the desired new result
+                based on originalValue and other captured values ...
+
+ // Xxx can be Acquire, Release, or null
+ if (InterlockedCompareExchangeXxx(
+            &amp;sharedVariable,
+            newValue, oldValue) == oldValue) {
+  break; // update was successful
+ }
+
+ ... clean up newValue ...
+
+} // loop back and try again
+</pre>
+<p>
+We calculate the desired new value based on the initial value,
+combining it with other values that vary depending on the operation
+you want to perform,
+and then use an <code>Interlocked&shy;Compare&shy;Exchange</code>
+to update the shared value,
+<i>provided the variable hasn't changed from its initial value</i>.
+If the value did change, then that means another thread raced against
+us and updated the value before we could;
+in that case, we go back and try it again.
+Maybe the next time through we won't collide against somebody.
+</p>
+<p>
+Note that the try/commit/try again pattern is unfair.
+There's no assurance that the thread that has been trying to update
+the value for the longest time will win the next race.
+(This is a property common to most lock-free algorithms.)
+</p>
+<p>
+The <code>Interlocked&shy;Multiply</code> function
+follows this pattern very closely:
+The other value required to perform the operation is simply
+the multiplier, which is a parameter to the function and therefore
+is independent of the shared variable.
+The new value is simply the product,
+and if we are unable to update the shared value (because somebody
+else modified it), we just start over.
+</p>
+<p>
+A variation of try/commit/try again is try/commit/abandon.
+In this pattern, there is no loop.
+If the exchange fails, you just give up and return a failure code.
+The function <code>Try&shy;Enter&shy;Critical&shy;Section</code> uses the
+try/commit/abandon pattern.
+(It also uses the Acquire version of
+<code>Interlocked&shy;Compare&shy;Exchange</code>
+for reasons which should be obvious.)
+</p>
+<p>
+Our singleton pattern is another special case of try/commit/try again
+where the "try again" is optimized out because we know what the result
+of "try again" is going to be, so we don't actually have to do it.
+In the singleton pattern case, the
+<code>Interlocked&shy;Compare&shy;Exchange</code>
+is a Release because the new value depends on other memory locations.
+</p>
+<p>
+Normally, the shared variable is an integer rather than a pointer,
+because a pointer is subject to the ABA problem if you incorporate
+the pointed-to data into your calculations.
+We get away with it in the singleton pattern case because the value
+change is unidirectional: It goes from <code>NULL</code> to
+<i>something</i>, and once it's <i>something</i> it never changes again.
+If the value of the shared variable can change in more general ways,
+then you have to be more careful if you use a pointer
+as the shared variable.
+(The most common solution is to make the shared variable not just
+a pointer but a pointer plus a counter which increments at each operation.)
+</p>
+<p>
+Here's another use of the try/commit/try again pattern, using
+a change counter as the shared variable.
+First, two helper functions:
+</p>
+<pre>
+LONG InterlockedReadAcquire(__in LONG *pl, __in LONG lUnlikely)
+{
+  return InterlockedCompareExchangeAcquire(pl, lUnlikely, lUnlikely);
+}
+
+LONG InterlockedReadRelease(__in LONG *pl, __in LONG lUnlikely)
+{
+  return InterlockedCompareExchangeRelease(pl, lUnlikely, lUnlikely);
+}
+</pre>
+<p>
+Although direct reads and writes of properly aligned <code>LONG</code>s
+are atomic, the operations are not synchronized and impose no
+memory ordering semantics.
+To read a value with specific semantics,
+I pull a sneaky trick:
+I perform an
+<code>Interlocked&shy;Compare&shy;Exchange</code> with the
+desired memory ordering semantics, passing the same value as the
+comparand and the exchange;
+therefore, the operation, even if successful, has no computational effect.
+</p>
+<pre>
+if (*pl == lUnlikely) *pl = lUnlikely;
+</pre>
+<p>
+To avoid dirtying the cache line,
+I use an unlikely value as the comparand/exchange,
+so most of the time, the comparison fails and no memory is written.
+(This trick doesn't help on all architectures, but it doesn't hurt.)
+</p>
+<p>
+Okay, back to the change counter example:
+</p>
+<pre>
+LONG g_lColorChange;
+
+...
+case WM_SYSCOLORCHANGE:
+ InterlockedIncrement(&amp;g_lColorChange);
+ ...
+
+int CalculateSomethingAboutSystemColors()
+{
+ LONG lColorChangeStart;
+ do {
+  lColorChangeStart = InterlockedReadAcquire(&amp;g_lColorChange, -1);
+  COLORREF clrWindow = GetSysColor(COLOR_WINDOW);
+  COLORREF clrHighlight = GetSysColor(COLOR_HIGHLIGHT);
+  ... other computations involving GetSysColor(...)
+ } while (InterlockedReadRelease(
+                       &amp;g_lColorChange, -1) != lColorChangeStart);
+ return iResult;
+}
+</pre>
+<p>
+We capture the color change counter and then begin doing our
+calculations.
+We capture the value with acquire semantics so that we get the value
+before we start reading the system colors.
+When we're done,
+we compare the value of the change counter against the value we
+captured.
+If it's different, then that means that the colors changed while
+we were doing our calculations, so our calculations are all messed up.
+In that case,
+we go back and try it again.
+</p>
+<p>
+This technique does assume that you won't get into a situation where
+one thread manages to increment the change counter 4&nbsp;billion times
+before the other thread manages to run.
+This is not a problem in practice.
+For example, in this case, it's reasonable to assume that
+nobody is going to change their system
+colors 4&nbsp;billion times within a single thread quantum.
+</p>
+<p>
+Next time,
+I'll show a different variation on try/commit/abandon
+which might be suitable for simple caches.
+</p>
+<p>
+<b>Exercise</b>:
+Criticize the following:
+"I noticed that there is no interlocked read operation,
+but there is <code>Interlocked&shy;Or</code>,
+so my plan is to perform an interlocked read by or'ing with zero."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (31)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-906853">
+				<div id="div-comment-906853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MSS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906853">
+			April 12, 2011 at 7:20 am</a>		</div>
+
+		<p>Could it be because using InterlockedOr would actually write to memory and therefore with trash the cache ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906863">
+				<div id="div-comment-906863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MSS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906863">
+			April 12, 2011 at 7:22 am</a>		</div>
+
+		<p>Arghhh, meant &quot;will trash&quot; instead of &quot;with trash&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-nathan_works even thread-even depth-1" id="comment-906883">
+				<div id="div-comment-906883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/nathan_works' rel='external nofollow' class='url'>nathan_works</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906883">
+			April 12, 2011 at 7:44 am</a>		</div>
+
+		<p>Is the use case for the lock-free patterns for high-performance, multi-core, multi-thread code ? I&#39;m struggling to see the usecase where one could apply this. Are there general benefits to using lock-less code? &nbsp;(Other than &quot;most folks don&#39;t grok locks&quot;)</p>
+<p>(Granted, I&#39;m working on an ARM project where there are no user-level &quot;atomic&quot; operations, so all my multi-threaded code is pthreads with locks).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906893">
+				<div id="div-comment-906893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906893">
+			April 12, 2011 at 7:50 am</a>		</div>
+
+		<p>Regardless of memory contents, CMPXCHG thrashes remote (on other processor) cache anyway. The cache coherency protocol is the biggest cost of interlocked operations.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906923">
+				<div id="div-comment-906923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken Herron</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906923">
+			April 12, 2011 at 8:59 am</a>		</div>
+
+		<p>You don&#39;t need an interlocked read because &quot;direct reads and writes of properly aligned LONGs are atomic&quot;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906933">
+				<div id="div-comment-906933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906933">
+			April 12, 2011 at 9:05 am</a>		</div>
+
+		<p>What would an interlocked read do in the first place? What would it consider as a failure? Is there any memory read failure that is unique to an interlocked read anyway?</p>
+<p>Either the old value is there or, wait, what would the definition of old and new be anyway? There is only one value involved: whatever value there was at the time you read the memory.</p>
+<p>This is all under the assumption that the memory area can be read atomically. If that assumption doesn&#39;t hold then you&#39;ve got bigger issues than this series are supposed to deal with.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906943">
+				<div id="div-comment-906943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906943">
+			April 12, 2011 at 9:16 am</a>		</div>
+
+		<p>@nathan_works I&#39;d say if you know what you&#39;re doing and you know you don&#39;t lock often at the system you&#39;re programming behaves exactly as you expect it to, fine. Still having lock-free constructs can result in immense improvements in the behaviour of some application. Windows programs had real problems with locks before, see:</p>
+<p><a rel="nofollow" target="_new" href="http://www.bluebytesoftware.com/blog/2006/12/15/AnticonvoyLocksInWindowsServer2003SP1AndWindowsVista.aspx" rel="nofollow">http://www.bluebytesoftware.com/&#8230;/AnticonvoyLocksInWindowsServer2003SP1AndWindowsVista.aspx</a></p>
+<p>There&#39;s no question that lock-free can be made much better than the solution with unnecessary locks, what I didn&#39;t get is the advantages of lock free initialisation which happens only once in the life of the program. However if you&#39;re not making the application that serves a single user (but some server-style one) and you&#39;d otherwise have to lock for every access to some variable or some data structure, switching to lock-free can give you immensely better program.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906953">
+				<div id="div-comment-906953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906953">
+			April 12, 2011 at 9:25 am</a>		</div>
+
+		<p>#define InterlockedReadAcquire(longptr) (MemoryBarrier(), *(longptr))</p>
+<p>No need for InterlockedReadRelease.</p>
+<div class="post">[<i>Close. Your memory barrier is on the wrong side of the read. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906973">
+				<div id="div-comment-906973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sean</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906973">
+			April 12, 2011 at 9:30 am</a>		</div>
+
+		<p>@ken &#8211; interlocked read is used for the memory barrier, not for the atomic read</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906983">
+				<div id="div-comment-906983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906983">
+			April 12, 2011 at 9:46 am</a>		</div>
+
+		<p>Suggestion: post code that comes from something that actually compiled.</p>
+<p>Doing so would avoid mistakes such as writing &quot;originalValue&quot; in one part of the code, and then writing &quot;oldValue&quot; elsewhere. &nbsp;I think we can assume what you really meant, but IMHO it&#39;s better for the code to not require assumptions for comprehension.</p>
+<p>Same thing came up in an earlier post in this series (code used an undeclared variable named &quot;m_ccsAlloc&quot; in <a target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx" rel="nofollow">blogs.msdn.com/&#8230;/10150261.aspx</a>). &nbsp;We can guess what that variable is, but it&#39;s better if it&#39;s right there in black and white.</p>
+<div class="post"><i>These were not meant to be real programs. They are illustrating the principle. Consider the implied exercise &quot;These code fragments are for pattern demonstration and therefore cannot be compiled as-is. (At least until compilers can fill in &quot;&#8230;&quot; with actual working code.) Given what you&#39;ve learned, fix any errors.&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906993">
+				<div id="div-comment-906993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Derek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-906993">
+			April 12, 2011 at 10:10 am</a>		</div>
+
+		<p>@pete.d</p>
+<p>So long as Raymond is taking the time to educate us all, I don&#39;t really care if he takes the time to compile all of his samples. &nbsp;If it&#39;s a choice between fewer posts with 100%-correct code or more posts with the occasional error, I&#39;ll take the more posts option.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907003">
+				<div id="div-comment-907003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907003">
+			April 12, 2011 at 10:13 am</a>		</div>
+
+		<p>@Derek:</p>
+<p>Education doesn&#39;t work if the communication is flawed. &nbsp;The people who are in most need of the education are also the least likely to be able to infer what the correct meaning is.</p>
+<p>In any case, it&#39;s merely a suggestion. &nbsp;I know it&#39;s popular to brown-nose around here, but surely Raymond is capable of choosing himself whether it makes sense for his code examples to work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907013">
+				<div id="div-comment-907013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">djlin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907013">
+			April 12, 2011 at 10:39 am</a>		</div>
+
+		<p>Taking a stab at the exercise: This will give you both acquire and release semantics when you might only want one?</p>
+<p>(Sorry if this is a duplicate &#8212; the first time I hit the button the page reloaded with no post and the text box filled.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907023">
+				<div id="div-comment-907023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Shane</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907023">
+			April 12, 2011 at 1:02 pm</a>		</div>
+
+		<p>In the first block of code, shouldn&#39;t &quot;oldvalue&quot; be &quot;originalvalue&quot; ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907053">
+				<div id="div-comment-907053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907053">
+			April 12, 2011 at 2:44 pm</a>		</div>
+
+		<p>@Raymond: Consider the implied exercise &quot;These code fragments are for pattern demonstration and therefore cannot be compiled as-is. (At least until compilers can fill in &quot;&#8230;&quot; with actual working code.) Given what you&#39;ve learned, fix any errors.&quot;</p>
+<p>Suit yourself. &nbsp;Personally, I think there&#39;s a big difference between incomplete (which is perfectly appropriate) and simply wrong. &nbsp;I&#39;m not suggesting the code examples themselves be compilable as-is. &nbsp;But they ought to at least be copied from code that <em>does</em> compile, so that they are at least self-consistent.</p>
+<p>But hey…it&#39;s your blog. &nbsp;If that&#39;s the persona and attitude you want to portray publicly, that&#39;s your prerogative.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907063">
+				<div id="div-comment-907063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Some Guy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907063">
+			April 12, 2011 at 3:30 pm</a>		</div>
+
+		<p>This is not a &quot;copy and paste stuff that works by magic&quot; blog. This is most definately a &quot;here&#39;s something neat, look up the details and learn how it actually works before you use it&quot; blog.</p>
+<p>And with something as complex as lock-free algorithms, anyone who can&#39;t figure out the occasional typo for themselves doesn&#39;t know enough to use the info, anyway.</p>
+<p>Like most people, I appreciate the effort Raymond has put into his blog, and hope a few complainers aren&#39;t going to put him off.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907073">
+				<div id="div-comment-907073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">benski</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907073">
+			April 12, 2011 at 3:41 pm</a>		</div>
+
+		<p>Exercize Answer: InterlockedOr is going to write to memory unnecessarily, always.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907083">
+				<div id="div-comment-907083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907083">
+			April 12, 2011 at 3:55 pm</a>		</div>
+
+		<p>Characterizing me as a &quot;complainer&quot; is stupid. &nbsp;I&#39;m not complaining. &nbsp;I&#39;m suggesting to Raymond, for his own information, that he&#39;s sending a wrong message. &nbsp;There&#39;s a difference.</p>
+<p>Fact is: with something as complex as lock-free algorithms, there really is no place whatsoever for carelessness.</p>
+<p>Hypothetically, knowing nothing else about a person, if that person can&#39;t be trusted to post code that is even consistent with itself, they may not really be a person one would want to trust to help get one&#39;s lock-free algorithms correct. &nbsp;They are hard enough to get right even when one is being careful and methodical in their implementation. &nbsp;Any carelessness or lack of concern for rigorousness is a recipe for disaster.</p>
+<p>That all said: &nbsp;I don&#39;t know that one shouldn&#39;t trust Raymond on this stuff, nor do I even have any reason to actually believe that. &nbsp;I&#39;ve worked as a Microsoft employee with him directly in the past (~15 years ago) and he seemed then, and still seems today, a smart, reliable person. &nbsp;But I know that if I didn&#39;t know those things about Raymond already and came across these articles cold, I&#39;d sure think twice before trusting them, given the carelessness applied to the code examples.</p>
+<p>As I said, if that&#39;s the image Raymond wants coming across in public, that&#39;s his prerogative. &nbsp;I&#39;m not now, nor will I ever, _complain_ that he&#39;s doing so. &nbsp;I simply offer these comments in the event that Raymond himself would like to reflect on the reality of the situation, and decide for himself whether or not that&#39;s a reality with which he&#39;s comfortable.</p>
+<p>I sure hope he understands the point I&#39;m trying to make better than &quot;SomeGuy&quot; and Derek do.</p>
+<p>And you guys need not worry: one thing I&#39;m sure of is that Raymond has a strong enough sense of self-worth that nothing I&#39;ve written here is going to affect his decision whether to continue writing this blog or not. &nbsp;In fact, the suggestion that it might is simply ludicrous. &nbsp;Get a grip.</p>
+<div class="post">[<i>I appreciate the corrections. But saying &quot;You should at least compile the code&quot; makes no sense when the &quot;code&quot; consists of clearly non-compilable fragments like &quot;newValue = &#8230; calculate the desired new result based on originalValue and other captured values &#8230;&quot; and &quot;InterlockedCompareExchangeXxx&quot;. A better reason for not trusting me with lock-free algorithms is that <a href="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/06/10150261.aspx" rel="nofollow">my first lock-free algorithm was wrong</a>. (And my second <a href="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/08/10151258.aspx" rel="nofollow">wasn&#39;t much better</a>.) As I noted, this is a &quot;taking the toaster apart&quot; series, not a &quot;how to build a toaster&quot; series. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907093">
+				<div id="div-comment-907093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907093">
+			April 12, 2011 at 4:29 pm</a>		</div>
+
+		<p>@Raymond: &hellip;saying &quot;You should at least compile the code&quot; makes no sense&hellip;</p>
+<p>You&#39;re right. &nbsp;That statement makes no sense. &nbsp;But then, I never actually wrote that.</p>
+<p>My very first message actually read &quot;post code that comes from something that actually compiled&quot;. &nbsp;In a follow-up, I wrote &quot;ought to at least be copied from code that _does_ compile&quot;.</p>
+<p>At no time did I ever claim the code posted should compile as-is.</p>
+<p>Perhaps it&#39;s too much to ask that what I write is read according to the words I wrote, rather than making up some other interpretation that makes it sound like I don&#39;t have a clue. &nbsp;If so, I apologize for having ever bothered. &nbsp;Silly me.</p>
+<div class="post">[<i>If I took it from code that compiled, I&#39;d have to rename the variables (from their actual names to placeholder names), remove the business logic, clean up what&#39;s left, and by that point it&#39;s more work than just writing the non-compilable code. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907103">
+				<div id="div-comment-907103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Crescens2k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907103">
+			April 12, 2011 at 4:37 pm</a>		</div>
+
+		<p>With how difficult this topic is in the first place, the people who are likely to get anything out of it are the ones who can infer the &#8230;s and the Xxxs in the code. I also think that this kind of thing isn&#39;t copy pastable is a good thing, since if you can&#39;t write the code yourself, then introducing it into a codebase is the worst thing you can do. All you would end up is adding a pile of code that nobody understands and is too afraid to touch just in case it breaks.</p>
+<p>I&#39;ve found the entire series really good. They have been a really informative few posts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907113">
+				<div id="div-comment-907113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907113">
+			April 12, 2011 at 7:37 pm</a>		</div>
+
+		<p>I had this variable that was a public global in a .NET Class. A maintenance programmer was doing code cleanup and mechanically converted it to a property. I told him to change it back.</p>
+<p>Calling InterlockedIncrement on a property compiles. The resulting code is not interlocked.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907123">
+				<div id="div-comment-907123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907123">
+			April 12, 2011 at 7:59 pm</a>		</div>
+
+		<p>&quot;Calling InterlockedIncrement on a property compiles. The resulting code is not interlocked.&quot;</p>
+<p>Accessing the variable via a class field isn&#39;t interlocked either. The property the maintenance programmer changed it to was equivalent.</p>
+<p>In fact, had you left the change to a property, that would have allowed for encapsulating in a single place whatever thread safety you needed in the property code. &nbsp;As a field, all the accessing code has to be fixed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907133">
+				<div id="div-comment-907133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907133">
+			April 13, 2011 at 12:37 am</a>		</div>
+
+		<p>&quot;Calling InterlockedIncrement on a property compiles. The resulting code is not interlocked.&quot;</p>
+<p>How does it compile? It certainly doesn&#39;t compile in C# ! You need to pass the variable by reference, which isn&#39;t possible for properties in C#. So if you aren&#39;t using C# you maybe should review if the language you are using is a good choice for lock-free algorithms &#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907143">
+				<div id="div-comment-907143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907143">
+			April 13, 2011 at 1:38 am</a>		</div>
+
+		<p>And no, I have no idea how I overlooked the clearly erroneous claim that &quot;calling InterlockedIncrement on a property compiles&quot;. &nbsp;Reading it now, it&#39;s a statement that is completely different from whatever I read it as before. &nbsp;Mea culpa.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907163">
+				<div id="div-comment-907163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Not Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907163">
+			April 13, 2011 at 3:18 am</a>		</div>
+
+		<p>@pete.d: I would imagine the type of developer that actually considers using a lock-free algorithm, let alone knowing that such a thing exists, would be smart enough to be able to correct the misnamed variables themselves.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907263">
+				<div id="div-comment-907263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">doug.kavendek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907263">
+			April 13, 2011 at 8:19 am</a>		</div>
+
+		<p>pete.d, you sound like loads of fun. &nbsp;Personally, this off-topic ranting is a lot more distracting than a mis-named variable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907273">
+				<div id="div-comment-907273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907273">
+			April 13, 2011 at 8:24 am</a>		</div>
+
+		<p>Sorry, pete.d but you can call InterlockedIncrement on a class-level variable thanks to byref. The vb.net compiler will also allow passing a property byref and generate code that reads the property into a local variable, passes the local variable byref, and assigns the result to the property.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907353">
+				<div id="div-comment-907353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907353">
+			April 13, 2011 at 1:36 pm</a>		</div>
+
+		<p>I&#39;m running these examples through my head and have a question: isn&#39;t there still a possibility of a deadly embrace scenerio where one thread acquires a resource but is switched out for another thread that acquires the same resource (which is in turn switched out&#8230;?) Wouldn&#39;t the acquisition check at the end of the try/commit/try again continually fail, or am I missing something?</p>
+<p>@pete.d: Sometimes the examples in this blog are meant solely to show how an algorithm works: in other words, they&#39;re written in pseudocode! I appreciate this because it means that I don&#39;t have to spend extra work separating the non-essentials from the essentials; it may be &quot;lazy&quot; coding but I don&#39;t mind because it allows me to be &quot;lazy&quot; too.</p>
+<div class="post">[<i>The The acquisition check fails if some other thread made progress, so you can&#39;t get stuck here forever because progress is made (by <span style="text-decoration:underline;">somebody</span></i>) at each iteration. -Raymond<i></i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907233">
+				<div id="div-comment-907233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907233">
+			April 13, 2011 at 7:35 am</a>		</div>
+
+		<p>@everyone who posted essentially this same sentiment (assuming it&#39;s really more than one person): &quot;I would imagine the type of developer that actually considers using a lock-free algorithm, let alone knowing that such a thing exists, would be smart enough to be able to correct the misnamed variables themselves.&quot;</p>
+<p>That&#39;s a completely illogical way of thinking. &nbsp;Following that kind of reasoning, the type of developer that actually considers using a lock-free algorithm can figure it out all by their lonesome, without help from Raymond or anyone else. &nbsp;Why bother with the articles at all then?</p>
+<p>I get Raymond&#39;s reply. &nbsp;The upshot of his explanation is basically simply that he&#39;s lazy, pedagogically speaking, and frankly that&#39;s his prerogative (as I already said). &nbsp;He doesn&#39;t want to bother starting from real code (*) to ensure that what he posts is actually valid (in any sense of the word, whether we&#39;re talking just about compiling the code, or even about getting it to do what it&#39;s supposed to). &nbsp;I admit, that takes time, and for someone who wants to post an article a day and still has a real job, I guess that&#39;s just too much trouble.</p>
+<p>(*) (note that I never said the code should be production code…just that it should exist as real code…the reluctance to rename contents of production code is simply a proxy for not wanting to bother writing a proper, standalone code example in the first place)</p>
+<p>But for the readers of the blog to make these foolish rationalizations? &nbsp;That&#39;s silly. &nbsp;There&#39;s no educational justification for the carelessness, and any argument that relies on the prior knowledge or skill of the person supposedly being educated falls flat. &nbsp;The fact is, the effectiveness of the article is limited by the accuracy of its contents, regardless of the audience. &nbsp;It&#39;s true that the smarter the audience, the less important correctness is. &nbsp;But it&#39;s also true that the smarter one is relying on one&#39;s audience to be, the less that audience really needs the article in the first place. &nbsp;You don&#39;t get one without the other.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-907403">
+				<div id="div-comment-907403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pete.d</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907403">
+			April 13, 2011 at 6:22 pm</a>		</div>
+
+		<p>@Joshua: &quot;Sorry, pete.d but you can call InterlockedIncrement on a class-level variable thanks to byref. The vb.net compiler will also allow passing a property byref and generate code that reads the property into a local variable, passes the local variable byref, and assigns the result to the property.&quot;</p>
+<p>Ah, okay. &nbsp;Yet another example of VB.NET going to extra trouble to allow you to do something you shouldn&#39;t be doing in the first place. &nbsp;Though, I wouldn&#39;t be surprised if that feature existed as a backward-compat thing (i.e. I&#39;m sure they do have a good reason for the feature…doesn&#39;t mean I have to like it though).</p>
+<p>Not that I have anything against VB.NET personally, but I&#39;ll stick with C#, thank you very much.</p>
+<p>@doug.kavendek:</p>
+<p>&quot;Ranting&quot;? &nbsp;Give me a break. &nbsp;If it weren&#39;t for all the suck-ups trying to defend the indefensible, there wouldn&#39;t even be a discussion on the issue I raised, and the truth is I acknowledged Raymond&#39;s explanation and respect his position on the question, even if it&#39;s not the choice I&#39;d make. &nbsp;That&#39;s pretty much the opposite of a rant.</p>
+<p>As for being &quot;fun&quot;, well…for some odd reason, entertaining the lot of you wasn&#39;t ever something I was worried about. &nbsp;I can be &quot;fun&quot; when it&#39;s time for being fun, and a pain in the ass when people around me are acting like idiots.</p>
+<p>See if you can guess which mode I&#39;ve been in here.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-907553">
+				<div id="div-comment-907553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ben</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110412-00/?p=10963#comment-907553">
+			April 14, 2011 at 2:37 pm</a>		</div>
+
+		<p>I wasn&#39;t aware that being a pain in the ass on teh internets was something to aspire to, you should be proud.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

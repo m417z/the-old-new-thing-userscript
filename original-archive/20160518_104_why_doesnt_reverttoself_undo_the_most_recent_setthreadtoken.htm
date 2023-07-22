@@ -1,0 +1,521 @@
+<html>
+<head>
+<title>Why doesn't RevertToSelf undo the most recent SetThreadToken?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why doesn&#8217;t RevertToSelf undo the most recent SetThreadToken?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 18, 2016 / year-entry #105</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>21</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">It removes all impersonation; it doesn't restore it.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer was experiencing unexpected behavior
+in their Windows service process with respect to impersonation.
+The customer's question had two parts.
+Let's take them one at a time.
+</p>
+<blockquote CLASS=m>
+<p>
+Our service receives a request from a client and impersonates the
+client in order to satisfy the request.
+</p>
+<p>
+As part of satisfying the request,
+the service needs to impersonate a specific unrelated identity
+in order to get some information.
+That nested impersonation is done with <code>Set&shy;Thread&shy;Token</code>.
+</p>
+<p>
+When the nested impersonation is complete,
+we call
+<code>Revert&shy;To&shy;Self</code>.
+But this does not restore the impersonation to the original client;
+instead, the thread loses all impersonation and becomes
+"Network Service", which is the token of the service process.
+</p>
+<p>
+Is this how the <code>Revert&shy;To&shy;Self</code> function
+is supposed to work?
+MSDN doesn't explicitly mention this.
+</p>
+</blockquote>
+<p>
+Here's
+<a HREF="https://msdn.microsoft.com/library/windows/desktop/aa379317(v=vs.85).aspx">
+what MSDN says about
+<code>Revert&shy;To&shy;Self</code></a>:
+</p>
+<blockquote CLASS=q>
+<p>
+<b><font SIZE=+2>Revert&shy;To&shy;Self function</font></b>
+</p>
+<p>
+The <b>Revert&shy;To&shy;Self</b> function terminates the impersonation
+of a client application.
+</p>
+</blockquote>
+<p>
+It states right there that
+<code>Revert&shy;To&shy;Self</code> ends impersonation.
+When it returns, impersonation has terminated.
+It is an ex-impersonation.
+</p>
+<p>
+I guess that's why the function is called
+<code>Revert&shy;To&shy;Self</code> and
+not
+<code>Revert&shy;To&shy;Previous&shy;Token&shy;Prior&shy;To&shy;Most&shy;Recent&shy;Call&shy;To&shy;Set&shy;Thread&shy;Token</code>.
+</p>
+<p>
+The thread token is a single value.
+It's not a stack of values;
+<code>Set&shy;Thread&shy;Token</code> does not push a new
+value onto the top of the stack,
+and <code>Revert&shy;To&shy;Self</code> does not pop the top value off
+the stack and reveal the previous value.
+For one thing, that model would make it hard to manage impersonation
+if you wanted to change impersonation in a non-stack-like manner.
+Second, maintaining a
+<a HREF="https://www.flickr.com/photos/42873250@N00/3455003346/">
+stack of tokens</a>
+would create problems if somebody destroyed a token while it was
+still in the token stack.
+</p>
+<p>
+Nope, a thread token is just one token.
+When you call <code>Set&shy;Thread&shy;Token</code>,
+it replaces the token.
+When you call <code>Revert&shy;To&shy;Self</code>,
+the token is cleared and the thread no longer has a token.
+Maybe
+<code>Revert&shy;To&shy;Self</code>
+should have been named
+<code>Clear&shy;Thread&shy;Token</code>,
+since that would emphasize that the function erases any
+existing thread token,
+leaving the thread to inherit the identity of its host process.
+</p>
+<p>
+If you want to change impersonation to some other identity,
+then call <code>Set&shy;Thread&shy;Token</code> with the token
+whose identity you want to impersonate.
+</p>
+<p>
+Okay, that's part one.
+The customer's original question anticipated this answer and
+had a follow-up question.
+</p>
+<blockquote CLASS=m>
+<p>
+Presumably, if this is the expected behavior of the
+<code>Revert&shy;To&shy;Self</code> function,
+then what the code needs to do in order to perform
+the nested impersonation is
+</p>
+<ol>
+<li>Call <code>Get&shy;Thread&shy;Token</code> to get the
+    current impersonation token.</p>
+<li>Call <code>Set&shy;Thread&shy;Token</code> to set the
+    nested impersonation token.</p>
+<li>Do the necessary work.
+<li>To end nested impersonation,
+    call <code>Set&shy;Thread&shy;Token</code> with the token
+    obtained in step&nbsp;1 to restore the thread token
+    to the original impersonation token.
+</ol>
+<p>
+Is that correct?
+</p>
+</blockquote>
+<p>
+Close.
+</p>
+<p>
+It's possible that step&nbsp;1 will fail with
+<code>ERROR_<wbr>NO_<wbr>TOKEN</code>.
+That happens if the thread is not impersonating
+at all, which means that your code is operating
+from a flawed assumption.
+In that case, you have no nested impersonation;
+you just have impersonation.
+Step&nbsp;4 needs to be adjusted as follows:
+</p>
+<ol>
+<li VALUE=4>If step&nbsp;1 failed with
+    <code>ERROR_<wbr>NO_<wbr>TOKEN</code>,
+    then call <code>Revert&shy;To&shy;Self</code>
+    to end impersonation.
+    If step&nbsp;1 succeeded, then the thread
+    was previously impersonating, in which case
+    call <code>Set&shy;Thread&shy;Token</code>
+    with the token obtained in step&nbsp;1
+    to restore the thread token to the original
+    impersonation token.</p>
+<li>Close the thread token obtained in step&nbsp;1,
+    if any.
+</ol>
+<p>
+The 
+customer replied,
+"Thanks. It appears that we misunderstood the statement in MSDN."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (21)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1249346">
+				<div id="div-comment-1249346" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249346">
+			May 18, 2016 at 8:17 am</a>		</div>
+
+		<p>Wise customer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf odd alt thread-odd thread-alt depth-1" id="comment-1249355">
+				<div id="div-comment-1249355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249355">
+			May 18, 2016 at 8:19 am</a>		</div>
+
+		<p>At first I wondered why close the thread token in step 1, but apparently the thing is that GetCurrentThreadToken() returns a pseudo-handle, therefore DuplicateHandle() is necessary (and thus, step 1 does create a new token handle that must be closed).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-matteo even thread-even depth-1" id="comment-1249365">
+				<div id="div-comment-1249365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Matteo+Italia' rel='external nofollow' class='url'>Matteo Italia</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249365">
+			May 18, 2016 at 10:19 am</a>		</div>
+
+		<p>It&#8217;s a bit disappointing that this special case is actually necessary, this is a case where a model similar to device contexts (where there&#8217;s always a valid &#8220;something&#8221; selected, even if a &#8220;magic&#8221; null one, and there&#8217;s a SelectObject-like to perform switches) would have proven nicer to work with.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1249375">
+				<div id="div-comment-1249375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Thomas Anderson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249375">
+			May 18, 2016 at 11:39 am</a>		</div>
+
+		<p>The SetThreadToken docs say &#8220;If Token is NULL, the function causes the thread to stop using an impersonation token.&#8221;.  So you should be able to pass NULL in step 4 in the case where GetThreadToken failed. (I think?).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1249385">
+				<div id="div-comment-1249385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249385">
+			May 18, 2016 at 2:42 pm</a>		</div>
+
+		<p>Yup, that&#8217;s certainly simpler.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1249405">
+				<div id="div-comment-1249405" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249405">
+			May 19, 2016 at 3:25 am</a>		</div>
+
+		<p>&#8220;causes the thread to stop using an impersonation token&#8221; sounds like the phrase that should have been used to describe the effect of RevertToSelf.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1249386">
+				<div id="div-comment-1249386" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">andy_k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249386">
+			May 18, 2016 at 9:46 pm</a>		</div>
+
+		<p>&gt; When it returns, impersonation has terminated. It is an ex-impersonation.</p>
+<p>The impersonation is not dead, it&#8217;s resting.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1249895">
+				<div id="div-comment-1249895" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">The_Assimilator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249895">
+			May 23, 2016 at 1:48 am</a>		</div>
+
+		<p>This impersonation is deceased! It is DEMISED!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-raykoopa even thread-odd thread-alt depth-1" id="comment-1249396">
+				<div id="div-comment-1249396" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ray+Koopa' rel='external nofollow' class='url'>Ray Koopa</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249396">
+			May 19, 2016 at 12:46 am</a>		</div>
+
+		<p>I totally agree with you that &#8220;ClearThreadToken&#8221; might have been a better name.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt thread-even depth-1 parent" id="comment-1249415">
+				<div id="div-comment-1249415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249415">
+			May 19, 2016 at 3:25 am</a>		</div>
+
+		<p>Mr Chen, it appears your blog&#8217;s font problem (mentioned in previous feedbacks) is still not resolved. The blog looks awful on any system other than Windows Vista or later. (That means iPhone, iPad, Android tablets and phones, etc.) If I am remembering right, you said you&#8217;ve filed a ticket with your &#8230; webmaster or webmistress?</p>
+<p>Your neighboring Windows PowerShell Blog seems to have solved this problem already.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1249425">
+				<div id="div-comment-1249425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Boris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249425">
+			May 19, 2016 at 3:33 am</a>		</div>
+
+		<p>I just want the old color scheme back, since white on black is more about uniformity and loss of identity among so many other MSDN blogs. The spirit of oldnewthing requires adaptation to new requirements and technology while also maintaining continuity with the past.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1249435">
+				<div id="div-comment-1249435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ron O</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249435">
+			May 19, 2016 at 5:03 am</a>		</div>
+
+		<p>A current/recommended solution is to use the Stylish plugin/extension (I know it&#8217;s available for both Firefox and Chrome) and then add The Old New Thing Classic Style (<a href="https://userstyles.org/styles/121616/the-old-new-thing-classic-style" rel="nofollow">https://userstyles.org/styles/121616/the-old-new-thing-classic-style</a>).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1249445">
+				<div id="div-comment-1249445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.dox.com.au' rel='external nofollow' class='url'>Ian Yates</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249445">
+			May 19, 2016 at 6:03 am</a>		</div>
+
+		<p>Thanks for the stylish link.  The familiar blog is back! :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt depth-3" id="comment-1249455">
+				<div id="div-comment-1249455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249455">
+			May 19, 2016 at 7:05 am</a>		</div>
+
+		<p>Hijacker!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1249446">
+				<div id="div-comment-1249446" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249446">
+			May 19, 2016 at 7:04 am</a>		</div>
+
+		<p>I don&#8217;t have an iPad so I don&#8217;t know how bad it looks there. Tell me what to fix.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command odd alt depth-3 parent" id="comment-1249465">
+				<div id="div-comment-1249465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249465">
+			May 19, 2016 at 7:07 am</a>		</div>
+
+		<p>Then don&#8217;t trust ipadpreview.com ever again. It is using the local font.</p>
+<p>I have an actual iPad. It is not okay.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1249696">
+				<div id="div-comment-1249696" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249696">
+			May 19, 2016 at 11:28 pm</a>		</div>
+
+		<p>In what way is that telling him what to fix? Anyone reading this blog ought to be able to leave a better bug report than &#8220;it is not okay&#8221;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1249735">
+				<div id="div-comment-1249735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://programmerman.net/' rel='external nofollow' class='url'>Nick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249735">
+			May 20, 2016 at 7:00 am</a>		</div>
+
+		<p>The theme sets font-family to &#8220;Segoe UI.&#8221; Add more fonts in the fallback (font-family: &#8220;Segoe UI&#8221;, sans-serif; would mostly solve it).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-odd thread-alt depth-1 parent" id="comment-1249656">
+				<div id="div-comment-1249656" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249656">
+			May 19, 2016 at 7:27 pm</a>		</div>
+
+		<p>That said the instructions in the followup question may work for them &#8220;for this case&#8221;.</p>
+<p>Since in the original qusetion, the customer mentioned reverting to &#8220;Network Service&#8221; is bad for them, I&#8217;ll think perheps their application code is always running under some impersonation context, so maybe the GetThreadToken() call would always succeed.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1249695">
+				<div id="div-comment-1249695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1249695">
+			May 19, 2016 at 11:26 pm</a>		</div>
+
+		<p>That&#8217;s certainly possible, but it&#8217;s also possible that they may or may not be impersonating originally, but they&#8217;re only asking about the case where they are because that&#8217;s the case where their code isn&#8217;t working. It&#8217;s prudent to make your answers a bit more general than the exact scope of the stated problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1250235">
+				<div id="div-comment-1250235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hofi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160518-00/?p=93485#comment-1250235">
+			May 23, 2016 at 11:13 pm</a>		</div>
+
+		<p>Any chance to get similar details in cases like this in the msdn documentation?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

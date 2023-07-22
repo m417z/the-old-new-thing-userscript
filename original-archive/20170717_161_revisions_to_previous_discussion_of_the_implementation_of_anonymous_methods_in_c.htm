@@ -1,0 +1,411 @@
+<html>
+<head>
+<title>Revisions to previous discussion of the implementation of anonymous methods in C#</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Revisions to previous discussion of the implementation of anonymous methods in C#</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 17, 2017 / year-entry #162</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>10</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">All instance all the time.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Welcome to CLR Week.
+</p>
+<p>
+Yes, it's been a long time since the last CLR Week.
+Some people might consider that a feature.
+</p>
+<p>
+Anyway, I'm going to start by calling attention to some revisions
+to previous discussion of the implementation of anonymous methods in C#.
+</p>
+<ul>
+<li>
+    <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20060802-00/?p=30263">Part 1</a>
+</li>
+<li>
+    <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20060803-00/?p=30253">Part 2</a>
+</li>
+<li>
+    <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20060804-00/?p=30233">Part 3</a>
+</li>
+</ul>
+<p>
+The first revision is one most people are well aware of,
+namely that
+<a HREF="https://ericlippert.com/2009/11/16/closing-over-the-loop-variable-considered-harmful-part-two/">
+the scope of the control variable of a <code>foreach</code> statement is now the controlled statement</a>.
+What this means for you is that closing over the loop control variable
+of a <code>foreach</code> statement is not dangerous.
+Note, however, that closing over the loop control variable of a <code>for</code> statement
+is still dangerous.
+</p>
+<p>
+The second revision is that noncapturing lambdas are no longer wrappers around a
+static method.
+Even if the lambda captures nothing, it is still converted to an instance method
+(of an anonymous type).
+</p>
+<p>
+The reason
+<a HREF="http://stackoverflow.com/q/30897647/#comment49837759_30897727">
+given by Kevin Pilch-Bisson</a>
+is that "delegate invokes are optimized for instance methods and have space on the stack for them.
+To call a static method they have to shift parameters around."
+</p>
+<p>
+Let's unpack that explanation.
+</p>
+<p>
+Recall that instance methods have a hidden <code>this</code> parameter,
+whereas static methods do not.
+Suppose you want to forward a call from one method to another.
+For concreteness, let's say you have
+</p>
+<pre>
+class C1
+{
+ public void M1(int x, int y, int z)
+ {
+  System.Console.WriteLine("From {0} to {1} via {2}", x, y, z);
+ }
+ static public void S1(int x, int y, int z)
+ {
+  System.Console.WriteLine("From {0} to {1} via {2}", x, y, z);
+ }
+}
+
+class C2
+{
+ private C1 c1 = new C1();
+ static private C1 s1 = new C1();
+
+ public void M2(int x, int y, int z)
+ {
+  c1.M1(x, y, z);
+ }
+ static public void S2(int x, int y, int z)
+ {
+  C1.S1(x, y, z);
+ }
+ public void M2S(int x, int y, int z)
+ {
+  C1.S1(x, y, z);
+ }
+ static public void S2M(int x, int y, int z)
+ {
+  s1.M1(x, y, z);
+ }
+}
+</pre>
+<p>
+Since the layouts for the parameters to both
+<code>C1.M1()</code> and
+<code>C2.M2()</code> method match,
+<code>C2.M2()</code> can get away with the following:
+</p>
+<ul>
+<li>
+    Fetch <code>this.c1</code>.
+</li>
+<li>
+    Validate that the fetched value is not null.
+</li>
+<li>
+    Replace <code>this</code> with the fetched value.
+</li>
+<li>
+    Jump to <code>C1.M1</code>.
+</li>
+</ul>
+<p>
+The assembly for <code>C2.M2</code> on x86 would go something like this:
+</p>
+<pre>
+; <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20040108-00/?p=41163">fastcall convention</a> passes
+; the first parameter (this) in ecx
+; the second parameter (x) in edx
+; remaining parameters (y, z) on the stack
+
+C2.M2:
+    mov  ecx, [ecx].c1  ; fetch this.c1
+    cmp  ecx, [ecx]     ; <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20070816-00/?p=25553">null check</a>
+    jmp  C1.M1          ; all the other parameters are already set
+</pre>
+<p>
+Similarly, forwarding a call from one static method to another can
+reuse the stack frame as-is:
+</p>
+<pre>
+C2.S2:
+    jmp C1.S1           ; all parameters are already set properly
+</pre>
+<p>
+However, forwarding from an instance method to a static method or vice versa
+isn't so easy.
+The compiler would either have to generate a traditional non-tail call:
+</p>
+<pre>
+C2.M2S:
+    mov  ecx, edx       ; put x into ecx
+    mov  edx, [esp][4]  ; put y into edx
+    push edx, [esp][8]  ; push z
+    call C1.S1
+    ret  8
+
+C2.S2M:
+    push [esp][4]       ; push z
+    push edx            ; push y
+    mov  edx, ecx       ; put x into edx
+    mov  ecx, [C2.s1]   ; put C2.s1 into ecx
+    cmp  ecx, [ecx]     ; <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20070816-00/?p=25553">null check</a>
+    call C1.M1          ; call it
+    ret  8
+</pre>
+<p>
+Or maybe the compiler plays funny stack rewriting games:&sup1;
+</p>
+<pre>
+C2.M2S:
+    mov  ecx, edx       ; put x into ecx
+    pop  eax            ; pop return address
+    pop  edx            ; pop y into edx
+                        ; leave z on the stack
+    push eax            ; restore return address
+    jmp  C1.S1
+
+C2.S2M:
+    pop  eax            ; pop return address
+    push edx            ; push y
+    push eax            ; restore return address
+    mov  edx, ecx       ; put x into edx
+    mov  ecx, [C2.s1]   ; put C2.s1 into ecx
+    cmp ecx, [ecx]      ; <a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20070816-00/?p=25553">null check</a>
+    jmp C1.M1
+</pre>
+<p>
+Both of these are worse than the case where the call is forwarded to a function
+of matching ilk.
+</p>
+<p>
+Since delegate invoke is done instance-style, the code to dispatch
+the delegate to the lambda is more efficient if the lambda is also
+instance.
+</p>
+<p>
+Since the language specification does not specify the nature of the
+lambda, whether the delegate represents a static or instance method
+is an implementation detail that can change at any time.
+</p>
+<p>
+And it did.
+</p>
+<p>
+&sup1; Note that these stack rewriting games are not available to x64
+because of alignment requirements.
+On x64, we are forced to generate a traditional non-tail call.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (10)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1302195">
+				<div id="div-comment-1302195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bradley</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302195">
+			July 17, 2017 at 7:22 am</a>		</div>
+
+		<p>Personally, I love CLR week.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong odd alt depth-2" id="comment-1302266">
+				<div id="div-comment-1302266" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302266">
+			July 17, 2017 at 7:59 pm</a>		</div>
+
+		<p>So do I.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1302245">
+				<div id="div-comment-1302245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302245">
+			July 17, 2017 at 12:55 pm</a>		</div>
+
+		<p>I am no longer embarrassed at passing List.Add() to a function expecting a delegate.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1302265">
+				<div id="div-comment-1302265" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nico</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302265">
+			July 17, 2017 at 2:40 pm</a>		</div>
+
+		<p>I, for one, welcome our temporary CLR overlord.</p>
+<p>That&#8217;s interesting about the for loop variable closure.  I had kind of assumed (oops) that when they changed the behavior of foreach it also applied to for, so thanks for calling it out.</p>
+<p>For anyone who wants to see this in action:  <a href="https://dotnetfiddle.net/GtAZ32" rel="nofollow">https://dotnetfiddle.net/GtAZ32</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1302285">
+				<div id="div-comment-1302285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivan K</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302285">
+			July 17, 2017 at 9:53 pm</a>		</div>
+
+		<p>I remember that ReSharper would emit a warning / suggestion for any method that could be made static (whether called from another static or not). Googling, I see that FxCop did too. I found the warning helpful for design, but also thought based on the documentation that making the method static improved performance a teeny tiny bit (eliminate the null this check). I guess that turns out to not be the case anymore, maybe with x64 more common? I&#8217;m not really an x86 assembly person so don&#8217;t know the clock counts, etc of the instructions on new cpu&#8217;s.<br />
+<a href="https://www.jetbrains.com/help/resharper/MemberCanBeMadeStatic.Local.html" rel="nofollow">https://www.jetbrains.com/help/resharper/MemberCanBeMadeStatic.Local.html</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1302286">
+				<div id="div-comment-1302286" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302286">
+			July 18, 2017 at 12:18 am</a>		</div>
+
+		<p>Note that the articles didn&#8217;t make any statement over the performance of static methods in general, only for the case where you take a *delegate* to a static methods. If you call the static method yourself the compiler can actually see the method call and optimize for it (instead of it being hidden in a delegate)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1302295">
+				<div id="div-comment-1302295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302295">
+			July 18, 2017 at 12:21 am</a>		</div>
+
+		<p>Also, Raymonds article is about forwarding calls. He explains that these are always faster when the signature matches exactly (because then no extra work needs to be done). Again this doesn&#8217;t make a general statement over the performance static methods.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1302306">
+				<div id="div-comment-1302306" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302306">
+			July 18, 2017 at 4:17 am</a>		</div>
+
+		<p>All these alternatives are at least better than what powershell has implemented (in .net clr!), both as default but also even considering that it&#8217;s possible to close (an re-close) the function explicitly in powershell.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1302345">
+				<div id="div-comment-1302345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Bonner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1302345">
+			July 18, 2017 at 10:31 am</a>		</div>
+
+		<p>I followed the &#8220;null check&#8221; link.  I think the behaviour of the typical commenter has got better over the last decade (or maybe I&#8217;m not reading enough comments).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1303325">
+				<div id="div-comment-1303325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kris Vandermotten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170717-00/?p=96625#comment-1303325">
+			July 24, 2017 at 3:22 am</a>		</div>
+
+		<p>This is why the U2U Consult code analyzer has a rule to warn about static methods that are used in delegate constructors. See <a href="https://github.com/u2uconsult/codeanalyzers/blob/master/docs/U2U1003.md" rel="nofollow">https://github.com/u2uconsult/codeanalyzers/blob/master/docs/U2U1003.md</a> for an explanation and a benchmark, and <a href="https://marketplace.visualstudio.com/items?itemName=vs-publisher-363830.U2UConsultPerformanceCodeAnalyzersforC7" rel="nofollow">https://marketplace.visualstudio.com/items?itemName=vs-publisher-363830.U2UConsultPerformanceCodeAnalyzersforC7</a> for the Visual Studio extension.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

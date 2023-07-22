@@ -1,0 +1,620 @@
+<html>
+<head>
+<title>Gotchas when using linker sections to arrange data, part 1</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Gotchas when using linker sections to arrange data, part 1</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 8, 2018 / year-entry #252</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>11</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Nulls can show up in unexpected places.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+We saw
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20181107-00/?p=100155">
+last time</a>
+that you can use linker sections
+to arrange the order in which data appears in
+the module.
+We ended with a diagram like this:
+</p>
+<table CLASS="cp3" CELLPADDING=3
+    BORDER=0 STYLE="border-collapse: collapse">
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>mydata$a</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>firstInitializer</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>main.obj</code>
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td ROWSPAN=2 STYLE="border: solid 1px black">
+    <code>mydata$g</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>DoThisSooner3</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file3.obj</code>
+  </td>
+<td ROWSPAN=2 STYLE="border: solid black; border-width: 1px 0px">unspecified<br>order</td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>DoThisSooner4</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file4.obj</code>
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td ROWSPAN=3 STYLE="border: solid 1px black">
+    <code>mydata$m</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>Function2</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file2.obj</code>
+  </td>
+<td ROWSPAN=3 STYLE="border: solid black; border-width: 1px 0px">unspecified<br>order</td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>Function1</code><br>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file1.obj</code>
+  </td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>Function3</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file3.obj</code>
+  </td>
+</tr>
+<tr>
+<td ROWSPAN=2 STYLE="border: solid 1px black">
+    <code>mydata$t</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>DoThisLater2</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file2.obj</code>
+  </td>
+<td ROWSPAN=2 STYLE="border: solid black; border-width: 1px 0px">unspecified<br>order</td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>DoThisLater4</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file4.obj</code>
+  </td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>mydata$z</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>lastInitializer</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>main.obj</code>
+  </td>
+</tr>
+</table>
+<p>
+Based on this table, we would be tempted to write
+code like this:
+</p>
+<pre>
+// Code in italics is wrong.
+<i>void NaiveInitializeAllTheThings()
+{
+    const INITIALIZER* initializer = &amp;firstInitializer + 1;
+    while (initializer &lt; &amp;lastInitializer) {
+      (*initializer++)();
+    }
+}</i>
+</pre>
+<p>
+From a language lawyer standpoint, this
+code is not valid because it dereferences
+a pointer beyond the end of an object,
+and because it compares two pointers which
+are not part of the same aggregate.
+We can fix this by switching to <code>uintptr_t</code>
+as our currency.
+</p>
+<pre>
+// Code in italics is still wrong.
+<i>void LessNaiveInitializeAllTheThings()
+{
+    auto begin = (uintptr_t)&amp;firstInitializer
+                 + sizeof(firstInitializer);
+    auto end = (uintptr_t)&amp;lastInitializer;
+    for (auto current = begin; current &lt; end;
+         current += sizeof(INITIALIZER)) {
+      auto initializer = *(const INITIALIZER*)current;
+      initializer();
+    }
+}</i>
+</pre>
+<p>
+The conversion between pointers and <code>uintptr_t</code>
+is implementation-defined (rather than undefined),
+so this avoids the undefined behavior problems of using
+pointers to walk between two global variables.
+</p>
+<p>
+But the code is still not right,
+because it fails to take into account another
+detail of linker sections: intra-section padding.
+</p>
+<p>
+The linker will add padding after a fragment in order
+to satisfy any alignment requirements of the subsequent fragment.
+That's expected.
+</p>
+<p>
+What most people aren't aware of is that
+the linker is permitted but not required to add padding
+after each fragment,
+up to the section's alignment.
+In practice, you are likely to see this "unnecessary"
+padding when
+using
+<a HREF="https://docs.microsoft.com/en-us/cpp/build/reference/incremental-link-incrementally">
+incremental linking</a>.
+</p>
+<p>
+In all cases,
+the padding bytes (if any) will be zero.
+</p>
+<table CLASS="cp3" CELLPADDING=3
+    BORDER=0 STYLE="border-collapse: collapse">
+<tr>
+<td ROWSPAN=2 STYLE="border: solid 1px black">
+    <code>mydata$a</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>firstInitializer</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>main.obj</code>
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td ROWSPAN=4 STYLE="border: solid 1px black">
+    <code>mydata$g</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>DoThisSooner3</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file3.obj</code>
+  </td>
+<td ROWSPAN=4 STYLE="border: solid black; border-width: 1px 0px">unspecified<br>order</td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>DoThisSooner4</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file4.obj</code>
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td ROWSPAN=6 STYLE="border: solid 1px black">
+    <code>mydata$m</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>Function2</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file2.obj</code>
+  </td>
+<td ROWSPAN=6 STYLE="border: solid black; border-width: 1px 0px">unspecified<br>order</td>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>Function1</code><br>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file1.obj</code>
+  </td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>Function3</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file3.obj</code>
+  </td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td ROWSPAN=4 STYLE="border: solid 1px black">
+    <code>mydata$t</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>DoThisLater2</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file2.obj</code>
+  </td>
+<td ROWSPAN=4 STYLE="border: solid black; border-width: 1px 0px">unspecified<br>order</td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td STYLE="border: solid 1px black">
+    <code>DoThisLater4</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>file4.obj</code>
+  </td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+<tr>
+<td ROWSPAN=2 STYLE="border: solid 1px black">
+    <code>mydata$z</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>lastInitializer</code>
+  </td>
+<td STYLE="border: solid 1px black">
+    <code>main.obj</code>
+  </td>
+</tr>
+<tr>
+<td COLSPAN=2 STYLE="border: solid 1px black; text-align: center">
+    Optional padding
+  </td>
+<td STYLE="border: none"></td>
+</tr>
+</table>
+<p>
+To accommodate padding, we need to skip over any possible null pointers.
+</p>
+<pre>
+void InitializeAllTheThings()
+{
+    auto begin = (uintptr_t)&amp;firstInitializer
+                 + sizeof(firstInitializer);
+    auto end = (uintptr_t)&amp;lastInitializer;
+    for (auto current = begin; current &lt; end;
+         current += sizeof(INITIALIZER)) {
+      auto initializer = *(const INITIALIZER*)current;
+      <font COLOR=blue>if (initializer)</font> initializer();
+    }
+}
+</pre>
+<p>
+We'll look at another consequence of padding next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (11)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-oldnewthingcommentsectionparticipant even thread-even depth-1 parent" id="comment-1370215">
+				<div id="div-comment-1370215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Anders+Munch' rel='external nofollow' class='url'>Anders Munch</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370215">
+			November 8, 2018 at 10:02 am</a>		</div>
+
+		<p>The uintptr_t version has undefined behaviour as well, from the point of view of the C standard.   But that&#8217;s OK: Nothing stops a particular implementation from defining a behaviour for something that the C standard does not define a behaviour for.</p>
+<p>A particular implementation could even have chosen to define past-the-end pointer arithmetic in a way that would make the first all-wrong attempt correct, except for the padding.  (And the infinite loop.  Why is the pointer incremented outside of the while loop?)</p>
+<p>Language lawyering aside,  I&#8217;m sure Raymond has a good handle on what is defined with the compiler(s) he uses, so it&#8217;s still good advice to use uintptr_t.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1370265">
+				<div id="div-comment-1370265" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370265">
+			November 8, 2018 at 12:40 pm</a>		</div>
+
+		<p>6.3.2.3 Pointers: &#8220;An integer may be converted to any pointer type. Except as previously speciﬁed, the result is <u>implementation-deﬁned</u>.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-henke even thread-odd thread-alt depth-1 parent" id="comment-1370245">
+				<div id="div-comment-1370245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Henke37' rel='external nofollow' class='url'>Henke37</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370245">
+			November 8, 2018 at 12:05 pm</a>		</div>
+
+		<p>Pretty sure that it&#8217;s undefined behavior to convert an uintptr_t value back to a pointer that is not equal to the value you got when converting from a pointer to uintptr_t.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1370255">
+				<div id="div-comment-1370255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370255">
+			November 8, 2018 at 12:35 pm</a>		</div>
+
+		<p>[expr.reinterpret.cast] says &#8220;A value of integral type or enumeration type can be explicitly converted to a pointer. A pointer converted to an integer of suﬃcient size (if any such exists on the implementation) and back to the same pointer type will have its original value; mappings between pointers and integers are otherwise <u>implementation-deﬁned</u>.&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wilsone8 even thread-even depth-1" id="comment-1370295">
+				<div id="div-comment-1370295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/wilsone88' rel='external nofollow' class='url'>wilsone88</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370295">
+			November 9, 2018 at 8:27 am</a>		</div>
+
+		<p>I know that the NaiveInitializeAllTheThings function is wrong anyways, but it is also an infinite loop; you never increment the <i>initializer</i> variable.</p>
+<p>[<i>Oops. &#8220;Fixed.&#8221; -Raymond</i>]</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuffa8 odd alt thread-odd thread-alt depth-1 parent" id="comment-1370305">
+				<div id="div-comment-1370305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/uffa8' rel='external nofollow' class='url'>uffa8</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370305">
+			November 9, 2018 at 11:55 am</a>		</div>
+
+		<p>first at all when if declare `const INITIALIZER initializer##fn = fn` &#8211; use `const` the latest msvc compiler (i assume optimization and /GL &#8211; link time code generation) not even create variable (no such name (?initializer&#8230;) in obj file ) if no <b>reference for it address</b>. say if we will be use `&amp;firstInitializer` and `&amp;lastInitializer` &#8211; will be such symbols obj but if no reference &#8211; no variable. but even if we remove `const` modificator &#8211; with /GL and /OPT:REF optimization &#8211; symbol will be dropped by linker. i test this.<br />
+one way use direct `/include` linker option: __pragma(comment(linker, &#8220;/include:?__x_m@@3P6AXXZEA&#8221;)) (i use `__x_m` symbol)<br />
+also i note that if section name the same as used in #pragma init_seg(*) (or `.CRT$XCU` as default place) &#8211; where msvc put addresses of initializers &#8211; linker in this case not drop our custom ?__x_m@@.. too.</p>
+<p>so really question how correct declare self data, without reference for it in code and to be not dropped. how i say &#8211; i found only explicit `/include` linker option for every declared symbol. but standard intializers generated by compiler (when we declare global objects with constructor or global variable with function call initialization) not droped</p>
+<p>also instead use #pragma section we can better use `#pragma const_seg(&#8220;mydata$*&#8221;)` for firstInitializer, lastInitializer if we declare it with `const` (this possible because we take it addresses) even not need `__declspec(allocate(&#8220;*&#8221;))` because it will be const data, but for other initializers this need, because we must declare it without const. </p>
+<p>so my demo code for test: (<a href="https://pastebin.com/V0bgQrst" rel="nofollow">https://pastebin.com/V0bgQrst</a>)</p>
+<p>typedef void (__cdecl *INITIALIZER)();</p>
+<p>#pragma const_seg(&#8220;mydata$a&#8221;)<br />
+const INITIALIZER firstInitializer = 0;</p>
+<p>#pragma const_seg(&#8220;mydata$z&#8221;)<br />
+const INITIALIZER lastInitializer = 0;</p>
+<p>void InitializeAllTheThings(const INITIALIZER * pfbegin, const INITIALIZER * pfend) {<br />
+	// if (pfbegin &lt; pfend)<br />
+	do {<br />
+		if (const INITIALIZER initializer = *pfbegin++) initializer();<br />
+	} while(pfbegin &lt; pfend);<br />
+}</p>
+<p>void InitializeAllTheThings()<br />
+{<br />
+	InitializeAllTheThings(&amp;firstInitializer + 1, &amp;lastInitializer);<br />
+}</p>
+<p>void __cdecl someFunc();</p>
+<p>#pragma const_seg(&quot;mydata$u&quot;)<br />
+__declspec(allocate(&quot;mydata$u&quot;)) /*const*/ INITIALIZER __x_m = someFunc;</p>
+<p>#pragma warning(disable : 4075) // initializers put in unrecognized initialization area<br />
+#pragma init_seg(&quot;mydata$u&quot;)</p>
+<p>struct XXX {<br />
+	XXX() { someFunc(); }<br />
+};</p>
+<p>//static XXX g_x;<br />
+__pragma(comment(linker, &quot;/include:?__x_m@@3P6AXXZEA&quot;))</p>
+<p>(look in obj, asm (set /FAs) and map file). and mandatory use /GL /OPT:REF /O1 or more )</p>
+<p>comment __pragma(comment(linker, &quot;/include:?__x_m@@3P6AXXZEA&quot;)) and ?__x_m@@3P6AXXZEA (even all &quot;mydata$u&quot;) go away from map (and final code). un comment static XXX g_x; just for demo &#8211; `?__x_m@@3P6AXXZEA` again exist</p>
+<p>at second i not agree with *From a language lawyer standpoint, this code is not valid because it dereferences a pointer beyond the end of an object, and because it compares two pointers which are not part of the same aggregate.*</p>
+<p>why ? code perfect compiled, are something wrong in my implementation `void InitializeAllTheThings(const INITIALIZER * pfbegin, const INITIALIZER * pfend)` ? or in call `InitializeAllTheThings(&amp;firstInitializer + 1, &amp;lastInitializer);` ? and if you look for `_initterm` in msvc crt files &#8211; your view the same implementation. we have knowledge that here we have array of objects (pointers) and can work with it. not view nothing wrong (by syntax or semantic) in use say `&amp;firstInitializer + 1`. and what we gain if try use `uintptr_t` in mix with pointers ? we anyway use the same knowledge that here we have array of objects (pointers in concrete case). if you think that correct (by sense) take some `uintptr_t` value and convert it to pointer to object (`INITIALIZER*`)and insist that this is correct pointer to object, despite we not take it via &amp; of any object, why not correct say that `&amp;firstInitializer + 1` also correct pointer to the some object ? i think use trick with uintptr_t have no any sense here</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip even depth-2 parent" id="comment-1370325">
+				<div id="div-comment-1370325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370325">
+			November 9, 2018 at 4:57 pm</a>		</div>
+
+		<p>Unless you are using the /Gw compiler command line option, the compiler, and thus the linker, will group all variables together.<br />
+This means that if you have two global variables, but you only access one of them, then both of them will be included. It doesn&#8217;t matter how many you use define, as long as one of the global variables are referenced then all of them will come along for the ride.<br />
+The other option if you know that your variable will not be included (you are using /Gw or you are not referencing a global variable), then the linker&#8217;s /include option is the only option, but you can tell the linker at compile time to include a symbol. The compiler has the #pragma directive, and you can use #pragma comment(linker. &#8220;/include:&lt;decorated symbol name&gt;&#8221;) to get the compiler to tell the linker to do this automatically. (<a href="https://docs.microsoft.com/en-gb/cpp/preprocessor/comment-c-cpp?view=vs-2017" rel="nofollow">https://docs.microsoft.com/en-gb/cpp/preprocessor/comment-c-cpp?view=vs-2017</a>)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-yuffa8 odd alt depth-3 parent" id="comment-1370345">
+				<div id="div-comment-1370345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/uffa8' rel='external nofollow' class='url'>uffa8</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370345">
+			November 10, 2018 at 1:34 am</a>		</div>
+
+		<p>/Gw compiler here unrelated. problem here how used `const`. if we write `const INITIALIZER initializer_fn = fn;` and no reference to address of `initializer_fn` &#8211; compiler not generate variable for `initializer_fn` (look in obj file). we need add reference for `&amp;initializer_fn` somehow. i found way how add this and no generate additional code. look full comment <a href="https://blogs.msdn.microsoft.com/oldnewthing/20181107-00/?p=100155#comment-1370335" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20181107-00/?p=100155#comment-1370335</a> . unfortunately dont know how correct format code in comment. external link &#8211; <a href="https://pastebin.com/32RehATA" rel="nofollow">https://pastebin.com/32RehATA</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-archangelpip even depth-4 parent" id="comment-1370425">
+				<div id="div-comment-1370425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Darran+Rowe' rel='external nofollow' class='url'>Darran Rowe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370425">
+			November 12, 2018 at 10:22 am</a>		</div>
+
+		<p>Even if the variable isn&#8217;t const, when you build using optimisation, the compiler doesn&#8217;t the initialisation function at compile time if it is able to work out the value. In the PE format, global variables are allocated storage in the object file/executable itself, and if the compiler can figure out the value of a variable, then it can just write that value to the object itself.<br />
+For example:<br />
+const int value()<br />
+{<br />
+	return 1;<br />
+}</p>
+<p>const int g_value = value();<br />
+Why should the compiler generate the initialisation function for g_value when it can see that it is being initialised by a constant value? Instead, it can just write the value 1 to the space for g_value in the object right? It completely cuts out the need for running the g_value initialisation function.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-yuffa8 odd alt depth-5" id="comment-1370445">
+				<div id="div-comment-1370445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/uffa8' rel='external nofollow' class='url'>uffa8</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370445">
+			November 12, 2018 at 11:26 am</a>		</div>
+
+		<p>but how this is related to what i wrote ? i can only propose for you and Raymond take my concrete code <a href="https://pastebin.com/32RehATA" rel="nofollow">https://pastebin.com/32RehATA</a> and compile build it. and comment / remove MAKE_VAR(random_var) &#8211; and compare result. all what i try say &#8211; if we have in code `const T* x = y;` and no reference fo `&amp;x` in code &#8211; compiler can not create variable at all. will be no `?x@..` even in obj file. because this &#8211; proposed code is not correct. the original Raymond macros `ADD_INITIALIZER_TO_SECTION` will be have no effect. i found how force it not drop via `MAKE_VAR` macro. another my point &#8211; instead use #pragma section and __declspec(allocate better use __pragma(const_seg(section)). and finally i not agree that code with pointer increment is not correct, but code when we convert pointer to `uintptr_t`, increment it and that convert back to pointer is correct. anyway &#8211; are you try really compile and build and look in result ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuffa8 even thread-even depth-1" id="comment-1370465">
+				<div id="div-comment-1370465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/uffa8' rel='external nofollow' class='url'>uffa8</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20181108-00/?p=100165#comment-1370465">
+			November 12, 2018 at 12:17 pm</a>		</div>
+
+		<p>unfortunately i sure that author even not compile self code (<a href="https://godbolt.org/z/OqAqUV" rel="nofollow">https://godbolt.org/z/OqAqUV</a>) &#8211; the constructions like <b>__declspec(allocate(&#8220;mydata$&#8221;&#8221;m&#8221;))</b> not correct &#8211; string <b>&#8220;mydata$&#8221;&#8221;m&#8221;</b> not spited by linker to <b>&#8220;mydata$m&#8221;</b> </p>
+<p>about your concrete note: if we write `const int g_value = 1;` and even will be use `g_value` in code (say like <b>void __cdecl someFunc() {<br />
+	DbgPrint(&#8220;%u\n&#8221;, g_value);<br />
+}</b> ) compile anyway replace <b>g_value</b> to <b>1</b> and you not found <b>?g_value@@</b> in obj file at all. and it will be no in <b>map</b> file too. simply no such variable. but if we add reference to <b>&amp;g_value</b> address say via <b>static void fakeFn() { if (&amp;g_value)__debugbreak(); };</b> &#8211; all is changed &#8211; will be `?g_value@@3HB` symbol in obj and map files. was real variable in binary. despite even in code it will be not used &#8211; where we use <b>g_value</b> in code &#8211; compiler just insert <b>1</b> and never reference variable memory, but allocate  memory for it in section</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

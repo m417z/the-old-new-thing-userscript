@@ -1,0 +1,294 @@
+<html>
+<head>
+<title>What happens if you forget to pass an OVERLAPPED structure on an asynchronous handle?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What happens if you forget to pass an OVERLAPPED structure on an asynchronous handle?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 12, 2012 / year-entry #241</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer noticed that they were accidentally issuing some I/O's against an overlapped handle without using an OVERLAPPED structure. The calls seemed to work, and the program did not appear to suffer any ill effects, but they were worried that they just being lucky and that eventually the error will come back to bite them....</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>A customer noticed that they were accidentally issuing some I/O's against an overlapped handle without using an <code>OVERLAPPED</code> structure. The calls seemed to work, and the program did not appear to suffer any ill effects, but they were worried that they just being lucky and that eventually the error will come back to bite them. So what really happens if you forget to pass an <code>OVERLAPPED</code> structure on an asynchronous handle?</p>
+<p> Well, the layer of the kernel that deals with <code>OVERLAPPED</code> structures doesn't know whether then handle is synchronous or asynchronous. It just assumes that if you don't pass an <code>OVERLAPPED</code> structure, then the handle is synchronous. And the way it deals with synchronous I/O without an <code>OVERLAPPED</code> is that it creates a temporary <code>OVERLAPPED</code> structure on the stack with a null <code>hEvent</code>, issues an asynchronous I/O with that temporary <code>OVERLAPPED</code> structure, and then waits for completion with <code>Get&shy;Overlapped&shy;Result(<wbr>bWait = TRUE)</wbr></code>. It then returns the result. </p>
+<p> What does this mean for you? </p>
+<p> Well, what happens if the <code>hEvent</code> is null? </p>
+<blockquote class="q"><p> <a href="http://msdn.microsoft.com/en-us/library/ms683209.aspx"> If the <b>hEvent</b> member of the <b>OVERLAPPED</b> structure is NULL</a>, the system uses the state of the <b>hFile</b> handle to signal when the operation has been completed. </p>
+</blockquote>
+<p> Okay, let's step back and look at what's going on here. </p>
+<p> First of all, a file handle is a waitable object: It becomes unsignaled when an I/O operation begins, and it becomes signaled when an I/O operation ends. </p>
+<p> Second of all, this behavior is not useful in general. If you are operating on a synchronous handle, you already know when the I/O operation ends: It ends when the synchronous I/O call returns. And if you are operating on an asynchronous handle, all the <code>hFile</code> tells you is that <i>some</i> I/O completed, but you don't know which one it was. That's why the documentation also says </p>
+<blockquote class="q"><p> Use of file, named pipe, or communications-device handles for this purpose is discouraged. It is safer to use an event object because of the confusion that can occur when multiple simultaneous overlapped operations are performed on the same file, named pipe, or communications device. In this situation, there is no way to know which operation caused the object's state to be signaled. </p>
+</blockquote>
+<p> What's more, if somebody initiates a new I/O after your asynchronous I/O completed, the file object becomes unsignaled, and there's a possibility that this happened before you got a change to call <code>Wait&shy;For&shy;Single&shy;Object</code>. </p>
+<p> So why have this weird behavior if it's not useful in general? Because it's what the system itself uses internally to implement synchronous I/O! It issues the I/O asynchronously, then waits on the handle. Since the handle is synchronous, the system already knows that there can be only one I/O in progress at a time, so it can just wait on the <code>hFile</code> to know when that I/O is complete. </p>
+<p> Okay, so let's look again at the case of the overlapped I/O issued with no <code>OVERLAPPED</code> structure. The layer that deals with <code>OVERLAPPED</code> structure assumes it has a synchronous handle and issues an asynchronous I/O, then waits until the handle is signaled, under the mistaken belief that the handle will be signaled when that I/O completes (since it "knows" that that's the only outstanding I/O request). But if your handle is actually asynchronous, what happens is that the <code>OVERLAPPED</code> layer waits on the <code>hFile</code>, and the call returns when <i>any</i> I/O on that handle completes. In other words, you're in the "... is discouraged" part of the documentation. </p>
+<p> Theoretically speaking, then, it is legal to pass <code>NULL</code> as the <code>lpOverlapped</code> to <code>Read&shy;File</code> when the handle is asynchronous, but the results may not be what you want, since the call may return prematurely if there is other I/O going on at the same time. And then when the I/O actually completes, it updates the <code>OVERLAPPED</code> structure that was created temporarily on the stack, and we saw that that leads to <a href="http://blogs.msdn.com/b/oldnewthing/archive/2011/02/02/10123392.aspx"> memory corruption that goes away when you try to debug it</a>. </p>
+<p> There are those who argue that the documentation for <code>Read&shy;File</code> is overly cautious when it outright bans the use of a null <code>lpOverlapped</code> on asynchronous handles, because if you are <i>really careful</i>, you can get it to work, if you can guarantee that no I/O is outstanding on the handle at the time you issue your I/O call, and no other I/O will be issued against the handle while you're waiting for your call to complete. </p>
+<p> I'm of the camp that it's like telling people that it's okay to <a href="http://blogs.msdn.com/b/oldnewthing/archive/2010/11/22/10094489.aspx"> change gears on your manual transmission by just slamming the gear stick into position without using the clutch</a>. Yes, you can do it if you are really careful and get everything to align just right, but if you mess up, your transmission explodes and spews parts all over the road.  </p>
+<p> In the customer's case they were issuing the I/O without an <code>OVERLAPPED</code> structure after the handle was created and before asynchronous operations began, so it was indeed the case that nobody else was using the handle.&sup1; The usage was therefore technically safe, but the customer nevertheless chose to switch to using an explicit <code>OVERLAPPED</code> structure with an explicit <code>hEvent</code>, just in case future code changes resulted in asynchronous operations being performed on the handle at an earlier point. (Wise choice on the customer's part. Safety first!) </p>
+<p> &sup1; We're assuming that there aren't any bugs that result in somebody using a handle after closing it or using an uninitialized handle variable. Even if that assumption isn't true, it would also cause problems even in the case where we we passed an explicit <code>OVERLAPPED</code> structure, so it's no buggier than it was before. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1015783">
+				<div id="div-comment-1015783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015783">
+			October 12, 2012 at 7:08 am</a>		</div>
+
+		<p>I know that there is a cost associated with change, but I still find it difficult to comprehend the attitude of people who discover that they&#39;re doing the &quot;wrong thing&quot;, and then ask &quot;can I carry on doing the wrong thing?&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1015793">
+				<div id="div-comment-1015793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015793">
+			October 12, 2012 at 7:18 am</a>		</div>
+
+		<p>I would assume the question was more along the lines of &quot;It seems to work, but if we get weird random crash reports from our customers, could this be a potential source&quot;, since the code in question might already be in released products.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1015803">
+				<div id="div-comment-1015803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015803">
+			October 12, 2012 at 7:23 am</a>		</div>
+
+		<p>@Damien: This seems smart behavior to me. &nbsp;The customer may be resolving many important questions:</p>
+<p>-How urgent is it that I fix this bug, compared to fixing other bugs?</p>
+<p>-Is this bug the cause of any outstanding issues?</p>
+<p>-Does this bug have any effects which I may be inadvertently relying on?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1015813">
+				<div id="div-comment-1015813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">parkrrrr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015813">
+			October 12, 2012 at 7:33 am</a>		</div>
+
+		<p>In a modern transmission, all you do is cause undue wear on the synchronizers, which will eventually wear out and make you unable to shift with or without the clutch. I used to shift without a clutch pretty frequently in my &#39;93 Saturn SL1, because the hydraulic clutch had a small leak somewhere, so it tended to lose fluid over time and just randomly stop working. (A better workaround for this condition was to keep a new bottle of brake fluid in the car, but I wasn&#39;t very good about remembering to replace it after I used it.)</p>
+<p>What happens from the user point of view is that you just can&#39;t shift into the desired gear until you hit precisely the right engine RPM for your speed, and then it just slips into gear. (What this means in practice is that if you&#39;re downshifting, you&#39;ll need to shift into neutral, hit the gas briefly, then hold the gearshift against the new gear while the engine winds down. When upshifting, you can skip the engine-revving part. This holding-the-gearshift-against-the-gear part is what wears out the synchros.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-1015843">
+				<div id="div-comment-1015843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015843">
+			October 12, 2012 at 8:22 am</a>		</div>
+
+		<p>@Stephen O:</p>
+<p>Exactly. If you serialize IO operations, as a synchronous handle promises, you MUST have the IO inside a mutex-protected critical section. Obviously, this can&#39;t be done in user mode. But the IO manager must only use the mutex for synchronous handles. Thus, at the decision point whether to create a temporary OVERLAPPED and wait on the handle, the IO manager already knows the type of the handle.</p>
+<p>Also, what if you opened a file for async IO, but used no standard GENERIC mask (which includes SYNCHRONIZE), but passed an explicit mask without SYNCHRONIZE.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1015853">
+				<div id="div-comment-1015853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015853">
+			October 12, 2012 at 9:00 am</a>		</div>
+
+		<p>It actually sounds useful, but only on pipes (for which two outstanding I/O requests are bad anyway).</p>
+<p>Basically, a crude method of simulating the Unix select() call on pipes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1015823">
+				<div id="div-comment-1015823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/stephen.oberholtzer_4000_freedompay.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>stephen.oberholtzer@freedompay.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015823">
+			October 12, 2012 at 7:52 am</a>		</div>
+
+		<p>This design seems like it would make synchronous handles not-thread-safe. &nbsp;Consider a synchronous serial port handle:</p>
+<p>(1) Thread A calls WriteFile to transmit; transmit buffer is full, so operation blocks.</p>
+<p>(2) Thread B calls ReadFile to receive</p>
+<p>(3) After a several milliseconds some transmit buffer space becomes available and the IRP_MJ_WRITE operation completes.</p>
+<p> &nbsp; &nbsp;The handle is signaled, and both A and B wake up.</p>
+<p>What protects against this? &nbsp;Some sort of system-maintained critical section or mutex? &nbsp;Or nothing at all? (in which case, FILE_FLAG_OVERLAPPED would be *critical* for any handle that might be accessed by multiple threads simultaneously)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1015883">
+				<div id="div-comment-1015883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015883">
+			October 12, 2012 at 4:50 pm</a>		</div>
+
+		<p>How come the system doesn&#39;t know if a handle is sync or async anyway?</p>
+<p>What&#39;s the point of the FILE_FLAG_OVERLAPPED flag when creating the handle in that case?</p>
+<div class="post">[<i>There are multiple parts to the system. The part of the system that deals with <code>OVERLAPPED</code> structures doesn&#39;t know. (The lower-level part that handles the I/O does know. That lower-level part is the one who cares about <code>FILE_FLAG_OVERLAPPED</code>.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1015893">
+				<div id="div-comment-1015893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Boyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015893">
+			October 12, 2012 at 6:39 pm</a>		</div>
+
+		<p>My bosses were called to drive 3 hours, to get a 2 hour scolding from the customer over a bug i introduced when fixing a bug that wasn&#39;t causing any problems.</p>
+<p>Some customers don&#39;t care about technical correctness or purity, only that they don&#39;t get fined thousands of dollars when financial information isn&#39;t being recorded properly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1015903">
+				<div id="div-comment-1015903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015903">
+			October 13, 2012 at 3:29 am</a>		</div>
+
+		<p>I like the analogy here.</p>
+<p>Handle = Gearbox</p>
+<p>OVERLAPPED = Clutch</p>
+<p>Synchronous fallback = Synchromesh fallback</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1015913">
+				<div id="div-comment-1015913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Henning Makholm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1015913">
+			October 13, 2012 at 4:41 am</a>		</div>
+
+		<p>This is all well and fine for disk files, but it bears notice that the situation is a lot murkier for socket I/O.</p>
+<p>In particular, it seems (based on anecdotal experience) that the kernel feature Raymond describes that reduces everything to asynchronous overlapped operations is not used for socket I/O. Instead the socket provider gets to see all the details of the call issued by the program (synchronous? asynchronous? OVERLAPPED? completion routine?) and is left to interpreting them correctly itself. II assume Microsoft&#39;s default socket provider knows how to do this the right way, but third-party socket providers for personal firewalls, VPNs or the like &#8230; generally don&#39;t. Often it seems they have only ever been tested with the Berkeley sockets subset of the Winsock interface.</p>
+<p>When you&#39;re writing for servers, you can generally get away with telling customers not to use a buggy network stack, but for the desktop/laptop market, the prudent developer will be a lot more conservative than MSDN tells you you need to be.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1016213">
+				<div id="div-comment-1016213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1016213">
+			October 16, 2012 at 1:11 am</a>		</div>
+
+		<p>[There are multiple parts to the system. The part of the system that deals with OVERLAPPED structures doesn&#39;t know. (The lower-level part that handles the I/O does know. That lower-level part is the one who cares about FILE_FLAG_OVERLAPPED.) -Raymond]</p>
+<p>MSDN (<a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa363858%28v=vs.85%29.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/aa363858%28v=vs.85%29.aspx</a>) says:</p>
+<p>&quot;FILE_FLAG_OVERLAPPED: &#8230; If this flag is not specified, then I/O operations are serialized, even if the calls to the read and write functions specify an OVERLAPPED structure. &#8230;&quot;</p>
+<p>This contradicts your statement that the layer dealing with the OVERLAPPED structures don&#39;t care about that flag. So, I&#39;m still confused and still think, the MSDN documentation needs to be improved to document the real behavior.</p>
+<div class="post">[<i>The level that deals with OVERLAPPED structures doesn&#39;t care whether the handle is synchronous or asynchronous. If you pass an OVERLAPPED, it converts it to a kernel-thingie and calls the next lower level. If you don&#39;t pass an OVERLAPPED, it creates a temporary kernel-thingie and calls the next lower level. The lower-level part is the one that knows whether the handle is synchronous or asynchronous. But it no longer knows whether you passed an OVERLAPPED or not. (All it gets is a kernel-thingie.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1016513">
+				<div id="div-comment-1016513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121012-00/?p=6343#comment-1016513">
+			October 17, 2012 at 12:25 am</a>		</div>
+
+		<p>[The lower-level part is the one that knows whether the handle is synchronous or asynchronous.]</p>
+<p>But as you described it works like this: WriteFile() and ReadFile() with lpOverlapped = NULL are using an temporary OVERLAPPED structure and Get&shy;Overlapped&shy;Result, which gives such calls &quot;blocking&quot; behavior. When called with an actual OVERLAPPED structure, the temporary OVERLAPPED structure and Get&shy;Overlapped&shy;Result are not employed, making such calls &quot;nonblocking&quot;.</p>
+<p>The quoted desribtion in MSDN gives FILE_FLAG_OVERLAPPED the additional semantics of making WriteFile() and ReadFile() &quot;blocking&quot; even if you are using an OVERLAPPED structure, which by your describtion seems not to be true.</p>
+<p>So the question remains: What else of the semantics of FILE_FLAG_OVERLAPPED is left for the lower level part to take care about? What does it control at all?</p>
+<div class="post">[<i>I simplified the story so I could get to the point. The <code>Get&shy;Overlapped&shy;Result</code> actually happens at the lower level, which knows whether the handle is synchronous or asynchronous. (It is also the lower level which serializes I/O operations on synchronous handles.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

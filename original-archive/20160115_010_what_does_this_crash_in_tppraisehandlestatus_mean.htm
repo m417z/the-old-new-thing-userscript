@@ -1,0 +1,277 @@
+<html>
+<head>
+<title>What does this crash in TppRaiseHandleStatus mean?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What does this crash in TppRaiseHandleStatus mean?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 15, 2016 / year-entry #11</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Imagining how a feature was written.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer found that their program was crashing with this stack:
+</p>
+<pre>
+ntdll!TppRaiseHandleStatus
+ntdll!TppSetupNextWait
+ntdll!TppWaitCompletion
+ntdll!TppWorkerThread
+kernel32!BaseThreadInitThunk
+ntdll!RtlUserThreadStart
+</pre>
+<p>
+"Since none of our code is on the stack, it is unclear
+what may have gone wrong here."
+</p>
+<p>
+A naming convention followed by many teams is to
+come up with a short prefix for a component and put that prefix
+on every function in that component.
+For example,
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/hardware/ff548397(v=vs.85).aspx">
+all of the I/O manager functions</a>
+begin with
+<code>Io</code>, then a capital letter.
+Furthermore, functions intended
+to be called from other components use the unadorned prefix,
+and functions that are internal to the component add a
+<code>p</code> (for <i>private</i>) to the prefix.
+For example, all of the functions internal to the I/O manager
+begin with <code>Iop</code>, then a capital letter.
+</p>
+<p>
+(An older convention is to use the lowercase prefix
+to indicate internal functions.
+Under the older convention, the internal functions in the I/O manager
+would begin with <code>io</code> followed by a capital letter.)
+</p>
+<p>
+Given that information about naming conventions,
+you can guess that the functions prefixed <code>Tpp</code>
+are functions that are internal to a component whose prefix is
+<code>Tp</code>.
+</p>
+<p>
+And your guess would be correct.
+This code is from the thread pool.
+</p>
+<p>
+One of the purposes of the thread pool is to consolidate waits.
+If one object wants to do something when handle A is signaled,
+and another object wants to do something when handle B is signaled,
+one way to do this is to have each object create a thread, and have
+that thread wait on the corresponding handle.
+Unfortunately, that results in two threads, and when you have
+a hundred objects, this results in a hundred threads,
+and that doesn't scale well.
+Better would be to put one thread in charge of all the waiting,
+so that it can use <code>Wait&shy;For&shy;Multiple&shy;Objects</code>.
+That way, you need only &lceil;<var>n</var>&nbsp;&#x2215;
+<code>MAXIMUM_WAIT_OBJECTS</code>&rceil; threads to wait on
+<var>n</var> handles.
+</p>
+<p>
+Okay, so let's see what this stack is telling us.
+I am not familiar with the thread pool's internals,
+so this is all educated guesswork.
+It's educated by the fact that
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/01/31/10495737.aspx">
+code is not intentionally written to be impossible to understand</a>.
+For example,
+if a function is called <code>Tpp&shy;Setup&shy;Next&shy;Wait</code>,
+it probably sets up the next wait.
+</p>
+<p>
+The thread pool started its own worker thread with
+<code>Tpp&shy;Worker&shy;Thread</code>; that makes sense.
+And then a
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms686273(v=vs.85).aspx">
+wait</a>
+completed, which was handled by
+<code>Tpp&shy;Wait&shy;Completion</code>.
+After handling that wait,
+the thread wants to go back
+to waiting until the next handle becomes signaled,
+which is done by the function
+<code>Tpp&shy;Setup&shy;Next&shy;Wait</code>.
+But something went wrong, and it needs to raise a status,
+which is done by the
+<code>Tpp&shy;Raise&shy;Handle&shy;Status</code> function.
+And that's where we crashed.
+</p>
+<p>
+What could go wrong in
+<code>Tpp&shy;Setup&shy;Next&shy;Wait</code>?
+The most likely reason in my opinion is that the list of handles
+it is being asked to wait on is no longer valid,
+probably because an application closed a handle while it was still
+registered with the thread pool,
+so when the thread pool tried to wait on it,
+it got an <code>ERROR_INVALID_HANDLE</code> error.
+</p>
+<p>
+The
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms686273(v=vs.85).aspx">
+documentation for the
+<code>Set&shy;Threadpool&shy;Wait</code> function</a>
+says,
+</p>
+<blockquote CLASS="q"><p>
+If this handle is closed while the wait is still pending,
+the function's behavior is undefined. 
+</p>
+</blockquote>
+<p>
+The customer wrote back that they have another crashing stack
+that points at their application code, so they have something
+else to work with to help pin down where the handle went bad.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1223191">
+				<div id="div-comment-1223191" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861#comment-1223191">
+			January 15, 2016 at 7:34 am</a>		</div>
+
+		<p>Sorry for the off topic post, but //Build2016 registrations start soon (01/19 IIRC), will you be there Raymond? (better question is there any place that you have on your blog that lists what conferences you&#8217;re going to?). On my bucket list is to meet my programming idol and get him to sign his book! I&#8217;m willing to go to Build JUST for that!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1223201">
+				<div id="div-comment-1223201" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861#comment-1223201">
+			January 15, 2016 at 7:37 am</a>		</div>
+
+		<p>I have not been invited to //Build. If that changes, I&#8217;ll post it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1223212">
+				<div id="div-comment-1223212" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">EduardoS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861#comment-1223212">
+			January 15, 2016 at 8:05 am</a>		</div>
+
+		<p>Initially I tough Tpp were the component prefix&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman odd alt thread-even depth-1" id="comment-1223241">
+				<div id="div-comment-1223241" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861#comment-1223241">
+			January 15, 2016 at 11:03 am</a>		</div>
+
+		<p>TppXxxx are the private functions written by The Great Cornholio <a href="http://www.bing.com/images/search?q=cornholio&#038;qpvt=cornholio&#038;qpvt=cornholio&#038;FORM=IGRE" rel="nofollow">http://www.bing.com/images/search?q=cornholio&#038;qpvt=cornholio&#038;qpvt=cornholio&#038;FORM=IGRE</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1223251">
+				<div id="div-comment-1223251" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861#comment-1223251">
+			January 15, 2016 at 12:53 pm</a>		</div>
+
+		<p>Does it ever disturb you that Microsoft has this knack of appearing blissfully aware of bugs that simple Google searches can find?</p>
+<p>Of course, trying to weed through stuff like this might be part of the cause.</p>
+<p>Yet I wonder what a publicly visible and community verified bug database would turn up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-msn odd alt thread-even depth-1" id="comment-1223281">
+				<div id="div-comment-1223281" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/poizan42' rel='external nofollow' class='url'>poizan42</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160115-00/?p=92861#comment-1223281">
+			January 16, 2016 at 3:12 am</a>		</div>
+
+		<p>The &#8220;code is not intentionally written to be impossible to understand.&#8221; link seems to be broken. Here is a working link: <a href="https://blogs.msdn.microsoft.com/oldnewthing/20140131-00/?p=1913" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20140131-00/?p=1913</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,858 @@
+<html>
+<head>
+<title>Inadvertently passing large objects by value</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Inadvertently passing large objects by value</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 29, 2006 / year-entry #113</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>41</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">One mark of punctuation can make all the difference. One program was encountering a stack overflow exception in a function that didn't appear to be doing anything particularly stack-hungry. The following code illustrates the problem: bool TestResults::IsEqual(TestResults& expected) { if (m_testMask != expected.m_testMask) { return false; } bool result = true; if (result && (m_testMask...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One mark of punctuation can make all the difference.
+</p>
+<p>
+One program was encountering a stack overflow exception in
+a function that didn't appear to be doing anything particularly
+stack-hungry.
+The following code illustrates the problem:
+</p>
+<pre>
+bool TestResults::IsEqual(TestResults&amp; expected)
+{
+ if (m_testMask != expected.m_testMask) {
+  return false;
+ }
+
+ bool result = true;
+
+ if (result &amp;&amp; (m_testMask &amp; AbcTestType)) {
+  result = CompareAbc(expected);
+ }
+
+ if (result &amp;&amp; (m_testMask &amp; DefTestType)) {
+  result = CompareDef(expected);
+ }
+
+ if (result &amp;&amp; (m_testMask &amp; GhiTestType)) {
+  result = CompareGhi(expected);
+ }
+
+ if (result &amp;&amp; (m_testMask &amp; JklTestType)) {
+  result = CompareJkl(expected);
+ }
+
+ return result;
+}
+</pre>
+<p>
+(In reality, the algorithm for comparing two tests results
+was much more complicated, but that's irrelevant to this
+discussion.)
+</p>
+<p>
+And yet on entry to this function, a stack overflow was raised.
+</p>
+<p>
+The first thing to note is that this problem occurred only
+on the x64 build of the test.
+The x86 version ran fine, or at least appeared to.
+It so happens that the x64 compiler aggressively inlines functions,
+which as it turned out was a major exacerbator of the problem.
+</p>
+<p>
+The title of this entry probably tipped you off to what happened:
+The helper functions accepted the test results parameter by value
+not by reference:
+</p>
+<pre>
+bool TestResults::CompareAbc(TestResults expected);
+bool TestResults::CompareDef(TestResults expected);
+bool TestResults::CompareGhi(TestResults expected);
+bool TestResults::CompareJkl(TestResults expected);
+</pre>
+<p>
+and those comparison functions in turn called other
+comparison functions, which also passed the <code>TestResults</code>
+by value.
+Since the test results were passed by value, a temporary
+copy was made on the stack and passed to the comparison function.
+It so happened that the <code>TestResults</code> class was
+a very large one, a hundred kilobytes or so, and the
+<code>TestResults::IsEqual</code> function therefore needed
+to reserve room for a large number of such temporary copies,
+one for each call to a comparison function in each of the
+inlined functions.
+A dozen temporary copies times a hundred kilobytes per copy
+comes out to over a megabyte of temporary variables,
+which exceeded the default one megabyte stack size
+and therefore resulted in a stack overflow exception on entry
+to the <code>TestResults::IsEqual</code> function.
+</p>
+<p>
+This code appeared to run fine when compiled for the x86 architecture
+because the x86-targetting compiler did not inline quite as
+aggressively, so the large temporaries were not reserved on the
+stack until the helper comparison was actually called.
+Since the comparisons went only three levels deep,
+there were only three temporary copies of the
+<code>expected</code> parameter, which fit within the one megabyte
+default stack.
+It was still bad code&mdash;consuming a few hundred kilobytes
+of stack for no reason&mdash;but it wasn't bad enough to cause
+a problem.
+The fix, of course, was to change the comparison functions to
+accept the parameter by reference.
+</p>
+<pre>
+bool TestResults::IsEqual(const TestResults&amp; expected) const;
+bool TestResults::CompareAbc(const TestResults&amp; expected) const;
+bool TestResults::CompareDef(const TestResults&amp; expected) const;
+bool TestResults::CompareGhi(const TestResults&amp; expected) const;
+bool TestResults::CompareJkl(const TestResults&amp; expected) const;
+</pre>
+<p>
+For good measure, the parameter was changed to a
+<code>const</code> reference, and the function was
+tagged as itself <code>const</code> to emphasize that
+neither the object nor the expected value will be modified
+as part of the comparison,
+thereby ensuring that changing from a copy to a <code>const</code> reference
+didn't change the previous behavior.
+Without the <code>const</code> reference,
+there was a possibility that somewhere deep inside the comparison
+functions, they made a change to the <code>expected</code>
+parameter.
+Under the old pass-by-value declaration, this change was discarded
+when the function returned since the change was made to a copy.
+If we had left off the <code>const</code> from the reference,
+then we would have changed the behavior: The change to the
+<code>expected</code> parameter would have modified the original
+<code>TestResults</code>.
+Making the parameter <code>const</code> reassures us that an
+attempt to modify <code>expected</code> would be flagged by the
+compiler and therefore brought to our attention.
+</p>
+<p>
+(This technique is not foolproof, however.
+Somebody could always cast away <code>const</code>-ness and
+modify the original,
+but we were being reckless and assuming that nobody would be that
+crazy.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (41)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-361033">
+				<div id="div-comment-361033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nawak</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361033">
+			March 29, 2006 at 10:16 am</a>		</div>
+
+		<p>Is &#8216;x64&#8217; the same as &#8216;x86-64&#8217;?</p>
+<p>If so, do someone have an idea of why 64-bit extensions would &#8216;favor&#8217; inlining? Or is it just because the x64 compiler is more recent and therefore &#8216;aware&#8217; of the large caches available today, allowing larger (inlined) code to be generated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361063">
+				<div id="div-comment-361063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361063">
+			March 29, 2006 at 10:32 am</a>		</div>
+
+		<p>Nawak: Wider addresses and more general-purpose registers means that the data to push on the stack can get larger, and also that smart inlining can allow more flexible register assignment. Both of these means that inlining will pay off more on x64.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361093">
+				<div id="div-comment-361093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">shf301</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361093">
+			March 29, 2006 at 11:01 am</a>		</div>
+
+		<p>It&#8217;s too bad that C++ doesn&#8217;t have anyway to tell from the call whether or not something is passed by reference or by value. &nbsp;That would have made this bug obvious, but as it is what is happening on the stack is not obvious.</p>
+<p>I would consider a function that takes a non-const reference to always be an error. &nbsp;If the function needs to modify the object, pass a pointer, at least that way from looking at the call you can say &quot;Oh I&#8217;m giving this function a pointer, maybe it&#8217;s going to change the object.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361183">
+				<div id="div-comment-361183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361183">
+			March 29, 2006 at 12:32 pm</a>		</div>
+
+		<p>shf301:</p>
+<p>To me, passing a pointer implies that, in fact, the value might be NULL &#8212; bringing in another failure path that you&#8217;ve got to explore.</p>
+<p>I don&#8217;t use non-const references that much, but in some cases (functors), you need them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361203">
+				<div id="div-comment-361203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361203">
+			March 29, 2006 at 12:36 pm</a>		</div>
+
+		<p>I think the x64 compiler&#8217;s inliner is broken if it allows the function&#8217;s stack to grow by &gt; 10k or so as a result of inlining. &nbsp;Any more than that and you&#8217;re touching so much memory that the branches probably don&#8217;t matter.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361233">
+				<div id="div-comment-361233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">cashto</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361233">
+			March 29, 2006 at 1:30 pm</a>		</div>
+
+		<p>100KB object?! &nbsp;How the heck do you create one of those? &nbsp;Sounds like he&#8217;s been using a large, fixed-sized array instead of std::vector (or other standard data structure).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361243">
+				<div id="div-comment-361243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NotAmused</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361243">
+			March 29, 2006 at 1:38 pm</a>		</div>
+
+		<p>My head just &#8216;esploded! OK, admittedly I don&#8217;t do much C++, but when I see the &quot;&amp;&quot; in a parameter list I think &quot;hmmm&#8230;that parameter&#8217;s going to be modified&quot;. But you&#8217;re saying &quot;const &#8230; &amp;&#8230;&quot; means &quot;no it&#8217;s not going to be modified; we&#8217;re just gimmicking the compiler into passing a reference to the original object so&#8217;s it won&#8217;t create a stack copy&quot;?</p>
+<p>Sounds like a mess. Why can&#8217;t the optimizer just figure out that a passed-by-value parameter isn&#8217;t being modified and change to a pass-by-reference parameter-passing style? Or alternatively, if the compiler needs some help (I think this&#8217;s how I&#8217;ve been writing code) just put a &quot;const&quot; in front of the parameter name without using the &quot;&amp;&quot; sign?</p>
+<p>&quot;const&quot;+&quot;&amp;&quot; just doesn&#8217;t seem right.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361263">
+				<div id="div-comment-361263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.morganalley.com' rel='external nofollow' class='url'>Dewi Morgan</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361263">
+			March 29, 2006 at 2:21 pm</a>		</div>
+
+		<p>People still pass data structures by value? WHY?</p>
+<p>Can&#8217;t compilers be told to throw a warning when people do that, or something?</p>
+<p>Maybe I&#8217;ve just been working with Java (eww) for too long.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361273">
+				<div id="div-comment-361273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://denisbider.blogspot.com' rel='external nofollow' class='url'>denis bider</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361273">
+			March 29, 2006 at 2:25 pm</a>		</div>
+
+		<p>Re: NotAmused</p>
+<p>&quot;const&amp;&quot; is a cornerstone of C++ parameter passing. Unlike Java, C# and similar higher-level languages, C++ is very &quot;close to the metal&quot;. As such, it MUST give you full control over how you are passing parameters. It is an essential part of design that you have control over this. Hence, in C++ code, you will see &quot;Class const&amp; x&quot; in many many places where C# code would only have &quot;Class x&quot; and nothing else.</p>
+<p>If you aren&#8217;t accustomed to const&amp;, I must say, you must indeed be a pretty bad C++ programmer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361283">
+				<div id="div-comment-361283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken E</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361283">
+			March 29, 2006 at 2:29 pm</a>		</div>
+
+		<p>If the class was never meant to be passed by value it should have defined a private copy contructor so the offending code could not compile.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361333">
+				<div id="div-comment-361333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361333">
+			March 29, 2006 at 4:08 pm</a>		</div>
+
+		<p>Ray:</p>
+<p>The power of references, other than the non-NULL pointers is with operator overloading. &nbsp;Not being able pass arguments to traditional functions would be a bit of a pain, but it wouldn&#8217;t cause any serious issues. &nbsp;However, not having references makes operator overloading much harder.</p>
+<p>I&#8217;ve had to track down too many bugs with output parameters being references. &nbsp;I don&#8217;t let my people do it and I&#8217;ve never run into any serious issues with that rule. &nbsp;Having a crash due to a NULL output parameter pointer is very quick to track down. &nbsp;However, having a variable in a routine unexpectedly changed usually takes a long time to locate in a large codebase.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361383">
+				<div id="div-comment-361383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361383">
+			March 29, 2006 at 4:41 pm</a>		</div>
+
+		<p>I find it odd that nobody has yet considered limiting stack size on debug builds. Anything over 64k and you&#8217;re probably doing something wrong. Actually, even 8k is pushing it, but I know how application programmers love stack-declared character arrays.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361393">
+				<div id="div-comment-361393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361393">
+			March 29, 2006 at 5:24 pm</a>		</div>
+
+		<p>It&#8217;s not like doing what you did automatically saves you in the general case. If anything can be implicitly converted to TestResults you can still run into it with pass by const reference. It&#8217;s much better off passing by const pointer in this case but it&#8217;s ugly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361403">
+				<div id="div-comment-361403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.abstractspoon.com' rel='external nofollow' class='url'>dan.g.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361403">
+			March 29, 2006 at 5:24 pm</a>		</div>
+
+		<p>would someone care to comment on how much of a performance difference you gain on x86 systems by passing a double to a function as a const reference (const double&amp;) rather than just by value. ie what &#8216;real&#8217; effect does saving 32 bits on the stack have?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361413">
+				<div id="div-comment-361413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361413">
+			March 29, 2006 at 5:44 pm</a>		</div>
+
+		<p>Dan, probably none whatsoever, except that you&#8217;re eating a GPR that could possibly be used for something better. Doubles should generally be passed by value. Any structure larger than a double should be passed by const reference. At least that&#8217;s how I do it and it appears to be a good rule of thumb. The generated assembly code looks good.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361443">
+				<div id="div-comment-361443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361443">
+			March 29, 2006 at 6:01 pm</a>		</div>
+
+		<p>So&#8230; what was this about? To display &quot;the world is still full of bad interface designers&quot;? I mean, noone in their right mind would make a comparison function, especially for a <em>large</em> object, take anything bug a const ref. Perhaps it&#8217;s more a display that Java and C++ are different languages &#8211; to make people see &quot;if you don&#8217;t know what you&#8217;re doing; Don&#8217;t do it!&quot;?</p>
+<p>What I find more interesting is that Raymond found such obvious idiocy worth blogging about. Is perhaps all the noteworthy stuff already covered, or is it to raise awareness of the increse in the collective ignorance that seemingly is becoming silly?</p>
+<p>On a related issue &#8211; is the reserved stack space for 64-bit threads doubled, or more? I&#8217;d think it is, else a 100% 64-bit &quot;compatible&quot; source code could catastrophically fail when compiled as a 64-bit binary, even that it works perfectly fine in 32-bit mode. Also, are the memory requirements for 64-bit XP twice that of 32-bit?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361463">
+				<div id="div-comment-361463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pavel Lebedinsky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361463">
+			March 29, 2006 at 7:37 pm</a>		</div>
+
+		<p>Cooney &#8211; appverifier does something similar. There&#8217;s a &quot;Disable automatic stack expansion&quot; check under Low Resource Simulation. If your process must be able to survive low memory conditions it might be a good idea to enable this check and if you get any breaks, either reduce stack usage or increase the initial stack size so that you never run out of committed stack space.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-361493">
+				<div id="div-comment-361493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361493">
+			March 29, 2006 at 8:27 pm</a>		</div>
+
+		<p>&quot;So what was this about?&quot;</p>
+<p>It was about a bug that I thought was interesting enough to share with other people so they will recognize the mistake when they make it. (And if you think you&#8217;re so smart that you&#8217;d never make a mistake like this, then I tip my hat to you.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361173">
+				<div id="div-comment-361173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361173">
+			March 29, 2006 at 12:30 pm</a>		</div>
+
+		<p>&quot;I would consider a function that takes a non-const reference to always be an error.&quot;</p>
+<p>Personally, I consider it an error to use a pointer for anything except optional parameters (i.e. one that could be NULL if you don&#8217;t need to do anything with that parameter). </p>
+<p>If you *really* can&#8217;t tell whether there are out parameters from the function name (which means you didn&#8217;t spend enough time thinking about the function name in the first place), you can always change the function name to add something like an &quot;R&quot; at the end to point out that it&#8217;s a reference.</p>
+<p>This is just yet another example of how names are paramount in C++. If you can&#8217;t come up with a really clear and concise name for a class, the class probably doesn&#8217;t make sense. If you can&#8217;t tell what a function does from the name, you&#8217;re probably not sure what it does anyway.</p>
+<p>Using pointers instead of references misses the whole point of references, which have nothing to do with saving a character while you&#8217;re accessing member variables, and *everything* to do with not scribbling over random memory or dereferencing a NULL pointer. &nbsp;</p>
+<p>Not to mention&#8230; When you&#8217;re *inside the function*, if you use a pointer you have to worry about that every time you touch the pointer. You can&#8217;t tell what param-&gt;foo = bar will really do except by runtime inspection. With a reference (barring other stack/heap mangling such that you&#8217;re screwed anyway) you can look at param.foo = bar and know that it&#8217;s safe. </p>
+<p>Besides, even with pointer parameters you can&#8217;t always tell just from looking at a function call whether you have an out parameter unless you happen to be directly passing the address of a variable instead of a pointer variable (well, ok, you can use Hungarian notation to fix that if you want). You still have to look at the type of the parameters, which isn&#8217;t really any easier than looking at the function prototype.</p>
+<p>Oh, and BTW, Visual C++ (all the way back to at least 6.0) happily shows you the function signature right there when you look at it with nothing more than a mouseover. Is your tool inferior?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361533">
+				<div id="div-comment-361533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.tringali.org' rel='external nofollow' class='url'>Scott Tringali</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361533">
+			March 29, 2006 at 11:07 pm</a>		</div>
+
+		<p>This really is a newbieish error. &nbsp;You always pass objects by const-ref by default unless you have reason not to.</p>
+<p>NotAmused: The optimizer can&#8217;t and shouldn&#8217;t pick the &quot;right one&quot; for you. &nbsp;And that reason is user-defined copy ctors. &nbsp;It&#8217;s not good to have a function call site that sometimes calls a function and sometimes doesn&#8217;t depending on the phase of the moon. &nbsp;When you run the optimizer, goal is to have the same behavior as when you didn&#8217;t.</p>
+<p>When you pass by value, you are copying the object via the copy constructor. &nbsp;When you pass by reference, no function is called and no copy is performed.</p>
+<p>Copy ctors may be user-defined, and they can do anything &#8211; lots of useful things.</p>
+<p>Many time passing by const-ref is the same as passing by value, but certainly not always. &nbsp;The optimizer can&#8217;t read your code to decide what the copy ctor really means, and that simply ignoring it and replacing it with a reference would have the same effect.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361543">
+				<div id="div-comment-361543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jamie Anderson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361543">
+			March 29, 2006 at 11:10 pm</a>		</div>
+
+		<p>shf301: &quot;I would consider a function that takes a non-const reference to always be an error.&quot;</p>
+<p>Not always. It depends on what you want to do with the parameter. For example:</p>
+<p>void x(const std::string &amp;str) &#8230;<br />
+<br />gives you a string you can only look at (read-only reference)</p>
+<p>void x(std::string str) &#8230;<br />
+<br />gives a string which you can modify, but the changes are lost when you leave the function (copy)</p>
+<p>void x(std::string &amp;str) &#8230;<br />
+<br />gives you a string which you can modify, and the changes persist when you leave the function (read/write reference)</p>
+<p>dan.g.: &quot;would someone care to comment on how much of a performance difference you gain on x86 systems by passing a double to a function as a const reference (const double&amp;) rather than just by value&quot;</p>
+<p>The general rule in this case is that anything that&#8217;ll fit into a register can be passed by value, everything else should be passed by reference.</p>
+<p>Cooney: &quot;I find it odd that nobody has yet considered limiting stack size on debug builds. Anything over 64k and you&#8217;re probably doing something wrong. Actually, even 8k is pushing it, but I know how application programmers love stack-declared character arrays.&quot;</p>
+<p>Often it&#8217;s more efficient to allocate a temporary buffer on the stack than on the heap. On the stack, you change your stack pointer, and you&#8217;re done. With the heap, allocation tables need to be read and updated, and you can have contention on multi-threaded processes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361563">
+				<div id="div-comment-361563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.imit.kth.se/~zayenz' rel='external nofollow' class='url'>Mikael</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361563">
+			March 30, 2006 at 12:15 am</a>		</div>
+
+		<p>Mike: &quot;What I find more interesting is that Raymond found such obvious idiocy worth blogging about.&quot;</p>
+<p>Obvious idiocy is fun. Go see <a href="http://www.thedailywtf.com" rel="nofollow">http://www.thedailywtf.com</a> for examples.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361583">
+				<div id="div-comment-361583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://notes.dpdx.net' rel='external nofollow' class='url'>Brooks Moses</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361583">
+			March 30, 2006 at 2:57 am</a>		</div>
+
+		<p>Mike: What a privileged life as a programmer you seem to lead! &nbsp;You can just blithely assume that any good programmer is a competent C++ programmer.</p>
+<p>I&#8217;ll admit it: This was useful to me. &nbsp;I&#8217;ve probably made this mistake, several times, without knowing it. &nbsp;Why? &nbsp;Well, I&#8217;m not a comp sci major. &nbsp;I&#8217;ve had two classes of formal programming training &#8212; one of them an intro to engineering class with a few weeks of basic Fortran, and one of them an elective on the esoterica of high-performance supercomputing.</p>
+<p>And yet I ended up doing a dissertation on computational fluid dynamics, so I am in large part a programmer by trade.</p>
+<p>So, I&#8217;m in a position that I suppose you haven&#8217;t considered the existence of. &nbsp;I believe I&#8217;m a fairly good self-taught programmer in my field; I&#8217;ve continually put a fair bit of effort into improving my skills. &nbsp;But I learned primarily by being a Fortran programmer (and, yes, that means I&#8217;ve done recursive algoritms in Fortran 77 which doesn&#8217;t support recursion, and encapsulated objects in Fortran 95 which supports them); C++ was something I picked up a couple of years ago as part of this consciously working at skill improvement, and I&#8217;m still largely a beginner at it.</p>
+<p>This all means that I understand pass-by-value and pass-by-reference and pass-by-copy-in-copy-out very well, and I can tell you exactly how the Fortran standard requires compilers to handle this. &nbsp;But the upshot is that Fortran does this quite differently from C++; in particular, it tends to Do The Right Thing most of the time. &nbsp;So, although I realize C++ is different, I doubt I always <em>remember</em>, and this is an error that almost never has symptoms other than slowness and memory overuse.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361483">
+				<div id="div-comment-361483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">shf301</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361483">
+			March 29, 2006 at 7:56 pm</a>		</div>
+
+		<p>Ray Trent said:</p>
+<p>&quot;If you *really* can&#8217;t tell whether there are out parameters from the function name (which means you didn&#8217;t spend enough time thinking about the function name in the first place),<br />
+<br />you can always change the function name to add something like an &quot;R&quot; at the end to point out that it&#8217;s a reference.&quot;</p>
+<p>I agree that&#8217;s the way it should be, but do you program with developers? &nbsp;Where I work (Maintaining and extended an old C application)<br />
+<br />sometimes the function name doesn&#8217;t even decribe what the function does. &nbsp;</p>
+<p>Using pointers does have its own problems, what I really would want is like C# has where you have to specify ref and out. &nbsp;Using naming correctly is great, and should be done, but unless the compiler enforces a rule it will be broken.</p>
+<p>And as for is my tool inferior, well I just wish that I had a real tool&#8230;<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361633">
+				<div id="div-comment-361633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">strik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361633">
+			March 30, 2006 at 4:39 am</a>		</div>
+
+		<p>One thing I don&#8217;t understand (have I missed something?):</p>
+<p>Why doesn&#8217;t the compiler just generate memory for ONE temporary object, and copy the original over it after another function was called &#8211; or, even better, but not always possible, determine itself that the CompareXXX() functions do not change the object?</p>
+<p>This way, the needs for stack space would be much lower.</p>
+<p>Of course, this would not be the optimum, but better than the current behaviour.</p>
+<p>Anyway, the generated code (which uses 3 temporary objects) has to copy the original object over the temporary object 3 times, thus, using 1 object again and again would not be much worse than this (timely and space-wise).</p>
+<p>&#8211; strik.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361653">
+				<div id="div-comment-361653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrei</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361653">
+			March 30, 2006 at 5:21 am</a>		</div>
+
+		<p>Perhaps a little profiling would also have brought that issue into surface. When I was profiling my first C++ program, it was surprising to me that copy constructors took most of the running time. Especially std::vector, std::list and std::string.</p>
+<p>A coding standard might be helpful in avoiding problems like this one.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361663">
+				<div id="div-comment-361663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tobi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361663">
+			March 30, 2006 at 6:48 am</a>		</div>
+
+		<p>I concur to Trent&#8217;s opinion about pointers. Use them, if you can&#8217;t avoid it &#8211; but there are usually better/safer tools in C++ anyway. It&#8217;s just an old C-coding habit which doesn&#8217;t buy you much.</p>
+<p>When passing a pointer as a parameter, you never know what is expected by the function actually before studying it&#8217;s docs. (Maybe you are lucky and the naming of the parameter makes it obvious, although this is not always possible.) For instance the function may or may not handle NULL. It might even store that pointer somewhere for later use, so you would have to be very careful about it&#8217;s life time&#8230; and so on.</p>
+<p>Even for optional arguments, one might prefer the use of something like boost::optional&lt;&gt; as long as you don&#8217;t need the tiny bit of performance a raw pointer could save you. The justification is the same as above &#8211; you never know if the pointer-argument is meant to be an optional value, a return value or something else, while using an explicit type/wrapper would make it very clear.</p>
+<p>Besides the same holds true much more for returning pointers as function results. The life time of an object returned in such a way and the question who gets responsible for cleaning up are anything but trivial questions. Luckily there are smart pointers and alike. And usually this doesn&#8217;t even result in a performance hit as modern compilers are great when it comes to optimizing template based types &#8211; and most smart pointers are templates.</p>
+<p>And last but not least, if you feel uneasy with non-const references, used as a return value surrogate where single return values just don&#8217;t suffice, you should consider using explicit structs or classes for it or just using tuples as the return type &#8211; like boost::tuple or the proposed std::tuple. Returning larger structs by value isn&#8217;t that much of a problem anymore, as (again) modern compilers can avoid the overhead in most cases.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361673">
+				<div id="div-comment-361673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361673">
+			March 30, 2006 at 7:42 am</a>		</div>
+
+		<p>I tend NEVER to use pointers unless I WANT to say &quot;this can be NULL&quot;.</p>
+<p>However, there is way too much old C-style code (including MFC-style :-)) that uses pointers which are assumed to be non-NULL, never checked etc. But MS is partly to blame for our bad habbits, as they didn&#8217;t do references in MFC (well, almost) and they probably could have done better in ATL, too. And you do look up to the &quot;big guys&quot;, especially when all the books tell you how great MFC/ATL/whatever is, so you take in the good and the bad&#8230; Pitty!</p>
+<p>Using pointers for pass-by-ref is simply not C++ style. Yes, there is a benefit of pointers of having pass-by-ref <em>visible</em> in the code (&#8216;-&gt;&#8217; or &#8216;*&#8217; instead of &#8216;.&#8217;) But, it&#8217;s not worth the ambiguity (the &quot;can this ptr be NULL here!?&quot; question).</p>
+<p>One can also argue for maintenance like this: &nbsp;&quot;if we use pointer, we can allow this parameter to be NULL later&quot;, but, imo, this doesn&#8217;t happen often enough to be justified.</p>
+<p>IMO, C# does it best by using &quot;ref&quot; keyword. Can we have that in C++, please?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361683">
+				<div id="div-comment-361683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Amos Houndsbreath</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361683">
+			March 30, 2006 at 8:00 am</a>		</div>
+
+		<p>C++ is full of subtle traps like this. Most of the time, you get away with awful inefficient, unreliable code through sheer luck.</p>
+<p>As a friend of mine said, if you&#8217;ve never single stepped through your code, you have no idea if it works on or not.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-361703">
+				<div id="div-comment-361703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger Clark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361703">
+			March 30, 2006 at 8:58 am</a>		</div>
+
+		<p>No offense, but this doesn&#8217;t seem to qualify as blog material, especially when a lot of other MS employees are busy talking about the internals of their projects or what&#8217;s cooking on the backburner.</p>
+<p>This is just a very basic C++ programmer error. It&#8217;s not even a fringe case or something fine-grained or nitpicky. What&#8217;s next, a blog post on the pitfalls of sprintf?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361723">
+				<div id="div-comment-361723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MIke Fitzpatrick</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361723">
+			March 30, 2006 at 9:59 am</a>		</div>
+
+		<p>I have never been excited about some of C++&#8217;s syntax. Passing by reference, for example, seems to me to be a syntax obfuscation. It only hides the fact that what you are really doing is using a const pointer. So<br />
+<br /> &nbsp; bool TestResults::IsEqual(TestResults&amp; expected)</p>
+<p>could also be </p>
+<p>bool TestResults::IsEqual(TestResults * const pExpected)</p>
+<p>In this way the language syntax doesn&#8217;t hide what&#8217;s really going on.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-362733">
+				<div id="div-comment-362733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dhiren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-362733">
+			March 30, 2006 at 2:47 pm</a>		</div>
+
+		<blockquote><p>
+  Why doesn&#8217;t the compiler just generate memory<br />
+  <br />&gt;for ONE temporary object, and copy the original<br />
+  <br />&gt;over it after another function was called &#8211; or,<br />
+  <br />&gt;even better, but not always possible, determine<br />
+  <br />&gt;itself that the CompareXXX() functions do not<br />
+  <br />&gt;change the object? </p>
+<p>What happens in this case then:</p>
+<p>void func1(bigstruct st)<br />
+  <br />{<br />
+  <br />..<br />
+  <br />}</p>
+<p>void func2(bigstruct st)<br />
+  <br />{<br />
+  <br />st.somevalue = newvalue; &nbsp;//modify my copy of st and pass to func1<br />
+  <br />func1(st); &nbsp;//call func1 with the modified copy</p>
+<p>//do more stuff with my copy of st here<br />
+  <br />}</p>
+<p>void func3(bigstruct st)<br />
+  <br />{<br />
+  <br />st.someothervalue = anothervalue;<br />
+  <br />func2(st);</p>
+<p>//do other stuff with my copy of st here where<br />
+  <br />//st.somevalue is still what i want it to be<br />
+  <br />//and not some newvalue that func2 overwrote in<br />
+  <br />//the memory for the one temporary object<br />
+  <br />}</p>
+<p>The whole point of passing by value is so that each function call has its own copy to do what it wants with it. &nbsp;If you have concerns about the impact your object has on the stack then either pass by const reference, or a pointer to the object.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-361693">
+				<div id="div-comment-361693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://denisbider.blogspot.com' rel='external nofollow' class='url'>denis bider</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-361693">
+			March 30, 2006 at 8:49 am</a>		</div>
+
+		<p>I don&#8217;t think the argument that &#8216;ref&#8217; in C# is somehow better has any merit. These are apples and oranges. C# ALWAYS passes objects by reference. I.e. these two are comparable:</p>
+<p>// C#<br />
+<br />public void Method(Object x) { &#8230; }</p>
+<p>// C++<br />
+<br />public void Method(Object&amp; x) { &#8230; }</p>
+<p>Note that C# simply doesn&#8217;t have const. It simplifies the language, but any Method can change anything in your object without even asking about it. If you want the equivalent of const in C#, you need to implement a special &quot;read-only&quot; interface to the object and have the method take that interface.</p>
+<p>But the &#8216;ref&#8217; parameter in C#:</p>
+<p>// C#<br />
+<br />public void Method(ref Object x) { &#8230; }</p>
+<p>is actually comparable to this:</p>
+<p>// C++<br />
+<br />public void Method(Object** x) { &#8230; }</p>
+<p>It&#8217;s a second degree pointer and unrelated to this topic.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-363203">
+				<div id="div-comment-363203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-363203">
+			March 30, 2006 at 7:03 pm</a>		</div>
+
+		<p>I tend to agree with KenE and asdf.</p>
+<p>By the way, is there a W1048576 warning: large object passed by value?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-363253">
+				<div id="div-comment-363253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Dunn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-363253">
+			March 30, 2006 at 7:38 pm</a>		</div>
+
+		<p>Re passing a modifyable object by reference vs. passing a pointer to it&#8230;</p>
+<p>I constantly (no pun intended) struggle with myself about which is the better way. If your functions always take a &quot;const Foo&amp;&quot; for input params, and always take a &quot;Foo*&quot; for output params, it&#8217;s clear at the call sites which objects are outputs. Any param that&#8217;s a pointer to Foo is gonna be modified.<br />
+<br />If your functions take a &quot;const Foo&amp;&quot; for inputs and &quot;Foo&amp;&quot; for outputs, it&#8217;s not always clear at the call site what the intent of the params are. You have to start looking either at the function/variable names &#8211; and hope their names indicate their usage &#8211; or go to the called function itself &#8211; and hope it&#8217;s sufficiently documented.</p>
+<p>Passing a reference avoids the problem of the param being null, and that usually wins out in the end. Why introduce the possibility of bugs related to null pointers when it&#8217;s not necessary?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-363343">
+				<div id="div-comment-363343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vince P</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-363343">
+			March 30, 2006 at 9:59 pm</a>		</div>
+
+		<p>To denis:</p>
+<p>Actually C# passes parameters by value. &nbsp;For value types, a copy of the value will be sent to the method, for reference types a copy of the reference is made and passed to the method.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-363583">
+				<div id="div-comment-363583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-363583">
+			March 31, 2006 at 4:04 am</a>		</div>
+
+		<p>to denis: you mix C#&#8217;s reference types (i.e. classes) with pass-by-ref.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-364033">
+				<div id="div-comment-364033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Vince P</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-364033">
+			March 31, 2006 at 1:53 pm</a>		</div>
+
+		<p>Denis:</p>
+<p>C# has a unified type system, so it&#8217;s ambigious to say that &quot;objects&quot; are passed by reference. &nbsp;An Int32 is derived from ValueType which is derived from Object.</p>
+<p>What you&#8217;re really saying is that Reference Types use references to reference them. &nbsp;And in method parameters, C# passes a copy of the reference to the reference type to the method.</p>
+<p>(Unless you use &nbsp;the ref or out keywords on the parameter)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-363823">
+				<div id="div-comment-363823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogpost.denisbider.com' rel='external nofollow' class='url'>denis bider</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-363823">
+			March 31, 2006 at 11:00 am</a>		</div>
+
+		<p>Vince P: What I said is that C# always passes *objects* by reference. Unlike in C++, you cannot pass class objects by value.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-364563">
+				<div id="div-comment-364563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://denisbider.blogspot.com' rel='external nofollow' class='url'>denis bider</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-364563">
+			April 1, 2006 at 8:13 am</a>		</div>
+
+		<p>Vince: the unified type system is a gimmick. It&#8217;s useful, but I wouldn&#8217;t say that int is quite the same as Int32, even though it&#8217;s automatically boxable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-365093">
+				<div id="div-comment-365093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Billy Boy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060329-02/?p=31733#comment-365093">
+			April 3, 2006 at 9:00 am</a>		</div>
+
+		<p>Are you implying that 640k isn&#8217;t enough for everyone?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

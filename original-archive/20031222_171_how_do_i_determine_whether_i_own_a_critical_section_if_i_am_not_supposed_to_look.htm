@@ -1,0 +1,464 @@
+<html>
+<head>
+<title>How do I determine whether I own a critical section if I am not supposed to look at internal fields?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I determine whether I own a critical section if I am not supposed to look at internal fields?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 22, 2003 / year-entry #172</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Seth asks how he can perform proper exception-handling cleanup if he doesn't know whether he needs to clean up a critical section. I'm using SEH, and have some __try/__except blocks in which the code enters and leaves critical sections. If an exception occurs, I don't know if I'm currently in the CS or not. Even...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p><a href="http://weblogs.asp.net/oldnewthing/posts/44425.aspx#44659">Seth asks</a> how he can perform proper exception-handling cleanup if he doesn't know whether he needs to clean up a critical section. </p>
+<blockquote class=q><p>I'm using SEH, and have some __try/__except blocks in which the code enters and leaves critical sections. If an exception occurs, I don't know if I'm currently in the CS or not. Even wrapping the code in __try/__finally wouldn't solve my problems. </p>
+</blockquote>
+<p>Answer: You know whether you own the CRITICAL_SECTION because you entered it. </p>
+<dl>
+<dt>Method 1: Deduce it from your instruction pointer. </p>
+<dd>"If I'm at this line of code, then I must be in the critical section." </p>
+<pre>__try {
+  ...
+  EnterCriticalSection(x);
+  __try { // if an exception happens here
+     ...  // make sure we leave the CS
+  } __finally { LeaveCriticalSection(x); }
+  ...
+} except (filter) {
+  ...
+}
+</pre>
+<p>Note that this technique is robust to nested calls to EnterCriticalSection. If you take the critical section again, then wrap the nested call in its own try/finally. </p>
+<dt>Method 2: Deduce it from local state </p>
+<dd>"I'll remember whether I entered the critical section." </p>
+<pre>int cEntered = 0;
+__try {
+  ...
+  EnterCriticalSection(x);
+  cEntered++;
+  ...
+  cEntered--;
+  LeaveCriticalSection(x);
+  ...
+} except (filter) {
+  while (cEntered--)
+    LeaveCriticalSection(x);
+  ...
+}
+</pre>
+<p>Note that this technique is also robust to nested calls to EnterCriticalSection. If you take the critical section again, increment cEntered another time. </p>
+<dt>Method 3: Track it in an object </p>
+<dd>Wrap the CRITICAL_SECTION in another object. </p>
+<p>This most closely matches what Seth is doing today. </p>
+<pre>class CritSec : CRITICAL_SECTION
+{
+public:
+ CritSec() : m_dwDepth(0), m_dwOwner(0)
+   { InitializeCriticalSection(this); }
+ ~CritSec() { DeleteCriticalSection(this); }
+ void Enter() { EnterCriticalSection(this);
+    m_dwDepth++;
+    m_dwOwner = GetCurrentThreadId(); }
+ void Leave() { if (!--m_dwDepth) m_dwOwner=0;
+    LeaveCriticalSection(this); }
+ bool Owned()
+   { return GetCurrentThreadId() == m_dwOwner; }
+private:
+  DWORD m_dwOwner;
+  DWORD m_dwDepth;
+};
+
+__try {
+  assert(!cs.Owned());
+  ...
+  cs.Enter();
+  ...
+  cs.Leave();
+  ...
+} except (filter) {
+  if (cs.Owned()) cs.Leave();
+}
+</pre>
+<p>Notice that this code is <b>not</b> robust to nested critical sections (and correspondingly, Seth's code isn't either). If you take the critical section twice, the exception handler will only leave it once. </p>
+<p>Note also that we assert that the critical section is not initially owned. If it happens to be owned already, then our cleanup code may attempt to leave a critical section that it did not enter. (Imagine if an exception occurs during the first "...".) </p>
+<dt>Method 4: Track it in a smarter object </p>
+<dd>Wrap the CRITICAL_SECTION in a smarter object. </p>
+<p>Add the following method to the CritSec object above: </p>
+<p><pre> DWORD Depth() { return Owned() ? m_dwDepth : 0; }
+</pre>
+</p>
+<p>Now you can be robust to nested critical sections: </p>
+<pre>DWORD dwDepth = cs.Depth();
+__try {
+  ...
+  cs.Enter();
+  ...
+  cs.Leave();
+  ...
+} except (filter) {
+  while (cs.Depth() &gt; dwDepth)
+    cs.Leave();
+}
+</pre>
+</dd>
+</dl>
+<p>Note however that I am dubious of the entire endeavor that inspired the original question. </p>
+<p>Cleaning up behind an exception thrown from within a critical section raises the issue of "How do you know what is safe to clean up?" You have a critical section because you are about to destabilize a data structure and you don't want others to see the data structure while it is unstable. But if you take an exception while owning the critical section - well your data structures are unstable at the point of the exception. Merely leaving the critical section will now leave your data structures in an inconsistent state, leading to harder-to-diagnose bugs later on. "How did my count get out of sync?" </p>
+<p>More rants on exceptions in a future entry. </p>
+<p><b>Exercise</b>: Why don't we need to use synchronization to protect the uses of m_dwDepth and m_dwOwner? </p>
+<p>
+<b>Update 2004/Jan/16</b>: Seth pointed out that I got the two branches of the ternary operator backwards in the Depth() function. Fixed.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-117553">
+				<div id="div-comment-117553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Seth McCarus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117553">
+			December 22, 2003 at 10:27 am</a>		</div>
+
+		<p>Thanks very much for addressing this, Raymond.  The last class looks like a good implementation.</p>
+<p>My incorrect guess to the posted question is that since DWORD assignments involve only one assembler instruction, they are atomic and cannot be interrupted mid-execution.  I&#8217;m assuming this is incorrect due to the existence of such functions as InterlockedIncrement().</p>
+<p>This begs my next question: when do I need to protect data with a critical section?  When multiple threads read the data?  Or only when one or more threads write the data?  Or only if it&#8217;s a complex data type such as a char buffer, where a read or write operation can be interrupted?</p>
+<p>Thanks!&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-117563">
+				<div id="div-comment-117563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117563">
+			December 22, 2003 at 11:12 am</a>		</div>
+
+		<p>You can make option more robust to nested critsecs if you change the exception handler to the following:<br />
+<br />while (cs.Owned()) cs.Leave();</p>
+<p>It seems like the answer to the exercise is a trick question.  The m_dw* functions are inherently protected because you are doing them from within the critical section that the code already owns.  The only exception is Owned() which, like Seth says, is atomic.  But don&#8217;t let atomicity let you get sloppy, there are cache issues on MP systems you have to worry about.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-117573">
+				<div id="div-comment-117573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.codeproject.com/script/articles/list_articles.asp?userid=152' rel='external nofollow' class='url'>Mike Dunn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117573">
+			December 22, 2003 at 11:15 am</a>		</div>
+
+		<p>The thing about &quot;it&#8217;s only one asm instruction, so it can&#8217;t be interrupted&quot; doesn&#8217;t hold on multiple-CPU boxes, though. A CS is not needed in the sample code because those member vars are accessed only between calls to EnterCriticalSection() and LeaveCriticalSection(), so you know that only one thread is in a position to be accessing those vars.</p>
+<p>As for when to use a CS: If all you&#8217;re doing is reading, no CS is needed (assuming your underlying data store is thread-safe). As soon as you write to it, you need to lock it. If you have a copy of _Advanced Windows_ there&#8217;s a nice chunk of code in there called a SWMRG (single writer, multiple reader guard) that demonstrates many multithreaded concepts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-117583">
+				<div id="div-comment-117583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Centaur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117583">
+			December 22, 2003 at 11:23 am</a>		</div>
+
+		<p>“Why don&#8217;t we need to use synchronization to protect the uses of m_dwDepth and m_dwOwner?”</p>
+<p>It seems to me they are protected by *this CRITICAL_SECTION.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-117593">
+				<div id="div-comment-117593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117593">
+			December 22, 2003 at 12:51 pm</a>		</div>
+
+		<p>Mike Dunn: Actually, we read from m_dwOwner from outside the critical section, but we&#8217;ll see below why this is safe anyway.</p>
+<p>Changes to m_dwOwner and m_dwDepth are protected by *this. m_dwOwner is read from outside the critical section, but that&#8217;s okay, because if you don&#8217;t own the critical section, then m_dwOwner is not you, and even if it changes, it will just change to something else that is still not you, so the test against GetCurrentThreadId will still fail. m_dwDepth is in turn protected by m_dwOwner.</p>
+<p>Note that using &quot;while (cs.Owner()) cs.Leave()&quot; will cause problems if the critical section entered your code already owned; you&#8217;ll be leaving critical sections that you never entered.  That&#8217;s what method 4 there to fix.</p>
+<p>But I still don&#8217;t like any of this &#8211; there&#8217;s more to cleaning up behind an exception than just leaving critical sections. All you&#8217;re doing is delaying the crash to a point where you can&#8217;t debug it any more.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-117613">
+				<div id="div-comment-117613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117613">
+			December 22, 2003 at 3:49 pm</a>		</div>
+
+		<p>Knowing that you still don&#8217;t like any of this, I&#8217;m surprised you didn&#8217;t mention this popular method:<br />
+<br />class LockSection<br />
+<br />{<br />
+<br />  CRITICAL_SECTION *cs;<br />
+<br />public:<br />
+<br />  LockSection(CRITICAL_SECTION *cs)<br />
+<br />    : cs(cs)<br />
+<br />  {<br />
+<br />    EnterCriticalSection(cs);<br />
+<br />  }</p>
+<p>  ~LockSection()<br />
+<br />  {<br />
+<br />    LeaveCriticalSection(cs);<br />
+<br />  }<br />
+<br />};</p>
+<p>__try<br />
+<br />{<br />
+<br />  LockSection lock(&amp;mycs);<br />
+<br />  //stuff<br />
+<br />}<br />
+<br />except<br />
+<br />{<br />
+<br />  // critical section left from stack unwinding<br />
+<br />}</p>
+<p>// critical section left from going out of scope.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-117643">
+				<div id="div-comment-117643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117643">
+			December 22, 2003 at 9:26 pm</a>		</div>
+
+		<p>Yes, that&#8217;s a common method, and it&#8217;s fine if you like it. You do run into problems if you want to exit the critical section at a point other than the end of the block that declared the LockSection object.  E.g., if you want to exit the critical section, do something, then re-enter the critical section.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-117663">
+				<div id="div-comment-117663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.virtualdub.org/' rel='external nofollow' class='url'>Phaeron</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117663">
+			December 23, 2003 at 2:16 am</a>		</div>
+
+		<p>There are legitimate reasons why you would want to throw exceptions from within a critical section.  Raymond brought up the case where a thread lock the CS in order to prevent others from seeing its modifications in progress (write lock), but he didn&#8217;t mention the case where a thread locks to prevent others from modifying the data structure (read lock).  An example would be cloning objects off a shared list and encountering an allocation error in the middle.  Throwing out of a read lock is perfectly safe and I find it frequently occurs in multithreaded, exception-based code.</p>
+<p>If you really want to get fancy, add an operator int() const { return 0; } method, and then this macro:</p>
+<p>#define synchronized(lock) switch(LockSection locksection=(lock))default:</p>
+<p>This then allows you to emulate Java&#8217;s synchronized statement, which IMO makes for much more readable code.  It even works without braces around the controlled code.  The downside is that this particular incarnation crashes every version of Visual C++ since at least 6.0, requiring an if() workaround.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-117683">
+				<div id="div-comment-117683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frederik Slijkerman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117683">
+			December 23, 2003 at 4:34 am</a>		</div>
+
+		<p>You can simply open a new scope if you want to leave the critical section earlier. Example:</p>
+<p>// do stuff before entering CS<br />
+<br />{<br />
+<br />  LockSection lock(&amp;cs);<br />
+<br />  // stuff inside CS<br />
+<br />}<br />
+<br />// stuff after leaving CS</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-117703">
+				<div id="div-comment-117703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Seth McCarus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117703">
+			December 23, 2003 at 6:30 am</a>		</div>
+
+		<p>Joe,</p>
+<p>Your code produces warning C4509 and error C2712 &#8211; Cannot use __try in functions that require object unwinding.  Do you compile your apps with /GX- to overcome this?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-117723">
+				<div id="div-comment-117723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117723">
+			December 23, 2003 at 9:46 am</a>		</div>
+
+		<p>The &quot;new scope&quot; trick has two problems, one aesthetic and one technical.</p>
+<p>The aesthetic problem is that &quot;magic happens&quot; at the close-brace and it isn&#8217;t obvious.  Somebody might later decide to remove the &quot;redundant&quot; braces and break your code, unaware that twenty lines into the block, you created a LockSection object.  This can be fixed with some coding conventions (for example, always comment the close-brace with &quot;// exit lock()&quot;).</p>
+<p>The technical problem is that this still restricts you critical section use that matches the ambient block structure.  Consider:</p>
+<p>cs.Enter();<br />
+<br />for (p = m_first; p; p = p-&gt;m_next) {<br />
+<br />  p-&gt;prepare();<br />
+<br />  cs.Leave();<br />
+<br />  result = Callback(p);<br />
+<br />  cs.Enter();<br />
+<br />  if (p-&gt;revalidate()) {<br />
+<br />   use(result);<br />
+<br />  }<br />
+<br />}<br />
+<br />cs.Leave();</p>
+<p>The entry/exit of the critical section here does not match the block structure of the surrounding code.</p>
+<p>&quot;Who would be so crazy as to write code like this?&quot;</p>
+<p>Answer: Anybody who supports callbacks. If you call out to uncontrolled code while holding a critical section, you risk deadlocking.  You must leave the critical section, call the callback, then re-enter the critical section and revalidate all active variables.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-117733">
+				<div id="div-comment-117733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117733">
+			December 23, 2003 at 10:20 am</a>		</div>
+
+		<p>Heh, to be honest I haven&#8217;t done much C++ exception programming under windows lately, and I&#8217;ve specifically never done the above (I&#8217;ve used it plenty for multiple exit points in a function) so I don&#8217;t know how to work around it.  Sorry.  </p>
+<p>My guess is you have to use a different exception method?  From that message it doesn&#8217;t seem like the compiler can handle it.  It could be that it requires RTTI to function and you have it turned off.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-117903">
+				<div id="div-comment-117903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.whirlingdervishes.com' rel='external nofollow' class='url'>Henk Devos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-117903">
+			December 24, 2003 at 8:12 am</a>		</div>
+
+		<p>Joe&#8217;s solution is about what i am using myself.<br />
+<br />But since this is a C++ solution, you have to use C++ exception handling.<br />
+<br />Instead of __try etc. use try and catch. </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-118023">
+				<div id="div-comment-118023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pavel Lebedinsky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-118023">
+			December 25, 2003 at 10:32 pm</a>		</div>
+
+		<p>Back when I was coding in C++ I used the LockSection method a lot. I think it&#8217;s the most natural approach in C++. If you want to leave and reenter critical section at arbitrary places you can add Leave() and Enter() methods to the lock class. Or you could create an UnlockSection class that would unlock in constructor and lock in destructor.&lt;p&gt;As for callbacks, another approach is to lock, clone the list of listeners into a local variable, unlock then invoke the callbacks using the copy.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-118093">
+				<div id="div-comment-118093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-118093">
+			December 26, 2003 at 8:04 am</a>		</div>
+
+		<p>&quot;lock, clone the list of listeners into a local variable, unlock then invoke the callbacks using the copy&quot;</p>
+<p>Yes, you can do this. And even in this case, you need to able to unlock temporarily while inside a nested lock.</p>
+<p>cs.Lock();<br />
+<br />while (condition) {<br />
+<br />.. blah blah();<br />
+<br />.. if (need to make callback) {<br />
+<br />.. .. list = copy_callback_list();<br />
+<br />.. .. cs.Unlock(); // &lt;&lt; nested unlock<br />
+<br />.. .. callback_each_entry(list);<br />
+<br />.. .. free(list);<br />
+<br />.. .. cs.Lock(); // &lt;&lt;re-lock<br />
+<br />.. }<br />
+<br />}<br />
+<br />cs.Unlock();</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-118973">
+				<div id="div-comment-118973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BTannenbaum</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031222-00/?p=41403#comment-118973">
+			December 30, 2003 at 1:33 pm</a>		</div>
+
+		<p>Be careful if you unlock the critical section.  I did that in some code (to call out to a callback, exactly as suggested).  If the callback returned an error, the code exited the routine without reacquiring the lock.  The destructor was stupid and assumed that it owned the lock, so it simply called LeaveCriticalSection.  So the execution sequence (from the point of view of the critical section) was</p>
+<p>EnterCriticalSection<br />
+<br />LeaveCriticalSection<br />
+<br />LeaveCriticalSection</p>
+<p>Needless to say, this was not good for the health of my application.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

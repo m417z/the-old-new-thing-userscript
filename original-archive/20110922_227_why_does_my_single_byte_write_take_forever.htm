@@ -1,0 +1,368 @@
+<html>
+<head>
+<title>Why does my single-byte write take forever?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Why does my single-byte write take forever?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 22, 2011 / year-entry #228</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A customer found that a single-byte write was taking several seconds, even though the write was to a file on the local hard drive that was fully spun-up. Here's the pseudocode: // Create a new file - returns quickly hFile = CreateFile(..., CREATE_NEW, ...); // make the file 1GB SetFilePointer(hFile, 1024*1024*1024, NULL, FILE_BEGIN); SetEndOfFile(hFile); //...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer found that a single-byte write was taking several seconds,
+even though the write was to a file on the local hard drive that was
+fully spun-up.
+Here's the pseudocode:
+</p>
+<pre>
+// Create a new file - returns quickly
+hFile = CreateFile(..., CREATE_NEW, ...);
+
+// make the file 1<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2009/06/11/9725386.aspx">GB</a>
+SetFilePointer(hFile, 1024*1024*1024, NULL, FILE_BEGIN);
+SetEndOfFile(hFile);
+
+// Write 1 byte into the middle of the file
+SetFilePointer(hFile, 512*1024*1024, NULL, FILE_BEGIN);
+BYTE b = 42;
+/ this write call takes several seconds!
+WriteFile(hFile, &amp;b, &amp;nBytesWritten, NULL);
+</pre>
+<p>
+The customer experimented with using asynchronous I/O,
+but it didn't help.
+The write still took a long time.
+Even using <code>FILE_<wbr>FLAG_<wbr>NO_<wbr>BUFFERING</code>
+(and
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/04/14/9995509.aspx">
+writing full sectors, naturally</a>)
+didn't help.
+</p>
+<p>
+The reason is that on NTFS, extending a file reserves disk space but
+does not zero out the data.
+Instead, NTFS keeps track of the "last byte written",
+technically known as the
+<i>valid data length</i>,
+and only zeroes out up to that point.
+The data past the valid data length
+are logically zero but are not
+physically zero on disk.
+When you write to a point past the current valid data length,
+all the bytes between the valid data length and the start of
+your write need to be zeroed out before the new valid data length
+can be set to the end of your write operation.
+(You can manipulate the valid data length directly with
+<a HREF="http://msdn.microsoft.com/library/aa365544.aspx">
+the <code>Set&shy;File&shy;Valid&shy;Data</code> function</a>,
+but be very careful since it comes with serious security implications.)
+</p>
+<p>
+Two solutions were proposed to the customer.
+</p>
+<p>
+Option&nbsp;1 is to force the file to be zeroed out immediately
+after setting the end of file by writing a zero byte to the end.
+This front-loads the cost so that it doesn't get imposed on
+subsequent writes at seemingly random points.
+</p>
+<p>
+Option&nbsp;2 is to
+<a HREF="http://msdn.microsoft.com/library/aa365564.aspx">
+make the file sparse</a>.
+Mark the file as sparse with the
+<a HREF="http://msdn.microsoft.com/library/aa364596.aspx">
+<code>FSCTL_<wbr>SET_<wbr>SPARSE</code> control code</a>,
+and
+immediately after setting the end of file,
+use
+<a HREF="http://msdn.microsoft.com/library/aa364597.aspx">
+the <code>FSCTL_<wbr>SET_<wbr>ZERO_<wbr>DATA</code> control code</a>
+to make the entire file sparse.
+This logically fills the file with zeroes without committing physical
+disk space.
+Anywhere you actually write gets converted from "sparse" to "real".
+This does open the possibility that a later write into the middle
+of the file will encounter a disk-full error,
+so it's not a "just do this and you won't have to worry about
+anything" solution,
+and depending on how randomly you convert the file from "sparse"
+to "real", the file may end up more fragmented than it would have
+been if you had "kept it real" the whole time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-936653">
+				<div id="div-comment-936653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ipoverscsi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936653">
+			September 22, 2011 at 7:23 am</a>		</div>
+
+		<p>I didn&#39;t realize you had to mark the file as sparse ahead of time; I assumed NTFS did that automatically. &nbsp;After putting a little brain power to it, however, it makes sense that sparse files are optional: you don&#39;t want to confuse the developer or break compatibility.</p>
+<p>What I find interesting is the document linked to from the fragment &quot;make the file sparse&quot; claims that sparse files are &quot;an inefficient use of disk space&quot;. &nbsp;On the surface I find that argument preposterous &#8212; how can NOT using disk be inefficient? &#8212; but I suspect either 1) there are implementation details that make it so; or 2) I am reading too much into the comment. &nbsp;It&#39;s probably the latter.</p>
+<div class="post">[<i>Read the sentence again: &quot;The problem with files that contain sparse data sets is &#8230;, and, because of this, they are an inefficient user of disk space.&quot; It&#39;s saying that if you have a sparse data set (data that is mostly zero), then normal file storage is inefficient. The concept of sparse files isn&#39;t introduced until paragraph three. (Note that automatic sparsification puts you in an overcommit situation, wherein overwriting existing data in a file can generate an &quot;out of disk space&quot; error.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936663">
+				<div id="div-comment-936663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Random832</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936663">
+			September 22, 2011 at 7:37 am</a>		</div>
+
+		<p>&quot;how can NOT using disk be inefficient?&quot; Other than the fragmentation he mentioned? Well, I can see how you might not get that that makes it use more <em>space</em>&#8230;</p>
+<p>Traditional Unix filesystems (I bring this up because on unix every file <em>is</em> automatically a sparse file under these circumstances &#8211; which may well be the reason people assume this to be true on other systems supporting sparse files) contain an explicit address for every block in a file. This means that the metadata for fragmented files takes up no more actual disk space than for non-fragmented files. This isn&#39;t generally true of modern filesystems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936673">
+				<div id="div-comment-936673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">keithmo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936673">
+			September 22, 2011 at 7:50 am</a>		</div>
+
+		<p>&quot;The customer experimented with using asynchronous I/O, but it didn&#39;t help.&quot;</p>
+<p>Extending a file in NTFS is always an inherently synchronous operation.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936683">
+				<div id="div-comment-936683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936683">
+			September 22, 2011 at 8:18 am</a>		</div>
+
+		<p>The only way to avoid the zeroing out penalty while writing to the middle of a non-sparse file is to have a data structure in the file metadata with that notes which blocks are completely zero or not. &nbsp;I can&#39;t imagine that such a structure would be of overwhelming usefulness, however, as it raises new issues like what happens if the structure gets corrupted, etc.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936703">
+				<div id="div-comment-936703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936703">
+			September 22, 2011 at 8:44 am</a>		</div>
+
+		<p>@Kyle: you mean like implementing sparse files by hand.</p>
+<p>I suspect this particular customer hadn&#39;t realized that you have to explicitly ask for sparse files.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936713">
+				<div id="div-comment-936713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936713">
+			September 22, 2011 at 9:15 am</a>		</div>
+
+		<p>@Joshua</p>
+<p>Not quite what I mean. &nbsp;It seems like preallocation is what&#39;s desired (to bypass the possible disk over commitment), without the zeroing penalty for writing to the middle of the file. &nbsp;As we know, disk space allocation is cheap compared to zeroing out that disk space. &nbsp;My solution was more of one that only Microsoft could implement by changing the NTFS on-disk data structures. &nbsp;Obviously not something to be taken lightly in any way, shape or form. &nbsp;And anyway, as I point out, adding a data structure that explicitly declares some allocated blocks to be zero just asks for massive file corruption since corrupting a localized data structure is much more likely than corruption on a massive scale, say on a multi-gigabyte file.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936723">
+				<div id="div-comment-936723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936723">
+			September 22, 2011 at 9:31 am</a>		</div>
+
+		<p>I thought the answer was going to be that he&#39;d managed to accidentally pass an address as the nNumberOfBytesToWrite parameter, but I bet that&#39;s just a typo. ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936773">
+				<div id="div-comment-936773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936773">
+			September 22, 2011 at 4:42 pm</a>		</div>
+
+		<p>Note that using SetFileValidData is generally not an option, since you need the SE_MANAGE_VOLUME_NAME privilege. Even if you have it, you must make sure that no one else can read the file while you&#39;re busy with it, and that when you&#39;re done all valid bits of the file have been written. And your program could crash or be killed or there might be a power cut, so the file must be in a location inaccessible without SE_MANAGE_VOLUME_NAME for the duration of the operation. Not for general use indeed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936783">
+				<div id="div-comment-936783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936783">
+			September 22, 2011 at 6:25 pm</a>		</div>
+
+		<p>At the point where the code has the comment &quot;This takes several seconds!&quot;, if I would start trying to put the pieces together. I&#39;ve asked Windows to create a 1GB file and write something halfway through. Knowing the average transfer speed of a hard drive, this should be expected (and I should be grateful for caching)! If I don&#39;t want to wait for the write to commit, then I should probably be using async calls/completion ports instead, and then take my chances if something happens later on.</p>
+<p>It&#39;s a good thing that the customer wasn&#39;t trying this on a FAT volume or across the network!</p>
+<div class="post">[<i>Indeed, now that you mention it, the customer never noticed that the SetEndOfFile was wicked-fast! That cost has to go <span style="text-decoration:underline;">somewhere</span>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936803">
+				<div id="div-comment-936803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Buchan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936803">
+			September 22, 2011 at 6:34 pm</a>		</div>
+
+		<p>I&#39;m assuming SetFileValidData() was invented for the registry, and exposed to user-mode for SQL Server?</p>
+<p>@Kyle: I&#39;m assuming NTFS doesn&#39;t lazily zero dense files for simplicity &#8211; any situation it is useful for is probably one that a sparse file is needed.</p>
+<p>@Raymond: Do you think SetEndOfFile() doesn&#39;t zero-extend so it can optimize the likely case of sequentially filling the file data?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936793">
+				<div id="div-comment-936793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Buchan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936793">
+			September 22, 2011 at 6:34 pm</a>		</div>
+
+		<p>I&#39;m assuming SetFileValidData() was invented for the registry, and exposed to user-mode for SQL Server?</p>
+<p>@Kyle: I&#39;m assuming NTFS doesn&#39;t lazily zero dense files for simplicity &#8211; any situation it is useful for is probably one that a sparse file is needed.</p>
+<p>@Raymond: Do you think SetEndOfFile() doesn&#39;t zero-extend so it can optimize the likely case of sequentially filling the file data?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936813">
+				<div id="div-comment-936813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936813">
+			September 22, 2011 at 11:32 pm</a>		</div>
+
+		<p>@Simon: I&#39;d guess that it&#39;s actually fairly rare that somebody would call SetEndOfFile() because they want to add a whole lot of zero-bytes to the end of a file. The most common use cases are probably truncating a file or reserving space for either memory mapping or sequentially filling it with data (like the COPY command).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936833">
+				<div id="div-comment-936833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936833">
+			September 23, 2011 at 3:28 am</a>		</div>
+
+		<p>I take it there&#39;s no option 3, where you set the end of the file (thus committing physical disk space) but then mark it &quot;not quite sparse&quot; so that the zero pages don&#39;t have to be written to disk (as if the file was sparse).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-936873">
+				<div id="div-comment-936873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Farnsworth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936873">
+			September 23, 2011 at 7:22 am</a>		</div>
+
+		<p>@Neil:</p>
+<p>You&#39;d need to redesign NTFS to do that; right now, it stores a list of extents against a file. A portion of the file not covered by any extents reads back as zeroes, as there&#39;s no data to provide. You commit disk space when you add an extent to that list; the filesystem then knows that if it reads that bit of physical disk, it will get the right data back.</p>
+<p>To fix this, you&#39;d need to add a flag to every extent, to indicate that this is a preallocated extent, and should read as zeros. Every read would have to check that flag, and ensure that it returns zeros instead of reading the disk. The complexity implications of this are high, the benefits are low, and thus it will struggle to get out of the &quot;minus 100&quot; state.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-936893">
+				<div id="div-comment-936893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110922-00/?p=9573#comment-936893">
+			September 23, 2011 at 8:20 am</a>		</div>
+
+		<p>@keithmo: &nbsp;That is exactly what the linked Microsoft article says. &nbsp;Did you bother to read it? &nbsp;:-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

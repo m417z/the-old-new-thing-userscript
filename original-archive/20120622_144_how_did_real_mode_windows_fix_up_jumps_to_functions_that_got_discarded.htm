@@ -1,0 +1,713 @@
+<html>
+<head>
+<title>How did real-mode Windows fix up jumps to functions that got discarded?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How did real-mode Windows fix up jumps to functions that got discarded?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 22, 2012 / year-entry #145</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>25</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">In a discussion of how real-mode Windows walked stacks, commenter Matt wonders about fixing jumps in the rest of the code to the discarded functions. I noted in the original article that "there are multiple parts to the solution" and that stack-walking was just one piece. Today, we'll look at another piece: Inter-segment fixups. Recall...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+In a discussion of how real-mode Windows
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/03/16/10141735.aspx">
+walked stacks</a>,
+commenter Matt wonders
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/03/16/10141735.aspx#10142248">
+about fixing jumps in the rest of the code to the discarded functions</a>.
+</p>
+<p>
+I noted in the original article that
+"there are multiple parts to the solution"
+and that stack-walking was just one piece.
+Today, we'll look at another piece:
+Inter-segment fixups.
+</p>
+<p>
+Recall that real-mode Windows ran on an 8086 processor,
+a simple processor with no memory manager, no CPU privilege levels,
+and no concept of task switching.
+Memory management in real-mode Windows was handled manually by
+the real-mode kernel,
+and the way it managed memory was by loading code from disk
+on demand, and discarding code when under memory pressure.
+(It didn't discard data because it wouldn't know how to regenerate it,
+and it can't swap it out because there was no swap file.)
+</p>
+<p>
+There were a few flags you could attach to a segment.
+Of interest for today's discussion are <i>movable</i>
+(and it was spelled without the "e")
+and <i>discardable</i>.
+If a segment was not movable (known as <i>fixed</i>),
+then it was loaded into memory and stayed there until the
+module was unloaded.
+If a segment was movable, then the memory manager was allowed
+to move it around when it needed to defragment memory in order
+to satisfy a large memory allocation.
+And if a segment was discardable,
+then it could even be evicted from memory
+to make room for other stuff.
+</p>
+<table BORDER=1 BORDERCOLOR=black STYLE="border-collapse: collapse"
+    CELLPADDING=3>
+<tr>
+<th>Movable</th>
+<th>Discardable</th>
+<th>Meaning</th>
+</tr>
+<tr>
+<td>No</td>
+<td>No</td>
+<td>Cannot be moved or discarded</td>
+</tr>
+<tr>
+<td>No</td>
+<td>Yes</td>
+<td>(invalid combination)</td>
+</tr>
+<tr>
+<td>Yes</td>
+<td>No</td>
+<td>Can be moved in memory</td>
+</tr>
+<tr>
+<td>Yes</td>
+<td>Yes</td>
+<td>Can be moved or purged from memory</td>
+</tr>
+</table>
+<p>
+I'm going to combine the movable and discardable cases,
+since the effect is the same for the purpose of
+today's discussion,
+the difference being that with discardable memory,
+you also have the option of throwing the memory out entirely.
+</p>
+<p>
+First of all, let's get the easy part out of the way.
+If you had an intra-segment call
+(calling a function in your own segment),
+then there was no work that needed to be done.
+Real-mode Windows always discarded full segments,
+so if your segment was running code,
+it was by definition present,
+and therefore any other code in that segment was also present.
+The hard part is the inter-segment calls.
+</p>
+<p>
+As it happens,
+<a HREF="http://support.microsoft.com/kb/65122">
+an old document on the 16-bit Windows executable file format</a>
+gives you some insight into how things worked,
+if you sit down and puzzle it out hard enough.
+</p>
+<p>
+Let's start with the <code>GetProcAddress</code> function.
+When you call <code>GetProcAddress</code>, the kernel needs
+to locate the address of the function inside the target module.
+The loader consults the <i>Entry Table</i> to find the function
+you're asking for.
+As you can see, there are three types of entries in the
+Entry Table.
+Unused entries (representing ordinals with no associated function),
+fixed segment entries, and movable segment entries.
+Obviously, if the match is in an unused entry, the return value
+is <code>NULL</code> because there is no such function.
+If the match is in a fixed entry, that's pretty easy too:
+Look up the segment number in the target module's segment list
+and combine it with the specified offset.
+Since the segment is fixed, you can just return the raw pointer
+directly, since the code will never move.
+</p>
+<p>
+The tricky part is if the function is in a movable segment.
+If you look at the document, it says that "a moveable segment entry
+is 6 bytes long and has the following format."
+It starts with a byte of flags (not important here),
+a two-byte <code>INT&nbsp;3Fh</code> instruction,
+a one-byte segment number, and the offset within the segment.
+</p>
+<p>
+What's the deal with the
+<code>INT&nbsp;3Fh</code> instruction?
+It seems rather pointless to specify that a file format
+requires some <code>INT&nbsp;3Fh</code> instructions
+scattered here and there.
+Why not get rid of it to save some space in the file?
+</p>
+<p>
+If you called <code>GetProcAddress</code> and the result
+was a function in a movable segment,
+the <code>GetProcAddress</code> didn't actually return the
+address of the target function.
+It returned the address of the <code>INT&nbsp;3Fh</code> instruction!
+(Thankfully, the Entry Table is always a fixed segment,
+so we don't have to worry about the Entry Table itself being discarded.)
+</p>
+<p>
+(Now you see why the file format includes these strange
+<code>INT&nbsp;3Fh</code> instructions:
+The file format was designed to be loaded directly
+into memory.
+When the loader loads the entry table,
+it just slurps it into memory and bingo, it's ready to go,
+<code>INT&nbsp;3Fh</code> instructions and all!)
+</p>
+<p>
+Since <code>GetProcAddress</code> returned the address of the
+<code>INT&nbsp;3Fh</code> instruction,
+calls to imported functions didn't actually go straight
+to the target.
+Instead, you called the <code>INT&nbsp;3Fh</code> instruction,
+and it was the
+<code>INT&nbsp;3Fh</code> handler which said,
+"Gosh, somebody is trying to call code in another segment.
+Is that segment loaded?"
+It took the return address of the interrupt and used it to
+locate the segment number and offset.
+If the segment in question was already in memory,
+then the handler jumped straight to the segment at the
+specified offset.
+You got the function call you wanted, just in a roundabout way.
+</p>
+<p>
+If the segment wasn't loaded, then the
+<code>INT&nbsp;3Fh</code> handler loaded it
+(which might trigger a round of discarding
+and consequent
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/03/16/10141735.aspx">
+stack patching</a>),
+then jumped to the newly-loaded segment at the specified offset.
+An even more roundabout function call.
+</p>
+<p>
+Okay, so that's the case where a function pointer is obtained
+by calling <code>GetProcAddress</code>.
+But it turns out that a lot of stuff inside the kernel turns into
+<code>GetProcAddress</code> at the end of the day.
+</p>
+<p>
+Suppose you have some code that calls a function in another
+segment within the same module.
+As we saw earlier, fixups are
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2006/07/17/668284.aspx">
+threaded through the code segment</a>,
+and if you scroll down to the
+<i>Per Segment Data</i> section of that old document,
+you'll see a description of the way the relocation records
+are expressed.
+A call to a function to a segment within the same module
+requires an <code>INTERNALREF</code> fixup,
+and as you can see in the document, there are two types of
+<code>INTERNALREF</code> fixups, ones which refer to fixed
+segments and ones which refer to movable segments.
+</p>
+<p>
+The easy case is a reference to a fixed segment.
+In that case, the kernel can just look up where it put that
+segment, add in the offset, and patch that address into the
+code segment.
+Since it's a fixed segment, the patch will never have to be
+revisited.
+</p>
+<p>
+The hard case is a reference to a movable segment.
+In that case, you can see that the associated information in the
+fixup table is the "ordinal number index into [the] Entry Table."
+</p>
+<p>
+Aha, you now realize that the Entry Table is more than just a list
+of your exported functions.
+It's also a list of all the functions in movable segments that
+are called from other segments.
+In a sense, these are "secret exports" in your module.
+(However, you can't get to them by <code>GetProcAddress</code>
+because
+<code>GetProcAddress</code> knows how to keep a secret.)
+</p>
+<p>
+To fix up a reference to a function in a movable segment,
+the kernel calls the <code>SecretGetProcAddress</code> (not its real name)
+function, which as we saw before, returns not the actual function pointer
+but rather a pointer to the magic <code>INT&nbsp;3Fh</code> in the
+Entry Table.
+It is that pointer which is patched into your code segment,
+so that when your code calls what it thinks is a function in
+another segment,
+it's really calling the Entry Table,
+which as we saw before, loads the code in the target segment if necessary
+before jumping to it.
+</p>
+<p>
+Matt wrote,
+"If the kernel wants to discard that procedure,
+it has to find that jump address in my code,
+and redirect it to a page fault handler,
+so that when my process gets to it,
+it will call the procedure and fault the code back in.
+How does it find all of the references to that function across the program,
+so that it can patch them all up?"
+Now you know the answer:
+It finds all of those references because it already had to find them
+when applying fixups.
+It doesn't try to find them at discard time;
+it finds them when it loads your segment.
+(Exercise:
+Why doesn't it need to reapply fixups when a segment moves?)
+</p>
+<p>
+All inter-segment function pointers were really pointers into the
+Entry Table.
+You passed a function pointer to be used as a callback?
+Not really; you really passed a pointer to your own Entry Table.
+You have an array of function pointers?
+Not really; you really have an array of pointers into your Entry Table.
+It wasn't actually hard for the kernel to find all of these
+because you had to declare them in your fixup table in the first place.
+</p>
+<p>
+It is my understanding that the <code>INT&nbsp;3Fh</code> trick
+came from the overlay manager which was included with
+the Microsoft&nbsp;C compiler.
+(The
+<a HREF="http://www.digitalmars.com/ctg/vcm.html">
+Zortech C compiler</a> followed a similar model.)
+</p>
+<p>
+<b>Note</b>:
+While the above discussion describes how things worked
+<i>in principle</i>,
+there are in fact a few places where the actual
+implementation differs from the description above,
+although not in any way that fundamentally affects the design.
+</p>
+<p>
+For example, real-mode Windows did a bit of optimization
+in the <code>INT 3Fh</code> stubs.
+If the target segment was in memory,
+then it replaced the <code>INT 3Fh</code> instruction
+with a direct <code>jmp xxxx:yyyy</code> to the target,
+effectively precalculating the jump destination when a segment
+is loaded rather than performing the calculation each time
+a function in that segment is called.
+</p>
+<p>
+By an amazing coincidence, the code sequence
+</p>
+<pre>
+    int 3fh
+    db  entry_segment
+    dw  entry_offset
+</pre>
+<p>
+is five bytes long, which is the exact length
+of a <code>jmp xxxx:yyyy</code> instruction.
+Phew, the patch just barely fits!</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (25)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-993143">
+				<div id="div-comment-993143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993143">
+			June 22, 2012 at 7:16 am</a>		</div>
+
+		<p>Phew! I&#39;ll just read that as &quot;Magic Happens&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993153">
+				<div id="div-comment-993153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993153">
+			June 22, 2012 at 7:35 am</a>		</div>
+
+		<p>I love these introspections into the workings of code from The Land Before I Started Programming. &nbsp;Keep up the good work, Raymond.</p>
+<p>Have you ever considered opening a tip jar? &nbsp;I would gladly donate, and I&#39;m sure many others would too.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993173">
+				<div id="div-comment-993173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993173">
+			June 22, 2012 at 8:35 am</a>		</div>
+
+		<p>Fascinating. Believe it or not this is the kind of technical discussion that draws me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993183">
+				<div id="div-comment-993183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike B</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993183">
+			June 22, 2012 at 10:42 am</a>		</div>
+
+		<p>I second Adam and Joshua&#39;s comments (except that I happened to be around for real mode Windows). I really appreciate these &#39;software archaeology&#39; articles.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-bboorman even thread-even depth-1" id="comment-993203">
+				<div id="div-comment-993203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993203">
+			June 22, 2012 at 12:27 pm</a>		</div>
+
+		<p>Anyone remember &quot;Windows 286&quot;? I also think there was a &quot;Windows 386&quot; that pre-dates Win 3.1</p>
+<p>Might be an interesting to read about the progression from Win 1 to Win 3.0 via these two intermediary versions. I remember as a college student in about 1991/2 trying to install Win286 on a 386 machine and all it did was lock the machine up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993223">
+				<div id="div-comment-993223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skyborne</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993223">
+			June 22, 2012 at 1:53 pm</a>		</div>
+
+		<p>@hacksoncode &#8211; I think that&#39;s covered in the link in this article about walking the stack.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993233">
+				<div id="div-comment-993233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993233">
+			June 22, 2012 at 4:20 pm</a>		</div>
+
+		<p>@Brian EE</p>
+<p>I installed Win/286 on a 386 many times and it worked just fine. &nbsp;so there was something else going on! :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-rat odd alt thread-odd thread-alt depth-1" id="comment-993193">
+				<div id="div-comment-993193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/hacksoncode' rel='external nofollow' class='url'>hacksoncode</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993193">
+			June 22, 2012 at 11:32 am</a>		</div>
+
+		<p>Great, so now we know how to *call* a function in a movable segment. How did it deal with *returns* into segments that are movable and/or discardable?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993243">
+				<div id="div-comment-993243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993243">
+			June 22, 2012 at 6:43 pm</a>		</div>
+
+		<p>Thanks for providing such an in-depth answer. &nbsp;Yet another piece of arcane brilliance from the Win16 days of yore!</p>
+<p>That jump table concept seems very similar to the PLT/GOT tables that are used by ELF files on *nix systems (although they&#39;re used only for dynamic module linking&#8211;they have the luxury of relying on the kernel to do page discarding!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-993253">
+				<div id="div-comment-993253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993253">
+			June 22, 2012 at 7:26 pm</a>		</div>
+
+		<p>Matt, I&#39;ll tell you a secret. Windows PE-format executables also use jump tables.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993263">
+				<div id="div-comment-993263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathamn Wilson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993263">
+			June 23, 2012 at 1:05 am</a>		</div>
+
+		<p>Always good to hear some stories about how things used to work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993273">
+				<div id="div-comment-993273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993273">
+			June 23, 2012 at 4:08 am</a>		</div>
+
+		<p>Presumably Windows 286 and later simply fixed up the movable (which is a valid spelling) entry table with jmp selector:offset instructions once and for all.</p>
+<p>I do wonder why the entry table didn&#39;t have the offset in the same position that it would have been for use with the jump instruction though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993283">
+				<div id="div-comment-993283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marcel Kilgus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993283">
+			June 23, 2012 at 6:23 am</a>		</div>
+
+		<p>@Neil</p>
+<p>Maybe because that&#39;s impossible anyway? It would have to be in the middle of the INT 3Fh instruction.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1" id="comment-993303">
+				<div id="div-comment-993303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993303">
+			June 24, 2012 at 8:05 pm</a>		</div>
+
+		<p>I think Win3.0 is the last version that supports all 3 modes: real mode, standard mode (286 mode) and 386 enhanced mode. The switch to ask Windows enter real mode is removed on Win3.1. My copy of Win3.1 served me on 286 and 486DX2-66 machine.</p>
+<p>Didn&#39;t try to run standard mode on 486 thorugh&#8230; I remember that protected mode didn&#39;t support instruction to go back to real mode, so if you start something that enters protected mode (like the DOSShell) and want to run something that must start in real mode (like some software that comes with it&#39;s own memory manager that&#39;s not compatable) later, you have to reboot.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1" id="comment-993313">
+				<div id="div-comment-993313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993313">
+			June 24, 2012 at 9:27 pm</a>		</div>
+
+		<p>&quot;I remember that protected mode didn&#39;t support instruction to go back to real mode, so if you start something that enters protected mode (like the DOSShell) and want to run something that must start in real mode (like some software that comes with it&#39;s own memory manager that&#39;s not compatable) later, you have to reboot.&quot;</p>
+<p>Or at least reset the processor. PC/AT compatibles has built-in support for this in the hardware and BIOS, which most software that needed to do this used, like Win3.x and OS/2 1.x. The 386 solved this and added an virtual 8086 mode.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993353">
+				<div id="div-comment-993353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993353">
+			June 25, 2012 at 7:28 am</a>		</div>
+
+		<p>I think &quot;movable&quot; is the preferred spelling, although &quot;moveable&quot; seems more logical. &nbsp;I also want to put two h&#39;s in threshold, which seems more logical than one h. &nbsp;But of course, spelling in this language is not always logical.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993513">
+				<div id="div-comment-993513" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">lefty</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993513">
+			June 25, 2012 at 11:35 am</a>		</div>
+
+		<p>@JamesJohnson:</p>
+<p>I think that the MS-DOS and 16-bit Windows source code might be version controlled on the old shell.windows.com server: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2009/01/14/9317706.aspx" rel="nofollow">blogs.msdn.com/&#8230;/9317706.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993333">
+				<div id="div-comment-993333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993333">
+			June 25, 2012 at 6:36 am</a>		</div>
+
+		<p>You know, it would be really awesome if Microsoft would publicly publish these old versions of their software, for free download, for posterity: all Windows &lt;= 3.x, DOS, and associated documentation. &nbsp;**And then post the SDKs for the above.** &nbsp;For example, the SDK/compilers necessary to write software for Windows 1.x, and 2.x, etc.</p>
+<p>I&#39;ve tracked down old versions of Windows/DOS on the Internet &#8211; that&#39;s not hard to do (legal? maybe not, but what&#39;s a collector to do?). &nbsp;SDKs/compilers are much harder to come by, it seems. &nbsp;(Why do I find it fascinating to collect these old things? &nbsp;I don&#39;t know&#8230;!)</p>
+<p>I would hope they haven&#39;t lost the source code. &nbsp;It&#39;s such an important part of company history. &nbsp;I would hope it isn&#39;t rotting on some floppy disks in some closet&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993543">
+				<div id="div-comment-993543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993543">
+			June 25, 2012 at 3:04 pm</a>		</div>
+
+		<p>I agree on one part of that. The old SDK and documentation would come in handy from time to time and asking for very big $$$ for extended support for what already exists in the archives does not seem reasonable to me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-993553">
+				<div id="div-comment-993553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993553">
+			June 25, 2012 at 5:14 pm</a>		</div>
+
+		<p>@lefty: I don&#39;t think so.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-993563">
+				<div id="div-comment-993563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993563">
+			June 25, 2012 at 6:53 pm</a>		</div>
+
+		<p>@JamesJohnson: Since MSDOS 6.0 and 6.22 is still available to be downloaded as part of MSDN Subscription (i.e.: Technically Microsoft is still selling it as part of a service), I&#39;ll remind you that if Microsoft intend to, they can claim considerable amount of fine from you. So better not saying something like that in the public.</p>
+<p>I think they still keep DOS available because up until a few years ago, DOS is still the way people preferred to access bare metal.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-993593">
+				<div id="div-comment-993593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993593">
+			June 25, 2012 at 11:38 pm</a>		</div>
+
+		<p>IMO Intel should have released the 386SX years earlier given the problems of the 286.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-993673">
+				<div id="div-comment-993673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993673">
+			June 26, 2012 at 7:22 am</a>		</div>
+
+		<p>@cheong00: I actually had an MSDN Universal academic subscription at the time &#8211; it was several years ago. &nbsp;The trouble was that DOS 6 and Windows 3.1 was the oldest available, and I wanted to learn what the older stuff was like. &nbsp;I highly doubt they have put anything older up in the last several years. &nbsp;And I&#39;ve owned full versions of Visual Studio and Microsoft Office, as well. &nbsp;One could argue I was just downgrading the license, since I was just experimenting in a virtual machine. &nbsp;Unfortunately all I ever found was end-user software as I recall&#8230; &nbsp;(Like I said&#8230; what was the SDK for developing Windows 1.0 or 2.0 apps in C, for example? and where would one find it?)</p>
+<p>Really &#8211; let&#39;s be realistic. &nbsp;How much money did Microsoft lose on me from my learning more about Microsoft products in this way?</p>
+<p>That mentality is what&#39;s putting us into the new &quot;digital dark age&quot; that one sometimes reads about. &nbsp;In another 20 years you&#39;ll be hard-pressed to find any of this stuff. &nbsp;It&#39;s sad.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-993923">
+				<div id="div-comment-993923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ender</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-993923">
+			June 27, 2012 at 12:44 am</a>		</div>
+
+		<p>@JamesJonhson: google for beta and archive, and you just might find what you&#39;re looking for.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-994943">
+				<div id="div-comment-994943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120622-00/?p=7303#comment-994943">
+			June 29, 2012 at 1:29 am</a>		</div>
+
+		<p>@Marcel Kilgus: Ah yes, I&#39;d forgotten that the 3F byte would go there.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,691 @@
+<html>
+<head>
+<title>The ways people mess up IUnknown::QueryInterface, episode 4</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The ways people mess up IUnknown::QueryInterface, episode 4</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 11, 2011 / year-entry #193</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>27</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">One of the rules for IUnknown::Query­Interface is so obvious that nobody even bothers to state it explicitly as a rule: "If somebody asks you for an interface, and you return S_OK, then the pointer you return must point to the interface the caller requested." (This feels like the software version of dumb warning labels.) During...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One of the rules for <code>IUnknown::<wbr>Query&shy;Interface</code> is so
+obvious that nobody even bothers to state it explicitly as a rule:
+"If somebody asks you for an interface,
+and you return <code>S_OK</code>,
+then the pointer you return must point to the interface the caller
+requested."
+(This feels like the software version of
+<a HREF="http://www.amazon.com/dp/0743244753?tag=tholneth-20">
+dumb warning labels</a>.)
+</p>
+<p>
+During compatibility testing for Windows&nbsp;Vista,
+we found a shell extension that behaved rather strangely.
+Eventually, the problem was traced to
+a broken <code>IUnknown::<wbr>Query&shy;Interface</code>
+implementation which depended subtly on the order in which
+interfaces were queried.
+</p>
+<p>
+The shell asked for the <code>IExtract&shy;IconA</code> and
+<code>IExtract&shy;IconW</code> interfaces in the following
+order:
+</p>
+<pre>
+// not the actual code but it gets the point across
+IExtractIconA *pxia;
+IExtractIconW *pxiw;
+punk-&gt;QueryInterface(IID_IExtractIconA, &amp;pxia);
+punk-&gt;QueryInterface(IID_IExtractIconW, &amp;pxiw);
+</pre>
+<p>
+One particular shell extension would return the same pointer to
+both queries;
+<i>i.e.</i>,
+after the above code executed,
+<code>pxia == pxiw</code> even though neither interface
+derived from the other.
+The two interfaces are not binary-compatible,
+because <code>IExtract&shy;IconA::<wbr>Get&shy;Icon&shy;Location</code>
+operates on ANSI strings, whereas
+<code>IExtract&shy;IconW::<wbr>Get&shy;Icon&shy;Location</code> operates
+on Unicode strings.
+</p>
+<p>
+The shell called <code>pxiw-&gt;Get&shy;Icon&shy;Location</code>,
+but the object interpreted the <code>szIcon&shy;File</code> as
+an ANSI string buffer; as a result, when the shell went to look at it,
+it saw gibberish.
+</p>
+<p>
+Further experimentation revealed that if the order of the two
+<code>Query&shy;Interface</code> calls were reversed,
+then <code>pxiw-&gt;Get&shy;Icon&shy;Location</code> worked as expected.
+In other words,
+the first interface you requested "locked" the object into that
+interface, and asking for any other interface just returned
+a pointer to the locked interface.
+This struck me as very odd; coding up the object this way
+seems to be <i>harder</i> than doing it the right way!
+</p>
+<pre>
+<i>// this code is wrong - see discussion above
+class CShellExtension : public IExtractIcon
+{
+ enum { MODE_UNKNOWN, MODE_ANSI, MODE_UNICODE };
+  HRESULT CShellExtension::QueryInterface(REFIID riid, void **ppv)
+  {
+   *ppv = NULL;
+   if (riid == IID_IUnknown) *ppv = this;
+   else if (riid == IID_IExtractIconA) {
+    if (m_mode == MODE_UNKNOWN) m_mode = MODE_ANSI;
+    *ppv = this;
+   } else if (riid == IID_IExtractIconW) {
+    if (m_mode == MODE_UNKNOWN) m_mode = MODE_UNICODE;
+    *ppv = this;
+   }
+   if (*ppv) AddRef();
+   return *ppv ? S_OK : E_NOINTERFACE;
+  }
+  ... AddRef / Release ...
+
+  HRESULT GetIconLocation(UINT uFlags, LPTSTR szIconFile, UINT cchMax,
+                          int *piIndex, UINT *pwFlags)
+  {
+   if (m_mode == MODE_ANSI) lstrcpynA((char*)szIconFile, "foo", cchMax);
+   else lstrcpynW((WCHAR*)szIconFile, L"foo", cchMax);
+   ...
+  }
+  ...
+}</i>
+</pre>
+<p>
+Instead of implementing both <code>IExtract&shy;IconA</code> and
+<code>IExtract&shy;IconW</code>, my guess is that they implemented
+just one of the interfaces and made it alter its behavior based
+on which interface it thinks it needs to pretend to be.
+It never occurred to them that the single interface might need
+to pretend to be two different things at the same time.
+</p>
+<p>
+The right way of supporting two interfaces is to actually implement
+two interfaces and not write a single morphing interface.
+</p>
+<pre>
+class CShellExtension : public IExtractIconA, public IExtractIconW
+{
+  HRESULT CShellExtension::QueryInterface(REFIID riid, void **ppv)
+  {
+   *ppv = NULL;
+   if (riid == IID_IUnknown ||
+       riid == IID_IExtractIconA) {
+    *ppv = static_cast&lt;IExtractIconA*&gt;(this);
+   } else if (riid == IID_IExtractIconW) {
+    *ppv = static_cast&lt;IExtractIconW*&gt;(this);
+   }
+   if (*ppv) AddRef();
+   return *ppv ? S_OK : E_NOINTERFACE;
+  }
+  ... AddRef / Release ...
+
+  HRESULT GetIconLocation(UINT uFlags, LPSTR szIconFile, UINT cchMax,
+                          int *piIndex, UINT *pwFlags)
+  {
+   lstrcpynA(szIconFile, "foo", cchMax);
+   return GetIconLocationCommon(uFlags, piIndex, pwFlags);
+  }
+
+  HRESULT GetIconLocation(UINT uFlags, LPWSTR szIconFile, UINT cchMax,
+                          int *piIndex, UINT *pwFlags)
+  {
+   lstrcpynW(szIconFile, L"foo", cchMax);
+   return GetIconLocationCommon(uFlags, piIndex, pwFlags);
+  }
+  ...
+}</i>
+</pre>
+<p>
+We worked around this in the shell by simply changing the order
+in which we perform the calls to
+<code>IUnknown::<wbr>Query&shy;Interface</code>
+and adding a comment explaining why the order of the calls is important.
+</p>
+<p>
+(This is another example of how the cost of a compatibility fix
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/07/23/4003873.aspx">
+is small potatoes</a>.
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2010/01/11/9946339.aspx">
+The cost of deciding whether or not to apply the fix far exceeds
+the cost of just doing it for everybody</a>.)
+</p>
+<p>
+A different shell extension had a compatibility problem that also was
+traced back to a dependency on the order in which the shell
+asked for interfaces.
+The shell extension registered as a context menu extension,
+but when the shell tried to create it, it got <code>E_NO&shy;INTERFACE</code>
+back:
+</p>
+<pre>
+CoCreateInstance(CLSID_YourAwesomeExtension, NULL,
+                 CLSCTX_INPROC_SERVER, IID_IContextMenu, &amp;pcm);
+// returns E_NOINTERFACE?
+</pre>
+<p>
+This was kind of bizarre.
+I mean, the shell extension went to the effort of registering itself
+as a context menu extension,
+but when the shell said,
+"Okay, it's show time, let's do the context menu dance!"
+it replied,
+"Sorry, I don't do that."
+</p>
+<p>
+The vendor explained that the shell extension relies
+on the order in which the shell asked for interfaces.
+The shell used to create and initialize the extension like this:
+</p>
+<pre>
+// error checking and other random bookkeeping removed
+IShellExtInit *psei;
+IContextMenu *pcm;
+
+CoCreateInstance(CLSID_YourAwesomeExtension, NULL,
+                 CLSCTX_INPROC_SERVER, IID_IShellExtInit, &amp;psei);
+psei-&gt;Initialize(...);
+psei-&gt;QueryInterface(IID_IContextMenu, &amp;pcm);
+psei-&gt;Release();
+// use pcm
+</pre>
+<p>
+We changed the order in a manner that you would think should be equivalent:
+</p>
+<pre>
+CoCreateInstance(CLSID_YourAwesomeExtension, NULL,
+                 CLSCTX_INPROC_SERVER, IID_IContextMenu, &amp;pcm);
+pcm-&gt;QueryInterface(IID_IShellExtInit, &amp;psei);
+psei-&gt;Initialize(...);
+psei-&gt;Release();
+</pre>
+<p>
+(Of course, it's not written in so many words in the code;
+the various parts are spread out over different components and
+helper functions,
+but this is the sequence of calls the shell extension sees.)
+</p>
+<p>
+The vendor explained that their shell extension will not respond
+to any shell extension interfaces (aside from
+<code>IShell&shy;Ext&shy;Init</code>)
+until it has been initialized,
+because it is at that point that they decide which extensions
+they want to support.
+Unfortunately, this violates the first of the
+<a HREF="http://msdn.microsoft.com/ms682521.aspx">
+four explicit rules for <code>IUnknown::<wbr>Query&shy;Interface</code></a>,
+namely that the set of interfaces must be static.
+(It's okay to have an object expose different interfaces
+conditionally, as long as it understands that once it says yes or no
+to a particular interface,
+it is committed to answering the same way for the lifetime of the object.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (27)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-929813">
+				<div id="div-comment-929813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anthony</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929813">
+			August 11, 2011 at 7:22 am</a>		</div>
+
+		<p>What would have been the correct solution to the last vendor&#39;s problem? Should they have made the decision about supporting each interface during the first call QueryInterface() rather than in Initialize()?</p>
+<div class="post">[<i>What&#39;s the point of registering an object as a context menu extension if you&#39;re going to say, &quot;Nah, I don&#39;t support IContextMenu&quot;? The decision to support IContextMenu should have been made when you registered the object! -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929823">
+				<div id="div-comment-929823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anthony</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929823">
+			August 11, 2011 at 7:48 am</a>		</div>
+
+		<p>Ah, that&#39;s the complaint. Not that they couldn&#39;t dynamically decide later what the REST of their interface set looked like, but that they should always support for the one they registered as in the first place.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jader3rd even thread-even depth-1" id="comment-929833">
+				<div id="div-comment-929833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/jader3rd' rel='external nofollow' class='url'>jader3rd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929833">
+			August 11, 2011 at 8:37 am</a>		</div>
+
+		<p>So the Windows shell team is held hostage by a bad implementation of some third party extension? I think if somebody&#39;s extension stopped working, users would stop using that extension.</p>
+<div class="post">[<i>And if that extension is essential to your business? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929843">
+				<div id="div-comment-929843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929843">
+			August 11, 2011 at 8:46 am</a>		</div>
+
+		<p>That&#39;s quite the tale. &nbsp;It makes we want to run away and never program again.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-929853">
+				<div id="div-comment-929853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zonk</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929853">
+			August 11, 2011 at 8:59 am</a>		</div>
+
+		<p>You are violating your own contract, &quot;This is the first method that the Shell calls after it creates an instance of a property sheet extension, shortcut menu extension, or drag-and-drop handler.&quot; QueryInterface must be the second.</p>
+<div class="post">[<i>The spec was not written by language lawyers but by people who assume you can read sentences <a href="http://blogs.msdn.com/b/oldnewthing/archive/2006/01/16/513311.aspx" rel="nofollow">in context</a>. The context here is <span style="text-decoration:underline;">among the various shell-specific interfaces and methods</span>. After all, you can also get an <a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/12/13/281910.aspx" rel="nofollow">IMarshal</a> request as part of CoCreateInstance. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-joshuaganes odd alt thread-odd thread-alt depth-1" id="comment-929863">
+				<div id="div-comment-929863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Joshua+Ganes' rel='external nofollow' class='url'>Joshua Ganes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929863">
+			August 11, 2011 at 9:05 am</a>		</div>
+
+		<p>I have to assume that these extensions were around for a while in previous Windows versions, but were causing problems for new Vista development. What prompted the reordering of calls in Vista?</p>
+<p><!-- p>Typo - "On particular shell extension"
+
+
+
+<div class="post">[<em>I don&#39;t know but I can guess, and so can you. I&#39;ll leave it as an exercise that I&#39;ll answer sometime next year. -Raymond</em>]</div>
+
+
+</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-929873">
+				<div id="div-comment-929873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929873">
+			August 11, 2011 at 9:25 am</a>		</div>
+
+		<p>This stuff is about as bad as the vendor that did:</p>
+<p>bool Driver::HasDirectXCapability(GUID cap) { return true; }</p>
+<p>This stuff must be frustrating for development. The more I read about the weird games people play in shell extensions the more I want to re-implement the open &amp; save dialogs just so that I don&#39;t load any weird DLLs into my memory space.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929893">
+				<div id="div-comment-929893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929893">
+			August 11, 2011 at 1:11 pm</a>		</div>
+
+		<p>@Peter: Before you do that, try Delphi. &nbsp;It makes COM much, much simpler. &nbsp;Microsoft may have invented COM, but it was the Delphi team that truly understood it. &nbsp;A lot of the &quot;COM horror stories&quot; I see on here and elsewhere would either not happen at all or simply be harder to get wrong than to get right in Delphi.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-929903">
+				<div id="div-comment-929903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken Hagan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929903">
+			August 11, 2011 at 1:42 pm</a>		</div>
+
+		<p>@Mason: I think you are rather missing the point that Raymond made in the article: even in raw COM, these mistakes required more effort on the part of the programmer than simply getting it right. These shell extensions would have been broken in Delphi too, but it would have taken the idiots longer to figure out how to work around Delphi&#39;s support, so they used raw COM instead. :(</p>
+<div class="post">[<i>Yeah, it&#39;s like these people went out of their way to do something weird. I mean, really, adding weird logic to your QI? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929913">
+				<div id="div-comment-929913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929913">
+			August 11, 2011 at 1:50 pm</a>		</div>
+
+		<p>If you can&#39;t handle COM&#39;s complexity &#8211; use .net, it&#39;s often dumbed down enough for everyone to grasp.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-929923">
+				<div id="div-comment-929923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929923">
+			August 11, 2011 at 2:32 pm</a>		</div>
+
+		<p>It&#39;s called KISS principle dude. COM got &quot;kissed&quot; by .net :D:D.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929933">
+				<div id="div-comment-929933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929933">
+			August 11, 2011 at 3:00 pm</a>		</div>
+
+		<p>Again, I call for the list of shame. Windows should keep (and dynamically update) a list of components with problems, and if an user installs one, there should be a message with the description of the vendor&#39;s sin. This would put a heat on the ISVs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-929943">
+				<div id="div-comment-929943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wayne</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929943">
+			August 11, 2011 at 10:07 pm</a>		</div>
+
+		<p>I&#39;ve been here long enough to answer that one, Alex. &nbsp;What if the vendor doesn&#39;t exist anymore? &nbsp;What if the problem is in version 2000 of their product and they&#39;ve sold 3 new versions since then? &nbsp;And so on&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929953">
+				<div id="div-comment-929953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Person</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929953">
+			August 11, 2011 at 10:24 pm</a>		</div>
+
+		<p>If Microsoft does the &quot;right thing&quot; and breaks code that is broken, people blame Windows when things stop working. If Microsoft does the &quot;right thing&quot; and fixes other people&#39;s broken code, people won&#39;t stop complaining about &quot;bloat&quot; and people won&#39;t fix their code. And even if they do everything perfectly, people expect them to use a time machine to port new code back to when the 286 was a shiny new and powerful processor.</p>
+<p>There are times I&#39;m glad I don&#39;t work for Microsoft.</p>
+<p>However, there is one obvious interim workaround. The language lawyers need to stand in front of the regular lawyers, when the revolution comes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-929963">
+				<div id="div-comment-929963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Worf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929963">
+			August 11, 2011 at 11:29 pm</a>		</div>
+
+		<p>So what would happen if two popular shell extensions required mutually exclusive fixes? I don&#39;t think the app shims work at the DLL level&#8230;</p>
+<div class="post">[<i>How could you get into that situation if you assume that both shell extensions worked at the time they were released? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-929973">
+				<div id="div-comment-929973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Leo Davidson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929973">
+			August 11, 2011 at 11:40 pm</a>		</div>
+
+		<p>I agree that it is good to re-order COM calls to avoid breaking stuff that user depend on (even if they are poorly written).</p>
+<p>However, since this isn&#39;t documented anywhere it makes it a nightmare for anyone else trying to host the same objects.</p>
+<p>ActiveX control hosting is a great example. Unless you painstakingly work out which order IE queries &amp; initialises interfaces, through trial &amp; error and writing debug/test objects that you feed to IE to work out what it does, you&#39;ll run into all sorts of problems like the one described.</p>
+<p>Sometimes the order of calls required to make one component work breaks another, too. There are some bits in the registry which certain objects are flagged with to deal with that, but I suspect some of it is also hardcoded within the hosting components.</p>
+<p>Since COM objects only tend to be tested against one host (IE for ActiveX, Explorer for shell extensions, etc.), it&#39;s easy for them to accidentally rely on non-contractual behaviour of those hosts. And since new versions of those hosts are then tested against those buggy COM objects to avoid breaking them, those behaviour quirks will never change. But nobody else knows what those behaviours are. They&#39;re effectively an undocumented part of the API.</p>
+<p>Of course, very few people write their own hosts and it absolutely makes sense to push the complexity towards the host rather than the hosted objects. I&#39;m not arguing against that. I just wish all this voodoo was documented somewhere.</p>
+<p>It doesn&#39;t have to be formal documentation or part of an API contract. Unofficial guidance would be enough, although if it is something that is never going to change because it would break things then it might as well be part of the API contract. We might not want it to be, but it is.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong even thread-even depth-1" id="comment-929983">
+				<div id="div-comment-929983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-929983">
+			August 12, 2011 at 12:49 am</a>		</div>
+
+		<p>@Anonymous Person: That&#39;s why it&#39;s a good idea to push companies register the &quot;Software Publisher&#39;s Digital ID for Authenticode&quot; of your company to Windows Error Reporting.</p>
+<p>If there&#39;s crash related to an extension that vendor information could be found, at least Microsoft might be able to contact the vendor directly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-930013">
+				<div id="div-comment-930013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">grumpy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930013">
+			August 12, 2011 at 2:58 am</a>		</div>
+
+		<p>@640k: yeah, but you&#39;ve gotta realize that you can&#39;t handle it before you decide tp switch. How many bad coders are actually aware that they&#39;re bad coders&#8230;? I&#39;ve met none.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-930023">
+				<div id="div-comment-930023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930023">
+			August 12, 2011 at 3:43 am</a>		</div>
+
+		<p>I&#39;m going to assume that these gotchas eventually make it into documentation updates, but I was wondering if there are programs that can test your components to see if they depend on these sorts of undocumented behaviours.</p>
+<div class="post">[<i>The rules for IUnknown are already spelled out in the existing documentation. It doesn&#39;t seem necessary to list every possible way of violating them. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jader3rd odd alt thread-odd thread-alt depth-1" id="comment-930043">
+				<div id="div-comment-930043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/jader3rd' rel='external nofollow' class='url'>jader3rd</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930043">
+			August 12, 2011 at 9:00 am</a>		</div>
+
+		<p>&quot;[And if that extension is essential to your business? -Raymond]&quot;</p>
+<p>It&#39;s okay for people to not update to the latest and greatest version of Windows. If a company looks at the next version of Windows and finds out that their favorite shell extension doesn&#39;t work with it they can A) ask the vendor for an upgrade, B) not upgrade the OS. At this point there&#39;s a cost/benefit decision. Do the new features of the OS justify an upgrade? Are they worth more than the shell extension? Does something else provide the functionality that we need in the shell extension, even if it&#39;s not as nice?</p>
+<p>While I love the work that Windows does to be backwards compatible, this is one of those situations where I feel it would be a benefit to Windows, in the long run, if they didn&#39;t do this. Because then, people will start to expect greater things from new versions of Windows, instead of thinking a new version of Windows is lipstick put on another layer of old bloat.</p>
+<p>I love how a well written program written decades ago can run on modern Windows. I don&#39;t like how a poorly written program written decades ago can run on modern Windows.</p>
+<div class="post">[<i>And what if the vendor is out of business, or the vendor wants to charge money, or (as is common with LOB applications) <span style="text-decoration:underline;">you are the vendor</span> and there&#39;s nobody left at your company who understands the code (or you lost the source code). It seems that you have forgotten that Windows exists <span style="text-decoration:underline;">in order to make customers happy and productive</span>, not to piss off its customers in pursuit of the world&#39;s most architecturally pure and beautiful operating system. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-930063">
+				<div id="div-comment-930063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930063">
+			August 12, 2011 at 10:21 am</a>		</div>
+
+		<p>Jader3rd: Are you aware that, even nearly 10 years after its release and 5 years after being superceded, Windows XP is still the most popular PC OS on the planet? And that&#39;s with MS doing everything humanly possible to make it compatible with old apps!</p>
+<p>It turns out that the answer to &quot;Do the new features of the OS justify an upgrade?&quot; is &quot;No&quot; at least 99% of the time. If MS took the &quot;It&#39;s okay for people to not update to the latest and greatest version of Windows&quot; attitude, Windows 7 might be 10% awesomer, but that wouldn&#39;t help you as a developer because 90% of your customers wouldn&#39;t be using it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1" id="comment-930103">
+				<div id="div-comment-930103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930103">
+			August 12, 2011 at 6:00 pm</a>		</div>
+
+		<p>@Gabe: Actaully there&#39;s more problem than that.</p>
+<p>For some industries (such as Banking/Stock trading related ones) there is security requirement that the company should not use any of the OSs that no longer has security updates. When WinXP goes out the extended support period in 2014, while some of the larger companies can still pay for extension beyond the extended support period, most other companies that have software that can&#39;t run on Vista or above will face difficult decision: whether to risk system rewrite of old components or allow the client OS continue to run without further security fixes, hence risk having a virus friendly network environment inside the company. (Note that if people write malicious software that take advantage of OS vulnerabilities to spread, antivirus softwares may not be able to stop them effectively.</p>
+<p>So for the benefit of most OS users, people will want Microsoft to continue make those software &quot;depending on undocumented implementation details&quot; to run on newer versions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-930123">
+				<div id="div-comment-930123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930123">
+			August 12, 2011 at 7:28 pm</a>		</div>
+
+		<p>@Cesar: Exactly what I was thinking. This thing was probably designed back in the 9x/NT split and 9x would only use the A version. I&#39;m sure NT4&amp;5 would ask for the W version first and if it failed, it would fall back to A. Why this was changed in Vista makes little sense to me since you want to use the W version if the object implements it. (Even if it was rewritten from scratch it would still make sense to ask for W first) Why Vista wants both versions is a even bigger question&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-930093">
+				<div id="div-comment-930093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930093">
+			August 12, 2011 at 1:15 pm</a>		</div>
+
+		<p>I can imagine how the weird behavior in the first example happens.</p>
+<p>The class probably has an instance variable like:</p>
+<p>IUnknown *pExtractIconImpl;</p>
+<p>Which is initialized to NULL in the constructor.</p>
+<p>When receiving a QueryInterface for IID_IExtractIconA, if that pointer is NULL, it creates an IExtractIconA and stores it there. The same for IExtractIconW. If the pointer is already set, it is returned directly. Basically, simple lazy initialization of the part of the object which deals with whatever IExtractIcon* does. A perfectly legitimate thing to do, and not that complex.</p>
+<p>The only mistake in this code is to use a single pointer for both interfaces, perhaps due to a mistaken assumption that Unicode hosts will only want to create the IExtractIconW, and that ANSI hosts will only want to create the IExtractIconA. The fix is simply to use two instance variables instead of one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-930153">
+				<div id="div-comment-930153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Leo Davidson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930153">
+			August 13, 2011 at 2:06 am</a>		</div>
+
+		<p>@WndSks: My guess is that the code in Explorer was changed to gets all the interfaces it might want to use at once, so all that code is in one place and separated from the logic of actually using the object.</p>
+<p>That&#39;s a perfectly valid thing to do. QueryInterface on an in-process object is virtually free, so if you can simplify the code by doing that then it makes sense to do so.</p>
+<p>This obviously depends how the object is being used, but there&#39;s nothing that weird about getting an interface on an object and then deciding not to use it in the end.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-930183">
+				<div id="div-comment-930183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alfred E. Neumann</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930183">
+			August 13, 2011 at 8:26 am</a>		</div>
+
+		<p>@640k: If you can&#39;t handle COM&#39;s complexity &#8211; use .net, &#8230;</p>
+<p>You just replaced one problem with two others!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1" id="comment-930213">
+				<div id="div-comment-930213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110811-00/?p=9923#comment-930213">
+			August 14, 2011 at 1:16 pm</a>		</div>
+
+		<p>[Yeah, it&#39;s like these people went out of their way to do something weird. I mean, really, adding weird logic to your QI? -Raymond]</p>
+<p>Probably because they were clueless that C++ had such a feature.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,459 @@
+<html>
+<head>
+<title>How do I know that Resource Monitor isnt just retaining a handle to the terminated process?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I know that Resource Monitor isnt just retaining a handle to the terminated process?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 15, 2018 / year-entry #11</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>14</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Let's try it again, with feeling.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Not too long ago,
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180101-00/?p=97685">
+I investigated whether the Resource Monitor
+retains an open handle to the process</a>
+as its way to continue
+showing statistics after the process exited.
+I used Task Manager to determine whether there was still an open handle,
+on the theory that Task Manager shows all the valid process IDs,
+even for processes that have terminated.
+</p>
+<p>
+A reader who needs to choose a better screen name
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20180101-00/?p=97685#comment-1319215">
+pointed out that it's possible that Task Manager intentionally removes
+terminated processes from display</a>.
+</p>
+<p>
+This was a fair criticism, so let's test this theory.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt; // horrors! Mixing stdio and C++!
+
+int __cdecl main()
+{
+ PROCESS_INFORMATION pi;
+ STARTUPINFO si = { sizeof(si) };
+ TCHAR command[] = TEXT("notepad.exe");
+ CreateProcess(nullptr, command,
+  nullptr, nullptr, FALSE, 0, nullptr, nullptr, &amp;si, &amp;pi);
+ WaitForSingleObject(pi.hProcess, INFINITE);
+ printf("Process has exited. "
+        "Keeping handle open for a little while longer.\n");
+ Sleep(10 * 1000);
+ CloseHandle(pi.hProcess);
+ CloseHandle(pi.hThread);
+ return 0;
+}
+</pre>
+<p>
+This program launches Notepad, waits for it to exit, then
+waits an additional ten seconds before terminating.
+During those ten seconds, the process handle is still open,
+and hopefully we'll see the process still listed in Task Manager.
+</p>
+<p>
+Run this test program, close the Notepad window the opens,
+and then during the ten second delay, go to the Details page
+of Task Manager to see if Notepad is present.
+</p>
+<p>
+Nope, it's not there.
+The commenter was correct.
+Task Manager <i>does</i> remove terminated processes
+from display, even though the process object has not been destroyed.
+</p>
+<p>
+(This changed at some point, because
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20040723-00/?p=38363">
+the old Task Manager did
+keep zombie processes around</a>.
+That was one way to find out that
+you had a process handle leak:
+The zombie processes started piling up in Task Manager.
+My guess is that the change occurred when Task Manager was
+rewritten for Windows 8.)
+</p>
+<p>
+Okay, so our test was flawed. We'll have to try a different test.
+This time, let's write a program that launches Notepad,
+waits for it to exit, and then tries to reopen it by its
+process ID.
+This will succeed if there is still an outstanding handle to
+the process, and will fail if there are no outstanding handles.
+</p>
+<pre>
+#include &lt;windows.h&gt;
+#include &lt;stdio.h&gt; // horrors! Mixing stdio and C++!
+
+int __cdecl main()
+{
+ PROCESS_INFORMATION pi;
+ STARTUPINFO si = { sizeof(si) };
+ TCHAR command[] = TEXT("notepad.exe");
+ CreateProcess(nullptr, command,
+  nullptr, nullptr, FALSE, 0, nullptr, nullptr, &amp;si, &amp;pi);
+ WaitForSingleObject(pi.hProcess, INFINITE);
+ CloseHandle(pi.hProcess);
+ CloseHandle(pi.hThread);
+ <font COLOR=blue>printf("Process has exited. Try to open the process by ID.\n");
+ Sleep(1000);
+ auto h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+   FALSE, pi.dwProcessId);
+ printf("Resulting handle: %p\n", h);
+ if (h) CloseHandle(h);</font>
+ return 0;
+}
+</pre>
+<p>
+This second test program waits for Notepad to exit,
+and then closes all the handles and then tries to reopen it.
+</p>
+<p>
+Note that there is a brief <code>Sleep</code> after the process
+exits.
+This gives a little time for anybody who was doing the
+"Close the handle as soon as the process terminate" thing
+to close their handle.
+Without it, you will find that even without Resource Manager
+running,
+you'll see a handle retained somewhere.
+My guess it's anti-malware software.
+</p>
+<p>
+Okay, run the test program with no Resource Monitor running.
+Close Notepad, wait one second, and observe that
+it reports that the resulting handle is <code>00000000</code>,
+which means that the <code>Open&shy;Process</code> failed
+and there is no process with that ID,
+meaning that the process object has been destroyed,
+which means that there are no open handles to it.
+</p>
+<p>
+Now run our experiment with Resource Monitor:
+Run the test program, let Resource Monitor observe the new
+Notepad process.
+Now connect a debugger to Resource Monitor and freeze it,
+so that if it had an open handle to Notepad,
+it won't be able to close it.
+Close the Notepad window, wait one second,
+and observe that the test program reports that the
+resulting handle is <code>00000000</code>.
+This demonstrates that Resource Monitor doesn't retain
+a handle to the Notepad process.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-ranta even thread-even depth-1" id="comment-1320825">
+				<div id="div-comment-1320825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ranta' rel='external nofollow' class='url'>ranta</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320825">
+			January 15, 2018 at 8:45 am</a>		</div>
+
+		<p>When I read the &#8220;This gives a little time&#8221; part, I immediately thought oplocks would be the correct way to solve this, now with process handles rather than file handles. But I have difficulty imagining what the semantics should be.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1320845">
+				<div id="div-comment-1320845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Austin Donnelly (MSFT)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320845">
+			January 15, 2018 at 8:56 am</a>		</div>
+
+		<p>Although in general, be careful when getting a handle to a process based on a process ID.   Those process IDs can (and do) get reused over time, so you might not be opening a handle to the process you thought you wanted.  If you really must open a process by PID, ensure you also know it&#8217;s parent&#8217;s PID.  Then when you open the handle, you can validate that the process&#8217;s parent is really the one you expected.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-wndsks even depth-2 parent" id="comment-1320855">
+				<div id="div-comment-1320855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320855">
+			January 15, 2018 at 10:08 am</a>		</div>
+
+		<p>No, the parent could also in theory be reused (unless you are the parent of course). The correct tuple is id + start-time, see RM_UNIQUE_PROCESS: &#8220;Uniquely identifies a process by its PID and the time the process began&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1320897">
+				<div id="div-comment-1320897" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pietro Gagliardi (andlabs)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320897">
+			January 15, 2018 at 12:35 pm</a>		</div>
+
+		<p>Yeah, but GetWindowThreadProcessId(), EnumProcesses(), and OpenProcess() don&#8217;t let you specify those unique pairs, and there are no -Ex() APIs that change this. Are those unique pairs specific to Restart Manager in this case?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1320905">
+				<div id="div-comment-1320905" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320905">
+			January 15, 2018 at 2:15 pm</a>		</div>
+
+		<p>Open-query-close. Such is life.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt depth-4" id="comment-1320945">
+				<div id="div-comment-1320945" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320945">
+			January 16, 2018 at 4:28 am</a>		</div>
+
+		<p>That struct was invented by the RM team but the uniqueness of such a tuple is valid everywhere.</p>
+<p>You don&#8217;t need a new API, 99% of the time OpenProcess on the PID gives you the correct process and the overhead is simply the extra query for the start time to verify the PID. If the open fails or if the PID was reused you have to abandon your operation anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-aegis03 even depth-3" id="comment-1322136">
+				<div id="div-comment-1322136" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/dmex' rel='external nofollow' class='url'>dmex</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1322136">
+			January 23, 2018 at 11:33 pm</a>		</div>
+
+		<p>@skSdnW</p>
+<p>&#8220;The correct tuple is id + start-time&#8221;</p>
+<p>This is one of those implementation details that should not be relied upon&#8230; </p>
+<p>Previous versions of Windows and the Restart Manager API (unfortunatly) still use the PID and &#8216;start-time&#8217;. However, the process &#8216;start-time&#8217; does not include timezone information and when the timezone changes (e.g. Daylight Saving Time) some processes will re-use the pid and the &#8216;start-time&#8217; because the system clock changed&#8230;</p>
+<p>Process Explorer also uses the &#8220;id + start-time&#8221; to show the child/parent process tree by validating the &#8216;ParentPID+ start-time&#8217; is less than the &#8216;ChildPID+start-time&#8217; but when the timezone changes (e.g. Daylight Saving Time) the children can have earlier start-times than their parents and Process Explorer ends up showing an incorrect child/parent process tree.</p>
+<p>This also gets more ticky on Windows 10 since some system processes such as the &#8220;Secure system&#8221; and &#8220;Registry&#8221; processes have creation times earlier than their parent &#8216;System&#8217; process and this is why Windows 10 now uses whats called a &#8220;ProcessSequenceNumber&#8221; for internal bookkeeping which is &#8220;guaranteed monotonic unlike time&#8221; and negates the need to compare &#8220;id + start-time&#8221; and solves the issues with timezone changes but Process Explorer and the Restart Manager API (unfortunatly) don&#8217;t use it yet.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1320865">
+				<div id="div-comment-1320865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle S.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320865">
+			January 15, 2018 at 10:09 am</a>		</div>
+
+		<p>This is a fantastic lesson. skSdnW noticed a logical gap in a model that otherwise fit the data extremely well. They were rewarded for their thoroughness with accusations of paranoia.</p>
+<p>Models are great because they don’t need to be completely accurate to be useful. But skSdnW has reminded us to be conscious of the limitations of modeling, and the other commenters have reminded us of how quickly programmers will convert short-term success into arrogance.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1320916">
+				<div id="div-comment-1320916" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320916">
+			January 15, 2018 at 4:50 pm</a>		</div>
+
+		<p>I&#8217;m curious what paranoia you thought you saw, given that Raymond said &#8220;This was a fair criticism&#8221;.</p>
+<p>If you&#8217;re referring to the rude name comment, well, read it backwards, and bear in mind this change was made after Raymond complained about the commenter&#8217;s original name, which was ruder.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1320925">
+				<div id="div-comment-1320925" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle S.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320925">
+			January 15, 2018 at 7:58 pm</a>		</div>
+
+		<p>Rick, I’m not referring to Raymond. I’m referring to people who replied to skSdnW’s comment on the original article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1320875">
+				<div id="div-comment-1320875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320875">
+			January 15, 2018 at 10:36 am</a>		</div>
+
+		<p>The man with the social skills of a thermonuclear device is remarkably tolerant.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1320885">
+				<div id="div-comment-1320885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">alexx</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1320885">
+			January 15, 2018 at 12:01 pm</a>		</div>
+
+		<p>One way to find out if you have zombie processes by using Process Explorer is to search for handles named &#8220;Non-existent Process&#8221;. If match, procexp will show handles with name &#8220;Non-existent Process (xxxx)&#8221;, where xxxx is the PID of the zombie process.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1321125">
+				<div id="div-comment-1321125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1321125">
+			January 17, 2018 at 1:25 am</a>		</div>
+
+		<p>&#8220;meaning that the process object has been destroyed, which means that there are no open handles to it.&#8221;</p>
+<p>My understanding is a bit different.</p>
+<p>The process object can live for itself, without any open handle. Example: Your program starts Notepad.exe, and then close the thread and the process handle you got from CreateProcess. The process and therefore it&#8217;s process object will be alive as long as the user does not close it. Note that this is different from other kernel objects; processes are not need to be &#8220;owned&#8221; by something outside the kernel.</p>
+<p>This situation changes when the process terminates: In the Terminated state, the process object is no longer needed by the kernel itself, so it will only be kept around until all referencing handles are closed. If the process terminates with no referencing handles at this point in time, then the process object is removed as soon as the kernel has finished the cleanup.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1321135">
+				<div id="div-comment-1321135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Someone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1321135">
+			January 17, 2018 at 2:00 am</a>		</div>
+
+		<p>If one is using the SysInternals tool &#8220;handle&#8221; (<a href="https://docs.microsoft.com/en-us/sysinternals/downloads/handle" rel="nofollow">https://docs.microsoft.com/en-us/sysinternals/downloads/handle</a>), it is surprising how many references to a process are held by kernel parts like &#8220;System&#8221;, &#8220;csrss.exe&#8221; or &#8220;lsass.exe&#8221; or even &#8220;svchost.exe&#8221;. So, the handle count as such is not enough for the discussion. The view needs to be splitted into &#8220;handle held by kernel component&#8221; and &#8220;handle held by regular process&#8221;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-alegrigoriev even depth-3" id="comment-1321355">
+				<div id="div-comment-1321355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1321355">
+			January 18, 2018 at 5:51 am</a>		</div>
+
+		<p>The handle tool can only show who owns handles to an object. It cannot show who owns references, because only kernel can add references to an object, and they don&#8217;t have an owner.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1321206">
+				<div id="div-comment-1321206" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1321206">
+			January 17, 2018 at 9:18 am</a>		</div>
+
+		<p>My statement was &#8220;destroyed implies no handles.&#8221; The converse is not true, which is the case you&#8217;re talking about.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ranta even depth-2" id="comment-1321305">
+				<div id="div-comment-1321305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/ranta' rel='external nofollow' class='url'>ranta</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180115-00/?p=97795#comment-1321305">
+			January 18, 2018 at 12:07 am</a>		</div>
+
+		<p>Re &#8220;this is different from other kernel objects&#8221;: I think the main difference here is that processes and threads are opened by ID, rather than by name. If these objects don&#8217;t have names in the first place, it does not matter whether the object manager deletes the name when the last handle is closed. (Drivers that create named objects can suppress this automatic deletion by setting the OBJ_PERMANENT flag in OBJECT_ATTRIBUTES.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

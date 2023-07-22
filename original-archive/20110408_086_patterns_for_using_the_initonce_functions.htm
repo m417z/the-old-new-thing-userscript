@@ -1,0 +1,538 @@
+<html>
+<head>
+<title>Patterns for using the InitOnce functions</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Patterns for using the InitOnce functions</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 8, 2011 / year-entry #87</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>14</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Letting the smart people do the work for you.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Since writing lock-free code is is
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/07/10150728.aspx#10151021">
+such a headache-inducer</a>,
+you're probably best off making some other people suffer the headaches
+for you.
+And those other people are the kernel folks, who have developed
+quite a few lock-free building blocks so you don't have to.
+For example, there's a collection of functions for manipulating
+<a HREF="http://msdn.microsoft.com/en-us/library/ms684121(VS.85).aspx">
+interlocked lists</a>.
+But today we're going to look at the
+<a HREF="http://msdn.microsoft.com/en-us/library/aa363808">
+one-time initialization</a> functions.
+</p>
+<p>
+The simplest version of the one-time initialization functions
+isn't actually lock-free,
+but it does implement the double-checked-lock pattern for you
+so you don't have to worry about the details.
+The usage pattern for the
+<a HREF="http://msdn.microsoft.com/en-us/library/ms683493(v=VS.85).aspx">
+<code>Init&shy;Once&shy;Execute&shy;Once</code> function</a>
+is pretty simple.
+Here it is in its simplest form:
+</p>
+<pre>
+int SomeGlobalInteger;
+
+BOOL CALLBACK ThisRunsAtMostOnce(
+    PINIT_ONCE initOnce,
+    PVOID Parameter,
+    PVOID *Context)
+{
+    calculate_an_integer(&amp;SomeGlobalInteger);
+    return TRUE;
+}
+
+void InitializeThatGlobalInteger()
+{
+    static INIT_ONCE initOnce = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&amp;initOnce,
+                        ThisRunsAtMostOnce,
+                        nullptr, nullptr);
+}
+</pre>
+<p>
+In the simplest form, you give
+<code>Init&shy;Once&shy;Execute&shy;Once</code> an
+<code>INIT_<wbr>ONCE</code> structure (where it records
+its state),
+and a callback.
+If this is the first time that
+<code>Init&shy;Once&shy;Execute&shy;Once</code> is called
+for a particular
+<code>INIT_<wbr>ONCE</code> structure,
+it calls the callback.
+The callback can do whatever it likes,
+but presumably it's doing some one-time initialization.
+If another thread calls
+<code>Init&shy;Once&shy;Execute&shy;Once</code> on the same
+<code>INIT_<wbr>ONCE</code> structure,
+that other thread will wait until the first thread is finished
+its one-time execution.
+</p>
+<p>
+We can make this a tiny bit fancier by supposing that
+the calculation of the integer can fail.
+</p>
+<pre>
+BOOL CALLBACK ThisSucceedsAtMostOnce(
+    PINIT_ONCE initOnce,
+    PVOID Parameter,
+    PVOID *Context)
+{
+    return SUCCEEDED(calculate_an_integer(&amp;SomeGlobalInteger));
+}
+
+BOOL TryToInitializeThatGlobalInteger()
+{
+    static INIT_ONCE initOnce = INIT_ONCE_STATIC_INIT;
+    return InitOnceExecuteOnce(&amp;initOnce,
+                               ThisSucceedsAtMostOnce,
+                               nullptr, nullptr);
+}
+</pre>
+<p>
+If your initialization function returns <code>FALSE</code>,
+then the initialization is considered to have failed,
+and the next time somebody calls
+<code>Init&shy;Once&shy;Execute&shy;Once</code>,
+it will try to initialize again.
+</p>
+<p>
+A slightly fancier use of the
+<code>Init&shy;Once&shy;Execute&shy;Once</code> function
+takes advantage of the <code>Context</code> parameter.
+The kernel folks noticed that an
+<code>INIT_<wbr>ONCE</code> structure in the "initialized"
+state has a lot of unused bits,
+and they've offered to let you use them.
+This is convenient if the thing you're initializing is a pointer
+to a C++ object, because it means that there's only one thing
+you need to worry about instead of two.
+</p>
+<pre>
+BOOL CALLBACK AllocateAndInitializeTheThing(
+    PINIT_ONCE initOnce,
+    PVOID Parameter,
+    PVOID *Context)
+{
+    *Context = new(nothrow) Thing();
+    return *Context != nullptr;
+}
+
+Thing *GetSingletonThing(int arg1, int arg2)
+{
+    static INIT_ONCE initOnce = INIT_ONCE_STATIC_INIT;
+    void *Result;
+    if (InitOnceExecuteOnce(&amp;initOnce,
+                            AllocateAndInitializeTheThing,
+                            nullptr, &amp;Result))
+    {
+        return static_cast&lt;Thing*&gt;(Result);
+    }
+    return nullptr;
+}
+</pre>
+<p>
+The final parameter to
+<code>Init&shy;Once&shy;Execute&shy;Once</code> function
+receives the magic almost-pointer-sized data that the function
+will remember for you.
+Your callback function passes this magic value back through
+the <code>Context</code> parameter,
+and then
+<code>Init&shy;Once&shy;Execute&shy;Once</code> gives it
+back to you as the <code>Result</code>.
+</p>
+<p>
+As before, if two threads call
+<code>Init&shy;Once&shy;Execute&shy;Once</code> simultaneously
+on an uninitialized <code>INIT_<wbr>ONCE</code> structure,
+one of them will call the initialization function and the other will wait.
+</p>
+<p>
+Up until now, we've been looking at the synchronous initialization
+patterns.
+They aren't lock-free:
+If you call <code>Init&shy;Once&shy;Execute&shy;Once</code>
+and initialization of the the <code>INIT_<wbr>ONCE</code> structure is 
+already in progress, your call will wait until that initialization
+attempt completes (either successfully or unsuccessfully).
+</p>
+<p>
+More interesting is the asynchronous pattern.
+Here it is, as applied to our <code>Singleton&shy;Manager</code> exercise:
+</p>
+<pre>
+ SingletonManager(const SINGLETONINFO *rgsi, UINT csi)
+               : m_rgsi(rgsi), m_csi(csi),
+                 m_rgio(new INITONCE[csi]) {
+   for (UINT iio = 0; iio < csi; iio++) {
+    InitOnceInitialize(&m_rgio[iio]);
+   }
+ }
+ ...
+ // Array that describes objects we've created
+ // runs parallel to m_rgsi
+ INIT_ONCE *m_rgio;
+};
+
+ITEMCONTROLLER *SingletonManager::Lookup(DWORD dwId)
+{
+ ... same as before until we reach the "singleton constructor pattern"
+
+ void *pv = NULL;
+ BOOL fPending;
+ if (!InitOnceBeginInitialize(&amp;m_rgio[i], INIT_ONCE_ASYNC,
+                              &amp;fPending, &amp;pv)) return NULL;
+
+ if (fPending) {
+  ITEMCONTROLLER *pic = m_rgsi[i].pfnCreateController();
+  if (pic &amp;&amp; InitOnceComplete(&amp;m_rgio[i],
+                              INIT_ONCE_ASYNC, pic)) {
+   pv = pic;
+  } else {
+   // lost the race - discard ours and retrieve the winner
+   delete pic;
+   InitOnceBeginInitialize(&amp;m_rgio[i], INIT_ONCE_CHECK_ONLY,
+                           &amp;fPending, &amp;pv);
+  }
+ }
+ return static_cast&lt;ITEMCONTROLLER *&gt;(pv);
+}
+</pre>
+<p>
+The pattern for asynchronous initialization is as follows:
+</p>
+<ul>
+<li>Call <code>Init&shy;Once&shy;Begin&shy;Initialize</code>
+    in async mode.</p>
+<li>If it returns <code>fPending == FALSE</code>,
+    then initialization has already been performed and you can
+    go ahead and use the result passed back in the final parameter.</p>
+<li>Otherwise, initialization is pending.
+    Do your initialization, but remember that since this is a lock-free
+    algorithm, there can be many threads trying to initialize
+    simultaneously, so you have to be careful
+    <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/04/07/10150728.aspx">
+    how you manipulate global state</a>.
+    This pattern works best if initialization takes the form of
+    creating a new object (because that means multiple threads
+    performining initialization are each creating independent objects).</p>
+<li>If you successfully created the object,
+    call <code>Init&shy;Once&shy;Complete</code> with the result
+    of your initialization.</p>
+<li>If <code>Init&shy;Once&shy;Complete</code> succeeds,
+    then you won the initialization race, and you're done.</p>
+<li>If <code>Init&shy;Once&shy;Complete</code> fails,
+    then you lost the initialization race and should clean up your
+    failed initialization.
+    In that case, you should call
+    <code>Init&shy;Once&shy;Begin&shy;Initialize</code>
+    one last time to get the answer from the winner.
+</ul>
+<p>
+it's conceptually simple; it just takes a while to explain.
+but at least now it's in recipe form.
+</p>
+<p>
+<b>Exercise</b>: Instead of calling
+<code>Init&shy;Once&shy;Complete</code> with
+<code>INIT_<wbr>ONCE_<wbr>INIT_<wbr>FAILED</code>,
+what happens if the function simply returns
+without ever completing the init-once?
+</p>
+<p>
+<b>Exercise</b>:
+What happens if two threads try to perform
+asynchronous initialization and the first one
+to complete fails?
+</p>
+<p>
+<b>Exercise</b>:
+Combine the results of the first two exercises
+and draw a conclusion.
+</p>
+<p>
+<b>Update</b>:
+I got it wrong in the case of a failed asynchronous
+initialization.
+You're just supposed to abandon the initialization
+rather than report failure.
+The code and discussion have been updated.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (14)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-906443">
+				<div id="div-comment-906443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">IC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906443">
+			April 8, 2011 at 7:48 am</a>		</div>
+
+		<p>It&#39;s 12:46AM on Saturday here in Australia and I&#39;m awake reading this series of articles. They are very good. Please keep posting in-depth explorations of challenging subject matter!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906463">
+				<div id="div-comment-906463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906463">
+			April 8, 2011 at 8:56 am</a>		</div>
+
+		<p>&gt; This pattern works best if initialization takes the form of creating a new object (because that means multiple threads performing initialization are each creating independent objects</p>
+<p>I&#39;m having hard time figuring out the real life scenario where this knowledge can be used. Can anybody give some specific and real example where it&#39;s important (in the sense &quot;it has visible performance impact&quot;) to have the lock free initialisation like here? I mean if it&#39;s just &quot;allocate some object&quot; (as &quot;on the heap&quot;) I see no reason to do all this. like, do you know if your allocator uses global lock anyway, etc? And especially for the case when the synchronisation is to happen only once in the life of the program?</p>
+<div class="post">[<i>If your algorithm is lock-free, then it cannot cause a deadlock. Handy when your function can be called with an unknown lock state. I should write an article about this aspect since you can even combine it with a lock to get lock-free-like behavior with locks. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906483">
+				<div id="div-comment-906483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906483">
+			April 8, 2011 at 3:36 pm</a>		</div>
+
+		<p>And I would have just used the lock-free multi-constructed singleton published in the previous article rather than try to untangle this API in my head.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906453">
+				<div id="div-comment-906453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906453">
+			April 8, 2011 at 8:41 am</a>		</div>
+
+		<p>1. If the function fails to call InitOnceComplete, then every subsequent call to InitOnceBeginInitialize is going to return with fPending == TRUE, so it will try to recreate the singleton every time and return a different object on each call to SingletonManager::Lookup. &nbsp;Result: not a singleton.</p>
+<p>2. The documentation on InitOnceComplete does not say what the effect of the INIT_ONCE_INIT_FAILED flag. &nbsp;In a quick test I did, InitOnceComplete returned 0 with GetlastError() = ERROR_INVALID_PARAMETER [*]. &nbsp;Result: The first thread which failed at initialization returns NULL from Lookup, subsequent threads will try again to initialize the singleton, since the initialization is still considered to be in progress (because nobody properly finished it).</p>
+<p>3. Don&#39;t fail your initialization.</p>
+<p>[*] I steppted through the disassembly, and it looks like InitOnceComplete checks that at most 1 bit is set in dwFlags; if not, the internal helper function returns STATUS_INVALID_PARAMETER_2, resulting in the last error getting set as ERROR_INVALID_PARAMETER. &nbsp;This suggests that (INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED) is not a valid parameter. &nbsp;I tried various flags combinations, along with passing NULL and non-NULL for lpContext, and they all resulted in ERROR_INVALID_PARAMETER.</p>
+<p>Thanks for this series on the Interlocked* and related functions this week, Raymond. &nbsp;Keep up the good stuff.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906493">
+				<div id="div-comment-906493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christopher</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906493">
+			April 8, 2011 at 5:16 pm</a>		</div>
+
+		<p>Hmmm&#8230; I&#39;m struggling a bit with the line</p>
+<p>static INIT_ONCE initOnce = INIT_ONCE_STATIC_INIT; // INIT_ONCE_STATIC_INIT == RTL_RUN_ONCE_INIT == {0}</p>
+<p>Does this get placed in .data or something by the compiler in an initialized state? Is that guaranteed somewhere? If not, how is the coordination done so that only one thread will initialize the uninitialized initOnce?</p>
+<div class="post">[<i>See chapter 6.7 paragraph 4 of the C++ language specification. I can&#39;t explain everything; some things you will just have to go figure out yourself. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906503">
+				<div id="div-comment-906503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christopher</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906503">
+			April 8, 2011 at 5:54 pm</a>		</div>
+
+		<p>Ah, thanks, Raymond. Searching for &quot;static&quot; resulted in way too many hits in the standard, so I was looking in the wrong places. Keyword overloading&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906573">
+				<div id="div-comment-906573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Burak KALAYCI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906573">
+			April 10, 2011 at 2:48 pm</a>		</div>
+
+		<p>Minimum supported client for InitOnceExecuteOnce is Vista!?! Useless for those of us who target 2000 or even XP&#8230; </p>
+<p>Have we run out of old new things?</p>
+<div class="post">[<i>Apparently I would have been better off if I had never mentioned, &quot;Oh, and if you&#39;re using Vista or higher, there&#39;s an easier way.&quot; I should just cover old stuff and not bother mentioning that newer versions of Windows make things easier. I&#39;ll remember that for next time. If you are targeting Windows NT 3.1, you can continue doing it the hard way. (And how dare you leave out people who are still targeting Windows NT 3.1?) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906593">
+				<div id="div-comment-906593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906593">
+			April 11, 2011 at 2:44 am</a>		</div>
+
+		<p>XP is still officially supported by MS.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906603">
+				<div id="div-comment-906603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Burak KALAYCI</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906603">
+			April 11, 2011 at 3:28 am</a>		</div>
+
+		<p>Dear Raymond: </p>
+<p>My comment was the result of my disappointment. It seems I missed your comment about Vista, my bad, but it certainly is not to be found in this post. I would have really appreciated a warning at the start of this post. </p>
+<p>Actually I think if you update the post (even now), you will cause a lot of people save time.</p>
+<p>Best.</p>
+<div class="post">[<i>I&#39;m not going to call out which version of Windows introduced each API I write about. If that&#39;s important to you, you can go look it up yourself. (That way you can&#39;t blame me if I looked it up wrong, which I often do.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906613">
+				<div id="div-comment-906613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906613">
+			April 11, 2011 at 4:55 am</a>		</div>
+
+		<p>@640k &#8211; That doesn&#39;t mean it is officially supported by Raymond though. Remember Raymond != Microsoft.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906623">
+				<div id="div-comment-906623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">acq</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906623">
+			April 11, 2011 at 6:30 am</a>		</div>
+
+		<blockquote><p>
+  &nbsp;I should write an article about this aspect
+</p></blockquote>
+<p>I&#39;m enjoying your writing and I&#39;m looking forward for such articles too.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906763">
+				<div id="div-comment-906763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">T.C.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906763">
+			April 11, 2011 at 10:39 pm</a>		</div>
+
+		<p>Neat! Any patterns for deleting the objects created by means of InitOnce? Is this something I&#39;d have to do at DLL unloading?</p>
+<div class="post">[<i>Destroy them when you don&#39;t want them any more. (Waiting until DLL unloading is not a great idea due to constraints on what you can do in DllMain.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906803">
+				<div id="div-comment-906803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">hex_omega</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906803">
+			April 12, 2011 at 12:30 am</a>		</div>
+
+		<p>&quot;Instead of calling Init­Once­Complete with INIT_ONCE_INIT_FAILED, what happens if the function simply returns without ever completing the init-once?&quot;</p>
+<p>Returning without ever calling InitOnceComplete is exactly what is done in the sample in MSDN.</p>
+<p><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/ms686934(v=VS.85).aspx" rel="nofollow">msdn.microsoft.com/&#8230;/ms686934(v=VS.85).aspx</a></p>
+<p>In either case, calling InitOnceComplete or not when initialization fails, would result in the Lookup method returning NULL. Unless I&#39;m missing some subtlety (completely possible), I don&#39;t see why calling it is necessary in the case of initialization failure. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906823">
+				<div id="div-comment-906823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nksingh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110408-01/?p=10983#comment-906823">
+			April 12, 2011 at 1:31 am</a>		</div>
+
+		<p>@hex_omega:</p>
+<p>It seems like this is a subtlety that&#39;s missing from the documentation. &nbsp;It&#39;s legitimate to signal INIT_FAILED if you&#39;re using the synchronous functionality, but you cannot do the same thing when using async.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

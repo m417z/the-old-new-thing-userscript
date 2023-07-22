@@ -1,0 +1,1055 @@
+<html>
+<head>
+<title>A cache with a bad policy is another name for a memory leak</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A cache with a bad policy is another name for a memory leak</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 2, 2006 / year-entry #153</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>37</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A common performance trick is to reduce time spent in the heap manager by caching the last item freed (or maybe the last few) so that a subsequent allocation can just re-use the item rather than having to go make a new one. But you need to be careful how you do this or you...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A common performance trick is to reduce time spent in the heap manager
+by caching the last item freed (or maybe the last few) 
+so that a subsequent allocation can just re-use the item rather
+than having to go make a new one.
+But you need to be careful how you do this or you can end up
+making things worse rather than better.
+Here's an example motivated by
+an actual problem the Windows performance team researched.
+</p>
+<p>
+Consider a cache of variable-sized buffers.
+I will use only a one-entry cache for simplicity.
+In real life, the cache would be more complicated:
+People tend to have a deeper cache of four to ten entries,
+and you would have to ensure that only
+one thread used the cache at a time; typically this is done
+by associating the cache with something that has thread affinity.
+Furthermore, you probably would keep the size of the cached buffer
+in a member variable instead
+of calling <code>LocalSize</code> all the time.
+I've left out all these complications to keep the presentation simple.
+</p>
+<pre>
+class BufferCache {
+public:
+ BufferCache() : m_pCache(NULL) { }
+ ~BufferCache() { LocalFree(m_pCache); }
+
+ void *GetBuffer(SIZE_T cb);
+ void ReturnBuffer(void *p);
+
+private:
+ void *m_pCache;
+};
+</pre>
+<p>
+If a request for a memory buffer arrives and it can be
+satisfied from the cache, then the cached buffer is returned.
+Otherwise, a brand new buffer is allocated.
+</p>
+<pre>
+void *BufferCache::GetBuffer(SIZE_T cb)
+{
+ // Satisfy from cache if possible
+ if (m_pCache &amp;&amp; LocalSize(m_pCache) &gt;= cb) {
+  void *p = m_pCache;
+  m_pCache = NULL;
+  return p;
+ }
+ return LocalAlloc(LMEM_FIXED, cb);
+}
+</pre>
+<p>
+When a buffer is returned to the cache, we compare it
+against the item already in the cache and keep the bigger
+one, since that is more likely to satisfy a <code>GetBuffer</code>
+in the future.
+(In the general case of a multiple-entry cache,
+we would free the smallest entry.)
+</p>
+<pre>
+<i>// Flawed design - see discussion
+void BufferCache::ReturnBuffer(void *p)
+{
+ SIZE_T cb = LocalSize(p);
+ if (!m_pCache || cb &gt; LocalSize(m_pCache)) {
+  // Returned buffer is bigger than the cache:
+  // Keep the returned buffer
+  LocalFree(m_pCache);
+  m_pCache = p;
+ } else {
+  // Returned buffer is smaller than the cache:
+  // Keep the cache
+  LocalFree(p);
+ }
+}</i>
+</pre>
+<p>
+Why is this a flawed design?
+I'll let you think about this for a while.
+</p>
+<p>
+No really, I want you to think about it.
+</p>
+<p>
+Are you thinking?
+Take your time; I'll be here when you're done.
+</p>
+<p>
+Okay, since I know you haven't actually thought about it but are
+just sitting there waiting for me to tell you,
+I'll give you a bit of a nudge.
+</p>
+<p>
+The distribution of buffer sizes is rarely uniform.
+The most common distribution is that small buffers are popular,
+with larger and larger buffers being required less and less often.
+Let's write a sample program that allocates and frees memory
+according to this pattern. 
+To make the bad behavior easier to spot in a short run,
+I'm going to use a somewhat flat distribution and say that half
+of the buffers are small,
+with larger buffers becoming less popular
+according to exponential decay.
+In practice, the decay curve is usually much, much steeper.
+</p>
+<pre>
+#include &lt;vector&gt;
+#include &lt;iostream&gt;
+
+// Since this is just a quick test, we're going to be sloppy
+using namespace std; //  sloppy
+int __cdecl main(int argc, char **argv)
+{
+ BufferCache b;
+
+ // seeding the random number generator is not important here
+
+ vector&lt;void *&gt; v; // keeps track of allocated memory
+ for (;;) {
+  // randomly allocate and free
+  if (v.size() == 0 || (rand() &amp; 1)) { // allocate
+   SIZE_T cb = 100;
+   while (cb &lt; 1024 * 1024 &amp;&amp; (rand() & 1)) {
+    cb *= 2; // exponential decay distribution up to 1MB
+   }
+   void* p = b.GetBuffer(cb);
+   if (p) {
+    cout &lt;&lt; " A" &lt;&lt; LocalSize(p) &lt;&lt; "/" &lt;&lt; cb;
+    v.push_back(p);
+   }
+  } else { // free
+   int victim = rand() % v.size(); // choose one at random
+   cout &lt;&lt; " F" &lt;&lt; LocalSize(v[victim]);
+   b.ReturnBuffer(v[victim]); // free it
+   v[victim] = v.back();
+   v.pop_back();
+  }
+ }
+}
+</pre>
+<p>
+This short program randomly allocates and frees memory
+from the buffer cache, printing (rather cryptically) the
+size of the blocks allocated and freed.
+When memory is allocated, it prints "A1/2" where "1" is the
+size of the block actually allocated and "2" is the size requested.
+When freeing memory, it prints "F3" where "3" is the size of the
+block allocated.
+Run this program, let it do its thing for maybe ten, fifteen
+seconds, then pause the output and study it.
+I'll wait.
+If you're too lazy to actually compile and run the program,
+I've included some sample output for you to study:
+</p>
+<pre>
+F102400 A102400/400 F800 F200 A800/100 A200/200 A400/400
+A400/400 A200/200 F1600 A1600/100 F100 F800 F25600 A25600/200
+F12800 A12800/200 F200 F400 A400/100 F200 A200/100 A200/200
+A100/100 F200 F3200 A3200/400 A200/200 F51200 F800 F25600
+F1600 F1600 A51200/100 F100 A100/100 F3200 F200 F409600 F100
+A409600/400 A100/100 F200 F3200 A3200/800 A400/400 F800 F3200
+F200 F12800 A12800/200 A100/100 F200 F25600 F400 F6400
+A25600/100 F100 F200 F400 F200 F800 F400 A800/800 A100/100
+</pre>
+<p>
+Still waiting.
+</p>
+<p>
+Okay, maybe you don't see it.  Let's make the effect even more
+obvious by printing some statistics periodically.
+Of course, to generate the statistics, we need to keep track
+of them, so we'll have to remember how big the requested buffer
+was (which we'll do in the buffer itself):
+</p>
+<pre>
+int __cdecl main(int argc, char **argv)
+{
+ BufferCache b;
+
+ // seeding the random number generator is not important here
+
+ vector&lt;void *&gt; v; // keeps track of allocated memory
+ <font COLOR=blue>SIZE_T cbAlloc = 0, cbNeeded = 0;
+ for (int count = 0; ; count++) {</font>
+  // randomly allocate and free
+  if (v.size() == 0 || (rand() &amp; 1)) { // allocate
+   SIZE_T cb = 100;
+   while (cb &lt; 1024 * 1024 &amp;&amp; !(rand() % 4)) {
+    cb *= 2; // exponential decay distribution up to 1MB
+   }
+   void* p = b.GetBuffer(cb);
+   if (p) {
+    <font COLOR=blue>*(SIZE_T*)p = cb;
+    cbAlloc += LocalSize(p);
+    cbNeeded += cb;</font>
+    v.push_back(p);
+   }
+  } else { // free
+   int victim = rand() % v.size(); // choose one at random
+   <font COLOR=blue>cbAlloc -= LocalSize(v[victim]);
+   cbNeeded -= *(SIZE_T*)v[victim];</font>
+   b.ReturnBuffer(v[victim]); // free it
+   v[victim] = v.back();
+   v.pop_back();
+  }
+  <font COLOR=blue>if (count % 100 == 0) {
+   cout &lt;&lt; count &lt;&lt; ": " &lt;&lt; v.size() &lt;&lt; " buffers, "
+        &lt;&lt; cbNeeded &lt;&lt; "/" &lt;&lt; cbAlloc &lt;&lt; "="
+        &lt;&lt; cbNeeded * 100.0 / cbAlloc &lt;&lt; "% used" &lt;&lt; endl;
+  }</font>
+ }
+}
+</pre>
+<p>
+This new version keeps track of how many bytes were allocated
+as opposed to how many were actually needed, and prints
+a summary of those statistics every hundred allocations.
+Since I know you aren't actually going to run it yourself,
+I've run it for you.
+Here is some sample output:
+</p>
+<pre>
+0: 1 buffers, 400/400=100% used
+100: 7 buffers, 4300/106600=4.03377% used
+200: 5 buffers, 1800/103800=1.7341% used
+300: 19 buffers, 9800/115800=8.46287% used
+400: 13 buffers, 5100/114000=4.47368% used
+500: 7 buffers, 2500/28100=8.8968% used
+...
+37200: 65 buffers, 129000/2097100=6.15135% used
+37300: 55 buffers, 18100/2031400=0.891011% used
+37400: 35 buffers, 10400/2015800=0.515924% used
+37500: 43 buffers, 10700/1869100=0.572468% used
+37600: 49 buffers, 17200/1874000=0.917823% used
+37700: 75 buffers, 26000/1889900=1.37573% used
+37800: 89 buffers, 30300/1903100=1.59214% used
+37900: 91 buffers, 29600/1911900=1.5482% used
+</pre>
+<p>
+By this point, the problem should be obvious:
+We're wasting insane quantities of memory.
+For example, after step 37900, we've allocated 1.8MB
+of memory when we needed only 30KB,
+for a waste of over 98%.
+</p>
+<p>
+How did we go horribly wrong?
+</p>
+<p>
+Recall that most of the time, the buffer being allocated is
+a small buffer, and most of the time, a small buffer is freed.
+But it's the rare case of a large buffer that messes up everything.
+The first time a large buffer is requested, it can't
+come from the cache, since the cache has only small buffers,
+so it must be allocated.
+And when it is returned, it is kept, since the cache keeps
+the largest buffer.
+</p>
+<p>
+The next allocation comes in, and it's probably one of the common-case
+small buffers, and it is given the cached buffer&mdash;which is big.
+You're wasting a big buffer on something that needs only 100 bytes.
+Some time later, another rare big buffer request comes in,
+and since that other big buffer got wasted on a small allocation,
+you have to allocate a new big buffer.
+You allocated two big buffers even though you need only one.
+Since big buffers are rare, it is unlikely that a big buffer
+will be given to a caller that actually <strong>needs</strong>
+a big buffer; it is much more likely to be given to a caller
+that needs a small buffer.
+</p>
+<blockquote CLASS=m><p>
+Bad effect&nbsp;1: Big buffers get wasted on small callers.
+</p>
+</blockquote>
+<p>
+Notice that once a big buffer enters the system,
+it is hard to get rid of,
+since a returned big buffer will be compared against  what
+is likely to be a small buffer,
+and the small buffer will lose.
+</p>
+<blockquote CLASS=m><p>
+Bad effect&nbsp;2: Big buffers rarely go away.
+</p>
+</blockquote>
+<p>
+The only way a big buffer can get freed is if the
+buffer in the cache is itself already a big buffer.
+If instead of a one-entry cache like we have here,
+you keep, say, ten buffers in your buffer cache,
+then in order to free a big buffer, you have to have
+eleven consecutive <code>ReturnBuffer</code> calls,
+all of which pass a big buffer.
+</p>
+<blockquote CLASS=m><p>
+Bad effect&nbsp;3: The more efficient you try to make your
+cache, the more wasteful it gets!
+</p>
+</blockquote>
+<p>
+What's more, when that eleventh call to <code>ReturnBuffer</code>
+is made with a big buffer, it is only the smallest of the
+big buffers that gets freed.
+The biggest buffers stay.
+</p>
+<blockquote CLASS=m><p>
+Bad effect&nbsp;4: When a big buffer does go away,
+it's only because you are keeping an even bigger buffer!
+</p>
+</blockquote>
+<blockquote CLASS=m><p>
+Corollary: The biggest buffer never gets freed.
+</p>
+</blockquote>
+<p>
+What started out as an "obvious" decision in choosing
+which buffer to keep has turned into a performance disaster.
+By favoring big buffers, you allowed them to "poison" the cache,
+and the longer you let the system run, the more allocations
+end up being big "poisoned" buffers.
+It doesn't matter how rare those big blocks are;
+you will eventually end up in this state.
+It's just a matter of time.
+</p>
+<p>
+When the performance team tries to explain this problem to people,
+many of them get the mistaken impression that the problem is
+merely that there is wasted space in the cache.
+But look at our example:
+Our cache has only one entry and we are still wasting over 90%
+of the memory.
+That's because the waste is not in the memory being held by the
+cache, but rather is in the memory that the cache <i>hands out</i>.
+(It's sort of like that scene in <i>It's a Wonderful Life</i>
+where George Bailey is explaining where all the money is.
+It's not in the bank; it's in all the places that got money <i>from</i>
+the bank.)
+</p>
+<p>
+My recommendations:
+</p>
+<ul>
+<li>
+Instrument your cache and understand what your program's
+memory allocation patterns are.</p>
+<li>
+Use that information to pick a size cutoff point beyond which you
+simply will not use the cache at all.
+This ensures that big buffers never get into the cache in the
+first place.
+Choosing this cutoff point is usually extremely easy once you
+look at then allocation histogram.</p>
+<li>
+Although you've taken the big buffers out of the picture,
+you will still have the problem that the small buffers
+will gradually grow up to your cutoff size.
+(<i>I.e.</i>, you still have the same problem, just in miniature.)
+Therefore, if the cache is full, you should just free the
+most recently returned buffer regardless of its size.</p>
+<li>
+Do not use the cached buffer if the waste is too great.
+You might decide to use multiple "buckets" of
+cached entries, say one for buffers below 100 bytes,
+another for buffers between 100 and 200 bytes,
+and so on.
+That way, the waste per allocation is never more than 100 bytes.</p>
+<li>
+Finally, reinstrument your cache to ensure that you're not
+suffering from yet some other pathological behavior that I haven't
+taken into account.
+</ul>
+<p>
+Here's a new <code>ReturnBuffer</code> implementation that takes
+some of the above advice into account.
+Instrumentation shows that three quarters of the allocations
+are in the 100&ndash;200 byte
+range, so let's cap our cache at 200 bytes.
+</p>
+<pre>
+void BufferCache::ReturnBuffer(void *p)
+{
+ if (m_pCache == NULL && LocalSize(p) &lt;= 200) {
+  m_pCache = p;
+ } else {
+  LocalFree(p);
+ }
+}
+</pre>
+<p>
+With this one seemingly-minor change, our efficiency stays above 90%
+and occasionally even gets close to 100%:
+</p>
+<pre>
+0: 1 buffers, 400/400=100% used
+100: 7 buffers, 4300/4400=97.7273% used
+200: 5 buffers, 1800/1800=100% used
+300: 19 buffers, 9800/9800=100% used
+400: 13 buffers, 5100/5100=100% used
+500: 7 buffers, 2500/2600=96.1538% used
+...
+37200: 65 buffers, 129000/130100=99.1545% used
+37300: 55 buffers, 18100/18700=96.7914% used
+37400: 35 buffers, 10400/11000=94.5455% used
+37500: 43 buffers, 10700/11000=97.2727% used
+37600: 49 buffers, 17200/18000=95.5556% used
+37700: 75 buffers, 26000/26800=97.0149% used
+37800: 89 buffers, 30300/31900=94.9843% used
+37900: 91 buffers, 29600/30600=96.732% used
+</pre>
+<p>
+Don't forget to check out performance guru
+<a HREF="http://blogs.msdn.com/ricom/">
+Rico Mariani</a>'s
+reminder that
+<a HREF="http://blogs.msdn.com/ricom/archive/2004/01/19/60280.aspx">
+Caching implies Policy</a>.
+As he explained to me,
+"Cache policy is everything
+so you must be dead certain that your policy is working as you intended.
+A cache with a bad policy is another name for a memory leak."</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (37)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-376043">
+				<div id="div-comment-376043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376043">
+			May 2, 2006 at 11:36 am</a>		</div>
+
+		<p>Adam makes a good point. &nbsp;Free lists for variably sized buffers doesn&#8217;t seem worth it.</p>
+<p>A simpler policy would be to always keep the most recently freed buffer regardless of its size. &nbsp;The zillions of little allocations are the ones that kill performance, so those are the ones you want to satisfy.</p>
+<p>Trying to keep the largest buffer around for re-use seems pointless, since larger allocations are rare (especially once the program reaches its steady state), and larger allocations don&#8217;t tend to fragment the heap as badly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376063">
+				<div id="div-comment-376063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andrew</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376063">
+			May 2, 2006 at 11:47 am</a>		</div>
+
+		<blockquote><p>
+  Therefore, if the cache is full, you should<br />
+  <br />&gt; just free the most recently returned buffer<br />
+  <br />&gt; regardless of its size.</p>
+<p>Why not free the oldest buffer in the cache? Presumably a cache with multiple elements would try to return the buffer that most closely matches the requested size so the oldest buffer is presumably the least desirable size for the current point in time? Or do requested memory allocation sizes typically not exhibit sufficient temporal locality to make the extra logic worthwhile?</p>
+<p>Andrew.</p>
+<p>p.s. Typo in &quot;Choosing this cutoff point is usually extremely easy once you look at then allocation histogram.&quot;
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376113">
+				<div id="div-comment-376113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Axe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376113">
+			May 2, 2006 at 1:21 pm</a>		</div>
+
+		<p>Andrew skipped Alex, Alexander, Alexi, etc.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-376123">
+				<div id="div-comment-376123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376123">
+			May 2, 2006 at 1:32 pm</a>		</div>
+
+		<p>zipping ahead in the alphabet&#8230;</p>
+<p>Why not have the BufferCache keep a list of pointers to caches of varying size? &nbsp;Serve the smallest cached memory that is at least as big as the amount requested.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376133">
+				<div id="div-comment-376133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nawak</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376133">
+			May 2, 2006 at 1:48 pm</a>		</div>
+
+		<p>Still in the correct order&#8230;.</p>
+<p>I never thought about making an &#8216;allocation&#8217; cache and I am glad I did! (Or should I say &#8216;I am glad I did not&#8217;? Since&#8230; well&#8230; I did not)<br />
+<br />As Adam said, some problems are better left to the allocation manager&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376153">
+				<div id="div-comment-376153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Not_Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376153">
+			May 2, 2006 at 2:22 pm</a>		</div>
+
+		<p>One reason for managing your own allocations is to make better use of CPU cache. &nbsp;This is a very specialized problem, and it&#8217;s generally better to add it later.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376163">
+				<div id="div-comment-376163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Orlphar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376163">
+			May 2, 2006 at 2:50 pm</a>		</div>
+
+		<p>Another possibility would be to return parts of a large buffered cache. &nbsp;Ie, if you&#8217;ve got a 500 byte buffer cached and you get a request for a 100 byte buffer and a 200 byte buffer, return first the pointer to the start of the 500 byte buffer, and then a pointer 100 bytes into it for the second.</p>
+<p>Again, you&#8217;d be essentially writing your own heap manager at this point.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-376203">
+				<div id="div-comment-376203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376203">
+			May 2, 2006 at 3:37 pm</a>		</div>
+
+		<p>Maurits: &quot;Why not have BufferCache keep a list of pointers to caches of varying size?&quot; Um, that was one of my recommendations.</p>
+<p>Orlphar: The whole point of these caches is to avoid (as much as possible) the overhead of a full heap manager in the first place.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-376213">
+				<div id="div-comment-376213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376213">
+			May 2, 2006 at 4:00 pm</a>		</div>
+
+		<blockquote><p>
+  use multiple &quot;buckets&quot; of cached entries</p>
+<p>Ah, so it was. &nbsp;Never mind then (sheepish grin)
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376243">
+				<div id="div-comment-376243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://bogol.blogspot.com' rel='external nofollow' class='url'>pHA HA HA</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376243">
+			May 2, 2006 at 5:24 pm</a>		</div>
+
+		<p>im sory raymand but you oughta not comented aftar orlphar. it was al alphaabeticel until tthen. for shame!</p>
+<p>unles its a casesensitve sort? in wich case maurits is teh fly in theh onttment!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376253">
+				<div id="div-comment-376253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://bogol.blogspot.com' rel='external nofollow' class='url'>pIA HA HA</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376253">
+			May 2, 2006 at 5:25 pm</a>		</div>
+
+		<p>p.s. totly cool post btw.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376263">
+				<div id="div-comment-376263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nate</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376263">
+			May 2, 2006 at 5:28 pm</a>		</div>
+
+		<p>You could also use a slab allocator, like available on FreeBSD and Linux.</p>
+<p><a rel="nofollow" target="_new" href="http://citeseer.ist.psu.edu/bonwick94slab.html" rel="nofollow">http://citeseer.ist.psu.edu/bonwick94slab.html</a></p>
+<p>It&#8217;s a bad idea to do your own cache because it encourages memory fragmentation and you don&#8217;t coalesce or free the cache under memory pressure. &nbsp;If your response to this is &quot;ok, I&#8217;ll have a hook that is called in a low memory situation to free my cache&quot;, you don&#8217;t get it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376013">
+				<div id="div-comment-376013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376013">
+			May 2, 2006 at 10:41 am</a>		</div>
+
+		<p>Hmph. In the end, you&#8217;ll just end up with your own heap manager which is not as widely tested as the one that comes with your system.</p>
+<p>If you&#8217;ve got a lot of same-sized items, I&#8217;d say that tracking free lists *might* be worth looking into if the heap manager on your system has *really* bad performance for that particular case. But caching variable sized free lists? That&#8217;s pretty much the definition of what the help manager does.</p>
+<p>If it&#8217;s *that* bad, I&#8217;d have thought a better idea would be to submit a bug report with test case and expected behavior/timings, and hope that the vendor releases a patch to fix the problem. Then *all* applications get to benefit.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376073">
+				<div id="div-comment-376073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ax</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376073">
+			May 2, 2006 at 12:01 pm</a>		</div>
+
+		<p>I&#8217;d be interested in seeing where you see caching &nbsp;algorithms screw up in the same-sized element case. Since the above issue is *very* specific to the variable-sized element case.</p>
+<p>(p.s. Named myself to keep the alphabetical order so far&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376313">
+				<div id="div-comment-376313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">steveg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376313">
+			May 2, 2006 at 8:29 pm</a>		</div>
+
+		<p>Excellent post, Raymond, thanks. Anything that contains &quot;exponential decay distribution&quot; is always good. </p>
+<p>A question though, what sort of performance difference does BufferCache introduce vs a BufferCache-less version?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-376323">
+				<div id="div-comment-376323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376323">
+			May 2, 2006 at 8:38 pm</a>		</div>
+
+		<p>steveg: It all depends on the scenario, but that wasn&#8217;t my point here. (For example, imagine that the buffers were really C++ objects with complicated constructors.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376363">
+				<div id="div-comment-376363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376363">
+			May 3, 2006 at 1:20 am</a>		</div>
+
+		<p>Since the memory in question is probably virtually mapped, will it really matter, so long as the address space isn&#8217;t exhausted?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding odd alt thread-odd thread-alt depth-1" id="comment-376373">
+				<div id="div-comment-376373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376373">
+			May 3, 2006 at 2:04 am</a>		</div>
+
+		<p>Cooney: It most definately will matter. The way it was originally written not only wastes memory, but you also end up with a pretty badly fragmented virtual address space (since you keep allocating bigger and bigger buffers, and only deallocating the small ones).</p>
+<p>Fragmentation of the virtual address space is possibly the biggest killer when writing long-running (i.e. server) applications.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376423">
+				<div id="div-comment-376423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376423">
+			May 3, 2006 at 5:25 am</a>		</div>
+
+		<blockquote><p>
+  If you&#8217;ve got a lot of same-sized items</p>
+<p>&#8230; then you should consider an arena allocator.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376473">
+				<div id="div-comment-376473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">josh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376473">
+			May 3, 2006 at 10:31 am</a>		</div>
+
+		<p>If you&#8217;re gonna have a limit that the size is guaranteed to grow to eventually, why not just allocate that much to begin with and avoid some of the extra processing?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376483">
+				<div id="div-comment-376483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mr.Pedantic</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376483">
+			May 3, 2006 at 10:35 am</a>		</div>
+
+		<blockquote><p>
+  Why is this a flawed design? </p>
+<p>Well, the freeing of the NULL pointer was a bit of a giveaway:</p>
+<p>&gt;if (!m_pCache || cb &gt; LocalSize(m_pCache)) &nbsp; &gt;LocalFree(m_pCache); </p>
+<p>Oh, you mean there were other flaws too? :-).
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-376493">
+				<div id="div-comment-376493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376493">
+			May 3, 2006 at 10:42 am</a>		</div>
+
+		<p>josh: So you&#8217;re saying we should&#8217;ve just allocated 1MB buffers and handed them out, even if the caller asked for only 100 bytes?</p>
+<p>Pedantic: LocalFree is explicitly documented as accepting NULL (and treating it as a nop).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376563">
+				<div id="div-comment-376563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://forbidden-planet.blogspot.com' rel='external nofollow' class='url'>richard</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376563">
+			May 3, 2006 at 1:30 pm</a>		</div>
+
+		<p>Hmmm … the voice sounds decidedly unlike you (not that I would know your voice from anything other than your blogs).</p>
+<p>Personally, I think that sort of caching policy sounds stupid. People need to implement first, optimize later.</p>
+<p>Then when they get to the optimization part, they need to learn to actually test and measure rather than going by gut. If I had nickel every time someone pointed to the code and said “It’s the string handling that is killing the performance,” I’d probably be near a dollar. If I gave back a quarter for every time it was string handling / manipulation that was at fault … gee, I’d still be near a dollar.</p>
+<p>People have intuitive feelings about performance that are usually dead wrong. And then machismo kicks in and nobody wants to admit they were wrong, so a whole lot of effort goes into wringing out a modicum of performance.</p>
+<p>While we are no longer trying to shoehorn applications into a 1KB footprint, memory is still not free. </p>
+<p>If I had to implement that optimization, I would probably profile the memory request distribution; establish a threshold based on that analysis and only cache those memory blocks which fall below a certain threshold. Large memory blocks would be allocated and freed as needed (since they are rare occurrences).<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376613">
+				<div id="div-comment-376613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Eli</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376613">
+			May 3, 2006 at 8:52 pm</a>		</div>
+
+		<p>Someone should show the Firefox team this.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376623">
+				<div id="div-comment-376623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ChrisW</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376623">
+			May 3, 2006 at 10:37 pm</a>		</div>
+
+		<p>Other negatives about private allocators even when they use the system heap manager include:</p>
+<p>1. Tools for finding heap overruns tend not to work. &nbsp;Application Verifier (debug heap) becomes close to useless.</p>
+<p>2. The new mitigations for heap overruns put into XPSP2 etc are bypassed, so it will be easier to write exploits if there is a heap overrun.</p>
+<p>3. Leak detection tools will be confused, or not. &nbsp;But if you tell a developer that these blocks looked leaked and they are on his special free list, he will be less interested in hearing from you the next time.</p>
+<p>4. I have seen a very famous internet facing component that had its own private heap manager on top of the Windows heap, with a policy to clear the cache when it got up to some limit. &nbsp;Testers were told, and they tested that condition. &nbsp;The problem was when it cleared it the first time, it set its state variables such that it never cleared the cache again. &nbsp;That took a while to figure out.</p>
+<p>net net: I&#8217;m against private allocators. &nbsp;Many of them in my experience have outlived their usefulness.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-376643">
+				<div id="div-comment-376643" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">josh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376643">
+			May 4, 2006 at 1:02 am</a>		</div>
+
+		<p>&quot;So you&#8217;re saying we should&#8217;ve just allocated 1MB buffers and handed them out, even if the caller asked for only 100 bytes?&quot;</p>
+<p>No, of course not. &nbsp;I&#8217;m not quite sure what I was thinking&#8230; now that I look at it again your buffering here seems much simpler than it did this morning. &nbsp;:/</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-376683">
+				<div id="div-comment-376683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-376683">
+			May 4, 2006 at 2:59 am</a>		</div>
+
+		<p>One big reason to use a cache (or otherwise similar memory management system that you design) is if you can get away with avoiding synchronization hits on memory allocation. That&#8217;s more to do with a custom memory allocator and less to do with a cache, but it is a reason one would do it &#8211; and it can result in shockingly impressive performance benefits in the right kind of system.</p>
+<p>The cache part&#8230;yeah, Rico&#8217;s notes about &#8216;DO NOT CACHE UNLESS YOU KNOW YOU NEED TO&#8217; always stuck with me. Caching in such a way that is both correct and improves performance significantly is a hard problem and changes the behavior of your system. It&#8217;s not something to undertake haphazardly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-377223">
+				<div id="div-comment-377223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">rsclient</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-377223">
+			May 4, 2006 at 2:42 pm</a>		</div>
+
+		<p>I&#8217;ll tell my cache war story:</p>
+<p>It was a dark and stormy night. &nbsp;The project made heavy use of STL (in the days when the &#8216;S&#8217; in STL was a cruel joke), exceptions (in the days when exceptions were new) and threads (again, in the days when threads didn&#8217;t have very good support). &nbsp;As a mere contractor working on a port, I had no say in the design of the project: I just had to port it.</p>
+<p>The compiler, alas, could support either exceptions or threads, but not both (there was even a comment in the compiler code about this). &nbsp;My group decided to keep the exceptions, but turn all the threads into processes, and &quot;just&quot; share all the memory between the process using shared memory. This means that I had to write my own memory allocator. &nbsp;Worse, once it allocated one block, it could never allocate another.</p>
+<p>As Raymond says: caches are hard. &nbsp;You get a bunch of choices about picking the right block to give back, and choices about when to consolidate blocks. &nbsp;In no case should you do this without lots of stress testing. &nbsp;We had one particular pattern of allocate/release that just killed the allocator &#8212; the code &quot;looked&quot; OK, but the result was to always take a &#8216;big&#8217; block, chop a bit off of it, and never be able to use it again&#8230;yuck!</p>
+<p>Recommendations: when in doubt, don&#8217;t cache. &nbsp;If you do, cache similar-size objects together. &nbsp;Plan to spend a week stress-testing the cache and verifying that it&#8217;s not causing Massive Headaches. &nbsp;Add the cache-validation logic early; you&#8217;re going to need it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-377603">
+				<div id="div-comment-377603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Boyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-377603">
+			May 5, 2006 at 1:29 pm</a>		</div>
+
+		<p>So handing back a buffer that is larger than you asked for is a bad thing?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-378383">
+				<div id="div-comment-378383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-378383">
+			May 8, 2006 at 11:22 pm</a>		</div>
+
+		<p>unless it is flushed, of course.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-379033">
+				<div id="div-comment-379033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://amanjit-gill.de' rel='external nofollow' class='url'>Amanjit Gill</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-379033">
+			May 10, 2006 at 5:17 am</a>		</div>
+
+		<p>Hi, </p>
+<p>&quot;the heap manager&quot; is actually an interesting beast. Especially with the combo VC7 + Dinkumware Std Lib. C++ tends to stress the heap manager regarding allocation/deallocation of small values (there are best practices about how to avoid that). We can use custom Allocators to manage the memory business for our container, and also to see when things get created, destroyed, alloced or freed&#8230; see </p>
+<p><a rel="nofollow" target="_new" href="http://www.josuttis.com/cppcode/myalloc.hpp.html" rel="nofollow">http://www.josuttis.com/cppcode/myalloc.hpp.html</a></p>
+<p>for an example. Then begin to scratch your head when you do a vector.resize(len*3) for a vector of small POD structs; The default impl directly calls malloc and bombards the heap manager with dozens of requests of small sizes, slowing down everything. This is not the Dinkumware lib bashing post, I am glad I have a very conforming implementation&#8230; REALLY&#8230; .) still I investigated the whole issue and found out </p>
+<p>1. you really want to use the low fragmenting heap if you are effectively trying to fragment it. Its off with Win XP Pro and later OSes!</p>
+<p>ULONG HeapFragValue = 2;<br />
+<br />HeapSetInformation((HANDLE)_get_heap_handle(), HeapCompatibilityInformation, &amp;HeapFragValue, sizeof(HeapFragValue)); &nbsp; &nbsp;</p>
+<p>and/or </p>
+<p>_set_sbh_threshold(128); </p>
+<p>and watch the performance of your c++ app increase (for the use case of small allocs and deallocs, of course)</p>
+<p>2. you really want to use a custom allocator with c++ std containers to release some stress from the win32 heap manager</p>
+<p>the easiest way to achieve this is to use a different malloc in a custom allocator, for example doug lea&#8217;s malloc (dmalloc), which is also in glibc I think (as ptmalloc). I came up with this idea, because my P3 450/256MB RAM would resize my hashmap&#8217;s buckets faster than a P4 2.4GHz Notebook!!! I love vc6/7 but this was blowing me away. I simply called dmalloc and dfree in my custom allocator and the performance would at least double. </p>
+<p>3. you should evaluate something less conforming, but sometimes more performant</p>
+<p>STLPort. std::list, strings and stringstreams are a whole lot faster, or at least deserve a closer look during a performance evaluation</p>
+<p>Of course, there are a whole bunch of c++ techniques to avoid massive heap allocations, but I do not think resizing a vector of small POD objects should effectively fragement the heap. </p>
+<p>Weird stuff!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-379043">
+				<div id="div-comment-379043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://amanjit-gill.de' rel='external nofollow' class='url'>Amanjit Gill</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-379043">
+			May 10, 2006 at 5:42 am</a>		</div>
+
+		<p>The p3/450 was actually running linux (debian sarge). And the same c++ app (my own hasmap implementation) ran 3 times faster on linux than on a p4/2400 Win2003 Std Edition / VC7 / Dinkumware STL. It tested HashMap&lt; std::string, long&gt; which of courses means tons of allocations (worst corse test))</p>
+<p>But then again, massive hashmap insertions and deletions with constant bucket size ideally measure the bandwidth between the CPU and memory (bucket access is basically array access), so It could be that the p3 and the p4 do not differ too much in this aspect.</p>
+<p>bottom line: the combination of small heap allocations and c++ always deserve a closer look. Also Caching and Pooling can be are solution (depends)</p>
+<p>cheers</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-379093">
+				<div id="div-comment-379093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ashod Nakashian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-379093">
+			May 10, 2006 at 9:17 am</a>		</div>
+
+		<p>Raymond, you go a long way to show some interesting facts. Great article, although sometimes I think you have too much free time!</p>
+<p>I learned about this case when I was asked to write a high-performance memory manager for a industrial software that would alloc/free 10s of GB&#8217;s of data over a period of 10-12 days in a single run with a final working set of about 20GBs (of course on 64-bit windows and linux systems). Profilling was by far the biggest lesson to learn although not the only important one. I must add that profilling a program like that is not an easy task, considering there is very little &#8216;small&#8217; intput data to use, and reading/grepping through MB&#8217;s worth of logs is your only friend.</p>
+<p>-Ash</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-380663">
+				<div id="div-comment-380663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Nathanael Nerode</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-380663">
+			May 14, 2006 at 12:08 am</a>		</div>
+
+		<p>Why not just fix the heap manager?</p>
+<p>I mean, geez. &nbsp;Avoiding the heap manager is silly: you end up writing your own heap manager.</p>
+<p>If the general-purpose heap manager doesn&#8217;t work for you, use a different, special-purpose implementation instead. &nbsp;(In UNIX-land, this would be called a &quot;replacement malloc&quot;.) &nbsp;I believe there are essentially off-the-shelf implementations for all of the major memory use cases.</p>
+<p>This blog entry is great advice for the writers of heap managers, but not so much for everyone else!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-519043">
+				<div id="div-comment-519043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/ricom/archive/2007/06/25/caching-redux.aspx' rel='external nofollow' class='url'>Rico Mariani's Performance Tidbits</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-519043">
+			June 25, 2007 at 11:47 am</a>		</div>
+
+		<p>I got some interesting questions about how to build good middle-tier caches in my inbox last week. I</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-566913">
+				<div id="div-comment-566913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.philosophicalgeek.com/2007/11/13/instant-searching-and-filtering-in-net-part-4/' rel='external nofollow' class='url'>Philosophical Geek &raquo; Instant Searching and Filtering in .Net - Part 4</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-566913">
+			November 13, 2007 at 6:47 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.philosophicalgeek.com/2007/11/13/instant-searching-and-filtering-in-net-part-4/" rel="nofollow">http://www.philosophicalgeek.com/2007/11/13/instant-searching-and-filtering-in-net-part-4/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-609503">
+				<div id="div-comment-609503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.roblevine.co.uk/?p=13' rel='external nofollow' class='url'>RoBlog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20060502-07/?p=31333#comment-609503">
+			March 12, 2008 at 12:17 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://blog.roblevine.co.uk/?p=13" rel="nofollow">http://blog.roblevine.co.uk/?p=13</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

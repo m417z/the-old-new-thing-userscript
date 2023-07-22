@@ -1,0 +1,547 @@
+<html>
+<head>
+<title>Another way to create a process with attributes, maybe worse maybe better</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Another way to create a process with attributes, maybe worse maybe better</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 26, 2013 / year-entry #114</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>17</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Adam Rosenfield noted that "those sure are a lot of hoops you have to jump through to solve this unusual problem" of specifying which handles are inherited by a new process. Well, first of all, what's so wrong with that? You have to jump through a lot of hoops when you are in an unusual...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Adam Rosenfield noted that
+"<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2011/12/16/10248328.aspx#10248973"
+>those sure are a lot of hoops you have to jump through to solve
+this unusual problem</a>"
+of specifying which handles are inherited by a new process.
+</p>
+<p>
+Well, first of all,
+what's so wrong with that?
+You have to jump through a lot of hoops when you are in an unusual
+situation.
+But by definition, most people are not in an unusual situation,
+so it's an instance of the
+<i>Pay for Play</i> principle:
+The simple case should be easy,
+and it's okay for the complicated case to be hard.
+(It's usually difficult to make the complicated case easy;
+that's why it's called the complicated case.)
+</p>
+<p>
+The complexity mostly comes from managing the general-purpose
+<code>PROC_<wbr>THREAD_<wbr>ATTRIBUTE_<wbr>LIST</code>,
+which is used for things other than just controlling inherited handles.
+It's a generic way of passing up to <i>N</i> additional parameters to
+<code>Create&shy;Process</code> without having to create
+2&#x1D3A; different variations of
+<code>Create&shy;Process</code>.
+</p>
+<p>
+The
+<code>Create&shy;Process&shy;With&shy;Explicit&shy;Handles</code>
+function was just one of the <i>N</i> special-purpose functions
+that the
+<code>PROC_<wbr>THREAD_<wbr>ATTRIBUTE_<wbr>LIST</code>
+tried to avoid having to create.
+And the special-purpose function naturally takes the special-purpose
+case and applies the general solution to it.
+It's complicated because you are now doing something complicated.
+</p>
+<p>
+That said, here's one attempt to make it less complicated:
+By putting all the complicated stuff closer to the complicated
+function:
+</p>
+<pre>
+<font COLOR=blue>typedef struct PROCTHREADATTRIBUTE {
+ DWORD_PTR Attribute;
+ PVOID lpValue;
+ SIZE_T cbSize;
+} PROCTHREADATTRIBUTE;</font>
+
+BOOL CreateProcessWith<font COLOR=blue>Attributes</font>(
+  __in_opt     LPCTSTR lpApplicationName,
+  __inout_opt  LPTSTR lpCommandLine,
+  __in_opt     LPSECURITY_ATTRIBUTES lpProcessAttributes,
+  __in_opt     LPSECURITY_ATTRIBUTES lpThreadAttributes,
+  __in         BOOL bInheritHandles,
+  __in         DWORD dwCreationFlags,
+  __in_opt     LPVOID lpEnvironment,
+  __in_opt     LPCTSTR lpCurrentDirectory,
+  __in         LPSTARTUPINFO lpStartupInfo,
+  __out        LPPROCESS_INFORMATION lpProcessInformation,
+    // here is the new stuff
+    <font COLOR=blue>__in       DWORD cAttributes,
+    __in_ecount(cAttributes) const PROCTHREADATTRIBUTE rgAttributes[]</font>)
+{
+ BOOL fSuccess;
+ BOOL fInitialized = FALSE;
+ SIZE_T size = 0;
+ LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList = NULL;
+
+ fSuccess = InitializeProcThreadAttributeList(NULL, <font COLOR=blue>cAttributes</font>, 0, &amp;size) ||
+            GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+
+ if (fSuccess) {
+  lpAttributeList = reinterpret_cast&lt;LPPROC_THREAD_ATTRIBUTE_LIST&gt;
+                                (HeapAlloc(GetProcessHeap(), 0, size));
+  fSuccess = lpAttributeList != NULL;
+ }
+ if (fSuccess) {
+  fSuccess = InitializeProcThreadAttributeList(lpAttributeList,
+                    <font COLOR=blue>cAttributes</font>, 0, &amp;size);
+ }
+ if (fSuccess) {
+  fInitialized = TRUE;
+  <font COLOR=blue>for (DWORD index = 0; index &lt; cAttributes &amp;&amp; fSuccess; index++) {</font>
+   fSuccess = UpdateProcThreadAttribute(lpAttributeList,
+                     0, <font COLOR=blue>rgAttributes[index].Attribute,
+                     rgAttributes[index].lpValue,
+                     rgAttributes[index].cbSize</font>, NULL, NULL);
+  }
+ }
+ if (fSuccess) {
+  STARTUPINFOEX info;
+  ZeroMemory(&amp;info, sizeof(info));
+  info.StartupInfo = *lpStartupInfo;
+  info.StartupInfo.cb = sizeof(info);
+  info.lpAttributeList = lpAttributeList;
+  fSuccess = CreateProcess(lpApplicationName,
+                           lpCommandLine,
+                           lpProcessAttributes,
+                           lpThreadAttributes,
+                           bInheritHandles,
+                           dwCreationFlags | EXTENDED_STARTUPINFO_PRESENT,
+                           lpEnvironment,
+                           lpCurrentDirectory,
+                           &amp;info.StartupInfo,
+                           lpProcessInformation);
+ }
+
+ if (fInitialized) DeleteProcThreadAttributeList(lpAttributeList);
+ if (lpAttributeList) HeapFree(GetProcessHeap(), 0, lpAttributeList);
+ return fSuccess;
+}
+</pre>
+<p>
+There, now the complexity is there because you're a generic
+complex function,
+so you have no reason to complain.
+</p>
+<p>
+A caller of this function might go like this:
+</p>
+<pre>
+  HANDLE handles[2] = { handle1, handle2 };
+  const PROCTHREADATTRIBUTE attributes[] = {
+   {
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    handles,
+    sizeof(handles),
+   },
+  };
+
+  fSuccess = CreateProcessWithAttributes(
+                           lpApplicationName,
+                           lpCommandLine,
+                           lpProcessAttributes,
+                           lpThreadAttributes,
+                           bInheritHandles,
+                           dwCreationFlags,
+                           lpEnvironment,
+                           lpCurrentDirectory,
+                           lpStartupInfo,
+                           lpProcessInformation,
+                           ARRAYSIZE(attributes),
+                           attributes);
+</pre>
+<p>
+Adam hates the "chained success" style and prefers the "goto" style;
+on the other hand, other people hate gotos.
+So to be fair, I will choose a coding style that nobody likes.
+That way everybody is equally unhappy.
+</p>
+<pre>
+BOOL CreateProcessWithAttributes(
+  __in_opt     LPCTSTR lpApplicationName,
+  __inout_opt  LPTSTR lpCommandLine,
+  __in_opt     LPSECURITY_ATTRIBUTES lpProcessAttributes,
+  __in_opt     LPSECURITY_ATTRIBUTES lpThreadAttributes,
+  __in         BOOL bInheritHandles,
+  __in         DWORD dwCreationFlags,
+  __in_opt     LPVOID lpEnvironment,
+  __in_opt     LPCTSTR lpCurrentDirectory,
+  __in         LPSTARTUPINFO lpStartupInfo,
+  __out        LPPROCESS_INFORMATION lpProcessInformation,
+    // here is the new stuff
+    __in       DWORD cAttributes,
+    __in_ecount(cAttributes) const PROCTHREADATTRIBUTE rgAttributes[])
+{
+ BOOL fSuccess = FALSE;
+ SIZE_T size = 0;
+
+ if (InitializeProcThreadAttributeList(NULL, cAttributes, 0, &amp;size) ||
+     GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+  LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList =
+         reinterpret_cast&lt;LPPROC_THREAD_ATTRIBUTE_LIST&gt;
+                                (HeapAlloc(GetProcessHeap(), 0, size));
+  if (lpAttributeList != NULL) {
+   if (InitializeProcThreadAttributeList(lpAttributeList,
+                     cAttributes, 0, &amp;size)) {
+    DWORD index;
+    for (index = 0;
+         index &lt; cAttributes &amp;&amp;
+         UpdateProcThreadAttribute(lpAttributeList,
+                       0, rgAttributes[index].Attribute,
+                       rgAttributes[index].lpValue,
+                       rgAttributes[index].cbSize</font>, NULL, NULL);
+         index++) {
+    }
+    if (index &gt;= cAttributes) {
+     STARTUPINFOEX info;
+     ZeroMemory(&amp;info, sizeof(info));
+     info.StartupInfo = *lpStartupInfo;
+     info.StartupInfo.cb = sizeof(info);
+     info.lpAttributeList = lpAttributeList;
+     fSuccess = CreateProcess(
+                           lpApplicationName,
+                           lpCommandLine,
+                           lpProcessAttributes,
+                           lpThreadAttributes,
+                           bInheritHandles,
+                           dwCreationFlags | EXTENDED_STARTUPINFO_PRESENT,
+                           lpEnvironment,
+                           lpCurrentDirectory,
+                           &amp;info.StartupInfo,
+                           lpProcessInformation);
+    }
+    DeleteProcThreadAttributeList(lpAttributeList);
+   }
+   HeapFree(GetProcessHeap(), 0, lpAttributeList);
+  }
+ }
+
+ return fSuccess;
+}
+</pre>
+<p>
+Those who are really adventuresome
+could try a version of
+<code>Create&shy;Process&shy;With&shy;Attributes</code>
+that uses varargs or
+<code>std::initializer_list</code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (17)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-1052853">
+				<div id="div-comment-1052853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052853">
+			April 26, 2013 at 7:31 am</a>		</div>
+
+		<p>Does anybody not like return-on-failure?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1052863">
+				<div id="div-comment-1052863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mordachai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052863">
+			April 26, 2013 at 7:47 am</a>		</div>
+
+		<p>Generally speaking, I prefer return-on-failure, but am comfortable with any of those three styles (return-on-error, chained success, nested if&#39;s); but my favorite is to use C++ and some sort of RAII mechanic (such as lambdas + ScopeGuard to generate the auto-exit-cleanup-on-success in combination with return-on-failure, so that the later failures in the chain still undo the former successes).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1052873">
+				<div id="div-comment-1052873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052873">
+			April 26, 2013 at 7:48 am</a>		</div>
+
+		<p>Hate is such a strong word. &nbsp;But in all fairness, the highly-nested-if-statements style does make me about equally unhappy as it makes fans of the chained-success style.</p>
+<p>@Maurits: I love return-on-failure. &nbsp;It&#39;s like gotos without the gotos. &nbsp;But in this case, you&#39;d need to make sure to use RAII to avoid resource leaks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1052883">
+				<div id="div-comment-1052883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052883">
+			April 26, 2013 at 8:02 am</a>		</div>
+
+		<p>Am I the only one who would have written that as throw-on-failure (combined with RAII)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1052903">
+				<div id="div-comment-1052903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mordachai</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052903">
+			April 26, 2013 at 9:26 am</a>		</div>
+
+		<p>Throw on failure is a gray area, in my book. &nbsp;</p>
+<p>I like it for a lot of things, but in a case like this, the wrapper function is essentially giving the same basic interface as the function its wrapping&#8230; so I&#39;d probably choose to do as Raymond did, and put it in a low-level WinAPI extensions library, then, if I wanted throw-on-failure, I&#39;d further wrap the interface in C++ using perhaps std::initialize_list that threw on failure, to make it entirely RAII and C++ friendly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1052983">
+				<div id="div-comment-1052983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052983">
+			April 26, 2013 at 10:42 am</a>		</div>
+
+		<blockquote><p>
+  &gt; So to be fair, I will choose a coding style that nobody likes.
+</p></blockquote>
+<p>The wisdom of Solomon.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1052993">
+				<div id="div-comment-1052993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1052993">
+			April 26, 2013 at 10:44 am</a>		</div>
+
+		<p>I&#39;ve worked on several projects where return anywhere other than the end of the function was not permitted. &nbsp;So, yes, there are some people who do not like return-on-failure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1053043">
+				<div id="div-comment-1053043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JDP</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053043">
+			April 26, 2013 at 11:25 am</a>		</div>
+
+		<blockquote><p>
+  &gt; I will choose a coding style that nobody likes
+</p></blockquote>
+<p>Just like everybody else.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1053083">
+				<div id="div-comment-1053083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">kjh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053083">
+			April 26, 2013 at 11:48 am</a>		</div>
+
+		<p>&quot;Does anybody not like return-on-failure?&quot;</p>
+<p>Yes. There are, believe it or not, still hardcore proponents of SESE (single entry, single exit) out there. I&#39;m not one of them but several of my university CS profs were.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1053093">
+				<div id="div-comment-1053093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053093">
+			April 26, 2013 at 12:02 pm</a>		</div>
+
+		<blockquote><p>
+  I&#39;m not one of them but several of my university CS profs were.
+</p></blockquote>
+<p>Probably because the graph looks nicer :-)</p>
+<p>(I seethe with indignity when someone suggests that the opinion of a code analysis tool is worth more than the opinion of me, a practitioner in the art of designing, implementing, shipping, AND SUPPORTING said code, over what makes code &#39;better&#39; structured)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1053133">
+				<div id="div-comment-1053133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Derlin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053133">
+			April 26, 2013 at 3:59 pm</a>		</div>
+
+		<p>I once worked on a project with a Single Entry, Single Exit coding standard. &nbsp;Some of our functions checked for quite a few error conditions, so this made the nested ifs quite frustrating. &nbsp;I proceeded to write a giant switch statement where the code would break after setting an appropriate error code. &nbsp;I was accused of violating the spirit of the coding standard, by using a &quot;goto&quot; without the keyword &quot;goto&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1053143">
+				<div id="div-comment-1053143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053143">
+			April 26, 2013 at 5:29 pm</a>		</div>
+
+		<p>@Derlin a similar meme is to have a big &quot;do { &#8230; } while (FALSE);&quot; around the function, with break-on-failure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1053153">
+				<div id="div-comment-1053153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053153">
+			April 26, 2013 at 6:24 pm</a>		</div>
+
+		<p>Maurits: The advantage of a &quot;switch&quot; is that you can violate the spirit of Single-Entry just as easily as you can violate the spirit of Single-Exit!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1053163">
+				<div id="div-comment-1053163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Myria</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053163">
+			April 26, 2013 at 8:24 pm</a>		</div>
+
+		<p>It&#39;s interesting how it took until Windows Vista to expose this feature that&#39;s been in the native NT API since at least NT 4.0 to the Win32 layer. &nbsp;Another feature exposed by these attribute lists in Windows Vista is parent process &#8211; NT 4.0&#39;s NtCreateProcess function already let you specify the parent process. &nbsp;These may even go as far back as NT 3.1, but I don&#39;t have a way to know.</p>
+<p>Here&#39;s a feature I&#39;d like to see for Windows 9, that would be an actual new feature: the ability to put a job object as an attribute. &nbsp;Right now, if you want explicitly to put a child process into a job you create but are not in, you have to CreateProcess as suspended then AssignProcessToJobObject. &nbsp;This leaves a small window inside which crashing the parent process could result in leaving the child process suspended as a zombie.</p>
+<p>@Maurits [MSFT]: Except that Visual Studio will complain about the conditional expression being constant&#8230; &gt;.&lt; &nbsp;As a result, I tend to use &quot;for (;;)&quot; with a &quot;break;&quot; at the end.</p>
+<p>I wish C++ had Java&#39;s syntax of &quot;break label;&quot; and &quot;continue label;&quot; to break or continue a loop other than the current innermost one.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1053193">
+				<div id="div-comment-1053193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">me2</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053193">
+			April 27, 2013 at 5:16 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; I wish C++ had Java&#39;s syntax of &quot;break label;&quot; and &quot;continue label;&quot; to break or continue a loop other than the current innermost one.
+</p></blockquote>
+<p>it is called &quot;goto&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1053253">
+				<div id="div-comment-1053253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mario</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053253">
+			April 29, 2013 at 3:41 am</a>		</div>
+
+		<p>one question&#8230; why did you use reinterpret_cast instead of static_cast in:</p>
+<p>LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList =</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; reinterpret_cast&lt;LPPROC_THREAD_ATTRIBUTE_LIST&gt;</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;(HeapAlloc(GetProcessHeap(), 0, size));</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1053373">
+				<div id="div-comment-1053373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20130426-00/?p=4543#comment-1053373">
+			April 29, 2013 at 8:25 am</a>		</div>
+
+		<p>The original meaning of &quot;single-entry single-exit&quot; has nothing to do with having only one return instruction in the function. It has to do with having multiple entry points in a function and multiple return addresses, both not made possible with structured languages like plain C/C++.</p>
+<p><a rel="nofollow" target="_new" href="http://programmers.stackexchange.com/questions/118703/where-did-the-notion-of-one-return-only-come-from/118793#118793" rel="nofollow">programmers.stackexchange.com/&#8230;/118793</a></p>
+<p>So please, call it &quot;one return only&quot;.</p>
+<p>In practice, it&#39;s stupid doctrine. Imagine forcing one return only in languages that implicitly return from the last executable statement: you&#39;d have to declare a return variable, an extra last statement and assign to that variable instead of letting the value(s) be returned :P blah</p>
+<p>DISCLAIMER: I&#39;m not an unconditional fan of multiple return instructions either, I adopt whatever makes the easiest to read and/or maintain, rarely ever thinking about performance because it doesn&#39;t matter for 99.99% of cases, for which profiling will aid better than wild assumptions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

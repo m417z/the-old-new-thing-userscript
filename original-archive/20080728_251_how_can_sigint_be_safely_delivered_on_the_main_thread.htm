@@ -1,0 +1,437 @@
+<html>
+<head>
+<title>How can SIGINT be safely delivered on the main thread?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How can SIGINT be safely delivered on the main thread?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>July 28, 2008 / year-entry #252</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Commenter AnotherMatt wonders why Win32 console programs deliver console notifications on a different thread. Why doesn't it deliver them on the main thread? Actually, my question is the reverse. Why does unix deliver it on the main thread? It makes it nearly impossible to do anything of consequence inside the signal handler. The main thread...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Commenter
+<a HREF="http://blogs.msdn.com/oldnewthing/pages/407234.aspx#524742">
+AnotherMatt</a> wonders why Win32 console programs deliver console
+notifications on a different thread.
+Why doesn't it deliver them on the main thread?
+</p>
+<p>
+Actually, my question is the reverse.
+Why does unix deliver it on the main thread?
+It makes it
+<a HREf="https://www.securecoding.cert.org/confluence/display/seccode/SIG31-C.+Do+not+access+or+modify+shared+objects+in+signal+handlers">
+nearly impossible to do anything of consequence
+inside the signal handler</a>.
+The main thread might be inside the heap manager (holding the heap
+critical section) when the signal is raised.
+If the signal handler tried to access the heap, it would deadlock
+with itself if you're lucky, or just corrupt the heap if you aren't.
+</p>
+<p>
+For example, consider this signal handler:
+</p>
+<pre>
+void catch_int(int sig_num)
+{
+    /* re-set the signal handler again to catch_int, for next time */
+    signal(SIGINT, catch_int);
+    /* and print the message */
+    printf("Don't do that");
+    fflush(stdout);
+}
+</pre>
+<p>
+What happens if the signal is raised while the main program is
+executing its own <code>fflush</code>, say after it had already
+flushed half the buffer?
+If two threads called <code>fflush</code>, the second caller would
+wait for the first to complete.
+But here, it's all coming from within the same thread;
+the second caller can't wait for the first caller to return,
+since the first caller can't run until the second caller returns!
+</p>
+<p>
+(Note also that this signal handler potentially modifies <code>errno</code>,
+which can lead to "impossible" bugs in the main program.)
+</p>
+<p>
+Win32 doesn't believe in interrupt user-mode code with other
+user-mode code asynchronously because it makes it impossible to reason
+about the state of the process.
+Delivering the console notification on a second
+thread means that if the second thread tries to access the heap
+while the first thread is inside the heap manager,
+the second thread will dutifully wait for the heap to stabilize
+before it goes ahead and starts mucking with it.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-650003">
+				<div id="div-comment-650003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650003">
+			July 28, 2008 at 10:16 am</a>		</div>
+
+		<p>This is the same reason you had to be careful about what calls you made in TSRs.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650013">
+				<div id="div-comment-650013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650013">
+			July 28, 2008 at 10:21 am</a>		</div>
+
+		<p>&quot;Why does unix deliver it on the main thread?&quot;</p>
+<p>History. IIRC, threads and the paraphernalia surrounding them weren&#8217;t standardised for quite a while, but POSIX needed to define a way of working with signals. So setting a sig_atomic_t, which can be tested on the main (single) thread later, was defined as The Right Thing. When POSIX later standardised threads, it needed to do so in a stable backwards-compatible manner. Sending signals to the main thread where the old Right Thing still worked is fine, as it means that you don&#8217;t have to fiddle with unrelated parts of your program just because one part of it (or a library you now want to use) wants to add threading support.</p>
+<p>Fortunately, with signalfd()[0] in Linux 2.6.22/glibc 2.8 signal delivery becomes part of the &quot;everything is a file&quot; unix philosophy and can be waited on with select()/poll()/epoll()/etc&#8230; which is a lot more elegant than asynchronous syscall-interrupting delivery.</p>
+<p>With timerfd()[1] from Linux 2.6.25 things get tidier still.</p>
+<p>(Hopefully, in the distant future, these might get ported to other unixen, and then even further down the line standardised by POSIX as an alternate way to handle signals.)</p>
+<p>I haven&#8217;t looked into it closely, but I suspect that Plan9[2] will have already been doing this for a while&#8230; :)</p>
+<p>[0] <a rel="nofollow" target="_new" href="http://kerneltrap.org/man/linux/man2/signalfd.2" rel="nofollow">http://kerneltrap.org/man/linux/man2/signalfd.2</a></p>
+<p>[1] <a rel="nofollow" target="_new" href="http://kerneltrap.org/man/linux/man2/timerfd_create.2" rel="nofollow">http://kerneltrap.org/man/linux/man2/timerfd_create.2</a></p>
+<p>[2] <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Plan_9_from_Bell_Labs" rel="nofollow">http://en.wikipedia.org/wiki/Plan_9_from_Bell_Labs</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650023">
+				<div id="div-comment-650023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.koroirc.com/' rel='external nofollow' class='url'>Koro</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650023">
+			July 28, 2008 at 10:42 am</a>		</div>
+
+		<p>Makes me think, I&#8217;d love if Unix had WSAEventSelect/WaitForMultipleObjects. Makes all threaded socket code SOOOO much easier. Just wait on both the socket event and a &quot;cancel&quot; event.</p>
+<p>In fact, just having a WaitForMultipleObjects equivalent would be more than enough. It seems everything in Unix has their own function to wait on them which are separate.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650033">
+				<div id="div-comment-650033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650033">
+			July 28, 2008 at 10:57 am</a>		</div>
+
+		<p>Koro &gt; If you supply your cancel event via a file descriptor (e.g. a pipe(2)) then you can wait on it and a socket with select()/poll()/epoll().</p>
+<p>If you&#8217;re on Linux (and some other unices, but you&#8217;ll have to check the documentation to know which) then you can reliably write() to a file descriptor created with pipe() in a signal handler.</p>
+<p>A search for &quot;self-pipe trick&quot;[0] will give you more info.</p>
+<p>[0] <a rel="nofollow" target="_new" href="http://www.google.com/search?q=%22self-pipe+trick%22" rel="nofollow">http://www.google.com/search?q=%22self-pipe+trick%22</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650043">
+				<div id="div-comment-650043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alexander Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650043">
+			July 28, 2008 at 11:05 am</a>		</div>
+
+		<p>&quot;Fortunately, with signalfd()[0] in Linux 2.6.22/glibc 2.8 signal delivery becomes part of the &quot;everything is a file&quot; unix philosophy and can be waited on with select()/poll()/epoll()/etc&#8230; which is a lot more elegant than asynchronous syscall-interrupting delivery.&quot;</p>
+<p>Which conceptually is no different than PostMessage/MsgWaitMultipleObjects</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650063">
+				<div id="div-comment-650063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.koroirc.com/' rel='external nofollow' class='url'>Koro</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650063">
+			July 28, 2008 at 11:47 am</a>		</div>
+
+		<p>Thank you a lot Karellen and Alexander, I will remember that when I port my code to Unix in a few years :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650093">
+				<div id="div-comment-650093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BryanK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650093">
+			July 28, 2008 at 12:50 pm</a>		</div>
+
+		<p>Karellen &#8212; the link that Raymond provided (to securecoding.cert.org, SIG31-C) has a link itself to SIG30-C, which says that the only functions that are guaranteed to be safe to call from a signal handler (by the C99 standard) are abort, _Exit, and signal (as long as signal&#8217;s first argument is the same signal that&#8217;s being caught).</p>
+<p>However, it also says that POSIX adds a few more functions to the list; in particular, write() and read() are both async-safe according to POSIX.</p>
+<p>So I believe that any OS that claims to be POSIX compliant should have a signal-safe write(). &nbsp;Of course, stdio is out of the question, but raw low-level write is possible.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650103">
+				<div id="div-comment-650103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SuperKoko</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650103">
+			July 28, 2008 at 1:14 pm</a>		</div>
+
+		<p>From Raymond:</p>
+<p>&quot;Why does unix deliver it on the main thread?&quot;</p>
+<p>It doesn&#8217;t necessarily. A signal delivered to a process is recieved by the first thread that doesn&#8217;t mask the signal.</p>
+<p>If you wish to recieve no signal on the main thread, simply mask all signals on it with sigprocmask.</p>
+<p>Signals specifically sent to a specific thread will remain pending during all the time the signal is masked on the thread.</p>
+<p>So, sigprocmask can be used for critical code sections, where signals aren&#8217;t accepted.</p>
+<p>Or, you may mask all messages, and then use sigwait().</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-649993">
+				<div id="div-comment-649993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tim Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-649993">
+			July 28, 2008 at 10:15 am</a>		</div>
+
+		<p>Back in my old fart days with VMS, if you did any type of programming with asynchronous system traps (AST) you had to worry about this sort of stuff. &nbsp;</p>
+<p>Instead of using things like a mutex to synchronize data access, you would have to disable ASTs. &nbsp;Given that having to worry about disabling AST or locking a lock boils down to basically the same thing, the question is how well protected from ASTs is the OS and runtime libraries such as CRTL. &nbsp;*shrug* &nbsp;It has been too long for me to remember exactly, but off the top of my head, I don&#8217;t remember having to worry about the OS calls. &nbsp;But is this much different from having to worry about a given library being multithreaded safe.</p>
+<p>I will say that given the choice between the two, I&#8217;ll take the Win32 model. &nbsp;When working with ASTs, you always did the least amount of work possible in the AST.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650143">
+				<div id="div-comment-650143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650143">
+			July 28, 2008 at 5:16 pm</a>		</div>
+
+		<p>Mac OS used completion routines to notify apps when async I/O was complete and these ran at interrupt time. There were some routines that was &quot;interrupt-safe&quot; and thus could be used at interrupt time:</p>
+<p><a rel="nofollow" target="_new" href="http://developer.apple.com/technotes/tn/tn1104.html" rel="nofollow">http://developer.apple.com/technotes/tn/tn1104.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650153">
+				<div id="div-comment-650153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650153">
+			July 28, 2008 at 6:07 pm</a>		</div>
+
+		<p>signal() dates back to at least Unix V6, released in 1975. &nbsp;Threads weren&#8217;t widely available on Unix until the 1990&#8217;s. &nbsp;IMHO, Linux didn&#8217;t really have usable threading until the 2.6 kernel.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650173">
+				<div id="div-comment-650173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650173">
+			July 28, 2008 at 7:34 pm</a>		</div>
+
+		<p>&quot;Makes me think, I&#8217;d love if Unix had WSAEventSelect/WaitForMultipleObjects. Makes all threaded socket code SOOOO much easier. Just wait on both the socket event and a &quot;cancel&quot; event.</p>
+<p>In fact, just having a WaitForMultipleObjects equivalent would be more than enough. It seems everything in Unix has their own function to wait on them which are separate.&quot;</p>
+<p>No, that&#8217;s not the case. &nbsp;You can use select()/poll() to wait on file descriptors, not only for input and output, but also for other events on those descriptors. &nbsp;If you use the self-pipe trick (instead of signalfd), you can also wait on signals with select(). &nbsp;It&#8217;s trivial to implement.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650183">
+				<div id="div-comment-650183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650183">
+			July 28, 2008 at 7:45 pm</a>		</div>
+
+		<p>There are two types of signal, asynchronous (SIGINT, SIGQUIT, etc) and synchronous (SIGSEGV, SIGBUS etc). Historically UNIX programs were single threaded, so a thread was not an option, But setting a flag, writing to a pipe or using longjmp() are all good solutions.</p>
+<p>For the MT world, using sigwait() in the main thread and having other threads do the applications work gets the best of all worlds.</p>
+<p>For the curious, try SIGSEGV on Win32.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650193">
+				<div id="div-comment-650193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roger</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650193">
+			July 28, 2008 at 8:04 pm</a>		</div>
+
+		<p>On Win32 you can inject code into the main thread by duplicating the current thread handle and using QueueUserAPC.</p>
+<p>However doing a longjmp() in a handler called during select() really screws winsock up.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650203">
+				<div id="div-comment-650203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Colascione</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650203">
+			July 28, 2008 at 9:00 pm</a>		</div>
+
+		<p>THE HARD WAY</p>
+<p>See also pselect, which can keep signals blocked except when waiting for IO, effectively allowing select() to wait on signals.</p>
+<p>Another option is to just keep signals blocked, and use signals for I/O completion.</p>
+<p>I.e., block all signals when the program starts up using sigmask). (Though if you&#8217;re polite, you still want SIGINT and SIGTERM to exit the program immediately.)</p>
+<p>Next, when you open a file descriptor on which you want to block, use fcntl() to make it send a signal. Have it send a realtime signal so the signals queue up.</p>
+<p>Then, when you&#8217;re ready to wait for IO, use sigwait(). When that returns, check which signal triggered the return and you&#8217;re set.</p>
+<p>THE EASY WAY</p>
+<p>Use the BSD-licensed libevent (<a rel="nofollow" target="_new" href="http://monkey.org/~provos/libevent/" rel="nofollow">http://monkey.org/~provos/libevent/</a>).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650223">
+				<div id="div-comment-650223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650223">
+			July 29, 2008 at 3:59 am</a>		</div>
+
+		<p>WinApis use threads as a golden hammer. They make programs far more complex, which we could observe recently in this article: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2008/07/25/8770548.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2008/07/25/8770548.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650243">
+				<div id="div-comment-650243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.justsoftwaresolutions.co.uk/blog/' rel='external nofollow' class='url'>Anthony Williams</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650243">
+			July 29, 2008 at 5:21 am</a>		</div>
+
+		<p>In code that conforms to the letter of the C (or C++) standard, there&#8217;s not a lot you can do in a signal handler, that is true.</p>
+<p>Windows runs the signal handler in a new thread, and thus allows more functions to be called from a signal handler. On the one hand, this is a good thing: you can do more in a signal handler.</p>
+<p>On the other, this is a bad thing: you now have a separate thread, and have to ensure that it correctly protects against race conditions with the other threads in the application. By allowing the handler to do more, you lead users along the path of wanting to access shared data, and thus exposing them to all the issues regarding protecting shared data from accesses from multiple threads.</p>
+<p>It&#8217;s all just swings and roundabouts.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-650493">
+				<div id="div-comment-650493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Drew Frezell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650493">
+			July 29, 2008 at 9:45 pm</a>		</div>
+
+		<p>Based on the documentation from opengroup, fflush() is not an async signal safe function. &nbsp;Here is a list of functions that can be safely called from a signal handler.</p>
+<p><a rel="nofollow" target="_new" href="http://www.opengroup.org/onlinepubs/009695399/functions/xsh_chap02_04.html#tag_02_04_03" rel="nofollow">http://www.opengroup.org/onlinepubs/009695399/functions/xsh_chap02_04.html#tag_02_04_03</a></p>
+<p>The basic guideline, if you call a function that may block, you shouldn&#8217;t be calling it in a signal handler.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-650543">
+				<div id="div-comment-650543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Daniel Colascione</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-650543">
+			July 30, 2008 at 7:58 am</a>		</div>
+
+		<p>Drew, note that it&#8217;s perfectly safe to call socket, connect, read, and write from a signal handler. Even fork and exec are permissible. You can actually do a lot from a signal handler, provided you obey certain restrictions and don&#8217;t use non-reentrant *library* functions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-652313">
+				<div id="div-comment-652313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20080728-00/?p=21453#comment-652313">
+			July 31, 2008 at 4:33 am</a>		</div>
+
+		<p>I don&#8217;t know much about UNIX, but I&#8217;ve spent quite a while writing code for OS-9 (Radisys&#8217;, not the one from Apple).</p>
+<p>The way to deal with signals in OS-9 is to put them into a queue in the signal handler, and then unqueue them in the main event loop and act on them.</p>
+<p>I honestly think this is the best way to deal with signals in any case. If your system treats signals as true interrupts, you have no idea what the system is doing at the time the signal is first processed, whether it is in the main thread or not. A secondary thread that terminates the process on a SIGINT would be just as bad as calling an unsafe function from the main thread.</p>
+<p>When I ported the software to Windows, I used &nbsp;QueueUserAPC() (as Roger suggested above). There is a slight difference in that the &#8216;quasi-signal&#8217; isn&#8217;t processed until the thread enters an alertable wait state, but that didn&#8217;t matter for my application.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

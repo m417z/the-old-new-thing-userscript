@@ -1,0 +1,607 @@
+<html>
+<head>
+<title>How to rescue a broken stack trace: Recovering the EBP chain</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to rescue a broken stack trace: Recovering the EBP chain</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 9, 2011 / year-entry #59</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">When debugging, you may find that the stack trace falls apart: ChildEBP RetAddr 001af118 773806a0 ntdll!KiFastSystemCallRet 001af11c 7735b18c ntdll!ZwWaitForSingleObject+0xc 001af180 7735b071 ntdll!RtlpWaitOnCriticalSection+0x154 001af1a8 2f6db1a9 ntdll!RtlEnterCriticalSection+0x152 001af1b4 2fe8d533 ABC!CCriticalSection::Lock+0x12 001af1d0 2fe8d56a ABC!CMessageList::Lock+0x24 001af234 2f6e47ac ABC!CMessageWindow::UpdateMessageList+0x231 001af274 2f6f040e ABC!CMessageWindow::UpdateContents+0x84 001af28c 2f6e4474 ABC!CMessageWindow::Refresh+0x1a8 001af360 2f6e4359 ABC!CMessageWindow::OnChar+0x4c 001af384 761a1a10 ABC!CMessageWindow::WndProc+0xb31 00000000 00000000 USER32!GetMessageW+0x6e This can't possible be the complete...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+When debugging, you may find that the stack trace falls apart:
+</p>
+<pre>
+ChildEBP RetAddr
+001af118 773806a0 ntdll!KiFastSystemCallRet
+001af11c 7735b18c ntdll!ZwWaitForSingleObject+0xc
+001af180 7735b071 ntdll!RtlpWaitOnCriticalSection+0x154
+001af1a8 2f6db1a9 ntdll!RtlEnterCriticalSection+0x152
+001af1b4 2fe8d533 ABC!CCriticalSection::Lock+0x12
+001af1d0 2fe8d56a ABC!CMessageList::Lock+0x24
+001af234 2f6e47ac ABC!CMessageWindow::UpdateMessageList+0x231
+001af274 2f6f040e ABC!CMessageWindow::UpdateContents+0x84
+001af28c 2f6e4474 ABC!CMessageWindow::Refresh+0x1a8
+001af360 2f6e4359 ABC!CMessageWindow::OnChar+0x4c
+001af384 761a1a10 ABC!CMessageWindow::WndProc+0xb31
+00000000 00000000 USER32!GetMessageW+0x6e
+</pre>
+<p>
+This can't possible be the complete stack.
+I mean, where's the thread procedure?
+That should be at the start of the stack for any thread.
+</p>
+<p>
+What happened is that the EBP chain got broken,
+and the debugger can't walk the stack any further.
+If the code was compiled with frame pointer optimization (FPO),
+then the compiler will not create EBP frames, permitting it to
+use EBP as a general purpose register instead.
+This is great for optimization, but it causes trouble for the
+debugger when it tries to take a stack trace through code
+compiled with FPO for which it does not have the necessary
+information to decode these types of stacks.
+</p>
+<p>
+<b>Begin digression</b>:
+Traditionally, every function began with the sequence
+</p>
+<pre>
+        push ebp      ;; save caller's EBP
+        mov ebp, esp  ;; set our EBP to point to this "frame"
+        sub esp, n    ;; reserve space for local variables
+</pre>
+<p>
+and ended with
+</p>
+<pre>
+        mov esp, ebp  ;; discard local variables
+        pop ebp       ;; recover caller's EBP
+        ret n
+</pre>
+<p>
+This pattern is so common that the x86 has dedicated instructions
+for it.
+The <code>ENTER n,0</code> instruction does the <code>push / mov / sub</code>,
+and the <code>LEAVE</code> instruction does the <code>mov / pop</code>.
+(In C/C++, the value after the comma is always zero.)
+</p>
+<p>
+if you look at what this does to the stack, you see that this
+establishes a linked list of what are called <i>EBP frames</i>.
+Suppose you have the following code fragment:
+</p>
+<pre>
+void Top(int a, int b)
+{
+ int toplocal = b + 5;
+ Middle(a, local);
+}
+
+void Middle(int c, int d)
+{
+ Bottom(c+d);
+}
+
+void Bottom(int e)
+{
+ int bottomlocal1, bottomlocal2;
+ ...
+}
+</pre>
+<p>
+When execution reaches the <code>...</code> inside function <code>Bottom</code>
+the stack looks like the following.
+(I put higher addresses at the top; the stack grows downward.
+I also assume that the calling convention is <code>__stdcall</code>
+and that the code is compiled with absolutely no optimization.)
+</p>
+<table CELLPADDING=3>
+<tbody>
+<tr>
+<td ROWSPAN=6 VALIGN=center>
+    <code>Top</code>'s stack frame
+    </td>
+<td ROWSPAN=6 STYLE="border-top: solid .75pt black;
+                         border-left: solid .75pt black;
+                         border-bottom: solid .75pt black;">&nbsp;</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8F8</code></td>
+<td VALIGN=baseline>parameter <code>b</code> passed to <code>Top</code></td>
+<td VALIGN=bottom ROWSPAN=4>During execution of <code>Top</code>,<br />&larr;<code>EBP = 0040F8EC</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8F4</code></td>
+<td VALIGN=baseline>parameter <code>a</code> passed to <code>Top</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8F0</code></td>
+<td VALIGN=baseline>return address of <code>Top</code>'s caller</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8EC</code></td>
+<td VALIGN=baseline>EBP of <code>Top</code>'s caller</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8E8</code></td>
+<td VALIGN=baseline><code>toplocal</code></td>
+</tr>
+<tr>
+<td ROWSPAN=5 VALIGN=center>
+    <code>Middle</code>'s stack frame
+    </td>
+<td ROWSPAN=5 STYLE="border-top: solid .75pt black;
+                         border-left: solid .75pt black;
+                         border-bottom: solid .75pt black;">&nbsp;</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8E4</code></td>
+<td VALIGN=baseline>parameter <code>d</code> passed to <code>Middle</code></td>
+<td VALIGN=bottom ROWSPAN=4>During execution of <code>Middle</code>,<br />&larr;<code>EBP = 0040F8D8</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8E0</code></td>
+<td VALIGN=baseline>parameter <code>c</code> passed to <code>Middle</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8DC</code></td>
+<td VALIGN=baseline>return address of <code>Middle</code>'s caller</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8D8</code></td>
+<td VALIGN=baseline><code>0040F8EC</code> = EBP of <code>Middle</code>'s caller</td>
+</tr>
+<tr>
+<td ROWSPAN=7 VALIGN=center>
+    <code>Bottom</code>'s stack frame
+    </td>
+<td ROWSPAN=7 STYLE="border-top: solid .75pt black;
+                         border-left: solid .75pt black;
+                         border-bottom: solid .75pt black;">&nbsp;</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8D4</code></td>
+<td VALIGN=baseline>parameter <code>e</code> passed to <code>Bottom</code></td>
+<td VALIGN=bottom ROWSPAN=3>During execution of <code>Bottom</code>,<br />&larr;<code>EBP = 0040F8CC</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8D0</code></td>
+<td VALIGN=baseline>return address of <code>Bottom</code>'s caller</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8CC</code></td>
+<td VALIGN=baseline><code>0040F8D8</code> = EBP of <code>Bottom</code>'s caller</td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8C8</code></td>
+<td VALIGN=baseline><code>bottomlocal1</code></td>
+</tr>
+<tr>
+<td VALIGN=baseline><code>0040F8C4</code></td>
+<td VALIGN=baseline><code>bottomlocal2</code></td>
+</tr>
+</tbody>
+</table>
+<p>
+Each stack frame is identified by the <code>EBP</code> value
+which the function uses during its execution.
+</p>
+<p>
+The structure of each stack frame is therefore
+</p>
+<table CELLPADDING=3>
+<tbody>
+<tr>
+<td><code>[ebp+n]</code></td>
+<td>Offsets greater than 4 access parameters</td>
+</tr>
+<tr>
+<td><code>[ebp+4]</code></td>
+<td>Offset 4 is the return address</td>
+</tr>
+<tr>
+<td><code>[ebp+0]</code></td>
+<td>Zero offset accesses caller's <code>EBP</code></td>
+</tr>
+<tr>
+<td><code>[ebp-n]</code></td>
+<td>Negative offsets access locals</td>
+</tr>
+</tbody>
+</table>
+<p>
+And the stack frames are all connected to each other in the form of
+a linked list threaded through the <code>EBP</code> values.
+This linked list is known as the <i>EBP chain</i>.
+<b>End digression</b>.
+</p>
+<p>
+To recover from the broken EBP chain,
+start dumping the stack a little before
+things go bad (in this case, I would start at <code>001af384-80</code>)
+and then look for something that looks like a valid stack frame.
+Since the parameters and locals to a function can be pretty much anything,
+all you have left to work with is the <code>EBP</code> and the return
+address.
+In other words, you are looking for
+pairs of values of the form
+</p>
+<pre>
+&laquo;pointer a little higher up the stack&raquo;.
+&laquo;code address&raquo;
+</pre>
+<p>
+In this case, I got lucky and didn't have to go very far:
+</p>
+<pre>
+  001af474  00000000
+ -001af478  001af494
+/ 001af47c  14f4fba8 <u>DEF!SubclassBase::CallOriginalWndProc+0x1a</u>
+| 001af480  2f6e4317 ABC!CMessageWindow::WndProc
+| 001af484  00970338
+| 001af488  0000000f
+| 001af48c  00000000
+\ 001af490  00000000
+ &gt;001af494  001af4f0
+  001af498  14f4fcd6 <u>DEF!SubclassBase::ForwardMessage+0x23</u>
+  001af49c  00970338
+  001af4a0  0000000f
+  001af4a4  00000000
+  001af4a8  00000000
+  001af4ac  00000000
+  001af4b0  2f6e4317 ABC!CMessageWindow::WndProc
+  001af4b4  ed758311
+  001af4b8  00000000
+  001af4bc  15143f70
+  001af4c0  00000000
+  001af4c4  14f4fb8e DEF!CView::SortItems+0x96
+  001af4c8  00000000
+  001af4cc  2f6e4317 ABC!CMessageWindow::WndProc
+  001af4d0  00000000
+</pre>
+<p>
+At stack address <code>001af478</code>, we have a pointer to
+memory higher up the stack followed by a code address.
+if you follow that pointer, it points to another instance of the
+same pattern: A pointer higher up the stack followed by the code address.
+</p>
+<p>
+Once you find where the EBP chain resumes, you can ask the debugger
+to resume its stack trace from that point with the <code>=n</code>
+option to the <code>k</code> command.
+</p>
+<pre>
+0:000&gt; k=001af478
+ChildEBP RetAddr
+001af478 14f4fba8 ntdll!KiFastSystemCallRet
+001af494 14f4fcd6 DEF!SubclassBase::CallOriginalWndProc+0x1a
+001af4f0 14f4fc8b DEF!SubclassBase::ForwardMessage+0x23
+001af514 14f32dd1 DEF!SubclassBase::ForwardChar+0x59
+001af530 14f4fcd6 DEF!SubclassBase::OnChar+0x3c
+001af58c 14f4fd76 DEF!HelpSubclass::WndProc+0x51
+001af5e4 761a1a10 DEF!SubclassBase::s_WndProc+0x1b
+001af610 761a1ae8 USER32!GetMessageW+0x6e
+001af688 761a1c03 USER32!GetMessageW+0x146
+001af6e4 761a3656 USER32!GetMessageW+0x261
+001af70c 77380e6e USER32!OffsetRect+0x4d
+001af784 761a2a98 ntdll!KiUserCallbackDispatcher+0x2e
+001af794 698fd0aa USER32!DispatchMessageW+0xf
+001af7a4 2f7bf15c ABC!CThread::DispatchMessageW+0x23
+001af7e0 2f7befc9 ABC!CMessageWindow::MessageLoop+0x3a2
+001af808 2ff56d20 ABC!CMessageWindow::ThreadProc+0x9f
+001af898 75c2384b ABC!CMessageWindow::s_ThreadProc+0x10
+001af8a4 7735a9bd kernel32!BaseThreadInitThunk+0x12
+001af8e4 00000000 ntdll!LdrInitializeThunk+0x4d
+</pre>
+<p>
+When you do this, make sure to ignore the first line of the
+resumed stack trace, since that is based on your current <code>EIP</code>,
+not the return address stored in the stack frame.
+</p>
+<p>
+Today was really just a warm-up for another debugging technique
+that I haven't finished writing up yet,
+so you're just going to be in suspense for another two years or so,
+though if you attended
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/12/01/10099005.aspx">
+my TechEd China talk</a>, you already know where I'm going.
+</p>
+<p>
+<b>Bonus reading</b>:
+In Ryan Mangipano's two-part series on kernel mode stack overflows,
+<a HREF="http://blogs.msdn.com/ntdebugging/archive/2009/12/01/part-2-got-stack-no-we-ran-out-and-kv-won-t-tell-me-why.aspx">
+the second part does a bit of EBP chain chasing</a>.
+(Feel free to read
+<a HREF="http://blogs.msdn.com/ntdebugging/archive/2009/11/25/got-stack-no-we-ran-out-of-kernel-mode-stack-and-kv-won-t-tell-me-why-part-1.aspx">
+the first part</a>,
+as well as
+<a HREF="http://blogs.msdn.com/ntdebugging/archive/2008/02/01/kernel-stack-overflows.aspx">
+earlier discussion on the subject of stack overflows</a>.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-899693">
+				<div id="div-comment-899693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899693">
+			March 9, 2011 at 8:23 am</a>		</div>
+
+		<p>Yossi Kreinin wrote a really good article about 1.5 years ago about getting stack traces of programs compiled with the frame pointer optimization enabled: <a rel="nofollow" target="_new" href="http://www.yosefk.com/blog/getting-the-call-stack-without-a-frame-pointer.html" rel="nofollow">http://www.yosefk.com/&#8230;/getting-the-call-stack-without-a-frame-pointer.html</a></p>
+<p>One cool trick he used is to have a program decode the instructions of its own function prologues to figure out the size of the stack frame and hence where the next stack frame was.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899703">
+				<div id="div-comment-899703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899703">
+			March 9, 2011 at 8:35 am</a>		</div>
+
+		<p>That digression is pure gold. &nbsp;Thanks!</p>
+<div class="post">[<i>Sadly, I was hoping that my audience already knows everything in that digression, because it was a digression merely to define the term <span style="text-decoration:underline;">EBP chain</span>. Someday I&#39;ll be able to cover advanced topics again. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-899713">
+				<div id="div-comment-899713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">anonymous</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899713">
+			March 9, 2011 at 9:07 am</a>		</div>
+
+		<p>In this example you have symbols for ABC. Usually the debugger is able to compensate for FPO if you have the corresponding PDB.</p>
+<div class="post">[<i>The symbols for ABC naturally came from a symbols-only PDB (no debugging information). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899733">
+				<div id="div-comment-899733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899733">
+			March 9, 2011 at 9:46 am</a>		</div>
+
+		<p>Awesome!</p>
+<p>Using a symbols-only PDB you can recover the stack frame another way (this almost always works).</p>
+<p>Walk down the stack, printing any value that is between start and end of any function. Start is exclusive, end is inclusive.</p>
+<p>You get all function calls on the stack and a very few integers that happen to be in the right range (you don&#39;t get any pointers unless someone took the address of a goto label).</p>
+<div class="post">[<i>Note that this also finds return addresses left in uninitialized stack variables. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-899743">
+				<div id="div-comment-899743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian G</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899743">
+			March 9, 2011 at 9:47 am</a>		</div>
+
+		<p>I&#39;m far below your target audience in terms of knowledge and expertise as a simple hobbiest, but I still find your work interesting to read even when (as today) it goes far over my head. &nbsp;All that being said, even when I don&#39;t understand what you&#39;re talking about, I&#39;m not going to ask you to clarify. &nbsp;After all, I&#39;m not a member of your target audience, just someone who&#39;s stumbled across your blog in the vast collection of internet stuff.</p>
+<p>Also, I love that you have something new every day. &nbsp;The line about 2 years&#39; suspense is fantastic.</p>
+<p>Thanks for all the info!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899753">
+				<div id="div-comment-899753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899753">
+			March 9, 2011 at 10:30 am</a>		</div>
+
+		<p>[Note that this also finds return addresses left in uninitialized stack variables. -Raymond]</p>
+<p>Personally I&#39;ve never seen it do that but yes it certainly could do that to you. Good catch.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-899763">
+				<div id="div-comment-899763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">zahical</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899763">
+			March 9, 2011 at 11:38 am</a>		</div>
+
+		<p>Brian G: After following the &#39;Old New Thing&#39; for 7 years now, I&#39;m pretty sure the &quot;2 years&#39; suspense&quot; line is actually not a joke.</p>
+<p>This is both good and bad because:</p>
+<p>a) Yes, there will almost certainly be a second article on the subject (Mr. Chen keeps his promises)</p>
+<p>and</p>
+<p>b) Yes, we are going to read it in &quot;two years or so&quot; (Mr. Chen keeps his promises)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899783">
+				<div id="div-comment-899783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian G.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899783">
+			March 9, 2011 at 12:16 pm</a>		</div>
+
+		<p>@Zahical: oh, I&#39;ve been reading for a couple years myself (and caught up on all the archives too over a few extremely slow days at work). &nbsp;I know it&#39;s completely serious. &nbsp;That takes away absolutely none of the amusement. &nbsp;&lt;grin&gt;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-899793">
+				<div id="div-comment-899793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899793">
+			March 9, 2011 at 2:49 pm</a>		</div>
+
+		<p>But I don&#39;t want to wait two years! Please can we have it early Mr Chen, please!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899803">
+				<div id="div-comment-899803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">campbell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899803">
+			March 9, 2011 at 5:44 pm</a>		</div>
+
+		<blockquote><p>
+  (In C/C++, the value after the comma is always zero.)
+</p></blockquote>
+<p>I tried generating assembly from a sample C program and I see slightly different &#8211; j in &quot;ret j&quot; is zero, but not the k in &quot;sub esp, k&quot;. If this parameter k is always zero, how does a function reserve its local space?</p>
+<p>I know Raymond wants to write in detail later about this, but perhaps someone can point me in the right direction.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-899813">
+				<div id="div-comment-899813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul M. Parks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899813">
+			March 9, 2011 at 6:24 pm</a>		</div>
+
+		<p>@campbell: Raymond&#39;s parenthetical was referring specifically to the ENTER instruction&#39;s second operand.</p>
+<p><a rel="nofollow" target="_new" href="http://www.sxlist.com/TECHREF/intel/x86/inst/enters.htm" rel="nofollow">http://www.sxlist.com/&#8230;/enters.htm</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899823">
+				<div id="div-comment-899823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hexatron</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899823">
+			March 9, 2011 at 7:42 pm</a>		</div>
+
+		<p>I stopped doing stuff like this when &#39;core dumps&#39; were 2-inch-thick fanfold listings that you got in the box where you thought the results of your batch run on the GE-635 would be.</p>
+<p>Now I subscribe to the snake-bite theory:</p>
+<p>Two miners are deep in the desert. One of them gets bitten on the privates by a rattlesnake. The other one looks in his field guide for snake-bite treatment. He reads about making x-shaped cuts over the bite and sucking the poison out. He tells his companion, &quot;You&#39;re gonna die.&quot;</p>
+<p>Nonsense from the debugger? &quot;You&#39;re gonna die.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-899833">
+				<div id="div-comment-899833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">campbell</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899833">
+			March 9, 2011 at 8:49 pm</a>		</div>
+
+		<p>@Marks:</p>
+<p>Thanks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-899843">
+				<div id="div-comment-899843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-899843">
+			March 9, 2011 at 9:06 pm</a>		</div>
+
+		<p>@Hexatron: how about a process that tended to crash the debugger while stopped at a debug break. I had to debug with that getting in the way. 100% managed code too.</p>
+<p>Found the problem eventually. Never did find out why it crashed the debugger so easily.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-900123">
+				<div id="div-comment-900123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joseph Koss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110309-00/?p=11263#comment-900123">
+			March 10, 2011 at 10:01 am</a>		</div>
+
+		<p>Going all the way back, the ENTER instruction has almost never been the most efficient (time-wise) way to erect a stack frame.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

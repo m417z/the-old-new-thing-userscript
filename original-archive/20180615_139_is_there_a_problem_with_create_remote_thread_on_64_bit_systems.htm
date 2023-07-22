@@ -1,0 +1,768 @@
+<html>
+<head>
+<title>Is there a problem with Create≠Remote≠Thread on 64-bit systems?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Is there a problem with <CODE>Create&shy;Remote&shy;Thread</CODE> on 64-bit systems?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 15, 2018 / year-entry #139</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>35</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">There's more to injecting code than copying bytes.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Back in the days when it was still fashionable to talk about the
+Itanium,
+a customer reported that the
+<code>Create&shy;Remote&shy;Thread</code> function
+didn't work.
+The customer explained that any attempt to call
+the
+<code>Create&shy;Remote&shy;Thread</code> function
+results in the target process being terminated.
+When they attempt to create a remote thread in Explorer, then the
+Explorer process crashes.
+When they attempt to create a remote thread in <code>lsass.exe</code>,
+<code>lsass.exe</code> process crashes, and the system restarts.
+They included a sample program that demonstrated the problem.
+</p>
+<pre>
+<i>// Code in italics is wrong.  In fact, this is so wrong
+// I've intentionally introduced compiler errors so you
+// can't possibly use it in production.
+struct UsefulInfo {
+    int <a HREF="https://www.amazon.com/dp/B00BLS4952?tag=tholneth-20">thing1</a>;
+    int thing2;
+};
+
+DWORD RemoteThreadProc(void* lpParameter)
+{
+  UsefulInfo* info =
+    reinterpret_cast&lt;UsefulInfo*&gt;(lpParameter);
+
+  blah blah blah
+  try {
+    blah blah blah
+  } catch (...) {
+    blah blah blah
+  }
+  return 0;
+}
+
+// This symbol lets us find the end of the RemoteThread function.
+static void EndOfRemoteThreadProc() { }
+
+// Error checking removed for simplicity of exposition.
+void InjectTheThread(
+    UsefulInfo* info,
+    HANDLE targetProcess)
+{
+  // Calculate the size of the function.
+  DWORD codeSize = (DWORD)EndOfRemoteThreadProc - (DWORD)RemoteThreadProc;
+
+  // Allocate an executable buffer in the target process.
+  BYTE* codeBuffer = VirtualAllocEx(targetProcess,
+                     codeSize + sizeof(*info),
+                     PAGE_EXECUTE_READWRITE);
+
+ // Copy the useful information to the target process
+ WriteProcessMemory(targetProcess, codeBuffer,
+                    info, sizeof(*info));
+
+ // Followed by the code
+ WriteProcessMemory(targetProcess, codeBuffer + sizeof(*info),
+                    (void*)RemoteThreadProc, codeSize);
+   
+ // Execute it and pass a pointer to the useful information.
+ CreateRemoteThread(targetProcess,
+                    codeBuffer + sizeof(*info), codeBuffer);
+}</i>
+</pre>
+<p>
+There is so much wrong with this code it's hard to say
+where to start.
+</p>
+<p>
+There's no guarantee that all the code in the
+<code>Remote&shy;Thread&shy;Proc</code> function
+is contiguous.
+The compiler might choose to spread it out into multiple chunks,
+possibly based on
+<a HREF="https://docs.microsoft.com/en-us/cpp/build/reference/profile-guided-optimizations">
+Profile-Guided Optimizations</a>.
+</p>
+<p>
+Similarly, there is no guarantee that the
+<code>End&shy;Of&shy;Remote&shy;Thread&shy;Proc</code> function
+will be placed immediately after
+<code>Remote&shy;Thread&shy;Proc</code> function
+in memory.
+</p>
+<p>
+There is no guarantee that the code in the
+<code>Remote&shy;Thread&shy;Proc</code> function
+is position-independent.
+</p>
+<p>
+There is no guarantee that the code in the
+<code>Remote&shy;Thread&shy;Proc</code> function
+is self-contained.
+There may be supporting data in the read-only data segment,
+such as jump tables for switch statements.
+</p>
+<p>
+The
+<code>Remote&shy;Thread&shy;Proc</code> function
+uses
+C++ exception handling,
+but the code didn't inject the C runtime support library
+or fix up the references to the runtime library.
+</p>
+<p>
+The code didn't
+register any exception tables for the dynamically-generated code.
+x86 is the only architecture that
+does not require explicit exception vector registration.
+Everybody else uses table-based exception handling.
+</p>
+<p>
+Now some ia64-specific remarks.
+</p>
+<p>
+Function pointers on ia64 don't point to the first byte of code,
+so subtracting function pointers
+doesn't give you any information about the size of the function
+(whatever that means),
+and copying data starting at the function pointer
+does not actually copy any code.
+</p>
+<p>
+Conversely, when you take a pointer to a block of memory that contains code
+and treat it as a function pointer, you are actually causing the
+first two 8-byte values at that address to be interpreted as a
+global pointer and a code address.
+This results in a garbage global pointer,
+and code executing from a random location.
+</p>
+<p>
+The copied code doesn't start at a multiple of 16.
+Code on ia64 must be 16-byte-aligned.
+</p>
+<p>
+In general the
+<code>Create&shy;Remote&shy;Thread</code> function
+requires deep knowledge of the machine architecture.
+Its intended audience was debugggers, which are already
+well-versed in the details of the machine architecture.
+</p>
+<p>
+We encouraged the customer to avoid the
+<code>Create&shy;Remote&shy;Thread</code> function
+entirely.
+In particular, using it with critical system processes like
+<code>lsass.exe</code> is a serious issue for
+system reliability.
+Faults in that process can bring the whole system down (as the
+customer observed),
+or cause other strange behavior like
+damaging parts of the security infrastructure,
+which will lead to hard-to-debug authentication problems at best
+and full-fledged security vulnerabilities at worst.
+And the system may in the future take stronger steps to prevent
+code injection and data tampering in critical system processes,
+so a design based on <code>Create&shy;Remote&shy;Thread</code>
+is living on borrowed time.
+It's not clear what the customer is trying to do,
+but they should investigate whether there are supported
+extensibility mechanisms that give them what they want.
+</p>
+<p>
+The customer replied that their product contains important
+functionality that they have constructed out of the
+<code>Create&shy;Remote&shy;Thread</code> function,
+and they cannot afford to abandon it at this point.
+</p>
+<p>
+Customers like this scare me.
+</p>
+<p>
+(The customer liaison never revealed the name of the customer,
+but I did learn that they develop anti-malware software.
+So now I'm even more scared.
+Fortunately, fixing this code to work on Itanium became a moot issue,
+but I still worry about their x64 version, because many of the issues
+here also apply to x64.)</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (35)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-bboorman even thread-even depth-1 parent" id="comment-1347075">
+				<div id="div-comment-1347075" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Brian_EE' rel='external nofollow' class='url'>Brian_EE</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347075">
+			June 15, 2018 at 7:07 am</a>		</div>
+
+		<p>It might be more accurate to characterize them as &#8220;they develop malware software&#8221; if this is how they are developing their application.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-koldude odd alt depth-2 parent" id="comment-1347095">
+				<div id="div-comment-1347095" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/kantos' rel='external nofollow' class='url'>kantos</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347095">
+			June 15, 2018 at 7:43 am</a>		</div>
+
+		<p>I&#8217;m fairly convinced that most AV could and probably should be characterized as Malware based on how they act. Many did things like kernel patching or proxying every connection on the system via MITM techniques that actually leave the user less secure because they don&#8217;t support or properly handle things like TLSv2 + or certificate validation or pinning etc. It&#8217;s bad enough that a major browser has sent nastygrams to several of the manufacturers asking them to please stop immediately.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1347125">
+				<div id="div-comment-1347125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347125">
+			June 15, 2018 at 8:09 am</a>		</div>
+
+		<p>If I had my way the browser would check its update site, and make sure the update site was configured correctly. If it wasn&#8217;t, bring up a MITM page rather than the home page.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1347155">
+				<div id="div-comment-1347155" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347155">
+			June 15, 2018 at 8:20 am</a>		</div>
+
+		<p>Let he who hunts malware beware, for when you gaze into a <code>void</code>, the <code>void</code> gazes also into you&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1347475">
+				<div id="div-comment-1347475" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347475">
+			June 18, 2018 at 2:30 am</a>		</div>
+
+		<p>Ugh, don&#8217;t talk to me about &#8220;AV&#8221; software and its malware-like behavior.  Our product does network whatevering, and the situation with AV is so bad that if we get one of a set of totally inexplicable network errors like the initial handshake succeeding but all subsequent data transfers failing we scan for the presence of network drivers from two major A/V vendors (Raymond, I assume naming names isn&#8217;t allowed?), and report an error along the lines of &#8220;You&#8217;re running AV Product X aren&#8217;t you?  You&#8217;ll need to disable it in order to get network access that works&#8221;.  In, oh, about 100% of cases this ends up being the problem.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1347595">
+				<div id="div-comment-1347595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347595">
+			June 18, 2018 at 10:45 am</a>		</div>
+
+		<p>Yeah AV software is a constant opponent. What I c really hate though are the &#8220;IT professionals&#8221; that refuse to disable their snake oil of choice long enough for me to demonstrate that the impossible failures that don&#8217;t happen for other users are because of their AV software, not because we couldn&#8217;t figure out a basic thing like connecting to SQL server over a LAN&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1347135">
+				<div id="div-comment-1347135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin Bonner</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347135">
+			June 15, 2018 at 8:19 am</a>		</div>
+
+		<p>OK, I can believe that people writing anti-malware software might have cause to use CreateRemoteThread &#8211; they sometimes have to get down and dirty with the machine.  What I find scary is that people writing anti-malware software didn&#8217;t *immediately* spot the problem with (at very least) the calls to the run time libraries supporting try/catch.  Really, they ought to have known all of that themselves.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1347145">
+				<div id="div-comment-1347145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Koro</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347145">
+			June 15, 2018 at 8:20 am</a>		</div>
+
+		<p>The proper way to do this is to copy hand-crafted assembly code to the target process. It might be possible to have the C compiler &#8220;help with generation&#8221;, but everything must be reviewed by hand.</p>
+<p>That code should just LoadLibrary some DLL of yours, GetProcAddress an entry point, and jump to it, passing its own address to it. The entry point should free that, and end with a FreeLibraryAndExitThread, for zero leaks.</p>
+<p>Luckily you can assume that KERNEL32 is loaded at the same address in every process, and just pass along the addresses of LoadLibrary and GetProcAddress baked in your thread stub (along with the path of your DLL too).</p>
+<p>Also why do my comments take so much time to show up? I know I changed email addresses a few months ago, but I am definitely not a &#8220;first-time commenter&#8221;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1347245">
+				<div id="div-comment-1347245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347245">
+			June 15, 2018 at 11:27 am</a>		</div>
+
+		<p>I think the system switched over so that all comments are marked as spam unless they come from somebody with an MSDN profile. I have to manually approve 90% of the comments now.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1347275">
+				<div id="div-comment-1347275" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Killer{R}</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347275">
+			June 15, 2018 at 12:54 pm</a>		</div>
+
+		<p>There is lazy poor man&#8217;s way. CreateRemoteThread(&#8230;&amp;LoadLibrary, pRemotelyAllocatedPathToLibrary). And to be really poor: CreateThread from its DllMain. But DONT wait it inside DllMain, just remember self hModule in global var before starting thread to use with FreeLibraryAndExitThread later.<br />
+There is obvious question: how pass information to it. Remembering that we&#8217;re lazy and poor &#8211; forget about named mappings and all that egghead stuff. Encode info in library&#8217;s name, and get it with GetModuleFileName.<br />
+No asm, no undocumenteds. Hehehe (evilly)&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1347345">
+				<div id="div-comment-1347345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347345">
+			June 16, 2018 at 4:20 am</a>		</div>
+
+		<p>Nah, just start scraping the loader data from the PEB. No need to send the pointers over. No need to make the assumption. And this is publicly documented, without stability warnings.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1347165">
+				<div id="div-comment-1347165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347165">
+			June 15, 2018 at 8:25 am</a>		</div>
+
+		<p>How to make it less scary:</p>
+<p>1) Get rid of try/catch.</p>
+<p>2) Write the code to embed in assembly.</p>
+<p>3) Check target process architecture (currently needed only on x64)</p>
+<p>4) Don&#8217;t inject csrss, lsass, ssms/wininit, or services.</p>
+<p>5) Don&#8217;t inject processes from the wrong subsystem.</p>
+<p>6) Have a feature for user-configuration of excluding specific processes /that actually excludes the processes from code injection/. I&#8217;ve seen too many that claim to but rather just set some configuration bits that makes the code injection pass-through rather than not done.</p>
+<p>6a)  Corollary: If your software requires code injection to all process to function, your software should use a kernel mode driver instead. There is such a thing as a filesystem filter driver.</p>
+<p>7) It&#8217;s a lot safer to CreateRemoteThread a process that&#8217;s already started and trying to do something than it is trying to CreateRemoteThread a process that is starting up. The process&#8217;s dlls might be linked to load right after the .exe and be not relocatable, and if you VirtualAlloc too soon that memory won&#8217;t be allocated yet, early dll load or not.</p>
+<p>I found that code injection by CreateRemoteThread, once done properly, was a lot less scary than AppInit dlls. AppInit dlls start too soon, don&#8217;t respect memory layout, and are deadlocky. Since VirtualAllocEx takes the lowest available address, memory layout is predictable and failures are essentially predetermined rather than random and easily tracked down.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1347175">
+				<div id="div-comment-1347175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347175">
+			June 15, 2018 at 8:30 am</a>		</div>
+
+		<p>Anti-malware has become a solution that is almost as bad as the problem it&#8217;s trying to solve.  It actually might be worse.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1347405">
+				<div id="div-comment-1347405" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">viila</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347405">
+			June 16, 2018 at 8:35 pm</a>		</div>
+
+		<p>The only time in the past 20 years that I have been infected with malware was during the couple years around 2008 when I had a paid-for resident AV running (one of the major reputable AV brands). The AV was absolutely no help in detecting, identifying or purging the malware. I noticed it myself via suspicious behaviour (namely the classic Task Manager is autokilled immediately when started) and manually identified it.</p>
+<p>But many times the AV &#8220;protected&#8221; me against false positives&#8230; even up to and including my own executable once that I had just compiled!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1347825">
+				<div id="div-comment-1347825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matthew W. Jackson</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347825">
+			June 19, 2018 at 8:07 am</a>		</div>
+
+		<p>Why are you compiling viruses?  *grin*</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1347195">
+				<div id="div-comment-1347195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Piotr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347195">
+			June 15, 2018 at 9:02 am</a>		</div>
+
+		<p>Can you even inject anything into lsass without tripping the watchdog and causing a bluescreen? Isn&#8217;t that the guy who has access to certificate private keys?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1347325">
+				<div id="div-comment-1347325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347325">
+			June 15, 2018 at 5:17 pm</a>		</div>
+
+		<p>Unfortunately you are asking the wrong questions. ReadProcessMemory will suffice. But as for the question you should have asked, only csrss is protected against such shenanigans. (csrss is uniquely poised to clobber kernel memory).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1347225">
+				<div id="div-comment-1347225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">matus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347225">
+			June 15, 2018 at 10:42 am</a>		</div>
+
+		<p>But other than that, the code is fine, right?<br />
+:D</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even thread-odd thread-alt depth-1 parent" id="comment-1347285">
+				<div id="div-comment-1347285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347285">
+			June 15, 2018 at 2:42 pm</a>		</div>
+
+		<p>This blog post reminds me of an xkcd panel. It showed a satirical chart that demonstrated future artificial intelligence development. In that chart, a futuristic government created centrally controlled unmanned weapon systems. In the next stage, these weapon systems became self-aware and started a robot apocalypse. The panel marked that final stage as &#8220;the stage everyone is worried about&#8221; while marking the prior stage as &#8220;the stage I am worried about&#8221;. So, Raymond, you are scarred that an AV company wants to use CreateRemoteThread but weren&#8217;t scarred when Microsoft created CreateRemoteThread. This beckons the question: Did a customer ever contact you about CreateRemoteThread with a non-scary question about it?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1347315">
+				<div id="div-comment-1347315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodr√≠guez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347315">
+			June 15, 2018 at 4:53 pm</a>		</div>
+
+		<p>Raymond explains in the article that there are legit uses for CreateRemoteThread, such as debugging a process. It&#8217;s not like it&#8217;s an useless and harmful function created just to undermine the OS reliability and torment the end user. In other words: if I&#8217;m driving and run over someone, don&#8217;t blame the inventor of the car or its maker.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2" id="comment-1347775">
+				<div id="div-comment-1347775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Aged .Net Guy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347775">
+			June 19, 2018 at 5:38 am</a>		</div>
+
+		<p>This <a href="https://xkcd.com/1968/" rel="nofollow">https://xkcd.com/1968/</a> is the xkcd you&#8217;re referring to.  Prescient indeed.  He must think about this topic a bunch since he also published <a href="https://xkcd.com/1955/" rel="nofollow">https://xkcd.com/1955/</a> about a month earlier.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1347305">
+				<div id="div-comment-1347305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James Sutherland</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347305">
+			June 15, 2018 at 4:50 pm</a>		</div>
+
+		<p>Ten years or so ago, I came across a laptop running Windows XP with some &#8220;interesting&#8221; behaviour. (Specifically, services.exe was trying to send email. Lots of it.) Someone had built a fairly crafty bit of malware &#8211; as I recall, it loaded itself as a Winlogon notification DLL, which in turn spawned a copy of services.exe and dynamically injected itself into that process&#8217;s memory space. The exe file&#8217;s signature was valid, it didn&#8217;t have any strange/suspicious DLLs loaded itself &#8211; quite crafty, I thought, for the time.</p>
+<p>Around the same time, I was baffled by some userspace code of mine somehow triggering a BugCheck &#8211; via CloseHandle on a file. Eventually, I traced the culprit; the AV product I was using at the time was trying to free some sort of data structure it assumed it had created during the file opening process, but in this particular case that structure was never allocated, so it was freeing an uninitialised pointer in kernel mode, leading rather rapidly to Bad Stuff(TM). Disabling the on-access AV scan avoided the issue, as did switching to an alternative AV product, but I decided to shelve that particular project rather than risk blue-screening other users of that product.</p>
+<p>Quite disturbing that the customer couldn&#8217;t/wouldn&#8217;t switch to a more robust/sane approach to implementing whatever this functionality was though. Something akin to a call to LoadLibrary would seem like a bit improvement, as Koro suggests, avoiding most of the pain shown here?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-the-wench even thread-odd thread-alt depth-1" id="comment-1347335">
+				<div id="div-comment-1347335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Monochrome+Wench' rel='external nofollow' class='url'>Monochrome Wench</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347335">
+			June 15, 2018 at 6:12 pm</a>		</div>
+
+		<p>There is a lot of gotchas with CreateRemoteThread. I&#8217;ve only ever used it to do slightly dubious stuff and inject a dll into the process. ASLR made things a lot more complicated</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1347395">
+				<div id="div-comment-1347395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://www.broadheath.com/' rel='external nofollow' class='url'>Frank Wilhoit</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347395">
+			June 16, 2018 at 4:48 pm</a>		</div>
+
+		<p>Quite generally, when customers do incomprehensible things like this, and like several other of your recent posts, Occam&#8217;s Razor suggests that they are trying to (A) do some kind of licensing-compliance enforcement, (B) in a manner that is as difficult as possible to reverse-engineer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1347445">
+				<div id="div-comment-1347445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347445">
+			June 17, 2018 at 2:16 pm</a>		</div>
+
+		<p>And here it is lads and gents, the number ONE (capital 1 that&#8217;s it) the reason why Itanium never lived. That is the reason why Apple MacOS still hasn&#8217;t catch with Windows on desktop. Here it is the reason why Linux, on its desktop format never catch either. And same reason why Nokia&#8217;s Symbian died, Blackberry too and so on and so forth so many systems.<br />
+Because you need to be freaking developer friendly!!!<br />
+You are nothing without developers. Hence why Android is number 1, even if it came out after iOS.<br />
+iOS, I am first to admit, is the exception to the rule, is still not developer friendly but it has a healthy developers community.<br />
+Oh, and Micro$$$oft cell business died too (sorry Ray, RIP), yet still I hope that one will make a comeback&#8230;after all your company has plenty of cash to burn to get it right&#8230;eventually :D</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1347455">
+				<div id="div-comment-1347455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347455">
+			June 17, 2018 at 7:57 pm</a>		</div>
+
+		<p>&#8220;Function pointers on ia64 don&#8217;t point to the first byte of code, so subtracting function pointers doesn&#8217;t give you any information about the size of the function (whatever that means), and copying data starting at the function pointer does not actually copy any code. </p>
+<p>&#8220;Conversely, when you take a pointer to a block of memory that contains code and treat it as a function pointer, you are actually causing the first two 8-byte values at that address to be interpreted as a global pointer and a code address. This results in a garbage global pointer, and code executing from a random location.&#8221;</p>
+<p>Don&#8217;t these two issues cancel each other out, in this case? When you copy a block of data starting from the function pointer, it sounds like the first things that should be copied are the global pointer and the code address, so when you treat the copied block as a function pointer it should read the same global pointer and code address as the original, shouldn&#8217;t it?</p>
+<p>Not that I&#8217;m defending any part of this practice, you understand.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1347485">
+				<div id="div-comment-1347485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347485">
+			June 18, 2018 at 7:10 am</a>		</div>
+
+		<p>The function descriptor is nowhere near the code bytes.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1347695">
+				<div id="div-comment-1347695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347695">
+			June 18, 2018 at 8:47 pm</a>		</div>
+
+		<p>Granted &#8211; but shouldn&#8217;t you still be copying the correct global pointer and code address this way (followed by a chunk of random data)? Or am I still missing something obvious? As far as I can understand what you&#8217;re saying, (void*)RemoteThreadProc points to the function descriptor, so the code copies the function descriptor into the remote process followed by a chunk of garbage data. So when we CreateRemoteThread, doesn&#8217;t it see the correct function descriptor there? If this is not the case, I don&#8217;t understand your sentence &#8220;Conversely, when you take a pointer to a block of memory that contains code and treat it as a function pointer, you are actually causing the first two 8-byte values at that address to be interpreted as a global pointer and a code address&#8221;, or at least its relevance here. (Obviously in general this is a bad thing.)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-4" id="comment-1347805">
+				<div id="div-comment-1347805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347805">
+			June 19, 2018 at 6:47 am</a>		</div>
+
+		<p>If you copy the function descriptor, then yes, you get a copy of the function descriptor. Of course, you didn&#8217;t copy any other data or code, so the pointers you copied are pointer to nowhere. If you take a pointer to code and treat it as a function pointer, then you also get garbage. Just saying various ways of generating garbage.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-andycadley2 odd alt depth-4 parent" id="comment-1347885">
+				<div id="div-comment-1347885" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/AndyCadley' rel='external nofollow' class='url'>AndyCadley</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1347885">
+			June 19, 2018 at 10:30 am</a>		</div>
+
+		<p>The subtlety here is that source and destination are in different address spaces.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1348155">
+				<div id="div-comment-1348155" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Scarlet Manuka</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1348155">
+			June 21, 2018 at 12:24 am</a>		</div>
+
+		<p>Ah &#8211; so the copied function descriptor points to the wrong address space, and we do indeed wind up executing garbage. (Actually, I suppose it&#8217;s technically the right address space, it&#8217;s just not the address space in which the code address part points to the intended function.) Thanks, I think the mention of a global pointer here threw me off.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1348225">
+				<div id="div-comment-1348225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://dcsoft.com' rel='external nofollow' class='url'>David Ching</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1348225">
+			June 21, 2018 at 5:14 pm</a>		</div>
+
+		<p>This technique was presented on CodeProject.  I used it in 2006 as a simple way to overcome SendMessage&#8217;s refusal to proxy wParam/lParam for user messages (i.e. messages with ID&#8217;s greater than WM_USER, e.g. common control messages), nothing to do with AV or malware.  <a href="https://www.codeproject.com/Articles/4610/Three-Ways-to-Inject-Your-Code-into-Another-Proces" rel="nofollow">https://www.codeproject.com/Articles/4610/Three-Ways-to-Inject-Your-Code-into-Another-Proces</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1348985">
+				<div id="div-comment-1348985" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1348985">
+			June 26, 2018 at 7:40 am</a>		</div>
+
+		<p>You don&#8217;t need remote code execution to marshal data for `WM_USER`.  It&#8217;s enough to do the VirtualAllocEx/WriteProcessMemory/ReadProcessMemory steps, without the final CreateRemoteThread.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1349035">
+				<div id="div-comment-1349035" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1349035">
+			June 26, 2018 at 9:59 am</a>		</div>
+
+		<p>Dude! Use WM_COPYDATA.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1349195">
+				<div id="div-comment-1349195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://dcsoft.com' rel='external nofollow' class='url'>David Ching</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180615-00/?p=99025#comment-1349195">
+			June 27, 2018 at 5:03 pm</a>		</div>
+
+		<p>I created a function called SendMessageRemote(), which people have used over the years especially to query Windows common controls for their states:  <a href="https://groups.google.com/forum/#!search/sendmessageremote/microsoft.public.vc.mfc/QMAHlPpEQyM/Nu9iQycmEykJ" rel="nofollow">https://groups.google.com/forum/#!search/sendmessageremote/microsoft.public.vc.mfc/QMAHlPpEQyM/Nu9iQycmEykJ</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

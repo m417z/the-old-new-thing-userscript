@@ -1,0 +1,377 @@
+<html>
+<head>
+<title>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result using intrinsics (part 2)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Creating double-precision integer multiplication with a quad-precision result from single-precision multiplication with a double-precision result using intrinsics (part 2)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 14, 2017 / year-entry #273</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171214-00/?p=97577</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Put it all in registers.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20171213-00/?p=97575">
+Last time</a>,
+we converted our original assembly language code for
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20141208-00/?p=43453">
+creating double-precision integer multiplication with
+a quad-precision result
+from single-precision multiplication
+with a double-precision result</a>
+to C++ code with intrinsics.
+We observed that the compiler was able to optimize out
+some memory accesses by extracting the values using shifts.
+</p>
+<p>
+Let's see if we can tweak the code to
+remove the last of the memory accesses.
+Although the Windows calling convention for x86
+does not have many general purpose registers available
+(only
+<code>eax</code>
+<code>ecx</code>, and
+<code>edx</code>),
+it does have eight <code>xmm</code> registers available,
+so we can use those as temporary holding places.
+</p>
+<pre>
+__m128i Multiply64x64To128(uint64_t x, uint64_t y)
+{
+    auto x128 = _mm_loadl_epi64((__m128i*) &amp;x);
+    auto term1 = _mm_unpacklo_epi32(x128, x128);
+
+    auto y128 = _mm_loadl_epi64((__m128i*) &amp;y);
+    auto term2 = _mm_unpacklo_epi32(y128, y128);
+
+    auto flip2 = _mm_shuffle_epi32(term2, _MM_SHUFFLE(1, 0, 3, 2));
+
+    auto result = _mm_mul_epu32(term1, term2);
+    auto crossterms = _mm_mul_epu32(term1, flip2);
+
+    // Now apply the cross-terms to the provisional result
+    unsigned temp;
+
+    auto result1 = _mm_srli_si128(result, 4);
+    auto carry = _addcarry_u32(0,
+                               _mm_cvtsi128_si32(result1),
+                               _mm_cvtsi128_si32(crossterms),
+                               &amp;temp);
+    result1 = _mm_cvtsi32_si128(temp);
+
+    auto result2 = _mm_srli_si128(result, 8);
+    crossterms = _mm_srli_si128(crossterms, 4);
+    carry = _addcarry_u32(carry,
+                          _mm_cvtsi128_si32(result2),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    result2 = _mm_cvtsi32_si128(temp);
+
+    auto result3 = _mm_srli_si128(result, 12);
+    _addcarry_u32(carry,
+                  _mm_cvtsi128_si32(result3),
+                  0,
+                  &amp;temp);
+    result3 = _mm_cvtsi32_si128(temp);
+
+    crossterms = _mm_srli_si128(crossterms, 4);
+    carry = _addcarry_u32(0,
+                          _mm_cvtsi128_si32(result1),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    result1 = _mm_cvtsi32_si128(temp);
+
+    crossterms = _mm_srli_si128(crossterms, 4);
+    carry = _addcarry_u32(carry,
+                          _mm_cvtsi128_si32(result2),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    result2 = _mm_cvtsi32_si128(temp);
+
+    _addcarry_u32(carry,
+                  _mm_cvtsi128_si32(result3),
+                  0,
+                  &amp;temp);
+    result3 = _mm_cvtsi32_si128(temp);
+
+    result = _mm_unpacklo_epi64(
+       _mm_unpacklo_epi32(result, result1),
+       _mm_unpacklo_epi32(result2, result3));
+
+    return result;
+}
+</pre>
+<p>
+We keep each of the four pieces of the result in a separate MMX
+register and convert it to an integer for the purpose of the
+<code>_addcarry_u32</code>,
+then convert it back to an MMX register once the arithmetic is complete.
+At the end, recombine the four pieces into a single value.
+</p>
+<p>
+The convert-on-demand-and-then-back pattern is
+</p>
+<pre>
+    carry = _addcarry_u32(carry,
+                          _mm_cvtsi128_si32(blah),
+                          _mm_cvtsi128_si32(crossterms),
+                          &amp;temp);
+    blah = _mm_cvtsi32_si128(temp);
+</pre>
+<p>
+where we take the low-order 32-bit value in <code>blah</code>,
+perform an add-with-carry with the low-order 32-bit vlaue
+in <code>crossterms</code>,
+then save the result back into <code>blah</code> while retaining
+the carry.
+</p>
+<p>
+The other trick is that the lanes of the cross-terms are
+consumed only once each, and in order,
+so we can shift them into position and
+use
+<code>_mm_cvtsi128_si32</code>
+to pull them out one at a time.
+</p>
+<p>
+The resulting compiler-generated assembly goes like this:
+</p>
+<pre>
+    ; xmm0 = y = { 0, 0, C, D }
+        movq     xmm0, QWORD PTR _y$[esp-4]
+    ; xmm1 = x = { 0, 0, A, B }
+        movq     xmm1, QWORD PTR _x$[esp-4]
+
+    ; xmm0 = { C, C, D, D }
+        punpckldq xmm0, xmm0
+
+    ; xmm4 = { C, C, D, D }
+        movaps   xmm4, xmm0
+
+    ; xmm1 = { A, A, B, B }
+        punpckldq xmm1, xmm1
+
+    ; xmm4 = { A * C, B * D } ; "result"
+        pmuludq xmm4, xmm1
+
+    ; xmm3 = { D, D, C, C }
+        pshufd   xmm3, xmm0, 78
+
+    ; xmm3 = { A * D, B * C } ; "crossterms"
+        pmuludq xmm3, xmm1
+
+    ; ecx = result[1]
+        movaps   xmm0, xmm4
+        psrldq   xmm0, 4
+        movd     ecx, xmm0
+
+    ; prepare to load result[2] from xmm0
+        movaps   xmm0, xmm4
+
+    ; eax = crossterms[0]
+        movd     eax, xmm3
+
+    ; prepare to load result[2] from xmm0
+        psrldq   xmm0, 8
+
+    ; shift crossterms[1] into position
+        psrldq   xmm3, 4
+
+    ; result[1] += crossterms[0], carry set appropriately
+        add      ecx, eax
+
+    ; eax = crossterms[1]
+        movd     eax, xmm3
+
+    ; shift crossterms[2] into position
+        psrldq   xmm3, 4
+
+    ; xmm1 = result[1]
+        movd     xmm1, ecx
+
+    ; ecx = result[2]
+        movd     ecx, xmm0
+
+    ; prepare to load result[3] from xmm0
+        movaps   xmm0, xmm4
+        psrldq   xmm0, 12
+
+    ; result[2] += crossterms[1] + carry, carry set appropriate
+        adc      ecx, eax
+
+    ; eax = result[3]
+        movd     eax, xmm0 
+
+    ; result[3] += carry
+        adc      eax, 0
+
+    ; xmm2 = result[2]
+        movd     xmm2, ecx
+
+    ; ecx = result[1]
+        movd     ecx, xmm1
+
+    ; xmm0 = result[3]
+        movd     xmm0, eax
+
+    ; eax = crossterms[2]
+        movd     eax, xmm3
+
+    ; shift crossterms[3] into position
+        psrldq   xmm3, 4
+
+    ; result[1] += crossterms[2], carry set appropriately
+        add      ecx, eax
+
+    ; eax = crossterms[3]
+        movd     eax, xmm3
+
+    ; xmm1 = result[1]
+        movd     xmm1, ecx
+
+    ; ecx = result[2]
+        movd     ecx, xmm2
+
+    ; xmm4 = { *, *, result[1], result[0] }
+        punpckldq xmm4, xmm1
+
+    ; result[2] += crossterms[3]
+        adc      ecx, eax
+
+    ; eax = result[3]
+        movd     eax, xmm0
+
+    ; result[3] += carry
+        adc      eax, 0
+
+    ; xmm2 = result[2]
+        movd     xmm2, ecx
+
+    ; xmm1 = result[3]
+        movd     xmm1, eax
+
+    ; xmm2 = { *, *, result[3], result[2] }
+        punpckldq xmm2, xmm1
+
+    ; xmm4 = { result[3], result[2], result[1], result[0] }
+        punpcklqdq xmm4, xmm2
+
+    ; set as return value
+        movaps   xmm0, xmm4
+        ret
+</pre>
+<p>
+I could go even further and realize that one of the <code>result#</code>
+variables could be left in a general-purpose register,
+since we need only two registers to perform the integer add.
+I also could have shifted the result a little bit at a time
+the same way I shifted the cross-terms a little bit at a time.
+</p>
+<p>
+This version can perform all its work in registers,
+which means that there's no need for stack variables,
+which means that it becomes a lightweight leaf function.
+That means it doesn't need to create a stack frame.
+</p>
+<p>
+Next time, we'll move on to signed multiplication.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20171214-00/?p=97577#respond" style="display:none;">Cancel reply</a></small></h3>			<form action="https://blogs.msdn.microsoft.com/oldnewthing/wp-comments-post.php" method="post" id="commentform" class="comment-form">
+				<p class="comment-form-comment"><textarea id="comment" name="comment" cols="45" rows="4" aria-required="true"></textarea></p><p class="comment-form-author"><label for="author">Name <span class="required">*</span></label> <input id="author" name="author" type="text" value="" size="30" maxlength="245" aria-required='true' required='required' /></p>
+<p class="comment-form-email"><label for="email">Email <span class="required">*</span></label> <input id="email" name="email" type="text" value="" size="30" maxlength="100" aria-describedby="email-notes" aria-required='true' required='required' /></p>
+<p class="comment-form-url"><label for="url">Website</label> <input id="url" name="url" type="text" value="" size="30" maxlength="200" /></p>
+<p class="form-submit"><input name="submit" type="submit" id="submit" class="submit btn btn-default" value="Post Comment" /> <input type='hidden' name='comment_post_ID' value='97577' id='comment_post_ID' />
+<input type='hidden' name='comment_parent' id='comment_parent' value='0' />
+</p><p style="display: none;"><input type="hidden" id="akismet_comment_nonce" name="akismet_comment_nonce" value="2a5ce7e728" /></p><p style="display: none;"><input type="hidden" id="ak_js" name="ak_js" value="113"/></p>			</form>
+			</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1 parent" id="comment-1317917">
+				<div id="div-comment-1317917" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171214-00/?p=97577#comment-1317917">
+			December 17, 2017 at 4:22 pm</a>		</div>
+
+		<p>The fun thing is how difficult it is to get a carry bit even in SSE4.2.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171214-00/?p=97577&#038;replytocom=1317917#respond' onclick='return addComment.moveForm( "div-comment-1317917", "1317917", "respond", "97577" )' aria-label='Reply to Yuhong Bao'>Reply</a></div>
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-yuhong-bao odd alt depth-2" id="comment-1318026">
+				<div id="div-comment-1318026" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171214-00/?p=97577#comment-1318026">
+			December 18, 2017 at 3:59 pm</a>		</div>
+
+		<p>It is not impossible though, and I just did it. One problem is that PCMPGTQ is a signed compare, meaning that you have to PXOR both values by 0x8000000000000000 before you do it.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20171214-00/?p=97577&#038;replytocom=1318026#respond' onclick='return addComment.moveForm( "div-comment-1318026", "1318026", "respond", "97577" )' aria-label='Reply to Yuhong Bao'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

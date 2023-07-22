@@ -1,0 +1,766 @@
+<html>
+<head>
+<title>How to turn off the exception handler that COM "helpfully" wraps around your server</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to turn off the exception handler that COM &quot;helpfully&quot; wraps around your server</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 20, 2011 / year-entry #14</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>37</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Historically, COM placed a giant try/except around your server's methods. If your server encountered what would normally be an unhandled exception, the giant try/except would catch it and turn it into the error RPC_E_SERVERFAULT. It then marked the exception as handled, so that the server remained running, thereby "improving robustness by keeping the server running...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Historically, COM
+placed a giant <code>try/<wbr>except</wbr></code> around your server's methods.
+If your server encountered what would normally be an unhandled exception,
+the giant <code>try/<wbr>except</wbr></code> would catch it and turn it into the
+error <code>RPC_<wbr>E_S<wbr>ERVERFAULT</wbr></wbr></code>.
+It then marked the exception as handled, so that the server
+remained running,
+thereby "improving robustness by keeping the server running
+even when it encountered a problem."
+</p>
+<p>
+Mind you, this was actually a disservice.
+</p>
+<p>
+The fact that an unhandled exception occurred means that the server
+was <i>in an unexpected state</i>.
+By catching the exception and saying,
+"Don't worry, it's all good,"
+you end up leaving a corrupted server running.
+For example:
+</p>
+<pre>
+HRESULT CServer::DoOneWork(...)
+{
+ CWork *pwork = m_listWorkPending.RemoveFirst();
+ if (pwork) {
+   pwork-&gt;UpdateTimeStamp();
+   pwork-&gt;FrobTheWidget();
+   pwork-&gt;ReversePolarity();
+   pwork-&gt;UnfrobTheWidget();
+   m_listWorkDone.Add(pwork);
+ }
+ return S_OK;
+}
+</pre>
+<p>
+Suppose there's a bug somewhere that causes
+<code>pwork-&gt;Reverse&shy;Polarity()</code> to crash.
+Maybe the problem is that the neutrons aren't flowing,
+so there's no polarity to reverse.
+Maybe the polarizer is not property initialized.
+Whatever, doesn't matter what the problem is,
+just assume there's a bug that prevents it from working.
+</p>
+<p>
+With the global <code>try/<wbr>except</wbr></code>, COM catches the
+exception and returns <code>RPC_<wbr>E_<wbr>SERVERFAULT</wbr></wbr></code> back to the caller.
+Your server remains up and running, ready for another request.
+Mind you, your server is also corrupted.
+The widget never got unfrobbed,
+the timestamp refers to work that never completed,
+and the <code>CWork</code> that you removed from the pending work list
+got leaked.
+</p>
+<p>
+But, hey, your server stayed up.
+</p>
+<p>
+A few hours later, the server starts returning <code>E_OUTOFMEMORY</code>
+errors (because of all the leaked work items),
+you get errors because there are too many outstanding frobs,
+and the client hangs because it's waiting for a completion notification
+on that work item that you lost track of.
+You debug the server to see why everything is so screwed up,
+but you can't find anything wrong.
+"I don't understand why we are leaking frobs.
+Every time we frob a widget, there's a call to unfrob right after it!"
+</p>
+<p>
+You eventually throw up your hands in resignation.
+"I can't figure it out.
+There's no way we can be leaking frobs."
+</p>
+<p>
+Even worse, the inconsistent object state can be a security hole.
+An attacker tricks you into reversing the polarity of a nonexistent
+neutron flow, which causes you to leave the widget frobbed by mistake.
+Bingo, frobbing a widget makes it temporarily exempt from unauthorized
+polarity changes,
+and now the bad guys can change the polarity at will.
+Now you have to chase a security vulnerability where widgets
+are being left frobbed, and you still can't find it.
+</p>
+<p>
+Catching all exceptions and letting the process continue running
+assumes that a server can recover from an unexpected failure.
+But this is absurd.
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/11/13/9921676.aspx">
+You already know that the server is unrecoverably toast: It crashed</a>!
+</p>
+<p>
+Much better is to let the server crash
+so that the crash dump can be captured <i>at the point of the failure</i>.
+Now you have a fighting chance of figuring out what's going on.
+</p>
+<p>
+But how do you turn off that massive <code>try/<wbr>except</wbr></code>?
+You didn't put it in your code; COM created it for you.
+</p>
+<p>
+Enter
+<a HREF="http://msdn.microsoft.com/en-us/library/aa344211(VS.85).aspx">
+<code>IGlobal&shy;Options</code></a>:
+Set the <code>COMGLB_<wbr>EXCEPTION_<wbr>HANDLING</wbr></wbr></code>
+property to
+<code>COMGLB_<wbr>EXCEPTION_<wbr>DONOT_<wbr>HANDLE</wbr></wbr></wbr></code>,
+which means
+"Please don't try to 'help' me by catching all exceptions.
+If a fatal exception occurs in my code, then go ahead and let the process
+crash."
+In Windows&nbsp;7, you can ask for the even stronger
+<code>COMGLB_<wbr>EXCEPTION<wbr>_DONOT_<wbr>HANDLE_<wbr>ANY</wbr></wbr></wbr></wbr></code>,
+which means
+"Don't even try to catch 'nonfatal' exceptions."
+</p>
+<p>
+Wait, what's a 'fatal' exception?
+</p>
+<p>
+A 'fatal' exception, at least as COM interprets it,
+is an exception like <code>STATUS_<wbr>ACCESS_<wbr>VIOLATION</wbr></wbr></code>
+or <code>STATUS_<wbr>ILLEGAL_<wbr>INSTRUCTION</wbr></wbr></code>.
+(A complete list is in this
+<a HREF="http://msdn.microsoft.com/en-us/library/aa379163(VS.85).aspx">
+sample Rpc exception filter</a>.)
+On the other hand a 'nonfatal' exception is something like
+a C++ exception or a CLR exception.
+You probably want an unhandled C++ or CLR exception to crash your
+server, too; after all, it would have crashed your program if it
+weren't running as a server.
+Therefore, my personal recommendation is to use
+<code>COMGLB_<wbr>EXCEPTION_<wbr>DONOT_<wbr>HANDLE_<wbr>ANY</wbr></wbr></wbr></wbr></code>
+whenever possible.
+</p>
+<p>
+"That's great, but why is the default behavior the dangerous
+'silently swallow exceptions' mode?"
+</p>
+<p>
+The COM folks have made numerous attempts to change the default
+from the dangerous mode to one of the safer modes,
+but the application compatibility consequences have always been too great.
+Turns out there are a lot of servers that actually rely on COM silently
+masking their exceptions.
+</p>
+<p>
+But at least now you won't be one of them.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (37)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-889663">
+				<div id="div-comment-889663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anthony Wieser</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889663">
+			January 20, 2011 at 7:14 am</a>		</div>
+
+		<p>A similar bit of exception swallowing is described here related to 32-64 bit transitions:</p>
+<p>I&#39;ve run into this quite a lot lately, where my error reporting code doesn&#39;t get triggered.</p>
+<p><a rel="nofollow" target="_new" href="http://blog.paulbetts.org/index.php/2010/07/20/the-case-of-the-disappearing-onload-exception-user-mode-callback-exceptions-in-x64" rel="nofollow">blog.paulbetts.org/&#8230;/the-case-of-the-disappearing-onload-exception-user-mode-callback-exceptions-in-x64</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889683">
+				<div id="div-comment-889683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">SimonRev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889683">
+			January 20, 2011 at 7:21 am</a>		</div>
+
+		<p>&quot;pwork-&gt;Reverse­Polarity() to crash. Maybe the problem is that the neutrons aren&#39;t flowing, so there&#39;s no polarity to reverse&quot;</p>
+<p>Been watching classic Jon Pertwee Doctor Who lately?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889693">
+				<div id="div-comment-889693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889693">
+			January 20, 2011 at 7:23 am</a>		</div>
+
+		<p>I like the homage to Pertwee&#39;s Doctor Who: &quot;I just reversed the polarity!&quot;</p>
+<p>And for all the nit-pickers, I know it&#39;s hard to imagine how you can reverse the polarity of a neutron (it being neutral, and all) but just let it go and enjoy the rest of the story. &nbsp;</p>
+<p>Hey! &nbsp;I sounded like Paul Harvey just then&#8230; :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889713">
+				<div id="div-comment-889713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">RoddyP</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889713">
+			January 20, 2011 at 7:55 am</a>		</div>
+
+		<p>I think some of this argument is a bit fallacious: If your &#39;widget&#39; has a persistence beyond the process (maybe it&#39;s a file widget or database widget) then if reversePolarity() bombs it&#39;s going to stay frobbed regardless of an external try/catch loop. Surely the real solution is to make your widget get frobbed in a RAII style, where a WidgetFrobber object would have a destructor to unfrob it automagically. That way you&#39;re safe regardless of what happens inside ReversePolarity()</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889733">
+				<div id="div-comment-889733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889733">
+			January 20, 2011 at 8:12 am</a>		</div>
+
+		<p>@RoddyP</p>
+<p>RAII is great for making your stuff exception safe when we&#39;re talking about C++ exceptions, but this COM handler is also catching system exceptions as well, like an access violation. &nbsp;If you get a fatal exception like that, you should crash without trying to unwind the stack frames and run destructors.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889763">
+				<div id="div-comment-889763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">bg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889763">
+			January 20, 2011 at 8:27 am</a>		</div>
+
+		<p>Is there a performance hit on the try/catch mechanism or to put it another way: will my code that uses lots of com components go faster if I turn the try/catch mechanism off? </p>
+<div class="post">[<i>Even if there were a difference (and I doubt there is; it&#39;s probably just a change to the filter), the difference is negligible (and zero on non-x86). Read up on how SEH is implemented for more information. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889783">
+				<div id="div-comment-889783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">RoddyP</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889783">
+			January 20, 2011 at 8:30 am</a>		</div>
+
+		<p>@Zarat: Exceptions in destructor aren&#39;t ignored: They should force terminate() to be called, so your process quits immediately. And no, I&#39;m not advocating keeping the external try/except loop &nbsp;&#8211; just pointing out that removing it doesn&#39;t fix the basic exception safety issues in DoOneWork().</p>
+<p>@Adrian: Ah, so system exceptions aren&#39;t always C++ exceptions? I guess that&#39;s toolchain specific, as I&#39;m sure I can try/catch (EAccessViolation &amp;e) with C++Builder. I don&#39;t think there&#39;s anything inherently &#39;non-continuable&#39; about access violations&#8230;?</p>
+<div class="post">[<i>It always amazes me how people focus on the details of the example and not the big picture. Who cares about DoOneWork. Substitute whatever you want that meets your personal coding standard. (C++ exceptions are synchronous. Win32 exceptions are asynchronous. Some compilers convert asynchronous exceptions into synchronous exceptions. I would argue that this is attempting to solve a problem by creating a bigger problem.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889793">
+				<div id="div-comment-889793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889793">
+			January 20, 2011 at 8:38 am</a>		</div>
+
+		<p>(Hmm, hope this doesn&#39;t double-post)</p>
+<p>I realize they are just generic terms, designed not to convey any particular meaning or function, but every time I read a sentence like &#39;The widget never got unfrobbed&#39; I can&#39;t help but laugh. &nbsp;One of your finest articles, Raymond.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889803">
+				<div id="div-comment-889803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Crescens2k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889803">
+			January 20, 2011 at 9:01 am</a>		</div>
+
+		<p>RoddyP:</p>
+<p>Things like AV etc are SEH exceptions and it isn&#39;t toolchain specific, this is how Windows itself works.</p>
+<p>What C++ Builder probably does is like what VC is capable of doing, and that is setting it to catch SEH exceptions with try/catch and wrapping the exception in an object. But a thing to note is that the VC documentation discourages you from using /EHa to catch SEH exceptions with try/catch.</p>
+<p>bg:</p>
+<p>The performance hit isn&#39;t with using code which is set up for exceptions, but when the exception occurs. So there should be no, or very little difference in speed between code which is set up to handle exceptions and code which isn&#39;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889813">
+				<div id="div-comment-889813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">o</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889813">
+			January 20, 2011 at 9:18 am</a>		</div>
+
+		<p>I find the frobbing widget polarity stuff to be more confusing and annoying than a simple real-world example.</p>
+<div class="post">[<i>I didn&#39;t have any simple real-world examples. (And I&#39;m not going to ask a customer &quot;Hey, can I post your source code on my blog?&quot;) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889833">
+				<div id="div-comment-889833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MikeCaron</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889833">
+			January 20, 2011 at 10:01 am</a>		</div>
+
+		<p>I am reminded of a post your colleague Eric Lippert posted regarding types of exceptions (<a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/ericlippert/archive/2008/09/10/vexing-exceptions.aspx" rel="nofollow">blogs.msdn.com/&#8230;/vexing-exceptions.aspx</a>), and why you shouldn&#39;t catch fatal exceptions (<a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/ericlippert/archive/2010/11/23/asynchrony-in-c-5-part-eight-more-exceptions.aspx" rel="nofollow">blogs.msdn.com/&#8230;/asynchrony-in-c-5-part-eight-more-exceptions.aspx</a>). Warning: CLR/.NET stuff beyond these links, but I imagine it&#39;s just as relevant to regular exceptions as well.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889843">
+				<div id="div-comment-889843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael Kohne</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889843">
+			January 20, 2011 at 10:08 am</a>		</div>
+
+		<p>OK, so we know why the COM team haven&#39;t fixed this (and I can&#39;t imagine they&#39;ll EVER be able to fix it &#8211; compatibility needs to take first priority here), but what I don&#39;t understand is how we got here to begin with! I have my issues with MS, but I don&#39;t usually see things that are quite this&#8230;problematic. How did this ever get out the door with this &#39;auto-eat exceptions&#39; thing turned on?</p>
+<div class="post">[<i>That&#39;s like asking why people wore stupid clothes in the 1970&#39;s. Fashions change. Everybody said &quot;it&#39;s about time, you idiots&quot; when Windows 3.1 added parameter validation, which means that back then the programming fashion was KeepRunning rather than FailFast. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick even thread-even depth-1" id="comment-889853">
+				<div id="div-comment-889853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889853">
+			January 20, 2011 at 10:19 am</a>		</div>
+
+		<p>@Crescens2k: there is always a performance hit on x86 Windows in fiddling with the exception frame chain when a new exception frame is created, by pushing various structures describing the filter onto</p>
+<p>the stack, storing the link to the previous handler from FS:[0], and setting FS:[0] to point to the new exception frame. This work has to be done for __finally handling, including any cases where you have stack locals that have non-trivial destructors. If it can prove that a function, and the tree of called functions, does not throw a C++ exception, the compiler will eliminate any auto-generated handlers. It can do this by assuming that only a &#39;throw&#39; statement generates an exception that it has to handle, which MS calls &#39;synchronous&#39;. Unfortunately that means if an SEH exception is raised by hardware (&#39;asynchronous&#39;), your stack locals won&#39;t be destructed.</p>
+<p>/EHa tells the Microsoft compiler not to discard the auto-generated handlers, so the stack should unwind properly even in the face of SEH exceptions. The cost is much larger code and constant exception frame management. Often the compiler cannot optimize a function with exception frames to the same extent that it could without.</p>
+<p>The compiler does use a single exception frame per function, no matter how many nested __try, try, or nested scopes containing destructable objects you have (assuming at least one, of course!) It generates tables to map the instruction pointer to the appropriate scope and appropriate handler &#8211; all exception frames then point to the same handler to process the tables. The CLR only pushes a new frame on transition to unmanaged code &#8211; the documentation for /EH says that with /clr, you get /EHa, which is expected because the CLR is already converting SEH exceptions to CLR exceptions (e.g. AccessViolationException).</p>
+<p>For all other processors that Windows has ever run on, including Windows CE on non-x86 processors, SEH exceptions are table-based. It&#39;s generally slower to locate handlers, because frequently the tables have either never been referenced or have been removed from the working set since last referenced, but zero code is generated to manage exceptions for the no-exceptions case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889863">
+				<div id="div-comment-889863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">tobi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889863">
+			January 20, 2011 at 10:45 am</a>		</div>
+
+		<p>Maybe any comments on why ignoring exception in an asp.net context is not harmful? (They just turn into 500 errors). My guess is that the framework assumes that requests are independent and any state that was corrupted gets thrown away when the request exits.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889873">
+				<div id="div-comment-889873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">barrkel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889873">
+			January 20, 2011 at 11:13 am</a>		</div>
+
+		<p>Delphi generally recommends using the &#39;safecall&#39; calling convention when implementing COM-style interfaces. That calling convention is &#39;stdcall&#39; with a couple of extra features: a return type of HRESULT, and an automatic exception handler for the method that routes the exception to a base class&#39;s method (TObject.SafeCallException). In certain base classes (like TComObject), that method is overridden and changes the return value to E_UNEXECTED, and does the whole ISupportErrorInfo, SetErrorInfo etc. with data from the native exception. SEH exceptions, meanwhile, are already converted at a low level on the stack to native exceptions, so they get similar treatment. If you want different behaviour (fail fast or whatever), you can override it and provide your own.</p>
+<p>Of course, Delphi has a different philosophy with regards to exceptions. In Delphi, when an exception is raised, it&#39;s not generally assumed that the application is toast, that all is lost, and the best thing to do is to terminate. Delphi, by default, has a message pump loop that catches all exceptions and displays their associated message in an error box. Raising an exception is a more or less accepted way of aborting a procedure with an associated error message. The error message associated with the exception is generally meant to be end-user readable where relevant (e.g. not an access violation exception).</p>
+<p>C++ Builder, sharing as it does much of the same RTL as Delphi, inherits many of these features, but I couldn&#39;t tell you offhand exactly which bits.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889883">
+				<div id="div-comment-889883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Crescens2k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889883">
+			January 20, 2011 at 11:24 am</a>		</div>
+
+		<p>Mike Dimmick:</p>
+<p>I know there is a hit on x86, I know how exception handling works, and if you read what I wrote then you would have noticed it said &quot;no, or very little&quot;, please note the very little. Even if you say optimisation get in the way, does that really make a staggering difference? I don&#39;t think so, and if it did then it is easy enough to just put the code in a seperate function and call that so the function doesn&#39;t have an exception handling frame. (It is a handful of assembly instructions per function).</p>
+<p>So even with your lecture on exception handling, the reply stays the same. There should be no difference, or at least very little difference in code set up for exception handling compared to functions not set up for exception handling.</p>
+<p>Of course, this isn&#39;t including the actual exception handling. That should be a rare occurance.</p>
+<p>Also remember, this was in the context of SEH exception handling around the COM functions and if turning them off would make a difference. So going into the whole C++ + /EHa + CLR was pointless.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889673">
+				<div id="div-comment-889673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Bugglin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889673">
+			January 20, 2011 at 7:18 am</a>		</div>
+
+		<p>If you can&#39;t use COMGLB_EXCEPTION_DONOT_HANDLE_ANY, couldn&#39;t you wrap your program in it&#39;s own try/except and terminate the process on an exception?</p>
+<p>Not the ideal solution (AFAIK using any sort of try block is slower than not) but it would be a working, if hacky, workaround. &nbsp;I think.</p>
+<div class="post">[<i>Wrapping doesn&#39;t help because exception handling is done innermost first, and the COM handler is inside your wrapper. You would have to put your wrapper *inside* the COM handler (i.e., on every method). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889903">
+				<div id="div-comment-889903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889903">
+			January 20, 2011 at 3:43 pm</a>		</div>
+
+		<p>Bit by the bug known as backwards compatibility. BeOS was the only one to manage to avoid that to my knowledge, but they didn&#39;t live long enough for us to really know if the experiment was successful.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889923">
+				<div id="div-comment-889923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Miral</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889923">
+			January 20, 2011 at 3:57 pm</a>		</div>
+
+		<p>@Crescens2k: Actually, /EHa vs. /EHs is very relevant. &nbsp;Under the default /EHsc, destructors are NOT guaranteed to be called on an asynchronous exception such as an access violation. &nbsp;So even if your code is written in perfect RAII form, you&#39;re not going to clean up properly from access violations unless you&#39;re using /EHa.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889933">
+				<div id="div-comment-889933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889933">
+			January 20, 2011 at 3:58 pm</a>		</div>
+
+		<p>Michael Kohne: It&#39;s easy to argue that ignoring exceptions should be the default. If you browse the web with a script debugger enabled, you will see that a vast number JavaScript exceptions showing up all over. Generally speaking, these errors are harmless. Usually they either cause something that you&#39;d never notice not to work or they cause something you don&#39;t care about not to work. Only rarely will such an error cause a form not to submit or some other unfortunate failure.</p>
+<p>So given the ubiquity of JS errors throughout the web, can you imagine what would happen if the browser closed a web page every time it threw an exception? The web would be unusable! What if the browser itself crashed every time a JS exception went unhandled? The use can&#39;t actually fix the problem, so why not just keep running and let the user decide if they can keep going?</p>
+<p>Of course there are many differences between COM servers and web pages, but it&#39;s easy to see how KeepRunning was the fashion.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889723">
+				<div id="div-comment-889723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Zarat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889723">
+			January 20, 2011 at 8:06 am</a>		</div>
+
+		<p>@RoddyP</p>
+<p>You&#39;d just moved the problem. What if the exception happens during unfrobbing in the destructor? The exception is still ignored and the server continues to run. Besides that there are kinds of exceptions which make it impossible to safely continue running *any* code in the process, and it&#39;d still be ignored.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889943">
+				<div id="div-comment-889943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jon23423</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889943">
+			January 20, 2011 at 7:41 pm</a>		</div>
+
+		<p>How does one turn off the try/except that also &quot;helpfully&quot; wrap (non-COM) RPC servers?</p>
+<p>I believe they are there to catch the exception and instead propagate it to the RPC client, however this can leave the server in an unexpected state.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889953">
+				<div id="div-comment-889953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889953">
+			January 20, 2011 at 8:21 pm</a>		</div>
+
+		<p>@Gabe: I think the web is a somewhat different case in that the code is being executed by some unknown interpreter over which the page author has no control. &nbsp;It&#39;s harder to expect web developers to program for strict correctness when &quot;correctness&quot; is a moving target (even if you write strictly to some standard, the interpreter might not be strictly conforming).</p>
+<p>That said, if errors were more visible, I&#39;m sure there&#39;s a large class of errors that would be fixed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-889973">
+				<div id="div-comment-889973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889973">
+			January 20, 2011 at 10:50 pm</a>		</div>
+
+		<p>James: And a JavaScript error is much less severe than an SEH.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dancol even thread-even depth-1" id="comment-889893">
+				<div id="div-comment-889893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Daniel++Colascione' rel='external nofollow' class='url'>Daniel Colascione</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889893">
+			January 20, 2011 at 3:35 pm</a>		</div>
+
+		<p>Eception swallowing wouldn&#39;t be so bad if, once an object broke by throwing an exception, it *stayed* broken until destroyed. You couldn&#39;t access the state at all in that case.</p>
+<p>Of course, it&#39;s too late to change now.</p>
+<div class="post">[<i>You&#39;re assuming that the damage is localized to the object which raised the unhandled exception. What if the exception in CWork::ReversePolarity was raised by a singleton CSonicScrewdriver::Enable object? Do you mark the CWork as broken, the singleton CSonicScrewdriver, the CServer? All of them? If the CServer is broken, then what&#39;s the point of running? -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-889993">
+				<div id="div-comment-889993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cheong</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889993">
+			January 20, 2011 at 11:53 pm</a>		</div>
+
+		<p>How about COM extensions that used by web servers?</p>
+<p>Take System.Web.Mail in .NET v1.1 for example, it is really built upon CDO COM objects. Would you prefer all further emails be blocked from sending just because some random email cased CDO to fail? Remind you, most web servers operates unattended and mostly offsite (especially for web hosting solutions)</p>
+<p>IMO, the automatic exception handler would make sense in this case. Although it would have been better if the wrapper can be configured to dump the &quot;core&quot; to some folder for later investigations. (Any chance to get such function in IGlobal­Options?)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-890013">
+				<div id="div-comment-890013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Morten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890013">
+			January 21, 2011 at 1:26 am</a>		</div>
+
+		<p>Lovely. Great explanation of why the design decisions we make today are going to be a royal PITA in 5 or 10 years. What&#39;s right today is not right tomorrow. Just got bitten by one of them things recently and it still smarts&#8230; There is no silver bullet.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-890053">
+				<div id="div-comment-890053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890053">
+			January 21, 2011 at 5:31 am</a>		</div>
+
+		<p>@Goran:</p>
+<p>Your last sentence is a perfect demonstration of what&#39;s wrong with the &quot;RAII as a substitute for try/finally&quot; idiom. &nbsp;You end up thinking of everything as &quot;a resource,&quot; when a lot of things aren&#39;t. &nbsp;(When all you have is a hammer&#8230;)</p>
+<p>To imitate a try/finally block, you need to create a whole new class for each different type of operation you want to perform, which then of course introduces the potential for new bugs and needs to be tested.</p>
+<p>For example, what&#39;s the simplest possible C++ implementation of this standard Delphi idiom?</p>
+<p>MyDataset.DisableControls;</p>
+<p>try</p>
+<p>&nbsp;LoadDataset(MyDataset, DataList);</p>
+<p>finally</p>
+<p>&nbsp;MyDataset.EnableControls;</p>
+<p>end;</p>
+<p>Can it be done without having to create a new class? &nbsp;Can it be done in anywhere near six lines? &nbsp;And can it be done in such a way that ensures that EnableControls fires immediately after LoadDataset, and not at the end of the function?</p>
+<p>RAII tends to be implemented with an implicit try/finally frame inserted by the compiler, and IMO the example above demonstrates a textbook case of why abstraction inversion is considered a bad thing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-889963">
+				<div id="div-comment-889963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-889963">
+			January 20, 2011 at 9:41 pm</a>		</div>
+
+		<p>I have to take exception (no pun intended) with the way this statement is presented as some sort of universal fact:</p>
+<p>&quot;The fact that an unhandled exception occurred means that the server was in an unexpected state. By catching the exception and saying, &quot;Don&#39;t worry, it&#39;s all good,&quot; you end up leaving a corrupted server running.&quot;</p>
+<p>Maybe if you&#39;re writing in C++, which has abysmal support for exception handling and no try/finally construct to take care of unexpected exceptions properly, (and no, RAII is *not* a proper substitute for a true try/finally,) this might be an issue. But as Barry Kelly pointed out above, things look very different in Delphi.</p>
+<p>It&#39;s idiomatic to wrap temporary state changes that need to be reversed in try/finally blocks, and then even if an unexpected exception occurs, your code remains in a consistent state while the stack is unwound, turning this &quot;severe corruption problem&quot; into a non-issue.</p>
+<div class="post">[<i>s/exception/unhandled exception/. Obviously, if your code is expecting the exception, then it&#39;s part of your normal code flow. I can&#39;t believe I had to write that. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-890063">
+				<div id="div-comment-890063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Briar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890063">
+			January 21, 2011 at 6:51 am</a>		</div>
+
+		<p>@Mason Wheeler: that&#39;s such a good example. So&#8230; LoadDataset essentially crashed. And you now want to re-enable the control that was being loaded ? What&#39;s the likelihood it contains what you want ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-890143">
+				<div id="div-comment-890143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890143">
+			January 21, 2011 at 8:34 am</a>		</div>
+
+		<p>@Mason Wheeler:</p>
+<p>Remember, RC isn&#39;t just talikng about C++ exceptions. In fact, he&#39;s primarily talking about non-C++ exceptions, such as access violation. When those occur, yes, your code is toast. The process memory may be in an unknown corrupted state, in general case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-890173">
+				<div id="div-comment-890173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890173">
+			January 21, 2011 at 9:13 am</a>		</div>
+
+		<p>James: The web is different in how it&#39;s used (I&#39;m not suggesting that COM servers and web browsers should handle exceptions the same way), but that&#39;s not my point. My point is that the web is a demonstration of how 99% of unhandled exceptions can be safely ignored.</p>
+<p>Most null pointer dereferences are just &quot;Oops, I forgot to check for NULL&quot;, not &quot;ZOMG!! HOW DID THAT BECOME NULL!!??&quot; so it usually doesn&#39;t matter if it&#39;s ignored. Of course ignoring them all to avoid annoying the user 99% of the time makes it impossible to debug the 1% of cases where it really is a problem.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-890023">
+				<div id="div-comment-890023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890023">
+			January 21, 2011 at 2:03 am</a>		</div>
+
+		<p>Wow, excellent, I didn&#39;t know about IGlobalOptions! 100% agree that catching faulted server errors is a disservice. That said&#8230;</p>
+<p>@Barry Kelly: Delphi is IMO wonderful, but even in Delphi, if you get e.g. access violation, in general case, code is toast. AFAIK, people who competently write Delphi code are rather clean WRT exception safety (they are IMO better than C++ people in that respect), but still I see little point in trying to continue upon an AV, even in Delphi. IOW, Borland made the same mistake as MS with /EHa. Perhaps they copied that? BTW, yes, VCL UI code has a message pump that displays exception, but so does e.g. MFC (that&#39;s overridable, too), and frankly, any UI framework worth it&#39;s salt should have that.</p>
+<p>@Mason Wheeler (&quot;RAII is *not* a proper substitute for a true try/finally&quot;):</p>
+<p>Take a look at ScopeGuard. That makes C++ without finally quite bearable. But you should note that if you need a lot of ScopeGuards in your code, you are doing it wrong (you aren&#39;t wrapping your resources in C++ types properly).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-890263">
+				<div id="div-comment-890263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890263">
+			January 21, 2011 at 12:26 pm</a>		</div>
+
+		<p>Briar: No, it didn&#39;t &quot;essentially crash&quot;. &nbsp;Something somewhere threw an exception, and we don&#39;t know what or which or where. It may or may not be recoverable, but we don&#39;t care at this point; that&#39;s the whole point of a try/finally block. &nbsp;We just want to make sure that if it *is* recoverable, (and most exceptions are, because the Delphi standard libraries are designed to continue working correctly if possible even if one thing fails,) the state of the program remains consistent.</p>
+<p>For all we know, something could have raised EAbort, a silent exception that basically signals a rollback of the current GUI operation. &nbsp;In that case, re-enabling the controls is *exactly* what you&#39;re supposed to do.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-890423">
+				<div id="div-comment-890423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Amit</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890423">
+			January 23, 2011 at 9:46 pm</a>		</div>
+
+		<p>FYI &#8211; IGlobalOptions is not available with Windows SDK 6.0 and 6.0A, it is available from SDK 7.0 onwards defined in ObjIdl.h</p>
+<p>To use Windows SDK 7.0 with VS 2008, look at <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/windowssdk/archive/2009/08/07/using-the-win-7-sdk-build-environment-with-vs-2008.aspx" rel="nofollow">blogs.msdn.com/&#8230;/using-the-win-7-sdk-build-environment-with-vs-2008.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-890653">
+				<div id="div-comment-890653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">random</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-890653">
+			January 25, 2011 at 8:00 am</a>		</div>
+
+		<p>Vectored Exceptions can give you a hook when any exception is raised. &nbsp;This hook comes with great danger. &nbsp;<a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/ms679274(v=VS.85).aspx" rel="nofollow">msdn.microsoft.com/&#8230;/ms679274(v=VS.85).aspx</a> has a good entry point.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-891063">
+				<div id="div-comment-891063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110120-00/?p=11713#comment-891063">
+			January 26, 2011 at 7:23 pm</a>		</div>
+
+		<p>I&#39;ve had to argue this one out a few times. There is a perception that the worst thing a program can do is &quot;crash&quot;; and from a marketing perspective, perhaps there is some truth to this. Certainly the exception dialog looks very bad from a user perception point of view. However, the worst thing a program can do is actually to &quot;continue to run in a corrupted state&quot;. Now if your program is a media player, running in a corrupt state is probably no big deal, but if your a database or controlling some industrial hardware, real damage could occur. If you crash, you just stop, if you run in a corrupt state, you corrupt databases and pour molten steel in places it wasn&#39;t supposed to go (like peoples heads). It&#39;s not always obvious that your creating this situation &quot;we just handle any exception from this task by logging an error&quot;. The sad fact is that you will probably end up with more crashes by doing this right (That method can throw the &quot;directory not found&quot; exception as well as the &quot;file not found&quot;?), but you&#39;ll avoid much worse scenarios that prove to be extremely difficult to resolve.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

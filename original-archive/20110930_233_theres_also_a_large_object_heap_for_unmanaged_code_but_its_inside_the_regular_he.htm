@@ -1,0 +1,154 @@
+<html>
+<head>
+<title>There's also a large object heap for unmanaged code, but it's inside the regular heap</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>There&#8217;s also a large object heap for unmanaged code, but it&#8217;s inside the regular heap</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>September 30, 2011 / year-entry #234</td></tr>
+<tr><td><b>Tags:</b></td><td>other</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110930-00/?p=9513</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Occasionally, a customer will ask for assistance explaining some strange heap behavior, or at least heap behavior that appears to be strange if you assume that the heap behaves purely classically. I need to understand the heap behavior we're seeing. I have a sample program which allocates five blocks of memory from the process heap,...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Occasionally, a customer will ask for assistance explaining some strange heap behavior, or at least heap behavior that appears to be strange if you assume that the heap behaves purely classically.</p>
+<blockquote class="q"><p>  I need to understand the heap behavior we're seeing. I have a sample program which allocates five blocks of memory from the process heap, each of size 100 bytes. When we dump the heap blocks with the <a href="http://msdn.microsoft.com/library/ff563189.aspx"> <code>!heap -x</code> command</a>, we find that all of them belong to the same heap segment, and when we do a <a href="http://msdn.microsoft.com/library/ff565577.aspx"> <code>!vadump -v</code></a>, we find that they all live on the same page. On the other hand, if we allocate five blocks of size 512KB, then we find that each one gets placed in its own virtually-allocated range, and the range is not size 512KB but rather 516KB. </p>
+<p> Questions: </p>
+<ol>
+<li>Why does the system combine the 100-byte allocations?     Why is there no extra overhead for the small allocations,     but the large allocations have a 4KB overhead? </li>
+<li>Why does the system allocate a separate virtual address     range for the 512KB block?     Which component makes this decision and what are the factors     involved? </li>
+<li>Why does allocating a 512KB block require 4KB of overhead? </li>
+<li>Is there any documentation for this behavior? </li>
+</ol>
+</blockquote>
+<p> Let's look at the last question first. There is no documentation for this behavior because it is all implementation detail. All the heap is required to do is return you a block of memory of the size you requested. How it goes about getting this memory block is at the discretion of the heap manager, and as we've seen in the past, <a href="http://blogs.msdn.com/oldnewthing/archive/2010/04/29/10004218.aspx"> the precise algorithm has varied over time</a>. </p>
+<p> The claim that there is no extra overhead for the small allocations is incorrect. There is still a small amount of overhead, but you can't see it because the <code>!heap -x</code> command doesn't report it. There is still overhead in the heap to keep track of the memory block's actual size, the fact that the memory block is allocated (and not free), and other overhead-type things. Indeed, even for large blocks, you didn't see the overhead reported by the <code>!heap -x</code> command; you had to drop below the heap and use the <code>!vadump</code> command to see it. (And how do you know that the other 3.9KB are being lost to overhead? Maybe they are being held for a future 3.9KB allocation?) </p>
+<p> Okay, so fine, small blocks have overhead, but why do larger blocks have significantly higher overhead? The answer to this is in the second question: The system allocates large blocks in a separate virtual address range because the default process heap treats large memory blocks differently from small memory blocks, in the same way that the CLR treats large and small objects differently. </p>
+<p> You might say that the unmanaged heap also has a large-object sub-heap. </p>
+<p> When objects get large, the heap switches to <code>VirtualAlloc</code>. You can think of it as creating a custom segment just for that object. And since <code>VirtualAlloc</code> allocates memory in integer multiples of the page size, any nonzero overhead will result in a full extra page being allocated since the requested allocation size was itself already an integral multiple of the page size. Mathematically: </p>
+<blockquote><p> <i>roundup</i>(<i>n</i> &times; <code>PageSize</code> + <i>v</i>, <code>PageSize</code>) = <i>n</i> &times; <code>PageSize</code> + <i>roundup</i>(<i>v</i>, <code>PageSize</code>). </p>
+</blockquote>
+<p> Therefore, even if a heap allocation has only one byte of overhead, you will have to pay a full page for it due to rounding. </p>
+<p> The precise point at which the heap will switch to <code>VirtualAlloc</code> has changed over time, so don't rely on it. In Windows&nbsp;95, the switchover point was around 4MB, but Windows&nbsp;NT set the cutover to something close to 512KB. If you're interested in details of the internal heap bookkeeping, you can check out <a href="http://blogs.msdn.com/oldnewthing/archive/2007/12/18/6794821.aspx"> <i>Advanced Windows Debugging</i></a> or <a href="http://www.amazon.com/dp/0735625301/?tag=tholneth-20"> <i>Windows Internals</i></a>. Note that information about the heap implementation is to be used for diagnostic and educational purposes only. Do not <a href="http://technet.microsoft.com/library/ff625273.aspx"> write code that takes advantage of the internals of the heap architecture</a>, because <a href="http://blogs.msdn.com/oldnewthing/archive/2010/04/29/10004218.aspx"> those details change all the time</a>. </p>
+<p> The purpose of a heap is to reduce memory and address space overhead compared to direct allocation via methods like <code>VirtualAlloc</code> by combining multiple small allocations into a single 64KB block, at a cost of some overhead per item. Although there is a small amount of overhead per item, the overall savings makes it a win. If you need eight hundred 100-byte chunks of memory, and you didn't have a heap manager, you would allocate eight hundred 64KB blocks (since <code>VirtualAlloc</code> allocates address space in 64KB chunks) and commit the first page in each, for a total memory usage of around 3MB and address space usage of around 50MB. Even if the heap overhead were a ridiculous 100%, the one thousand allocations would fit into forty 4KB pages, reducing the memory usage to 160KB and the address space usage to 192KB, a massive savings. (Looking at things in terms of relative overhead, 4KB out of a 512KB allocation is still less than one percent. You wish your <a href="http://www.fool.com/money/401k/401k05.htm"> index fund had such a low overhead</a>!) </p>
+<p> The advantage of chunking allocations together diminishes as the size of the allocations increase. By the time you reach 512KB, the heap is not really buying you much savings, since you're already <a href="http://blogs.msdn.com/oldnewthing/archive/2006/04/06/569873.aspx"> buying in bulk</a>. In fact, the switchover to direct <code>VirtualAlloc</code> is an admission by the heap manager that the allocation size has become so large that it is starting to make the overall heap degrade. If the 512KB allocation were made in the classic heap, it would probably not start on an exact page boundary; when you went to free the memory, there would be little fragments left over at the start and end which could not be decommitted and which would end up as little committed pages scattered about fragmenting your address space. (Besides, I don't think the heap decommits partial segments anyway.) </p>
+<p> If you know ahead of time that your allocation is large, and you control both the code which allocates the memory and the code which frees the memory, you can switch to <code>VirtualAlloc</code> directly and avoid burdening the heap with very large allocations. (On the other hand, the heap does this cutover automatically, so perhaps you're better off just letting the heap designers decide how big is "too big.") </p>
+<p> <b>Bonus chatter</b>: And no, the heap manager will never <a href="http://blogs.msdn.com/b/oldnewthing/archive/2011/01/28/10121300.aspx"> ask <code>VirtualAlloc</code> for large pages</a>. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-938263">
+				<div id="div-comment-938263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110930-00/?p=9513#comment-938263">
+			September 30, 2011 at 7:29 am</a>		</div>
+
+		<p>There is another use for a heap besides reducing memory overhead. If you have a set of related allocations which should be freed together (for instance, you created a large tree data structure and want to destroy it), you can create a separate heap for it and just drop the heap at the end, instead of manually freeing each allocation. I just took a quick look, and HeapDestroy explicitly allows this use case (see the documentation for it on MSDN, it says you do not need to HeapFree each allocation within the heap before destroying it).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-938283">
+				<div id="div-comment-938283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110930-00/?p=9513#comment-938283">
+			September 30, 2011 at 7:58 am</a>		</div>
+
+		<p>Doug Lea&#39;s malloc (<a rel="nofollow" target="_new" href="http://g.oswego.edu/dl/html/malloc.html" rel="nofollow">g.oswego.edu/&#8230;/malloc.html</a>) switches over to using mmap/VirtualAlloc at 256 KB by default.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-938333">
+				<div id="div-comment-938333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110930-00/?p=9513#comment-938333">
+			September 30, 2011 at 12:49 pm</a>		</div>
+
+		<p>Cesar: Yes, it&#39;s called an Arena Allocator. We used it to accumulate buffers, and then destroy them all at once when they&#39;re committed to storage. It also reduces fragmentation in the regular heap&#8230; At the price of slightly increasing address-space fragmentation (important in 32-bit, less so in 64-bit), and confusing leak-tracking software to no end.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-938393">
+				<div id="div-comment-938393" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jolyon Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110930-00/?p=9513#comment-938393">
+			October 2, 2011 at 4:35 pm</a>		</div>
+
+		<p>I think you missed the single biggest mis-statement in the original question/post&#8230;</p>
+<p>&quot;I need to understand&#8230;&quot; &nbsp;should of course have been &quot;I want/would like to understand&#8230;&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

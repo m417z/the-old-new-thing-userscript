@@ -1,0 +1,230 @@
+<html>
+<head>
+<title>Diagnosing a crash in unloaded_something.dll</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Diagnosing a crash in unloaded_something.dll</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 27, 2016 / year-entry #112</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160527-00/?p=93526</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Find out what used to be loaded there.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A failure report came in to the shell team
+because Explorer crashed at shutdown in what the debugger
+reported as
+<code>unloaded_themeui.dll</code>.
+Time to dig in.
+</p>
+<pre>
+ntdll!RtlpCallVectoredHandlers+0xeb
+ntdll!RtlDispatchException+0x81
+ntdll!KiUserExceptionDispatch+0x50
+&lt;Unloaded_themeui.dll&gt;+0x2bbfbd
+0x1fbdebe0
+0x1fbdebc0
+0x2357ef80
+
+&lt;Unloaded_themeui.dll&gt;+0x2bbfbd:
+00007ff8`e384bfbd ??              ???
+</pre>
+<p>
+Yup, there's nothing loaded there all right.
+But let's see what was loaded there before.
+</p>
+<pre>
+0:001&gt; lm
+...
+Unloaded modules:
+...
+00007ff8`e3590000 00007ff8`e385d000   themeui.dll
+00007ff8`e3840000 00007ff8`e385d000   abcdefg.dll
+</pre>
+<p>
+So there were two DLLs that used to be loaded at the address
+that crashed.
+Which could it be?
+</p>
+<pre>
+0:001&gt; !reload /unl themeui.dll
+0:001&gt; u 00007ff8`e384bfbd
+themeui!ext-ms-win-com-ole32-l1-1-1_NULL_THUNK_DATA_DLA &lt;PERF&gt; (themeui+0x2bffdd):
+00007ff8`e384bfbd 40              ???
+</pre>
+<p>
+Well, that doesn't look like code.
+How about abcdefg?
+</p>
+<pre>
+0:001&gt; !reload /unl abcdefg.dll
+0:001&gt; u 00007ff8`e384bfbd-80
+...
+abcdefg!AbcdefgImageList::GetClassImageList+0x1f
+00007ff8`e384bfb7 ff1593a20000    call    [abcdefg!_imp_SetupDiGetClassImageList]
+00007ff8`e384bfbd 85c0            test    eax,eax
+</pre>
+<p>
+That looks a lot more promising.
+What appears to have happened is that <code>abcdefg.dll</code>
+called <code>Setup&shy;Di&shy;Get&shy;Class&shy;Image&shy;List</code>,
+and while the call was in progress, the DLL got unloaded.
+When the call to
+<code>Setup&shy;Di&shy;Get&shy;Class&shy;Image&shy;List</code>
+finally returned, it returned to an unloaded DLL,
+which is the source of the crash.
+</p>
+<p>
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20130906-00/?p=3303">
+Reconstructing the stack</a>
+revealed a chain of calls that made sense
+in the context of <code>abcdefg.dll</code>,
+so this diagnosis is probably correct.
+(I've anonymized the name of the other DLL to protect the guilty.)
+</p>
+<p>
+What happened is that during Explorer startup,
+<code>abcdefg.dll</code> registered a wait
+with the thread pool on an event,
+and at shutdown it unregisters the wait.
+But it unregisters with
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms686870(v=vs.85).aspx">
+the <code>Unregister&shy;Wait</code> function</a>.
+If a callback is running at the time the wait is unregistered,
+the function returns <code>ERROR_<wbr>IO_<wbr>PENDING</code>,
+but nobody checks.
+The shutdown code proceeds to unload
+<code>abcdefg.dll</code>,
+and then we are left executing code that was freed.
+</p>
+<p>
+The code in
+<code>abcdefg.dll</code> needs to handle the case
+where the callback is still running at the time the
+wait is unregistered.
+You can use
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms686876(v=vs.85).aspx">
+the <code>Unregister&shy;Wait&shy;Ex</code> function</a>,
+which lets you pass an event that is set when the callback completes,
+or pass <code>INVALID_<wbr>HANDLE_<wbr>VALUE</code> to wait synchronously
+for the callback to complete before returning.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-scott-brickey even thread-even depth-1" id="comment-1250708">
+				<div id="div-comment-1250708" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Scott+Brickey' rel='external nofollow' class='url'>Scott Brickey</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160527-00/?p=93526#comment-1250708">
+			May 27, 2016 at 9:37 am</a>		</div>
+
+		<p>Raymond, any idea which approach they decided to take?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1250716">
+				<div id="div-comment-1250716" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yukkuri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160527-00/?p=93526#comment-1250716">
+			May 27, 2016 at 10:58 am</a>		</div>
+
+		<p>ABDCEFG? Clearly this was the hooked on phonics DLL :D</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1250726">
+				<div id="div-comment-1250726" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160527-00/?p=93526#comment-1250726">
+			May 28, 2016 at 2:46 am</a>		</div>
+
+		<p>The description of UnregisterWaitEx is so convoluted I&#8217;m sure they got it wrong anyway.</p>
+<p>If CompletionEvent is a handle to an event provided by the caller, it is possible for the function to succeed, fail with ERROR_IO_PENDING, or fail with a different error code. If the function succeeds, or if the function fails with ERROR_IO_PENDING, the caller should always wait until the event is signaled to close the event. If the function fails with a different error code, it is not necessary to wait until the event is signaled to close the event. </p>
+<p>Windows XP:  If CompletionEvent is a handle to an event provided by the caller and the function fails with ERROR_IO_PENDING, the caller should wait until the event is signaled to close the event. This behavior changed starting with Windows Vista.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1250756">
+				<div id="div-comment-1250756" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Boris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160527-00/?p=93526#comment-1250756">
+			May 30, 2016 at 11:33 am</a>		</div>
+
+		<p>Safari on iOS is finally showing me a font which isn&#8217;t Times New Roman.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

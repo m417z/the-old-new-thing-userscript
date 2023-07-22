@@ -1,0 +1,1146 @@
+<html>
+<head>
+<title>C++ scoped static initialization is not thread-safe, on purpose!</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>C++ scoped static initialization is not thread-safe, on purpose!</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 8, 2004 / year-entry #88</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>49</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">How the design of the C++ language subverts thread safety.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+[<b>Note</b>:
+After this article was written,
+the C++ standard has been revised.
+Starting in C++11,
+scoped static initialization is now thread-safe,
+but it comes with a cost: Reentrancy now invokes undefined behavior.]
+</p>
+<p>
+The rule for static variables at block scope
+(as opposed to static variables with global scope)
+is that they are initialized the first time execution
+reaches their declaration.
+</p>
+<p>
+Find the race condition:
+</p>
+<pre>
+int ComputeSomething()
+{
+  static int cachedResult = ComputeSomethingSlowly();
+  return cachedResult;
+}
+</pre>
+<p>
+The intent of this code is
+to compute something expensive the first time the
+function is called, and then cache the result to be
+returned by future calls to the function.
+</p>
+<p>
+A variation on this basic technique is
+<a HREF="http://users.utu.fi/~sisasa/oasis/cppfaq/ctors.html#[10.9]">
+is advocated by this web site to avoid the "static initialization
+order fiasco"</a>.
+(Said fiasco is well-described on that page so I encourage you
+to read it and understand it.)
+</p>
+<p>
+The problem is that this code is not thread-safe.  Statics
+with local scope are internally converted by the compiler into
+something like this:</p>
+<pre>
+int ComputeSomething()
+{
+<font COLOR=blue>  static bool cachedResult_computed = false;
+  static int cachedResult;
+  if (!cachedResult_computed) {
+    cachedResult_computed = true;
+    cachedResult = ComputeSomethingSlowly();
+  }</font>
+  return cachedResult;
+}
+</pre>
+<p>
+Now the race condition is easier to see.
+</p>
+<p>
+Suppose two threads both call this function for the first time.
+The first thread gets as far as setting
+cachedResult_computed&nbsp;=&nbsp;true,
+and then gets pre-empted.
+The second thread now sees that cachedResult_computed is true
+and skips over the body of the "if" branch and returns
+an uninitialized variable.
+</p>
+<p>
+What you see here is not a compiler bug.
+This behavior is <strong>required by the C++ standard</strong>.
+</p>
+<p>
+You can write variations on this theme to create even worse
+problems:
+</p>
+<pre>
+class Something { ... };
+int ComputeSomething()
+{
+  static Something s;
+  return s.ComputeIt();
+}
+</pre>
+<p>
+This gets rewritten internally as
+(this time, using pseudo-C++):
+</p>
+<pre>
+class Something { ... };
+int ComputeSomething()
+{
+<font COLOR=blue>  static bool s_constructed = false;
+  static uninitialized Something s;
+  if (!s_constructed) {
+    s_constructed = true;
+    new(&s) Something; // construct it
+    atexit(DestructS);
+  }</font>
+  return s.ComputeIt();
+}
+<font COLOR=blue>// Destruct s at process termination
+void DestructS()
+{
+ ComputeSomething::s.~Something();
+}</font>
+</pre>
+<p>
+Notice that there are multiple race conditions here.
+As before, it's possible for one thread to run ahead of the
+other thread and use "s" before it has been constructed.
+</p>
+<p>
+Even worse, it's possible for the first thread to get
+pre-empted immediately after testing s_constructed
+but <strong>before</strong> setting it to "true".
+In this case, the object s gets <strong>double-constructed</strong>
+and <strong>double-destructed</strong>.
+</p>
+<p>
+That can't be good.
+</p>
+<p>
+But wait, that's not all.  Not look at what happens if you
+have <em>two</em> runtime-initialized local statics:
+</p>
+<pre>
+class Something { ... };
+int ComputeSomething()
+{
+  static Something s(0);
+  static Something t(1);
+  return s.ComputeIt() + t.ComputeIt();
+}
+</pre>
+<p>
+This is converted by the compiler into the following
+pseudo-C++:
+</p>
+<pre>
+class Something { ... };
+int ComputeSomething()
+{
+<font COLOR=blue>  static char constructed = 0;
+  static uninitialized Something s;
+  if (!(constructed &amp; 1)) {
+    constructed |= 1;
+    new(&s) Something; // construct it
+    atexit(DestructS);
+  }
+  static uninitialized Something t;
+  if (!(constructed &amp; 2)) {
+    constructed |= 2;
+    new(&t) Something; // construct it
+    atexit(DestructT);
+  }</font>
+  return s.ComputeIt() + t.ComputeIt();
+}
+</pre>
+<p>
+To save space, the compiler placed the two
+"x_constructed" variables into a bitfield.
+Now there are multiple
+<strong>non-interlocked</strong>
+read-modify-store operations on the variable
+"constructed".
+</p>
+<p>
+Now consider what happens if one thread
+attempts to execute "constructed |= 1"
+at the same time another thread attempts
+to execute "constructed |= 2".
+</p>
+<p>
+On an x86, the statements likely assemble into</p>
+<pre>
+  or constructed, 1
+...
+  or constructed, 2
+</pre>
+<p>without any "lock" prefixes.
+On multiprocessor machines, it is possible
+for the two stores both to read the old value
+and clobber each other with conflicting values.
+</p>
+<p>
+On ia64 and alpha, this clobbering is much more
+obvious since they do not have a single
+read-modify-store instruction; the three
+steps must be explicitly coded:
+</p>
+<pre>
+  ldl t1,0(a0)     ; load
+  addl t1,1,t1     ; modify
+  stl t1,1,0(a0)   ; store
+</pre>
+<p>
+If the thread gets pre-empted between the load
+and the store, the value stored may no longer
+agree with the value being overwritten.
+</p>
+<p>
+So now consider the following insane sequence of execution:
+</p>
+<ul>
+<li>Thread A tests "constructed" and finds it zero and prepares
+    to set the value to 1, but it gets pre-empted.</p>
+<li>Thread B enters the same function, sees "constructed" is zero
+    and proceeds to construct both "s" and "t", leaving
+    "constructed" equal to 3.</p>
+<li>Thread A resumes execution and completes its load-modify-store
+    sequence, setting "constructed" to 1, then constructs "s"
+    (a second time).</p>
+<li>Thread A then proceeds to construct "t" as well (a second time)
+    setting "constructed" (finally) to 3.
+</ul>
+<p>
+Now, you might think you can wrap the runtime initialization
+in a critical section:
+</p>
+<pre>
+int ComputeSomething()
+{
+ EnterCriticalSection(...);
+ static int cachedResult = ComputeSomethingSlowly();
+ LeaveCriticalSection(...);
+ return cachedResult;
+}
+</pre>
+<p>
+Because now you've placed the one-time initialization inside
+a critical section and made it thread-safe.
+</p>
+<p>
+But what if the second call comes from within the same thread?
+("We've traced the call; it's coming from inside the thread!")
+This can happen if ComputeSomethingSlowly() itself calls
+ComputeSomething(), perhaps indirectly.
+Since that thread already owns the critical section, the code
+enter it just fine and you once again
+end up returning an uninitialized variable.
+</p>
+<p>
+Conclusion: When you see runtime initialization of a local static
+variable, be very concerned.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (49)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-151673">
+				<div id="div-comment-151673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.randomtree.org/eric/' rel='external nofollow' class='url'>Eric</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151673">
+			March 8, 2004 at 7:35 am</a>		</div>
+
+		<p>Is this true of statics in C# and Shared vars in VB.Net as well?</p>
+<p>Why does C++ require it be done this way?  Why not set the _constructed value to true after the call to the constructor?  (That wouldn&#8217;t alleviate the other race conditions, so I guess it wouldn&#8217;t really matter, though.)</p>
+<p>How would you recommend block-level statics be initialized (for instance to achieve the &quot;cache an expensive operation&quot; goal) instead?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151683">
+				<div id="div-comment-151683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lonnie McCullough</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151683">
+			March 8, 2004 at 7:42 am</a>		</div>
+
+		<p>Well this is actually about global static initialization, but this seems like the appropriate place to ask it:</p>
+<p>I am working on a contrl library that must run on both 9x and NT and there are a lot of functions in Win32 that are indirectly dependent on the character type (such as DefWindowProc).  I understand why this is the case and if I am running on Win9x I register my control classes with RegisterClassA (and use RegisterClassW on NTx).  So what I really want is to call the correct version of DefWindowProc (amongst others) depending on the platform which I do with the following code:</p>
+<p>extern &quot;C&quot; LRESULT (WINAPI *NcDefWindowProc)(HWND, UINT, WPARAM, LPARAM);<br />
+<br />#ifdef DefWindowProc<br />
+<br />#undef DefWindowProc<br />
+<br />#endif // DefWindowProc<br />
+<br />#define DefWindowProc			NcDefWindowProc</p>
+<p>then I set NcDefWindowProc to DefWindowProcA and in my DllMain I set NcDefWindowProc to DefWindowProcW if I&#8217;m on NT.  My question is, is this safe?  I&#8217;m not calling the functions in DllMain and the pointers should be to locations in my import table, but there is just something that makes me feel uneasy about all this.  Will those functions be relocated and my pointers invalidated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151693">
+				<div id="div-comment-151693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sean</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151693">
+			March 8, 2004 at 7:49 am</a>		</div>
+
+		<p>Hmm</p>
+<p>So in the same vein the following pattern for a singleton instance of some class is also not thread safe.</p>
+<p>class CSomeClass<br />
+<br />{<br />
+<br />public:<br />
+<br />   static CSomeClass&amp; GetInstance()<br />
+<br />   {<br />
+<br />      static CSomeClass instance;<br />
+<br />      return instance;<br />
+<br />   }<br />
+<br />&#8230;&#8230;&#8230;<br />
+<br />};</p>
+<p>CSomeClass::GetInstance().SomeMethod();</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151703">
+				<div id="div-comment-151703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151703">
+			March 8, 2004 at 7:54 am</a>		</div>
+
+		<p>Eric: A critical section will &quot;work&quot; as long as the function isn&#8217;t re-entered. If it is, then you are completely stuck. You want to use this local static which is in the middle of being constructed *by your caller*. You can&#8217;t &quot;wait&quot; since your caller is waiting for you!</p>
+<p>Lonnie: The best way to be sure is to stare at the codegen. I suspect this merely copies values around and doesn&#8217;t actually call GetProcAddress, so you&#8217;ll be fine.</p>
+<p>(The function can&#8217;t get relocated because that would break people who call GetProcAddress.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151723">
+				<div id="div-comment-151723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Centaur</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151723">
+			March 8, 2004 at 8:02 am</a>		</div>
+
+		<p>So, how does one protect oneself from trying to walk before being born? What if we protect the function with something stronger than a critical section or mutex, such as a semaphore with maximum = initial = 1? This way, if the function tries to indirectly reuse itself, it will just peacefully hang, not explode all over the place. Maybe, with clever use of synchronization primitives, the function can even detect that it is being called during initialization from the same thread, and “request the runtime to terminate it in a strange, weird, perverse, counternatural way”?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151743">
+				<div id="div-comment-151743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151743">
+			March 8, 2004 at 8:09 am</a>		</div>
+
+		<p>Centaur: Looks like you answered your own question. If that&#8217;s what you want, then go ahead and write it that way.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151763">
+				<div id="div-comment-151763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.randomtree.org/eric/' rel='external nofollow' class='url'>Eric</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151763">
+			March 8, 2004 at 8:20 am</a>		</div>
+
+		<p>So I guess using static variables in recursive functions is a Really Bad Thing.  ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151773">
+				<div id="div-comment-151773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.randomtree.org/eric/' rel='external nofollow' class='url'>Eric</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151773">
+			March 8, 2004 at 8:22 am</a>		</div>
+
+		<p>Sean: I presume that&#8217;s why most Singleton implementations place a critical section around the GetInstance() function.  As long as you don&#8217;t (directly or indirectly) call GetInstance() from within the GetInstance() function, you won&#8217;t block yourself, and any other threads will see the critical section and wait.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151793">
+				<div id="div-comment-151793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151793">
+			March 8, 2004 at 8:36 am</a>		</div>
+
+		<p>good article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151843">
+				<div id="div-comment-151843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151843">
+			March 8, 2004 at 9:27 am</a>		</div>
+
+		<p>Good article, Raymond.  Writing thread-safe C++ code can be tricky since there&#8217;s no language-level support.  Everyone is familiar with Critcal Sections and the Wait* functions, but I wonder if you can point to guarantees of what memory synchronization these functions provide.  I had just assumed they did the Right Thing, but this thread (<a target="_new" href="http://groups.google.com/groups?q=g:thl370189423d&amp;dq=&amp;hl=en&amp;lr=&amp;ie=UTF-8&amp;selm=d6652001.0403040142.8afd534%40posting.google.com" rel="nofollow">http://groups.google.com/groups?q=g:thl370189423d&#038;dq=&#038;hl=en&#038;lr=&#038;ie=UTF-8&#038;selm=d6652001.0403040142.8afd534%40posting.google.com</a>) in c.l.c++.m made me realized that I was just assuming.</p>
+<p>Thanks</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151923">
+				<div id="div-comment-151923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151923">
+			March 8, 2004 at 10:53 am</a>		</div>
+
+		<p>A way to work around this may be to add a class that will register a function call to a linked list.  Call into at process start, before creating threads&#8230;  Something like this (which I just wrote off the top of my head)</p>
+<p>class CInitializer<br />
+<br />{<br />
+<br />public:<br />
+<br />  CInitializer();</p>
+<p>  virtual void Function() = 0;</p>
+<p>  static void CallFunctions();<br />
+<br />private:<br />
+<br />  static CInitializer *sFirst;<br />
+<br />  CInitializer *mNext;<br />
+<br />};</p>
+<p>// implemenation</p>
+<p>CInitializer *CInitializer::sFirst = NULL;</p>
+<p>CInitializer::CInitializer()<br />
+<br />: mNext( sFirst )<br />
+<br />{<br />
+<br />  sFirst = this;<br />
+<br />}</p>
+<p>void CInitializer::CallFunctions()<br />
+<br />{<br />
+<br />  for ( CInitializer *at = sFirst; at; at = at-&gt;mNext )<br />
+<br />  {<br />
+<br />    at-&gt;Function();<br />
+<br />  }<br />
+<br />}</p>
+<p>// sub class</p>
+<p>int const Zero()<br />
+<br />{<br />
+<br />  static int zero = 0;</p>
+<p>  return zero;<br />
+<br />}</p>
+<p>namespace<br />
+<br />{<br />
+<br />class CZeroInitializer : public CInitializer<br />
+<br />{<br />
+<br />public:<br />
+<br />  void Function()<br />
+<br />  {<br />
+<br />    Zero();<br />
+<br />  }<br />
+<br />};</p>
+<p>CZeroInitializer junk;<br />
+<br />(junk);<br />
+<br />}</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151933">
+				<div id="div-comment-151933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151933">
+			March 8, 2004 at 10:54 am</a>		</div>
+
+		<p>(I assure you that I had proper spacing in the text I typed above&#8230;  Guess I needed to put some (amp)nbsp;&#8217;s in there instead.  Sorry.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151943">
+				<div id="div-comment-151943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151943">
+			March 8, 2004 at 11:03 am</a>		</div>
+
+		<p>But then you lose the &quot;don&#8217;t initialize until the function is called for the first time&quot; feature, and you&#8217;re back to the &quot;static initialization order fiasco&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-151983">
+				<div id="div-comment-151983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151983">
+			March 8, 2004 at 12:15 pm</a>		</div>
+
+		<p>Raymond:</p>
+<p>Nono, look at it again.  You get the call being initialzed the first time the function is called.  This just makes sure that all the functions are called once before any real work is done.  See, I have Zero() with a static in it.  Zero() would be a utility function that returns zero.  I just make it a dumb example with a static that gets used.</p>
+<p>So static initialization works fine and you have a guarantee of everything being done before the threads start.</p>
+<p>Of course, this doesn&#8217;t work for statics that do a lot of heavy lifting that may depend on other threads being started and it takes discipline to remember to write such a class to do that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-151993">
+				<div id="div-comment-151993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-151993">
+			March 8, 2004 at 12:25 pm</a>		</div>
+
+		<p>Okay I guess I don&#8217;t understand who calls CallFunctions().</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152013">
+				<div id="div-comment-152013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152013">
+			March 8, 2004 at 1:35 pm</a>		</div>
+
+		<p>main() does, before any threads were created.</p>
+<p>So let&#8217;s say you have the classic static situation.  Where a static depends on another static:</p>
+<p>int Func1()<br />
+<br />{<br />
+<br />  static int foo = 12345;</p>
+<p>  return foo;<br />
+<br />}</p>
+<p>int Func2()<br />
+<br />{<br />
+<br />  static int foo = Func1() * 2;</p>
+<p>  return foo;<br />
+<br />}</p>
+<p>Now, you could set up an initializer class for each that just calls Func1 and Func2.  At application startup, CallFunctions() gets called before any threads are created, which calls each of these.  Now, it doesn&#8217;t matter what order they get called in.  since Func2() guarantees Func1() gets called.  But since this happens before any other threads are created, you&#8217;ve guaranteed that subsequent calls cannoy have any of the problems you describe in your article.</p>
+<p>I&#8217;m just pointing out that with careful engineering, one can work around this shortcoming and still maintain the practice of using statics in this way.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152023">
+				<div id="div-comment-152023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152023">
+			March 8, 2004 at 1:43 pm</a>		</div>
+
+		<p>But this loses the &quot;delay initialization until the first time the function is called&quot; feature. When main() calls CallFunctions(), all the CInitializer::Function()s get called, even if for example the function that uses the variable &quot;junk&quot; is never called.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152053">
+				<div id="div-comment-152053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152053">
+			March 8, 2004 at 3:00 pm</a>		</div>
+
+		<p>Well yeah, but the only real REASON to do that delayed initialization 99% of the time is to fix interdependant systems, and to make link order a non issue.  That&#8217;s the problem that this solves.  And it solves it in a way that you really don&#8217;t have to change any existing code at all, just shoehorn a small bit of code when you use the feature.  You could even macro-ize it to one line.</p>
+<p>Speed isn&#8217;t the concern most of the time here, link order is.</p>
+<p>For more heavyweight operations (like non-trivial singletons and such), yeah, critical sections should be used.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152073">
+				<div id="div-comment-152073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152073">
+			March 8, 2004 at 4:34 pm</a>		</div>
+
+		<p>I&#8217;ve seen code that relied on the delayed initialization &#8211; for example, function X is always called after function Y succeeds; function Y sets up some global state that function X uses in its static initializer. (For example, maybe function Y registers a clipboard format name and function X uses it.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152083">
+				<div id="div-comment-152083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152083">
+			March 8, 2004 at 4:36 pm</a>		</div>
+
+		<p>&gt; What you see here is not a compiler bug.<br />
+<br />&gt; This behavior is required by the C++<br />
+<br />&gt; standard.</p>
+<p>Sorry I haven&#8217;t kept up with the standards this millennium, but I was still surprised to see this.  When did the C++ standard start imposing requirements on threading behavior?</p>
+<p>If it were C, the compiler would be allowed to add critical sections automatically around each initialization.  Of course the present behavior still isn&#8217;t a compiler bug, but safer behavior wouldn&#8217;t be a compiler bug either, because the C standard doesn&#8217;t impose any requirements on threading behavior.  (Well &#8230; it&#8217;s possible to interpret the C standard as outlawing threads altogether :-)</p>
+<p>Of course my personal preference is for unsafe code to get noisy diagnostics during development, rather than get the silent treatment.  But in case of silence, it&#8217;s surely better for the result to be made safe than unsafe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152103">
+				<div id="div-comment-152103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152103">
+			March 8, 2004 at 5:00 pm</a>		</div>
+
+		<p>Hm, it looks like this section was changed by TC1. There&#8217;s a new sentence that says, &quot;If control re-enters the declaration (recursively) while the object is being initialized, the behavior is undefined.&quot; And it gives exactly the same example that the old spec did, but now instead of explaining the behavior (under the old rules), it declares the results to be undefined!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152113">
+				<div id="div-comment-152113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152113">
+			March 8, 2004 at 5:07 pm</a>		</div>
+
+		<p>The word &quot;(recursively)&quot;, despite the parentheses, seems to be a reminder that the only method known to the standard for re-entering is recursion, i.e. still in a single thread.  It still seems, in this case at least, that the standard doesn&#8217;t restrict compiler behavior in the presence of multiple threads.</p>
+<p>Does the C++ standard really mention threads?  The C standard (1999 and its TC1 in 2001) still doesn&#8217;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152123">
+				<div id="div-comment-152123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152123">
+			March 8, 2004 at 5:17 pm</a>		</div>
+
+		<p>Correct, there is no mention of threads in the C or C++ standards (that I can find). My initial remarks were based on my findings in the pre-TC1 C++ standard that mandated the described behavior even in the absence of threading. Coincidentally, my copy of the post-TC1 C++ standard arrived late this morning, after I had written the original article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152133">
+				<div id="div-comment-152133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152133">
+			March 8, 2004 at 5:45 pm</a>		</div>
+
+		<p>3/8/2004 5:17 PM Raymond Chen</p>
+<p>&gt; My initial remarks were based on my findings<br />
+<br />&gt; in the pre-TC1 C++ standard that mandated<br />
+<br />&gt; the described behavior even in the absence<br />
+<br />&gt; of threading.</p>
+<p>It seems that the pre-TC1 C++ standard mandated the described behavior *ONLY* in the absence of threading.  It seems that the C++ standard always allowed the compiler to be noisy and/or to generate code that would be thread-safe in the presence of threading.</p>
+<p>The existing behavior still isn&#8217;t and wasn&#8217;t a bug, but it still seems to have been unnecessary and unfriendly all along.</p>
+<p>Do you have a machine-readable version of the C++ standard?  In the C standard for 1999, I searched the .pdf file for the word &quot;thread&quot; and there were no hits.  I&#8217;m not in the mood to pay ISO&#8217;s price for the C++ standard.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152143">
+				<div id="div-comment-152143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152143">
+			March 8, 2004 at 5:53 pm</a>		</div>
+
+		<p>My (new) C++ standard is a big heavy book, $65 from Amazon.com.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152153">
+				<div id="div-comment-152153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152153">
+			March 8, 2004 at 6:03 pm</a>		</div>
+
+		<p>&gt; I&#8217;ve seen code that relied on the delayed<br />
+<br />&gt; initialization &#8211; for example, function X is<br />
+<br />&gt; always called after function Y succeeds;<br />
+<br />&gt; function Y sets up some global state that<br />
+<br />&gt; function X uses in its static initializer. (For<br />
+<br />&gt; example, maybe function Y registers a clipboard<br />
+<br />&gt; format name and function X uses it.)</p>
+<p>Ugh, well that&#8217;s just plain bad design in my opinion.  If you&#8217;re initializing a static based on state like that, you&#8217;re asking for trouble.  But in this case, you&#8217;d just not use the construct I&#8217;m talking about.</p>
+<p>Ideally though, in your example, one could have a Function X call into Function Y to assert its initialization before proceeding.  Writing code that has this implicit dependance on ordering like this is just asking for trouble.  Especially if calling Function X before calling Function Y causes Function X to be irreparably harmed (if it&#8217;s indeed using a static).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152163">
+				<div id="div-comment-152163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tony Cox</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152163">
+			March 8, 2004 at 6:57 pm</a>		</div>
+
+		<p>Sure, it&#8217;s not exactly great design. But it&#8217;s kind of interesting that something that at first glance seems like it should be trivial actually turns out to be something that you need to design a non-trivial mechanism to handle properly.</p>
+<p>I think Raymond&#8217;s points are that (a) this sort of thing is easy to screw up, and that C/C++ doesn&#8217;t exactly go out of its way to help you out, and (b) some of the standard techniques for avoiding the problem fail in subtle ways when you consider multi-threaded scenarios.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152183">
+				<div id="div-comment-152183" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.redwoodroot.org' rel='external nofollow' class='url'>Peter Evans</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152183">
+			March 8, 2004 at 11:21 pm</a>		</div>
+
+		<p>Isn&#8217;t the main point that even with the common C++ idioms for protecting static initialization the C++ standard still leaves it to implementation to define specific primitives to protect static initialization in multi-threaded scenarios.</p>
+<p>It seems to me there was a recent comp.lang.c++.moderated thread on further issues involving CV qualified data.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152193">
+				<div id="div-comment-152193" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Ringrose</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152193">
+			March 9, 2004 at 12:15 am</a>		</div>
+
+		<p>Most software I have worked on has been single threaded most of the time.  E.g. we may start a thread when user chooses an option from a menu to so some background work.</p>
+<p>In server apps this is not always the case; however even in a server app most initialization needs to be done at start up time and hence can be done on a single thread.</p>
+<p>Yes we do need to be careful with this, but in real life I have only met problems with it a few times.  However when I was a C++ coder, I mat problems with memory management most weeks.</p>
+<p>Anyway as soon as you start using threads, all bets are of with C++, as the C++ design and standard never considered them.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152203">
+				<div id="div-comment-152203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pavel Lebedinsky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152203">
+			March 9, 2004 at 1:44 am</a>		</div>
+
+		<p>&gt; What if we protect the function with something stronger than a critical section or mutex, such as a semaphore with maximum = initial = 1? This way, if the function tries to indirectly reuse itself, it will just peacefully hang, not explode all over the place.</p>
+<p>Many people actually think that by default all locks should be non-recursive (like POSIX mutexes). I agree with them &#8211; the world would be a better place if poorly written multithreaded code would peacefully hang on a non-recursive mutex instead of exploding because of unexpected recursion (or STA-type reentracy).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152353">
+				<div id="div-comment-152353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152353">
+			March 9, 2004 at 10:21 am</a>		</div>
+
+		<p>Norman, see <a target="_new" href="http://webstore.ansi.org/ansidocstore/product.asp?sku=INCITS%2FISO%2FIEC+14882%2D2003" rel="nofollow">http://webstore.ansi.org/ansidocstore/product.asp?sku=INCITS%2FISO%2FIEC+14882%2D2003</a> . This is the INCITS edition of the latest C++ standard which has the same text and only costs $18. </p>
+<p>Brian, the situation is not quite as bad as James Kanze thinks. He&#8217;s not really up-to-date on Windows programming. However, he&#8217;s quite right that you can&#8217;t trust volatile. If you&#8217;re concerned about static initialisation in DLLs, as he was, see <a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/01/27/63401.aspx" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/01/27/63401.aspx</a><br />
+<br />and <a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/01/28/63880.aspx" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/01/28/63880.aspx</a> .</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152373">
+				<div id="div-comment-152373" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">The Sim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152373">
+			March 9, 2004 at 11:10 am</a>		</div>
+
+		<p>The real problem is simply that the MSFT C++ compiler is lame. The C++ Standard says no such thing about forcing the implementation to produce thread-unsafe code. The VMS C++ compiler, for example, automatically inserts spinlocks around the initialization of static local objects, so they are perfectly thread-safe. (There has even been discussion on usenet about how to define custom commands to direct the compiler whether you want synchronized or unsynchronized initialization of each static local.)</p>
+<p>PS, the real C++ Standard ISO 14882 is an $18 PDF document available directly from ISO or ANSI websites.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152403">
+				<div id="div-comment-152403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152403">
+			March 9, 2004 at 12:28 pm</a>		</div>
+
+		<p>As I already noted, the previous C++ standard required the function to be re-entrant and to SKIP static intialization if re-entered. So Visual Studio&#8217;s implementation was compliant with the old C++ standard (and the VMS C++ complier was in violation). But TC1 changed that and now re-entrancy during static initialization has been declared &quot;undefined&quot;.</p>
+<p>Did nobody complain to VMS that their compiler was in violation of the original C++ standard?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152413">
+				<div id="div-comment-152413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">The Sim</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152413">
+			March 9, 2004 at 12:56 pm</a>		</div>
+
+		<p>I don&#8217;t think so. Here is a snippet from the ISO IEC 14882-1998 (pre-TC1) version of the Standard (my PDF file is dated 6/17/2001):</p>
+<p>6.7/4 (relevant to static local object initialization):<br />
+<br />&quot;[..] Otherwise such an object is initialized the first time control passes through its declaration; such an<br />
+<br />object is considered initialized upon the completion of its initialization. [..] If control reenters<br />
+<br />the declaration (recursively) while the object is being initialized, the behavior<br />
+<br />is undefined.&quot;</p>
+<p>Of course the VMS compiler has some problems of its own, but this is not one of them. :-) Are you thinking of the ARM, maybe?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152423">
+				<div id="div-comment-152423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152423">
+			March 9, 2004 at 12:57 pm</a>		</div>
+
+		<p>Duh you&#8217;re right, it&#8217;s the ARM that says that recursion is allowed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152433">
+				<div id="div-comment-152433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152433">
+			March 9, 2004 at 1:52 pm</a>		</div>
+
+		<p>Ben and Raymond, I guess what I&#8217;m wondering is where is the guarantee that the proposed solution (of adding a Critical Section) will work, especially in the face of multiple processors?  If we add the Critical Section code into Raymond&#8217;s expansion, we get something like:</p>
+<p>int ComputeSomething()<br />
+<br />{<br />
+<br />  EnterCriticalSection(&#8230;);<br />
+<br />  static bool cachedResult_computed = false;<br />
+<br />  static int cachedResult;<br />
+<br />  if (!cachedResult_computed) {<br />
+<br />    cachedResult_computed = true;<br />
+<br />    cachedResult = ComputeSomethingSlowly();<br />
+<br />  }<br />
+<br />  LeaveCriticalSection(&#8230;);<br />
+<br />  return cachedResult;<br />
+<br />}</p>
+<p>It must be guaranteed then that the read of cachedResult_computed pulls from main memory, not just from local cache, right?  The documentation for Critical Sections (and Mutexes, etc) all speak very vaguely about protected resources and don&#8217;t say much about specific results of using a Critical Section.  Or am I just being dense? (don&#8217;t be afraid to say so, it wouldn&#8217;t be the first or last time).  Again, I don&#8217;t mean to say that I think the proposed solution is wrong, just that I&#8217;m curious about how you know it&#8217;s right.</p>
+<p>Thanks,<br />
+<br />Brian</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152523">
+				<div id="div-comment-152523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152523">
+			March 9, 2004 at 5:15 pm</a>		</div>
+
+		<p>3/9/2004 10:21 AM Ben Hutchings:<br />
+<br />&gt; Norman, see<br />
+<br />&gt; <a target="_new" href="http://webstore.ansi.org/ansidocstore/product.asp?sku=INCITS%2FISO%2FIEC+14882%2D2003" rel="nofollow">http://webstore.ansi.org/ansidocstore/product.asp?sku=INCITS%2FISO%2FIEC+14882%2D2003</a></p>
+<p>Thank you very much!</p>
+<p>3/9/2004 11:10 AM The Sim:<br />
+<br />&gt; PS, the real C++ Standard ISO 14882 is an<br />
+<br />&gt; $18 PDF document available directly from ISO<br />
+<br />&gt; or ANSI websites.</p>
+<p>Wrong.  It&#8217;s an $18 document from ANSI as Mr. Hutchings kindly informed me.  From ISO it&#8217;s 364 Swiss francs, SIXTEEN TIMES the price that ANSI charges.  Now I&#8217;ll guess I probably should have bought my C standard (also PDF) from ANSI instead of directly from ISO.  By the way, ISO said I should buy the C standard from JIS and JIS said I should buy it from ISO.  JIS really doesn&#8217;t sell it so ISO sold it to me.  Some time later ISO sent me a virus.</p>
+<p>By the way, although ISO delivered the C standard itself by e-mailing a URL for a downloadable PDF file, they sent the purchase receipt as an attachment in an e-mail message itself.  An attachment in an e-mail message itself is the exact same technique as the Sobig.F that they sent me some time later.  I thought I knew which one was safe to open, but I was wrong.  Of course I did know which one wasn&#8217;t safe to open (I knew not to open the .pif attachment), but it still seems I was wrong.  A while after that, I read that it is possible for PDF files to contain code that will be executed by Acrobat Reader.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152573">
+				<div id="div-comment-152573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152573">
+			March 9, 2004 at 5:52 pm</a>		</div>
+
+		<p>The memory coherency requirements of EnterCriticalSection and LeaveCriticalSection are rather complicated to express. In brief, my understanding is that EnterCriticalSection establishes a barrier with acquire semantics, and Leave establishes a barrier with release semantics.</p>
+<p>Acquire semantics = &quot;no memory access after the Enter will be reordered before it (however memory accesses before the Enter may be delayed to after it).&quot;</p>
+<p>Release semantics = &quot;no memory access before the Leave will be delayed to after it (however memory access after the Leave may be reordered to before it).&quot;</p>
+<p>The heavier synchronization objects (the ones that use WaitForSingleObject) establish both acquire and release barriers (since it is not obvious to the OS whether you are entering or leaving).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152703">
+				<div id="div-comment-152703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Moi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152703">
+			March 10, 2004 at 1:07 am</a>		</div>
+
+		<p>Guysd, you might want to look at <a target="_new" href="http://discuss.fogcreek.com/joelonsoftware/default.asp?cmd=show&amp;ixPost=122243&amp;ixReplies=2" rel="nofollow">http://discuss.fogcreek.com/joelonsoftware/default.asp?cmd=show&#038;ixPost=122243&#038;ixReplies=2</a> Someone pointed the price discrepance out there only yesterday (coincidence?) and someone said that it might be that you need to be members of INCITS to qualify for the cheaper price.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-152943">
+				<div id="div-comment-152943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152943">
+			March 10, 2004 at 11:39 am</a>		</div>
+
+		<p>Brian: The objects called &quot;critical sections&quot; in Win32 are really process-local mutexes (critical sections are really sections of code in which the thread needs to hold a mutex, not the mutexes themselves). It&#8217;s part of the nature of mutexes that they synchronise access to memory, and you can find my explanation of how that&#8217;s done at <a target="_new" href="http://groups.google.com/groups?selm=slrnc3clpp.p3b.do-not-spam-benh%40shadbolt.i.decadentplace.org.uk" rel="nofollow">http://groups.google.com/groups?selm=slrnc3clpp.p3b.do-not-spam-benh%40shadbolt.i.decadentplace.org.uk</a> .</p>
+<p>If the memory caches of multiple processors in a shared-memory system could not be kept mostly synchronised then they would have to be completely flushed at each synchronisation point which would take of the order of a whole millisecond and is simply unacceptable. Such systems instead have cache coherency protocols that take care of this. Memory synchronisation then only requires flushing the write queue and/or invalidating the read queue in the processor cores. These queues are relatively short.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-152973">
+				<div id="div-comment-152973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-152973">
+			March 10, 2004 at 11:48 am</a>		</div>
+
+		<p>Moi: Please don&#8217;t pay attention to idle speculation. No-one on comp.std.c++ has mentioned such a restriction, and I was able to take a purchase of the document as far as being prompted for CC details. (I haven&#8217;t bothered to buy it since I have the last version and Andrew Koenig&#8217;s list of changes.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-153103">
+				<div id="div-comment-153103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Norman Diamond</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-153103">
+			March 10, 2004 at 4:45 pm</a>		</div>
+
+		<p>I bought the INCITS version for US$18 (thank you again Mr. Hutchings).  If I understand correctly, INCITS members can buy the INCITS version for US$13.50.</p>
+<p>As far as I can tell, C++ compilers always had freedom to provide thread safety and/or warn noisily and/or be unfriendly as they have been, in the presence of threads.  As far as I can tell, the C++ standard only applies itself to single-threaded programs and implementations.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-154693">
+				<div id="div-comment-154693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.singularis.ltd.uk' rel='external nofollow' class='url'>Ian Miller</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-154693">
+			March 17, 2004 at 1:20 am</a>		</div>
+
+		<p>A good article; it is point you need to be aware of.  However the fix is very simple.  If you are using local static variables to avoid the &quot;static initialisation order fiasco&quot;, you may wish to add a static reference to the function to ensure that it is called during static initialisation.</p>
+<p>e.g. If you have:-</p>
+<p>int ComputeSomething()<br />
+<br />{<br />
+<br />  static int cachedResult = ComputeSomethingSlowly();<br />
+<br />  return cachedResult;<br />
+<br />}</p>
+<p>Then add:-<br />
+<br />static int never_used = ComputeSomething();</p>
+<p>This guarantees that the first call will be during static initialisation.  Note that once the first call is complete then ComputeSomething() IS thread-safe.  Provided no threads are spawned prior to the start of the main program the problem is solved.   As static initialisation is typically not thread-safe and certainly not guaranteed to be thread-safe this introduces no thread-safety issue that isn&#8217;t intrinsic to the language.</p>
+<p>This isn&#8217;t something you need be &quot;very concerned&quot; about.  </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-154743">
+				<div id="div-comment-154743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Merz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-154743">
+			March 17, 2004 at 7:15 am</a>		</div>
+
+		<p>But this loses the &quot;delay initialization until the first time the function is called&quot; feature (as Raymond puts it), the same as the code Jack Matthews posted does.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-159943">
+				<div id="div-comment-159943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua Nicholas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-159943">
+			April 1, 2004 at 6:28 am</a>		</div>
+
+		<p>Personally I like Ian Miller&#8217;s approach, but if you need the delay,<br />
+<br />then maybe this will suit you:</p>
+<p>static bool hasSlowResultBeenComputed = false;  // Will happen at static init time</p>
+<p>int ComputeSomethingSlowly<br />
+<br />{<br />
+<br />  static int slowCachedResult;  // Dont bother setting</p>
+<p>EnterCriticalSection(&#8230;);</p>
+<p>  if ( ! hasSlowResultBeenComputed )<br />
+<br />    {<br />
+<br />    slowCachedResult = the slow computation ;<br />
+<br />    }<br />
+<br />  hasSlowResultBeenComputed = true ;</p>
+<p>LeaveCriticalSection(&#8230;);</p>
+<p> return slowCachedResult;<br />
+<br />}</p>
+<p>int ComputeSomething()<br />
+<br />{<br />
+<br />  static int cachedResult = ComputeSomethingSlowly();<br />
+<br />  return cachedResult;<br />
+<br />}</p>
+<p>By hiding the critical section in the ComputeSomethingSlowly() routine you only have to pay for it once and it protects against multithread init.  (Though there is a certain amount of ugliness.)<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-186213">
+				<div id="div-comment-186213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Greg Jaxon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-186213">
+			June 22, 2004 at 5:38 pm</a>		</div>
+
+		<p>Local static initialization IS thread-safe,<br />
+<br />in a well-written C++ compiler that is properly operated in its thread-safe mode.  It should<br />
+<br />produce two kinds of synchronization for you:<br />
+<br />1) Exactly one construction of the local object.<br />
+<br />2) Callers that don&#8217;t construct the object WAIT until it has been completely constructed before they reach the statement following its declaration.</p>
+<p>There really isn&#8217;t any point in settling for less from a C++ compiler.  When you also consider that the C++ runtime library (and most exception handling schemes) also need modifications to be thread-safe, this is really a puny issue.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-186233">
+				<div id="div-comment-186233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-186233">
+			June 22, 2004 at 6:10 pm</a>		</div>
+
+		<p>&quot;Callers that don&#8217;t construct the object WAIT until it has been completely constructed before they reach the statement following its declaration.&quot;</p>
+<p>That&#8217;s not good enough.  If the function is called by a second thread which the constructing thread is blocked on, you just created a deadlock.  I thought I mentioned this already.</p>
+<p>I&#8217;m going to close commenting on this very old thread.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-538983">
+				<div id="div-comment-538983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.cnweblog.com/chefZ/archive/2007/08/19/247574.html' rel='external nofollow' class='url'>chefZ</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-538983">
+			August 18, 2007 at 4:17 pm</a>		</div>
+
+		<p>Function Static Variables in Multi-Threaded Environments</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-596633">
+				<div id="div-comment-596633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.csdn.net/zhongshan99/archive/2008/02/01/2076359.aspx' rel='external nofollow' class='url'>咬过的苹果</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040308-00/?p=40363#comment-596633">
+			January 31, 2008 at 9:10 pm</a>		</div>
+
+		<p>C static initialization thread-safe</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

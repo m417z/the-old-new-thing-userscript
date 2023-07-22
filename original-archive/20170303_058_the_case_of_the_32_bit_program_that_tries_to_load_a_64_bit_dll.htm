@@ -1,0 +1,757 @@
+<html>
+<head>
+<title>The case of the 32-bit program that tries to load a 64-bit DLL</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The case of the 32-bit program that tries to load a 64-bit DLL</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>March 3, 2017 / year-entry #59</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>36</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">A continuing saga which ultimately comes to a resolution.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One of our escalation engineers wrote up an epic case study
+of a particular problem that he was able to solve.
+I'll retell the story here, but redacted,
+and significantly abbreviated.
+</p>
+<p>
+A customer reported that when their 32-bit program called
+<code>IUpdate&shy;Searcher::Begin&shy;Search</code>,
+the resulting dialog box was empty.
+As in the dialog box had no controls on it.
+</p>
+<p>
+Debugging revealed that the dialog box tried to load
+the common controls,
+but instead of loading the 32-bit common controls library,
+it was trying to load the 64-bit common controls library.
+Since 32-bit processes cannot load 64-bit DLLs,
+this attempt fails, and consequently, no dialog controls appear.
+</p>
+<p>
+The escalation engineer reported that the customer originally
+had five clients with this problem.
+Over time, the number of clients with the problem decreased
+to one.
+But not because they managed to solve the problem.
+The number of clients with the problem went down to one
+because the other four clients canceled their contracts
+and went with a competitor.
+</p>
+<p>
+The escalation engineer eventually got access to a system that
+reproduced the problem (a story within a story that I'm
+redacting for space), and he found that the behavior on
+the problem system was very different from those on a
+clean system.
+In particular,
+the test scenario took ten times as long to run on the problem
+system as it did on a clean system:
+On the problem system, there was a DLL that was furiously
+allocating and freeing memory.
+The customer insisted that the DLL was not the problem, however.
+</p>
+<p>
+I'm redacting another part of the story where the customer
+claims to have a virtual machine that reproduces the problem,
+but turns out that they don't.
+</p>
+<p>
+Eventually, the customer admits that they just learned that
+the problem occurs only on systems with that mysterious DLL
+installed.
+</p>
+<p>
+Okay, well, it took a long time to get there, but at least
+we have something that is common to all failures.
+The mysterious DLL is part of an anti-malware system
+that bills itself as something like
+"The most advanced anti-malware
+platform."
+Okay, mister advanced anti-malware, let's take a look
+at what you're up to.
+</p>
+<p>
+Application compatibility guru extraordinaire
+<a HREF="https://channel9.msdn.com/Shows/Checking-In-with-Erik-Meijer/Checking-In-Gov-Maharaj-Shimming-the-World-Dreaming-in-Assembly">
+Gov Maharaj</a>
+suggested taking a look at
+<code>Wow64&shy;Disable&shy;Wow64&shy;Fs&shy;Redirection</code>
+and
+<code>Wow64&shy;Revert&shy;Wow64&shy;Fs&shy;Redirection</code>
+and to make sure they were matched up.
+And they were.
+So much for that theory.
+</p>
+<p>
+Another week of debugging passes
+(mixed in with various failed attempts to get a virtual machine
+that reproduces the problem),
+and Gov's suggestion to
+look at
+<code>Wow64&shy;Disable&shy;Wow64&shy;Fs&shy;Redirection</code>
+echoes like a flashback scene in a cheesy movie.
+File system redirection is disabled and re-enabled thousands of
+times during the running of the scenario.
+There were many instances of the code in the DLL,
+and reverse-engineering revealed that
+they all looked like this:
+</p>
+<pre>
+// disable redirection while we do something
+void* previousState;
+if (Wow64DisableWow64Redirection(&amp;previousState)) {
+   ... do something ...
+   // All done. Return to the previous state.
+   Wow64RevertWow64Redirection(previousState);
+}
+</pre>
+<p>
+except that there was one case where the code was subtly different:
+</p>
+<pre>
+// Code in italics is wrong.
+// disable redirection while we do something
+void* previousState;
+if (Wow64DisableWow64Redirection(&amp;previousState)) {
+   ... do something ...
+   // All done. Return to the previous state.
+   <i>Wow64RevertWow64Redirection(&amp;previousState);</i>
+}
+</pre>
+<p>
+The anti-malware DLL fell into the trap of the
+<a HREF="https://blogs.msdn.microsoft.com/oldnewthing/20160919-00/?p=94335">
+unfortunate choice of data type for the file system redirection cookie</a>.
+Furthermore, even though the code had a bug,
+the address of the redirection cookie
+was lucky enough to look enough like a genuine redirection cookie that
+it successfully restored the redirection state to what it should have been.
+But one time out of those thousands, its luck ran out,
+and it didn't restore the state properly.
+</p>
+<p>
+That one call left file system redirection disabled,
+and thereafter, all the correct code sequences which
+temporarily disabled redirection would restore the
+redirection to its previous state, which was now
+"disabled" rather than the "enabled" it was supposed to be.
+</p>
+<p>
+To verify that this needle-in-a-haystack situation was the root cause,
+the escalation engineer patched the DLL to fix the bug,
+and the test scenario ran to completion successfully.
+</p>
+<p>
+The customer went back to the vendor of the anti-malware software
+to get an updated version of the DLL,
+and that fixed the problem.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (36)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1287166">
+				<div id="div-comment-1287166" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287166">
+			March 3, 2017 at 7:20 am</a>		</div>
+
+		<p>&#8220;File system redirection is disabled and re-enabled thousands of times during the running of the scenario.&#8221;</p>
+<p>Is that normal?  What does it do for performance?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1287185">
+				<div id="div-comment-1287185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287185">
+			March 3, 2017 at 7:47 am</a>		</div>
+
+		<p>If you read the recommendations and must operate on x64 program files from x86 you too will do this. Disclaimer: I do not do this. I find ways to avoid it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-jeremytais even depth-3 parent" id="comment-1287195">
+				<div id="div-comment-1287195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287195">
+			March 3, 2017 at 8:56 am</a>		</div>
+
+		<p>Raymond strongly implies that someones antivirus is the one changing this setting (which as he would put it is akin to a houseguest deciding to remodel your home without asking).</p>
+<p>At first I assumed those functions were process wide, but since they are only thread wide, I suppose it is safe to do as long as you clean up after yourself (and don&#8217;t have a bug like the code in the example).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1287235">
+				<div id="div-comment-1287235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken in NH</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287235">
+			March 3, 2017 at 12:12 pm</a>		</div>
+
+		<p>The effect is not even process wide; it only effects the current thread. From MSDN:</p>
+<p><i>Note  The Wow64DisableWow64FsRedirection function affects all file operations performed by the current thread, which can have unintended consequences if file system redirection is disabled for any length of time. For example, DLL loading depends on file system redirection, so disabling file system redirection will cause DLL loading to fail. Also, many feature implementations use delayed loading and will fail while redirection is disabled. The failure state of the initial delay-load operation is persisted, so any subsequent use of the delay-load function will fail even after file system redirection is re-enabled. To avoid these problems, disable file system redirection immediately before calls to specific file I/O functions (such as CreateFile) that must not be redirected, and re-enable file system redirection immediately afterward using Wow64RevertWow64FsRedirection.</i></p>
+<p>Given that information, my assumption is that the anti-malware DLL is injected into the customer&#8217;s process and interposes itself between the process and some API call. So maybe some thread makes a call that takes a detour through this bug in the anti-malware and then has a failed delay-load of the 64-bit DLL which hoses it for the whole process lifetime.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1287255">
+				<div id="div-comment-1287255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287255">
+			March 3, 2017 at 1:17 pm</a>		</div>
+
+		<p>Wow, yes, that&#8217;s probably what&#8217;s happening.  Thanks for the additional background.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1287365">
+				<div id="div-comment-1287365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ender</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287365">
+			March 4, 2017 at 5:15 am</a>		</div>
+
+		<p>Filesystem redirection doesn&#8217;t affect Program Files &#8211; only System32/SysWoW64.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1287505">
+				<div id="div-comment-1287505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tanveer Badar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287505">
+			March 6, 2017 at 1:29 am</a>		</div>
+
+		<p>Then why is there a Program Files (x86) folder in the first place?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1287536">
+				<div id="div-comment-1287536" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker07</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287536">
+			March 6, 2017 at 7:33 am</a>		</div>
+
+		<p>Your favorite Web search tool will give the answer!  Also, you can search Raymond&#8217;s blog.  &#8220;File system redirection&#8221;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1287205">
+				<div id="div-comment-1287205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ZLB</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287205">
+			March 3, 2017 at 9:31 am</a>		</div>
+
+		<p>Just searched &#8220;The most advanced anti-malware platform&#8221;. Turns out they all are!</p>
+<p>Sorry tale all around really.</p>
+<p>Should have wrapped those FS redirect calls up in a RAII class.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-jeremytais odd alt depth-2" id="comment-1287555">
+				<div id="div-comment-1287555" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287555">
+			March 6, 2017 at 7:59 am</a>		</div>
+
+		<p>Yeah, frankly that shocked me &#8212; why they would hand code the redirection stuff each time you needed it (and get it right every time) instead of having a class to do that for them (and only get it right once)  tells you all you need to know about that particular antivirus vendor.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1287225">
+				<div id="div-comment-1287225" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287225">
+			March 3, 2017 at 11:32 am</a>		</div>
+
+		<p>Wow.<br />
+Wow64!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1 parent" id="comment-1287265">
+				<div id="div-comment-1287265" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287265">
+			March 3, 2017 at 3:06 pm</a>		</div>
+
+		<p>The lesson here is: Whoever decided to come up with that redirection kludge, screw you. And whoever felt they need to enable and disable it like crazy, screw you, too. Windows\Sysnative exists for a reason (although the reason is that you need to get around that redirection kludge).</p>
+<p>Every time Windows does things behind your back, you&#8217;re screwed.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1287285">
+				<div id="div-comment-1287285" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287285">
+			March 3, 2017 at 3:49 pm</a>		</div>
+
+		<p>Soo your solution would&#8217;ve been to just not allow any 32bit applications under 64-bit Windows? That does not seem like a particular viable solution either.</p>
+<p>In practice the redirects are not a problem for the vast, vast majority of programs. If you need to do something special you&#8217;ll need additional code and complexity &#8211; that&#8217;s quite fair.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1287305">
+				<div id="div-comment-1287305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287305">
+			March 3, 2017 at 5:36 pm</a>		</div>
+
+		<p>System64.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1287315">
+				<div id="div-comment-1287315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken in NH</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287315">
+			March 3, 2017 at 6:06 pm</a>		</div>
+
+		<p><i>Wow. I&#8217;m so excited that we&#8217;re moving to 64 bit OSes and processes! I&#8217;m going to release my program as 64 bit binaries.</i></p>
+<p>[Frobs the bitness drop down in IDE.]<br />
+[Recompiles]<br />
+[Execute aaaanndd&#8230;program goes down in flames.]</p>
+<p><i>Windows sucks.</i></p>
+<p><a href="https://technet.microsoft.com/en-us/library/ff955767.aspx" rel="nofollow">https://technet.microsoft.com/en-us/library/ff955767.aspx</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1287355">
+				<div id="div-comment-1287355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287355">
+			March 4, 2017 at 4:58 am</a>		</div>
+
+		<p>I don&#8217;t remember that being a problem during the 16→32 bit transition, although I&#8217;m sure this blog has an article that will prove me wrong. (Most of its articles seem to.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1287385">
+				<div id="div-comment-1287385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Joyal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287385">
+			March 4, 2017 at 1:49 pm</a>		</div>
+
+		<p>So because some programmers can&#8217;t do proper pointers and datatypes and expect their compiler to magically fix their stuff, every sysadmin is now stuck with:<br />
+System32 on 32 bit = 32 bit<br />
+System32 on 64 bit = 64 bit<br />
+SysWow64 on 64 bit = 32 bit<br />
+blech.<br />
+I think the Program Files team did it better, but they also managed to make it confusing with Program Files (x86) because if you&#8217;re going with a &#8220;user friendly&#8221; name like &#8220;Program Files&#8221; why add the technical x86 name instead of 32/64?</p>
+<p>I guess we could have had System32 being a junction to SystemX64 and System64 being a junction to SystemX86.</p>
+<p>Oh, to have one of Raymond&#8217;s time machines&#8230;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-5" id="comment-1287395">
+				<div id="div-comment-1287395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287395">
+			March 4, 2017 at 8:17 pm</a>		</div>
+
+		<p>Ken in NH: What didn&#8217;t work? Everything has the same names as on 32-bit (down to the &#8220;system32&#8221;) exactly so that you can just flip your IDE to &#8220;Target=x64&#8221;.</p>
+<p>Ray Joyal: If they were called &#8220;Program Files (32)&#8221; and &#8220;Program Files (64)&#8221;, then what would you call the directories on the Alpha? Native binaries were 32-bit Alpha AXP. Emulated binaries were 32-bit x86. Would you call them &#8220;Program Files (32)&#8221; and &#8220;Program Files (32) (no serious)&#8221;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even depth-5" id="comment-1287425">
+				<div id="div-comment-1287425" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287425">
+			March 5, 2017 at 10:57 am</a>		</div>
+
+		<p>There is already GetSystemDirectory though. Batch files might be more of an issue however.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1287435">
+				<div id="div-comment-1287435" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Michael</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287435">
+			March 5, 2017 at 1:51 pm</a>		</div>
+
+		<p>Raymond, I think Ken in NH was suggesting that if Joshua&#8217;s suggestion of System64 for the 64bit binaries, then &#8220;program goes down in flames&#8221; would happen with a final result of &#8220;Windows sucks&#8221;, but since it remained System32 for the &#8220;native&#8221; bitness, it worked, for bad programs that hardcoded System32, and for not-so-bad programs that had no choice but to.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1287585">
+				<div id="div-comment-1287585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287585">
+			March 6, 2017 at 9:17 am</a>		</div>
+
+		<p>@Raymond: sizeof(ptrdiff_t) != sizeof(int) anymore</p>
+<p>This exploded for us in production when realloc() finally moved a buffer more than 2GB.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1287675">
+				<div id="div-comment-1287675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Kissane</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287675">
+			March 6, 2017 at 1:40 pm</a>		</div>
+
+		<p>@Neil, I think the 1632 bit transition was more seamless in that you could mix 16-bit and 32-bit code in the same process.</p>
+<p>Raymond argues <a href="https://blogs.msdn.microsoft.com/oldnewthing/20081020-00/?p=20523" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20081020-00/?p=20523</a> that isn&#8217;t feasible due to the different address space sizes.</p>
+<p>I&#8217;m unconvinced, because other vendors manage this. If you look at z/OS, you can mix 24-bit, 31-bit and 64-bit addressing in the same process. Of course, that is a different CPU architecture – so maybe this is easier to implement on z/Architecture than x86/x64, but I&#8217;m unconvinced it would be impossible on x86/x64.</p>
+<p>In fact, strictly speaking, all 32-bit processes on 64-bit Windows are mixed 32-bit/64-bit code because WoW64 is mixed 32-bit/64-bit code. It&#8217;s just that Microsoft has decided not to support such mixing outside of the internal details of the WoW64 implementation. If WoW64 can do it internally, then why can&#8217;t other folks do it too?</p>
+<p>Also, a lot of this filesystem redirection stuff could have been avoided if Microsoft adopted fat binaries like how Apple has. Then they could have shipped a single DLL including both 32-bit and 64-bit code, and both 32-bit and 64-bit software can load the same DLL path and get the version of the code they need.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1287495">
+				<div id="div-comment-1287495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287495">
+			March 6, 2017 at 1:27 am</a>		</div>
+
+		<p>&gt; Every time Windows does things behind your back, you’re screwed.</p>
+<p>I don&#8217;t think so.</p>
+<p>Every timr I enable some compatibilty shims on some crazy-old game so that Windows does stuff behind it&#8217;s back, the game starts to work on Windows 10.</p>
+<p>So, screw you ! :p</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-alegrigoriev odd alt depth-3 parent" id="comment-1287615">
+				<div id="div-comment-1287615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287615">
+			March 6, 2017 at 10:20 am</a>		</div>
+
+		<p>Oh, when *you* enable compatibility shims, it&#8217;s not Windows doing things behind your back.</p>
+<p>When Windows decides by some heuristics that it needs compatibility shims for some app, no matter what you say, *this* is doing things behind your back. &#8220;Oh, the app you are debugging crashed; how about we tweak some knobs for it?&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1287725">
+				<div id="div-comment-1287725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">xcomcmdr</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287725">
+			March 7, 2017 at 4:02 am</a>		</div>
+
+		<p>You are really getting angry over nothing.</p>
+<p>I&#8217;m very grateful Windows has a very long list of known problematic games / apps and knows how to make them work instantly. It saves me the headache of finding the fix myself.</p>
+<p>Besides, the question Windows asks when an app/setup crashed does nothing if you ignore it. There&#8217;s nothing done behind your back in this case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-even depth-1 parent" id="comment-1287465">
+				<div id="div-comment-1287465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287465">
+			March 5, 2017 at 5:38 pm</a>		</div>
+
+		<p>[The number of clients with the problem went down to one because the other four clients canceled their contracts and went with a competitor. ]</p>
+<p>I wonder&#8230; if it&#8217;s antivirus DLL&#8217;s bug that cause a common control DLL not loading, how come the same behavior not exhibited on competitor&#8217;s system? (It&#8217;s not like antivirus is not mandatory these days) Or worse, affects other windows applications as well?</p>
+<p>Is so, that should be pretty visible symptom. I think that company is in real bad luck to have such problem readily reproducible in their application only.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command even depth-2" id="comment-1287466">
+				<div id="div-comment-1287466" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287466">
+			March 5, 2017 at 8:54 pm</a>		</div>
+
+		<p>Because the competitors didn&#8217;t make the mistake of writing &#8220;Wow64RevertWow64Redirection(&amp;previousState);&#8221;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alexcohn odd alt depth-2 parent" id="comment-1287735">
+				<div id="div-comment-1287735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Alex+Cohn' rel='external nofollow' class='url'>Alex Cohn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287735">
+			March 7, 2017 at 5:53 am</a>		</div>
+
+		<p>Possibly the competitors had 64-bit app</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-cheong even depth-3" id="comment-1287855">
+				<div id="div-comment-1287855" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287855">
+			March 7, 2017 at 7:47 pm</a>		</div>
+
+		<p>@Alex Cohn: That could explain it. :)</p>
+<p>Btw, want to reply with Reply button and greeted with &#8220;&#8216;addComment&#8217; is undefined&#8221; javascript error. The address on address bar is updated though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-cheong odd alt thread-odd thread-alt depth-1 parent" id="comment-1287475">
+				<div id="div-comment-1287475" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/cheong00' rel='external nofollow' class='url'>cheong00</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287475">
+			March 5, 2017 at 10:00 pm</a>		</div>
+
+		<p>I think the faulty code is on the anti-malware DLL, not the DLL from the customer&#8217;s application itself.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1287526">
+				<div id="div-comment-1287526" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jamie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287526">
+			March 6, 2017 at 3:38 am</a>		</div>
+
+		<p>Good sleuthing&#8230;<br />
+<i>&#8220;The customer went back to the vendor of the anti-malware software to get an updated version of the DLL, and that fixed the problem.&#8221;</i></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ltdrak odd alt thread-even depth-1 parent" id="comment-1287485">
+				<div id="div-comment-1287485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Drak' rel='external nofollow' class='url'>Drak</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287485">
+			March 5, 2017 at 10:19 pm</a>		</div>
+
+		<p>Any hint of when this happened (year, or year /month)? We had a mysterious period where 2 of our clients had the same type of problems, and after disabling their anti-virus it went away, Later on, re-enabling the anti-virus did not reproduce the problem anymore so we figured the anti-virus was updated.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2 parent" id="comment-1287595">
+				<div id="div-comment-1287595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287595">
+			March 6, 2017 at 9:39 am</a>		</div>
+
+		<p>This happened in Q2 2016.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3" id="comment-1287676">
+				<div id="div-comment-1287676" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287676">
+			March 6, 2017 at 5:13 pm</a>		</div>
+
+		<p>Excellent use of unmasking exactly enough information. If it&#8217;s a (key) collision he can reasonably check but nobody else can.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-ltdrak even depth-3" id="comment-1287695">
+				<div id="div-comment-1287695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Drak' rel='external nofollow' class='url'>Drak</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1287695">
+			March 6, 2017 at 10:16 pm</a>		</div>
+
+		<p>Thanks Raymond. It was possibly the same issue.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wswiktor odd alt thread-odd thread-alt depth-1" id="comment-1288345">
+				<div id="div-comment-1288345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Azarien' rel='external nofollow' class='url'>Azarien</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170303-00/?p=95655#comment-1288345">
+			March 10, 2017 at 8:11 am</a>		</div>
+
+		<p>So&#8230; it turns out that Wow64EnableWow64FsRedirection wasn&#8217;t that bad after all. At least it always does what you really want.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

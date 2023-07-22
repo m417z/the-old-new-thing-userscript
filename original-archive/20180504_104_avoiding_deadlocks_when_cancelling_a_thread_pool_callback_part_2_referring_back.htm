@@ -1,0 +1,366 @@
+<html>
+<head>
+<title>Avoiding deadlocks when cancelling a thread pool callback, part 2: Referring back to the containing object</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Avoiding deadlocks when cancelling a thread pool callback, part 2: Referring back to the containing object</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 4, 2018 / year-entry #104</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20180504-00/?p=98675</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>2</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Run it, but only as long as I still exist.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Last time, we looked at the case where the context for the
+callback is some data that isn't part of the containing object.
+However, most of the time, the context for the callback is
+the object that created the callback.
+</p>
+<p>
+You might na&iuml;vely decide to follow the preceding pattern,
+using the container object as the reference data.
+However, 
+this doesn't work because
+that would create a circular reference.
+Once you put the strong reference to the containing object in the
+reference data, you have a circular reference, and the object will
+never be destroyed.&sup1;
+Instead, you have to use a weak reference and try to promote it to a strong
+reference in the callback.
+</p>
+<pre>
+class ObjectWithTimer :
+  <font COLOR="blue">public RuntimeClass&lt;...&gt;</font> // WRL-specific code
+{
+public:
+ ObjectWithTimer();
+ void StartTimer();
+ void StopTimer();
+
+private:
+ static void CALLBACK TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer);
+
+ <font COLOR="blue">WRL::WeakRef weakThis;</font> // WRL-specific code
+ std::unique_ptr&lt;TP_TIMER, TpTimerDeleter&gt; timer;
+};
+
+ObjectWithTimer::ObjectWithTimer()
+{
+ // Error checking elided for expository purposes.
+ <font COLOR="blue">WRL::AsWeak(this, &amp;weakThis);</font> // WRL-specific code
+}
+</pre>
+<p>
+For convenience, we capture the weak reference
+at construction and just hang onto it for the lifetime
+of the object.
+This saves us the trouble of having to create the weak
+reference each time we start the timer.
+It also brings us a step closer to making <code>Start&shy;Timer</code>
+have no error path.
+(The last step would be to front-load the
+<code>Create&shy;Threadpool&shy;Timer</code>
+and leave the <code>PTP_TIMER</code> valid for the lifetime of the
+<code>Object&shy;With&shy;Timer</code>.
+I leave this as an exercise.)
+</p>
+<pre>
+void ObjectWithTimer::StartTimer()
+{
+  // Error checking elided for expository purposes.
+  timer = CreateThreadpoolTimer(
+    TimerCallback,
+    <font COLOR="blue">weakThis.Get(),</font> // WRL-specific code
+    nullptr);
+
+  // Start the timer
+  SetThreadpoolTimer(timer, ...);
+}
+
+void ObjectWithTimer::StopTimer()
+{
+  timer.reset();
+}
+</pre>
+<p>
+These methods are basically the same as before,
+except that we don't clean up the <code>weakThis</code>
+when stopping the timer, because we want to leave it ready
+for the next <code>Start&shy;Timer</code>.
+</p>
+<pre>
+void ObjectWithTimer::TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer)
+{
+ // Try to promote the weak reference to a strong reference.
+ <font COLOR="blue">WRL::ComPtr&lt;ObjectWithTimer&gt; strongThis;
+ WRL::WeakRef(reinterpret_cast&lt;IWeakReference*&gt;(context))
+    .As(&amp;strongThis);</font> // WRL-specific code
+
+ context = nullptr;
+
+ // If the weak reference failed to resolve, then our container is
+ // destructing.
+ if (!self) return;
+
+ DisassociateCurrentThreadFromCallback(instance);
+
+ ... do stuff with strongThis ...
+}
+</pre>
+<p>
+In the version from last time,
+we promoted the raw COM pointer to a strong reference,
+with the knowledge that the raw COM pointer was valid.
+However, it's possible that the promotion of the
+<code>WRL::WeakRef</code> to a strong reference may fail.
+How?
+We'll discuss that later.
+</p>
+<p>
+Here's a translation of the pattern into
+<code>std::weak_ref</code>:
+</p>
+<pre>
+class ObjectWithTimer :
+  // weak_ptr-specific code
+  <font COLOR="blue">public std::enable_shared_from_this&lt;ObjectWithTimer&gt;</font>
+{
+public:
+ ObjectWithTimer();
+ void StartTimer();
+ void StopTimer();
+
+private:
+ static void CALLBACK TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer);
+
+ <font COLOR="blue">std::weak_ref&lt;ObjectWithTimer&gt; weakThis;</font> // weak_ptr-specific code
+ std::unique_ptr&lt;TP_TIMER, TpTimerDeleter&gt; timer;
+};
+
+ObjectWithTimer::ObjectWithTimer()
+ <font COLOR="blue">: weakThis(weak_from_this())</font> // weak_ptr-specific code
+{
+}
+</pre>
+<p>
+In the case of <code>weak_ptr</code>,
+we can initialize <code>weakThis</code> via a member initializer.
+</p>
+<pre>
+void ObjectWithTimer::StartTimer()
+{
+  // Error checking elided for expository purposes.
+  timer = CreateThreadpoolTimer(
+    TimerCallback,
+    <font COLOR="blue">std::addressof(weakThis),</font> // weak_ptr-specific code
+    nullptr);
+
+  SetThreadpoolTimer(timer, ...);
+}
+
+void ObjectWithTimer::StopTimer()
+{
+  timer.reset();
+}
+
+void ObjectWithTimer::TimerCallback(
+  PTP_CALLBACK_INSTANCE instance,
+  void* context, PTP_TIMER timer)
+{
+ // Try to promote the weak reference to a strong reference.
+ <font COLOR="blue">// weak_ptr-specific code
+ auto strongThis =
+  reinterpret_cast&lt;
+   std::weak_ref&lt;ObjectWithTimer&gt;*&gt;(context))
+    -&gt;lock();</font>
+
+ context = nullptr;
+
+ // If the weak reference failed to resolve, then our container is
+ // destructing.
+ if (!strongThis) return;
+
+ DisassociateCurrentThreadFromCallback(instance);
+
+ ... do stuff with strongThis ...
+}
+</pre>
+<p>
+The subtlety in both of the cases
+is that the promotion of the weak reference
+to a strong reference may fail.
+You might think, "How is that possible?
+When we shut down the timer, we always wait until
+the callback has reached the
+<code>Disassociate&shy;Current&shy;Thread&shy;From&shy;Callback</code>,
+and since we're waiting, that means that the
+<code>Object&shy;With&shy;Timer</code> is still valid.
+Therefore, the conversion of the weak reference to a strong
+reference should always succeed."
+</p>
+<p>
+But it doesn't if the call to
+<code>Wait&shy;For&shy;Threadpool&shy;Xxx&shy;Callbacks</code>
+is running
+<i>as part of object destruction</i>.
+There is a race window between the start of destruction
+(when the last strong reference goes away)
+and the time the callback starts running.
+To close this window,
+weak references can no longer
+be promoted to strong references
+once an object starts destructing,
+(If they could, then it would mean that an object would finish
+running its destructors and find that there's still a
+strong reference to it.
+This is clearly a bad state of affairs, and since
+you can't "undestruct" an object,
+the system must prevent code from being able to
+"resurrect" a destructing
+object via a weak-to-strong conversion.)
+</p>
+<p>
+Note that if you follow this pattern, then the
+<code>Object&shy;With&shy;Timer</code>
+must be a heap-allocated object so that you can
+create a weak pointer to it and allow the callback
+to extend the object's lifetime
+after its owner has released
+its last reference.
+</p>
+<p>
+<b>Epilogue</b>:
+A reminder that this additional complexity is needed
+only to address the scenario where a callback
+deadlocks with its main thread.
+If your callback does not require its main thread to be
+in any particular state
+(doesn't use any locks or other exclusive resources
+that the main thread may be holding
+while waiting for the callback to complete, doesn't communicate
+with the main thread), then you can use the simpler
+life-time management technique described at the start of this mini-series.
+</p>
+<p>
+<b>Bonus reading</b>:
+<a HREF="https://blogs.msdn.microsoft.com/harip/tag/threadpool/">
+Threadpool articles</a>
+by
+<a HREF="https://blogs.msdn.microsoft.com/harip/">
+Hari Pulapaka</a>.</p>
+<p>
+&sup1;
+Then again, maybe that's what you want, in case this is
+a feature, not a bug.
+For example, you might want the timer to continue running
+until some condition is met.
+The object-with-timer is a fire-and-forget timer that
+turns itself off when it decides that its job is done.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (2)	</div>
+
+		<div id="respond" class="comment-respond">
+		<h3 id="reply-title" class="comment-reply-title"> <small><a rel="nofollow" id="cancel-comment-reply-link" href="/oldnewthing/20180504-00/?p=98675#respond" style="display:none;">Cancel reply</a></small></h3>			<form action="https://blogs.msdn.microsoft.com/oldnewthing/wp-comments-post.php" method="post" id="commentform" class="comment-form">
+				<p class="comment-form-comment"><textarea id="comment" name="comment" cols="45" rows="4" aria-required="true"></textarea></p><p class="comment-form-author"><label for="author">Name <span class="required">*</span></label> <input id="author" name="author" type="text" value="" size="30" maxlength="245" aria-required='true' required='required' /></p>
+<p class="comment-form-email"><label for="email">Email <span class="required">*</span></label> <input id="email" name="email" type="text" value="" size="30" maxlength="100" aria-describedby="email-notes" aria-required='true' required='required' /></p>
+<p class="comment-form-url"><label for="url">Website</label> <input id="url" name="url" type="text" value="" size="30" maxlength="200" /></p>
+<p class="form-submit"><input name="submit" type="submit" id="submit" class="submit btn btn-default" value="Post Comment" /> <input type='hidden' name='comment_post_ID' value='98675' id='comment_post_ID' />
+<input type='hidden' name='comment_parent' id='comment_parent' value='0' />
+</p><p style="display: none;"><input type="hidden" id="akismet_comment_nonce" name="akismet_comment_nonce" value="6fc33f1901" /></p><p style="display: none;"><input type="hidden" id="ak_js" name="ak_js" value="160"/></p>			</form>
+			</div><!-- #respond -->
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1335745">
+				<div id="div-comment-1335745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Simon Clarkstone</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180504-00/?p=98675#comment-1335745">
+			May 4, 2018 at 8:52 am</a>		</div>
+
+		<p>I am surprised by the line<br />
+    if (!self) return;<br />
+Why is the line not<br />
+    if (!strongThis) return;<br />
+? It could be a typo from you editing the code while composing the article, or maybe &#8220;self&#8221; is a C++ feature that was invented since I last read about C++ in the 90s.</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180504-00/?p=98675&#038;replytocom=1335745#respond' onclick='return addComment.moveForm( "div-comment-1335745", "1335745", "respond", "98675" )' aria-label='Reply to Simon Clarkstone'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1335825">
+				<div id="div-comment-1335825" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20180504-00/?p=98675#comment-1335825">
+			May 5, 2018 at 4:22 am</a>		</div>
+
+		<p>I spent too much time reading up on weak reference thread safety&#8230;</p>
+
+		<div class="reply"><a rel='nofollow' class='comment-reply-link' href='https://blogs.msdn.microsoft.com/oldnewthing/20180504-00/?p=98675&#038;replytocom=1335825#respond' onclick='return addComment.moveForm( "div-comment-1335825", "1335825", "respond", "98675" )' aria-label='Reply to Neil'>Reply</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

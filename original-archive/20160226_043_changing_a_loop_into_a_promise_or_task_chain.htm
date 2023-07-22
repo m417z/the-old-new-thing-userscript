@@ -1,0 +1,678 @@
+<html>
+<head>
+<title>Changing a loop into a promise or task chain</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Changing a loop into a promise or task chain</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 26, 2016 / year-entry #44</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>26</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Crack open your textbooks.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+If you are dealing with PPL Tasks in C++ or Promises in JavaScript,
+you run into the problem of having to rephrase loops in the
+form of callbacks.
+(On the other hand, if you're using Tasks in C#,
+then you have the wonderful <code>await</code> keyword to do
+this all for you.
+If you're a JavaScript programmer,
+<a HREF="http://www.joezimjs.com/javascript/synchronizing-asynchronous-javascript-es7/">
+you can look at the <code>async</code> keyword
+coming to ES7</a>.
+If you are using
+<a HREF="http://blogs.msdn.com/b/vcblog/archive/2013/12/20/asynchronous-programming-in-c-using-resumable-functions-and-await.aspx">
+C++ resumable functions</a>, then you can use <code>__await</code>.
+<a HREF="http://blogs.msdn.com/b/vcblog/archive/2014/11/12/resumable-functions-in-c.aspx">
+More about resumable functions</a>.
+<a HREF="http://blogs.msdn.com/b/vcblog/archive/2015/04/29/more-about-resumable-functions-in-c.aspx">
+Still more</a>.
+)</p>
+<p>
+Let's convert a loop into a promise/task chain.
+Here's the loop:
+</p>
+<pre>
+std::vector&lt;std::unique_ptr&lt;Thing&gt;&gt; things;
+
+void FrobEachThing()
+{
+    for (auto thing : things) {
+       thing-&gt;FrobAsync();
+    }
+}
+</pre>
+<p>
+The problem is that the <code>Frob&shy;Async</code> method is
+asynchronous and returns a task, and we want to perform each frob
+operation in series, not in parallel.
+If we were writing in C#, this would be a piece of cake:
+</p>
+<pre>
+async Task FrobEachThingAsync()
+{
+    foreach (var thing in things) {
+        await thing.FrobAsync();
+    }
+}
+</pre>
+<p>
+Similarly, if we had resumable functions:
+</p>
+<pre>
+task&lt;void&gt; FrobEachThingAsync()
+{
+    for (auto thing : things) {
+       __await thing-&gt;FrobAsync();
+    }
+}
+</pre>
+<p>
+But we don't have that, so we will need to do the transformation
+ourselves.
+</p>
+<p>
+At this point, you think back to Computer Science class and
+that stuff you learned about recursion and you wondered when
+anybody would ever want to do that.
+Well, we're going to do that.
+</p>
+<p>
+The idea is that we start the asynchronous operation, and pass
+as a callback a function that knows how to continue the loop.
+Since this is a loop, the callback may end up passing itself
+as the next callback, and that's where we get the appearance
+of recursion.
+(It's not really recursion because the creation of the
+task returns immediately;
+the callback runs when the task completes, which is some time later.)
+</p>
+<p>
+First, let's write out what that ranged for loop really means:</p>
+<pre>
+void FrobEachThing()
+{
+    auto first = begin(things);
+    auto last = end(things);
+    while (first != last) {
+        (*first)-&gt;FrobAsync();
+        first++;
+    }
+}
+</pre>
+<p>
+With this formulation, it's easier to see
+how to make it recursive.
+Actually, the important thing is that you make it <i>tail-recursive</i>.
+</p>
+<pre>
+typedef decltype(begin(things)) thing_iterator;
+
+void FrobTheRestOfTheThings(
+    thing_iterator first,
+    thing_iterator last)
+{
+    if (first != last) {
+        (*first)-&gt;FrobAsync();
+        FrobTheRestOfTheThings(first + 1, last);
+    }
+}
+
+void FrobEachThing()
+{
+    FrobTheRestOfTheThings(begin(things), end(things));
+}
+</pre>
+<p>
+Now that we have tail recursion, we can make it into a task chain:
+</p>
+<pre>
+task&lt;void&gt;
+FrobTheRestOfTheThingsAsync(
+    thing_iterator first,
+    thing_iterator last)
+{
+    if (first != last) {
+        return (*first)-&gt;FrobAsync().then([first, last]() {
+            return FrobTheRestOfTheThingsAsync(first + 1, last);
+        });
+    } else {
+        return create_task([](){}); // null task - base case of recursion
+    }
+}
+
+task&lt;void&gt; FrobEachThingAsync()
+{
+    return FrobTheRestOfTheThingsAsync(begin(things), end(things));
+}
+</pre>
+<p>
+The same logic applies to JavaScript.
+Starting with
+</p>
+<pre>
+function frobEachThing()
+{
+    things.forEach(function(thing) { thing.Frob(); });
+}
+</pre>
+<p>
+First, do the rewrite into an explicit loop.
+</p>
+<pre>
+function frobEachThing()
+{
+    var i = 0;
+    while (i &lt; things.length) {
+        things[i].frob();
+        i++;
+    }
+}
+</pre>
+<p>
+Then apply the same logic as above to convert this into
+a promise chain:
+</p>
+<pre>
+function frobTheRestOfTheThingsAsync(array, index, length) {
+    if (index != length) {
+        return array[index].frobAsync().then(function() {
+            return frobTheRestOfTheThingsAsync(array, index + 1, length);
+        });
+    } else {
+        return WinJS.Promise.wrap(); // null task - base case of recursion
+    }
+}
+
+function frobEachThingAsync()
+{
+    return FrobTheRestOfTheThingsAsync(things, 0, things.length);
+}
+</pre>
+<p>
+JavaScript captures by reference and uses garbage collection,
+so things are a bit easier.
+We can make one function local to the other and let the
+closures capture our state.
+</p>
+<pre>
+function frobEachThingAsync()
+{
+    var array = things;
+    var length = array.length;
+    var index = 0;
+
+    function rest() {
+        if (index != length) {
+            return array[index].frobAsync().then(function() {
+                index++;
+                rest();
+            });
+        } else {
+            return WinJS.Promise.wrap(); // null task - base case of recursion
+        }
+    }
+
+    return rest();
+}
+</pre>
+<p>
+<b>Bonus reading</b>:
+<a HREF="http://blogs.msdn.com/b/nativeconcurrency/archive/2012/05/09/how-to-put-a-ppltasks-continuation-chain-into-a-loop.aspx">
+How to put a PPLTasks continuation chain into a loop</a>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (26)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1228291">
+				<div id="div-comment-1228291" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://stephencleary.com' rel='external nofollow' class='url'>Stephen Cleary</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228291">
+			February 26, 2016 at 10:08 am</a>		</div>
+
+		<p>Another good option for JavaScript developers that&#8217;s available today (ES2015) is to have a generator that yields promises. That way you can have the compiler do all the awkward rewriting, and your own code is almost as clean as async/await.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1228292">
+				<div id="div-comment-1228292" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bob</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228292">
+			February 26, 2016 at 10:59 am</a>		</div>
+
+		<p>Once you got rid of the ranged loop, don&#8217;t you miss out on frobbing the last thing?  Perhaps the </p>
+<p> (*first)-&gt;FrobAsync();</p>
+<p>should be outside the if.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1228441">
+				<div id="div-comment-1228441" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228441">
+			February 27, 2016 at 11:46 am</a>		</div>
+
+		<p>No the code&#8217;s correct. Remember that end() points to one past the last element of the container.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1228321">
+				<div id="div-comment-1228321" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brad Barber</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228321">
+			February 26, 2016 at 12:06 pm</a>		</div>
+
+		<p>You can simplify the javascript version by using [].reduce &#8211; check out the collection portion of the following article:  <a href="http://taoofcode.net/promise-anti-patterns/" rel="nofollow">http://taoofcode.net/promise-anti-patterns/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1228381">
+				<div id="div-comment-1228381" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228381">
+			February 26, 2016 at 9:40 pm</a>		</div>
+
+		<p>Stroustrup et al are turning C++ into C#, little by little. I have stopped following them. What&#8217;s the point? All these funny constructs take more to understand than to do the equivalent in the &#8220;traditional&#8221; way. Just use a signal and wait for it. Case closed. No fuss, no headache, no room for mistakes. If you want to show off, start writing poetry :)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1228401">
+				<div id="div-comment-1228401" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://nbtparse.org' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228401">
+			February 26, 2016 at 10:47 pm</a>		</div>
+
+		<p>I agree with you that adding async makes C++ more like C#.  Specifically, it *simplifies* the language, by making certain things easier to express.  And that does bring C++ closer to C#, because C++ has so very far to go in that department (just look at template metaprogramming, or better yet, don&#8217;t, lest your head explode).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1228431">
+				<div id="div-comment-1228431" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228431">
+			February 27, 2016 at 11:43 am</a>		</div>
+
+		<p>&#8220;All these funny constructs take more to understand than to do the equivalent in the “traditional” way. Just use a signal and wait for it.&#8221;<br />
+The whole point of asynchronous programming is to *not* wait around and block threads. Now I&#8217;d argue that your preferred solution certainly isn&#8217;t any easier than the shown async solution, but it doesn&#8217;t matter since you&#8217;re doing something completely different. </p>
+<p>As someone who has written enough asynchronous code in several languages, the compiler transformations done by C# make the code vastly easier to understand and maintain than having nested callbacks everywhere. Yes C++ is taking some of C#&#8217;s features and by doing so they&#8217;re turning it into a better, safer language. </p>
+<p>Computing is a fast moving field, if you stop learning new things you&#8217;ll quickly become a dinosaurs who&#8217;s eclipsed by the younger generation.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1228461">
+				<div id="div-comment-1228461" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228461">
+			February 28, 2016 at 10:01 pm</a>		</div>
+
+		<p>well the particular example is about waiting so most of your comments are irrelevant</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1228591">
+				<div id="div-comment-1228591" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228591">
+			February 29, 2016 at 2:58 pm</a>		</div>
+
+		<p>No it&#8217;s not and understanding that basic idea is what asynchronous programming is all about. If you look at</p>
+<p>task FrobEachThingAsync()<br />
+{<br />
+    for (auto thing : things) {<br />
+       __await thing-&gt;FrobAsync();<br />
+    }<br />
+}</p>
+<p>the thread executing FrobEachThingAsync is *not* blocked while thing-&gt;FrobAsync() is being executed. </p>
+<p>It may actually be used to execute FrobAsync() or it might do some completely different task, you don&#8217;t know. But what it won&#8217;t do is being blocked waiting on a signal.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1228602">
+				<div id="div-comment-1228602" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228602">
+			February 29, 2016 at 10:58 pm</a>		</div>
+
+		<p>perhaps I need to look this up closer, but if the main thread is not blocked, what&#8217;s the point of the &#8220;await&#8221; keyword? Isn&#8217;t that waiting (blocking)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1228632">
+				<div id="div-comment-1228632" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228632">
+			March 1, 2016 at 6:14 am</a>		</div>
+
+		<p>There&#8217;s a pretty good introduction by Eric Lippert at <a href="https://msdn.microsoft.com/en-us/magazine/hh456401.aspx" rel="nofollow">https://msdn.microsoft.com/en-us/magazine/hh456401.aspx</a></p>
+<p>In the simplest terms await on a task signifies that anything following await should only be executed after the task is finished. But instead of blocking you release the thread to thread pool and allow it to do other work. As soon as the awaited task is finished a thread from the thread pool continues execution where the earlier task left off.</p>
+<p>This minimizes resource allocation and maximizes utilization at the cost of some extra scheduling cost. </p>
+<p>Nitpicker&#8217;s corner: yes vastly simplified, I do know what synchronization contexts and co are.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1228641">
+				<div id="div-comment-1228641" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mason Wheeler</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228641">
+			March 1, 2016 at 7:15 am</a>		</div>
+
+		<p>Nikos: No, it&#8217;s *awaiting*.  Essentially, the function returns at this point and execution can continue, (non-blocked,) but when the awaited task finishes, execution goes back to continue with the remainder of the function.</p>
+<p>If this seems strange, consider a GUI application.  You click a button, and it fires off a frob() operation, which takes a long time.  You don&#8217;t want to freeze the UI for a long time waiting for this to complete, so you await it, and when it finishes, it pushes a special message onto the event queue that, when handled, invokes a callback that executes the rest of your click handler.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1228751">
+				<div id="div-comment-1228751" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228751">
+			March 2, 2016 at 3:26 am</a>		</div>
+
+		<p>so what you guys are saying is that the thing IS blocking but you get a local pump for free so that the GUI stays responsive. We all have code to do that already. But thanks for the clarification</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1228781">
+				<div id="div-comment-1228781" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228781">
+			March 2, 2016 at 6:25 am</a>		</div>
+
+		<p>Yes we already had this functionality beforehand, just as machine code can do absolutely everything that higher level languages can do.</p>
+<p>The point is that await makes writing asynchronous code orders of magnitudes easier. Otherwise you either end up with a state machine in your explicit message loop (and that option is right out if you&#8217;re using thread pools) or nested callbacks. Both solutions make code pretty unmaintainable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-5" id="comment-1228881">
+				<div id="div-comment-1228881" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228881">
+			March 2, 2016 at 9:56 am</a>		</div>
+
+		<p>&#8220;the thing IS blocking but you get a local pump for free so that the GUI stays responsive.&#8221;</p>
+<p>It doesn&#8217;t run a local pump. it returns back to the main pump. The main pump then calls back into the function when the awaited operation completes. This is an important distinction, because returning back to the main pump avoids the problem of <a href="https://blogs.msdn.microsoft.com/oldnewthing/20050223-00/?p=36383" rel="nofollow">the stack with no support</a>. It also means that if two tasks take turns running, they do not call each other recursively. The stack unwinds completely when each task pauses.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1228491">
+				<div id="div-comment-1228491" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228491">
+			February 29, 2016 at 7:17 am</a>		</div>
+
+		<p>C++ has always been a bit of a magpie with regards to its features (hey, it started as a better C, after all); Bjarne&#8217;s term is &#8220;multi-paradigm&#8221;. An early premise of C++ was that &#8220;you don&#8217;t pay for what you don&#8217;t use&#8221;, and so if you want to program C++ like C (or use whatever your version of the &#8220;traditional way&#8221; is), then go ahead. But some folks do value borrowings from other languages, even C# (the horror!) and find it can make programming a lot simpler, clearer and more expressive. The one feature that C++ has over the C#s and Javas of this world is, however, the automatic calling of destructors on scope exit; that one feature means that C++ won&#8217;t turn into C# any time soon, modulo major changes in C++ or C# syntax/philosophy.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1228541">
+				<div id="div-comment-1228541" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228541">
+			February 29, 2016 at 10:41 am</a>		</div>
+
+		<p>I am all in for &#8220;progress&#8221; and increased conveniences, but all these stuff like lambdas and what this article introduced me to are not my cup of tea. For example they make debugging harder, and who knows what subtle assumptions they involve? Better the devil you know :)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1228561">
+				<div id="div-comment-1228561" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228561">
+			February 29, 2016 at 11:19 am</a>		</div>
+
+		<p>Simple; don&#8217;t use them, then. I&#8217;m a bit at a loss of how &#8220;they make debugging harder&#8221; or these mysterious &#8220;subtle assumptions&#8221; that you allude to; lambdas seem pretty well-defined, though like anything, you need to get used to the new syntax. But with respect to your sentiment, you&#8217;re not alone; C++ is a demonstrably larger language now, with lots more constructs and functionalities to take in, and code bases don&#8217;t automatically convert to newer, safer practices automatically. See for example: <a href="http://simpleprogrammer.com/2012/12/01/why-c-is-not-back/" rel="nofollow">http://simpleprogrammer.com/2012/12/01/why-c-is-not-back/</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1228612">
+				<div id="div-comment-1228612" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228612">
+			February 29, 2016 at 11:00 pm</a>		</div>
+
+		<p>wrt debugging: it&#8217;s like setting a breakpoint on a preprocessor macro. You can&#8217;t see clearly what&#8217;s going on. There is some opaque piece of code that you cannot examine</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1228631">
+				<div id="div-comment-1228631" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228631">
+			March 1, 2016 at 6:04 am</a>		</div>
+
+		<p>nikos: I am able to put a breakpoint on code inside a lambda, using Visual Studio 2012. Works fine (subject to the usual release vs debug optimizations and/or inlining). It&#8217;s really just a function call, after all, and not at all like a preprocessor macro.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even thread-even depth-1 parent" id="comment-1228411">
+				<div id="div-comment-1228411" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228411">
+			February 27, 2016 at 1:40 am</a>		</div>
+
+		<p>C++ really needs syntax highlighting&#8230;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1228481">
+				<div id="div-comment-1228481" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228481">
+			February 29, 2016 at 6:51 am</a>		</div>
+
+		<p>Syntax highlighting isn&#8217;t part of the C++ language; it&#8217;s a part of tools that display C++ code (like code editors); many code editors/IDEs do indeed perform syntax highlighting on C++. But ok, accepting your premise, what exactly would you highlight, and how (and why)?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1228422">
+				<div id="div-comment-1228422" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Hutchings</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228422">
+			February 27, 2016 at 7:51 am</a>		</div>
+
+		<p>For the C++ version, I think it would be better to use &#8220;++first&#8221; rather than &#8220;first + 1&#8221;. Using the latter adds the requirement that the iterators be RandomIterators and not just ForwardIterators.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1228471">
+				<div id="div-comment-1228471" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frank</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228471">
+			February 28, 2016 at 10:47 pm</a>		</div>
+
+		<p>Why not do the loop now and chain the asyncs?</p>
+<p>something like (didn&#8217;t test):</p>
+<p>auto task = create_task([](){});<br />
+for (auto thing : things) {<br />
+    task = task.then([]() {<br />
+        thing-&gt;FrobAsync();<br />
+    };<br />
+}</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1228871">
+				<div id="div-comment-1228871" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228871">
+			March 2, 2016 at 9:53 am</a>		</div>
+
+		<p>Yeah, that seems much nicer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-robrobpaveza-net odd alt thread-odd thread-alt depth-1" id="comment-1228533">
+				<div id="div-comment-1228533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Rob+Paveza+%5Bmsft%5D' rel='external nofollow' class='url'>Rob Paveza [msft]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160226-00/?p=93092#comment-1228533">
+			February 29, 2016 at 10:06 am</a>		</div>
+
+		<p>You can do something cooler in JavaScript to </p>
+<p>`return things.reduce(function(previous, current) {<br />
+    return previous.then(function() {<br />
+        return current.frobAsync();<br />
+    });<br />
+}, WinJS.Promise.as());`</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

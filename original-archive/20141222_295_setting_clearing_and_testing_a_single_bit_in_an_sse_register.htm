@@ -1,0 +1,365 @@
+<html>
+<head>
+<title>Setting, clearing, and testing a single bit in an SSE register</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Setting, clearing, and testing a single bit in an SSE register</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 22, 2014 / year-entry #296</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>8</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Today I'm going to set, clear, and test a single bit in an SSE register. Why? On Mondays I don't have to explain why. First, we use the trick from last time that lets us generate constants where all set bits are contiguous, and apply it to the case where we want only one bit....</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Today I'm going to set, clear, and test a single bit in an SSE register.
+</p>
+<p>
+Why?
+</p>
+<p>
+On Mondays I don't have to explain why.
+</p>
+<p>
+First, we use the trick from
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/12/15/10580665.aspx">
+last time</a>
+that lets us generate constants
+where all set bits are contiguous,
+and apply it to the case where we want only one bit.
+</p>
+<pre>
+    pcmpeqd xmm0, xmm0      ; set all bits to one
+    psrlq   xmm0, 63        ; set both 64-bit lanes to 1
+IF N LT 64
+    psrldq  xmm0, 64 / 8    ; clear the upper lane
+ELSE
+    pslldq  xmm0, 64 / 8    ; clear the lower lane
+ENDIF
+IF N AND 63
+    psllq   xmm0, N AND 63  ; shift the bit into position
+ENDIF
+</pre>
+<p>
+We start by setting all bits in <code>xmm0</code>.
+</p>
+<p>
+We then shift both 64-bit lanes right by 63 positions,
+putting 1 in each lane.
+</p>
+<p>
+If the bit we want is in the upper half,
+then we shift the entire value left 8 bytes (64 bits).
+This clears the bottom 64 bits and leaves the upper 64
+bits with all bits set.
+(Similarly, if the bit we want is in the lower half,
+shifting right instead of left.)
+</p>
+<p>
+Finally, if we need a bit other than 0 or 64, we shift
+left by the desired amount within the 64-bit lane.
+</p>
+<p>
+Now that we can generate a single bit value,
+we can use it to set and clear individual bits.
+</p>
+<pre>
+; Set bit N in xmm1 (using xmm0 as a helper)
+        &lang;set xmm0 = 2^N&rang;
+        por     xmm1, xmm0
+
+; Clear bit N in xmm1 (putting result in xmm0)
+        &lang;set xmm0 = 2^N&rang;
+        pandn   xmm0, xmm1
+</pre>
+<p>
+To test a bit, we can use the <code>PMOVMSKB</code> instruction.
+</p>
+<pre>
+IF 7 - (N AND 7)
+    psllq xmm0, 7 - (N AND 7)
+ENDIF
+    pmovmskb eax, xmm0
+IF N LT 64
+    test  al, 1 SHL (N / 8)
+ELSE
+    test  ah, 1 SHL (N / 8 - 8)
+ENDIF
+</pre>
+<p>
+First, we move the bit we want to test into a position that is 7 mod 8,
+because those are the bits captured by the
+<code>PMOVMSKB</code> instruction.
+(If the bit is already there, then we don't need to do anything.)
+Then we use the <code>PMOVMSKB</code> instruction to extract the bits
+into a general purpose register and test the one that corresponds to
+the bit we want.
+</p>
+<p>
+<b>Alternatives</b>:
+I tend to stick to SSE2 instructions because they are widely supported
+(and are indeed part of the
+<a HREF="http://windows.microsoft.com/en-us/windows-8/system-requirements">
+minimum system requirements for Windows 8</a>),
+but if you are willing to do CPU dispatching on SSE4, you can
+use <code>PTEST</code>, which might be faster, I haven't tested it.
+</p>
+<p>
+You could use <code>movd</code> and <code>movq</code>
+to load up a constant,
+but you do incur domain crossing penalties.
+Another alternative is to put the constant in memory,
+but then you pay an even bigger cost for memory access
+if the value is not in cache.</p>
+<p>
+<b>Other remarks</b>:
+Of course, you want to schedule the instructions better than the
+way I wrote them above.
+I wrote them in a logical order above to make the algorithm clearer,
+but you will want to reorder them to avoid stalls.
+</p>
+<p>
+<b>Using intrinsics</b>:
+</p>
+<pre>
+__m128i Calc2ToTheN(int N)
+{
+ __m128i zero = _mm_setzero_si128();
+ __m128i ones = _mm_cmpeq_epi32(zero, zero);
+ __m128i onesLowHigh = _mm_slli_epi64(ones, 63);
+ __m128i singleOne = N &lt; 64 ? _mm_srli_si128(onesLowHigh, 64 / 8) :
+                              _mm_slli_si128(onesLowHigh, 64 / 8);
+ return _mm_slli_epi64(singleOne, N &amp; 63);
+}
+
+__m128i SetBitN(__m128i value, int N)
+{
+  return _mm_or_si128(value, Calc2ToTheN(N));
+}
+
+__m128i ClearBitN(__m128i value, int N)
+{
+  return _mm_andnot_si128(value, Calc2ToTheN(N));
+}
+
+__m128i TestBitN(__m128i value, int N)
+{
+ __m128i positioned = _mm_slli_epi64(value, 7 - (N &amp; 7));
+ return (_mm_movemask_epi8(positioned) &amp; (1 &lt;&lt; (N / 8))) != 0;
+}
+</pre>
+<p>
+Note that since these functions pass a non-constant value to
+intrinsics like <code>_mm_slli_epi64</code>,
+you incur additional runtime penalties because the compiler
+is going to use a <code>movd</code> to load up the value,
+incurring the exact domain crossing penalty we are trying to avoid.
+To avoid this, templatize the function to force the bit number
+to be determined at compile time.
+</p>
+<pre>
+<font COLOR=blue>template&lt;int N&gt;
+__m128i Calc2ToTheN()</font>
+{
+ __m128i zero = _mm_setzero_si128();
+ __m128i ones = _mm_cmpeq_epi32(zero, zero);
+ __m128i onesLowHigh = _mm_slli_epi64(ones, 63);
+ __m128i singleOne = N &lt; 64 ? _mm_srli_si128(onesLowHigh, 64 / 8) :
+                              _mm_slli_si128(onesLowHigh, 64 / 8);
+ return _mm_slli_epi64(singleOne, N &amp; 63);
+}
+
+<font COLOR=blue>template&lt;int N&gt;
+__m128i SetBitN(__m128i value)</font>
+{
+  return _mm_or_si128(value, <font COLOR=blue>Calc2ToTheN&lt;N&gt;()</font>);
+}
+
+<font COLOR=blue>template&lt;int N&gt;
+__m128i ClearBitN(__m128i value)</font>
+{
+  return _mm_andnot_si128(value, <font COLOR=blue>Calc2ToTheN&lt;N&gt;()</font>);
+}
+
+<font COLOR=blue>template&lt;int N&gt;
+__m128i TestBitN(__m128i value)</font>
+{
+ __m128i positioned = _mm_slli_epi64(value, 7 - (N &amp; 7));
+ return (_mm_movemask_epi8(positioned) &amp; (1 &lt;&lt; (N / 8))) != 0;
+}
+</pre>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (8)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1167903">
+				<div id="div-comment-1167903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jeson Park</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1167903">
+			December 22, 2014 at 9:19 am</a>		</div>
+
+		<p>why you say about something that don&#39;t have to explain why?!?!? &nbsp;</p>
+<p>there is better topic to fall in&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1167933">
+				<div id="div-comment-1167933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Timothy Byrd (ETAP)</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1167933">
+			December 22, 2014 at 10:16 am</a>		</div>
+
+		<p>It&#39;s for the same reason I don&#39;t put honey in my tea on Mondays.</p>
+<p>And I don&#39;t have to say why either&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1167943">
+				<div id="div-comment-1167943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Axel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1167943">
+			December 22, 2014 at 10:35 am</a>		</div>
+
+		<p>SSE3 is propably fine by now as well. It is supported by everything since 2005. Depends on what audience you want to target. I&#39;m in gamedev and there it is definitely acceptable.</p>
+<div class="post">[<em>Since I work in the operating systems group, I tend to support the minimum operating system requirements. That&#39;s sort of what &quot;minimum operating system requirements&quot; means. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1167953">
+				<div id="div-comment-1167953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1167953">
+			December 22, 2014 at 12:10 pm</a>		</div>
+
+		<p>Where you say &quot;and leaves the upper 64 bits with all bits set&quot;, don&#39;t you mean &quot;leaves only bit 64 set&quot;, and similarly for bit 0 in the right-shift case?</p>
+<div class="post">[<em>No, really, all the top/bottom 64 bits remain set. Because <code>0xFFFFFFFF`FFFFFFFF`FFFFFFFF`FFFFFFF &lt;&lt; 64 = 0xFFFFFFFF`FFFFFFFF`00000000`00000000</code>. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1167973">
+				<div id="div-comment-1167973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1167973">
+			December 23, 2014 at 3:58 am</a>		</div>
+
+		<p>Yes, if you had not done the PSRLQ right before. After the PCMPEQD, the register is 0xFFFFFFFF`FFFFFFFF`FFFFFFFF`FFFFFFFF, and the PSRLQ turns that into 0x00000000`00000001`00000000`00000001, doesn&#39;t it? Also, I thought you wanted only a single bit set in each lane after that step, not all of them.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168173">
+				<div id="div-comment-1168173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Axel R.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1168173">
+			December 23, 2014 at 4:03 pm</a>		</div>
+
+		<p>Why? Because he can&#39;t wait for 128-bit CPUs ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1168213">
+				<div id="div-comment-1168213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tristan M.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1168213">
+			December 23, 2014 at 11:41 pm</a>		</div>
+
+		<p>Regarding &quot;Of course, you want to schedule the instructions better than the way I wrote them above. I wrote them in a logical order above to make the algorithm clearer, but you will want to reorder them to avoid stalls.&quot;, does the processor not execute SSE out of order or something? Or are you talking about somehow making the data dependencies clearer?</p>
+<div class="post">[<em>Whether and to what degree the processor executes SSE out of order is an implementation detail. Explicit scheduling makes you less dependent on implementation. (Because who knows, maybe the next generation of CPU will do things differently.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1168583">
+				<div id="div-comment-1168583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20141222-00/?p=43333#comment-1168583">
+			December 26, 2014 at 2:52 am</a>		</div>
+
+		<p>Why wouldn&#39;t the compiler be able to optimise the call to Calc2ToTheN with a constant argument? (Or do we have to wait for constexpr support for the magic to happen?)</p>
+<div class="POST">[<em>The compiler might choose to optimize it or not, at its discretion. The template forces the optimization to occur. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

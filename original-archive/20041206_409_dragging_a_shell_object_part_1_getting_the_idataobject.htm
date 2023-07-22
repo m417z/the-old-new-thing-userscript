@@ -1,0 +1,530 @@
+<html>
+<head>
+<title>Dragging a shell object, part 1: Getting the IDataObject</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Dragging a shell object, part 1: Getting the IDataObject</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 6, 2004 / year-entry #410</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>20</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The shell gives you the IDataObject; all you have to do is drag it around. (This is the first of a five-part series.) Start with the scratch program, and add the function GetUIObjectOfFile from an earlier article. Also, change the calls to CoInitialize and CoUninitialize to OleInitialize and OleUninitialize, respectively, since we're now going to...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The shell gives you the
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/oin_d_8cl0.asp">
+<code>IDataObject</code></a>;
+all you have to do is drag it around.
+(This is the first of a five-part series.)
+</p>
+<p>
+Start with
+<a HREF="/oldnewthing/archive/2003/07/23/54576.aspx">
+the scratch program</a>,
+and add
+<a HREF="/oldnewthing/archive/2004/09/20/231739.aspx">
+the function <code>GetUIObjectOfFile</code> from an earlier article</a>.
+Also, change the calls to
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/cmf_a2c_36qt.asp">
+<code>CoInitialize</code></a>
+and
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/cmf_a2c_7vqd.asp">
+<code>CoUninitialize</code></a>
+to
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/ofn_oa2k_7w85.asp">
+<code>OleInitialize</code></a> and
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/ofn_ol2z_13vp.asp">
+<code>OleUninitialize</code></a>, respectively,
+since we're now going to be using full-on OLE and not just COM.
+</p>
+<p>
+In order to initiate a drag/drop operation, we need a drop source:
+</p>
+<pre>
+class CDropSource : public IDropSource
+{
+public:
+  // *** IUnknown ***
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv);
+  STDMETHODIMP_(ULONG) AddRef();
+  STDMETHODIMP_(ULONG) Release();
+
+  // *** IDropSource ***
+  STDMETHODIMP QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState);
+  STDMETHODIMP GiveFeedback(DWORD dwEffect);
+
+  CDropSource() : m_cRef(1) { }
+private:
+  ULONG m_cRef;
+};
+
+HRESULT CDropSource::QueryInterface(REFIID riid, void **ppv)
+{
+  IUnknown *punk = NULL;
+  if (riid == IID_IUnknown) {
+    punk = static_cast&lt;IUnknown*&gt;(this);
+  } else if (riid == IID_IDropSource) {
+    punk = static_cast&lt;IDropSource*&gt;(this);
+  }
+
+  *ppv = punk;
+  if (punk) {
+    punk-&gt;AddRef();
+    return S_OK;
+  } else {
+    return E_NOINTERFACE;
+  }
+}
+
+ULONG CDropSource::AddRef()
+{
+  return ++m_cRef;
+}
+
+ULONG CDropSource::Release()
+{
+  ULONG cRef = --m_cRef;
+  if (cRef == 0) delete this;
+  return cRef;
+}
+
+HRESULT CDropSource::QueryContinueDrag(
+          BOOL fEscapePressed, DWORD grfKeyState)
+{
+  if (fEscapePressed) return DRAGDROP_S_CANCEL;
+
+  // [Update: missing paren repaired, 7 Dec]
+  if (!(grfKeyState &amp; (MK_LBUTTON | MK_RBUTTON)))
+    return DRAGDROP_S_DROP;
+
+  return S_OK;
+}
+
+HRESULT CDropSource::GiveFeedback(DWORD dwEffect)
+{
+  return DRAGDROP_S_USEDEFAULTCURSORS;
+}
+</pre>
+<p>
+As you can see, this drop source is extraordinarily boring.
+Even the interesting methods are uninteresting.
+</p>
+<p>
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/oin_d_76hz.asp">
+The <code>IDropSource::QueryContinueDrag</code> method</a>
+is pretty much boilerplate.
+If the Escape key was pressed, then cancel the drag/drop operation.
+If the mouse buttons are released, then complete the operation.
+Otherwise, continue the operation.
+</p>
+<p>
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/oin_d_4hm3.asp">
+The <code>IDropSource::GiveFeedback</code> method</a>
+is even less interesting.
+It merely returns
+<code>DRAGDROP_S_USEDEFAULTCURSORS</code>
+to indicate that it wants default drag feedback.
+</p>
+<p>
+Believe it or not, we now have everything we need to drag a file.
+</p>
+<pre>
+void OnLButtonDown(HWND hwnd, BOOL fDoubleClick,
+                   int x, int y, UINT keyFlags)
+{
+  IDataObject *pdto;
+  // In a real program of course
+  // you wouldn't use a hard-coded path.
+  // [comment added 11am because apparently some
+  // people thought this wasn't self-evident.]
+  if (SUCCEEDED(GetUIObjectOfFile(hwnd,
+                    L"C:\\Windows\\clock.avi",
+		    IID_IDataObject, (void**)&amp;pdto))) {
+    IDropSource *pds = new CDropSource();
+    if (pds) {
+      DWORD dwEffect;
+      DoDragDrop(pdto, pds, DROPEFFECT_COPY | DROPEFFECT_LINK,
+                 &amp;dwEffect);
+      pds-&gt;Release();
+    }
+    pdto-&gt;Release();
+  }
+}
+
+    HANDLE_MSG(hwnd, WM_LBUTTONDOWN, OnLButtonDown);
+</pre>
+<p>
+To drag an object, you need two things, a data object and
+a drop source.  We created our drop source above,
+and the data object comes from the shell.
+All that's left to do is start the drag/drop operation by
+calling
+<a HREF="http://msdn.microsoft.com/library/en-us/com/htm/ofn_a2o_706o.asp">
+the <code>DoDragDrop</code> function</a>.
+</p>
+<p>
+Notice that we specify that the permitted operations are
+<code>DROPEFFECT_COPY</code>
+and <code>DROPEFFECT_LINK</code>.
+We specifically disallow <code>DROPEFFECT_MOVE</code>
+because this program doesn't present a folder-like window;
+the user has no expectation that the drag/drop will result
+in a Move operation.
+</p>
+<p>
+Next time, adding Move support, just to see how it works.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (20)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-232553">
+				<div id="div-comment-232553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bigbeardy.co.uk' rel='external nofollow' class='url'>Mat Hall</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232553">
+			December 6, 2004 at 7:23 am</a>		</div>
+
+		<p>&quot;C:\Windows\clock.avi&quot;</p>
+<p>Hard-coded paths?  For shame!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232563">
+				<div id="div-comment-232563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.zeta-producer.com' rel='external nofollow' class='url'>Uwe Keim</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232563">
+			December 6, 2004 at 7:41 am</a>		</div>
+
+		<p>That is an example, Mat :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232583">
+				<div id="div-comment-232583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bigbeardy.co.uk' rel='external nofollow' class='url'>Mat Hall</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232583">
+			December 6, 2004 at 7:59 am</a>		</div>
+
+		<p>I know it&#8217;s an example, but it&#8217;s &quot;just examples&quot; like that that lead developers into doing things that are liable to break, thus requiring masses of appcompat kludges and shims that bloat the OS, which in turn leads to a lot of whining and complaining in the comments on this blog&#8230;  Raymond&#8217;s just making a rod for his own back. :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232603">
+				<div id="div-comment-232603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Fat Agnus and Denise</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232603">
+			December 6, 2004 at 8:15 am</a>		</div>
+
+		<p>Ok, Matt &#8211; how would YOU write this example? A call to GetOpenFileName, perhaps? Or .ini file containing the path?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232613">
+				<div id="div-comment-232613" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Fat Agnus and Denise</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232613">
+			December 6, 2004 at 8:17 am</a>		</div>
+
+		<p>Sorry Mat Hall, misspelled your first name :(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232623">
+				<div id="div-comment-232623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232623">
+			December 6, 2004 at 8:34 am</a>		</div>
+
+		<p>I used a hard-coded path because 1. it allows cut-paste-run, and 2. writing the whole GetOpenFileName thing would have distracted from the point of the article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232633">
+				<div id="div-comment-232633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Cooke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232633">
+			December 6, 2004 at 9:06 am</a>		</div>
+
+		<p>I read Mat&#8217;s &quot;complaint&quot; as being more about the hardcoded path to the Windows directory. That won&#8217;t work if Windows is in c:winnt or f:windows.</p>
+<p>Not to mention that I don&#8217;t have that stupid video file on my system anymore! What&#8217;s that used for, anyway?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232663">
+				<div id="div-comment-232663" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232663">
+			December 6, 2004 at 9:45 am</a>		</div>
+
+		<blockquote><p>
+  Not to mention that I don&#8217;t have that stupid video file on my system anymore! What&#8217;s that used for, anyway?</p>
+<p>It&#8217;s a dandy example file for demonstrations.
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232683">
+				<div id="div-comment-232683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt Green</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232683">
+			December 6, 2004 at 10:23 am</a>		</div>
+
+		<p>Thanks for the intro article, and what is with the dogmatic trolling? He writes this in his spare time. </p>
+<p>And I&#8217;m sure the MS devs stay up late at night worrying about all the hardcoded references to clock.avi. :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232693">
+				<div id="div-comment-232693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.bigbeardy.co.uk' rel='external nofollow' class='url'>Mat Hall</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232693">
+			December 6, 2004 at 10:56 am</a>		</div>
+
+		<p>&quot;I read Mat&#8217;s &quot;complaint&quot; as being more about the hardcoded path to the Windows directory. That won&#8217;t work if Windows is in c:winnt or f:windows&quot;</p>
+<p>That was precisely my point &#8212; Raymond is continually giving us little insights in to why some parts of Windows behave in unexpected ways, and normally the explanation is &quot;because some developer hardcoded [something] on the assumption it won&#8217;t ever change, so we had to add scads of code to stop it breaking in the future&quot;.</p>
+<p>&quot;what is with the dogmatic trolling?&quot;</p>
+<p>It certainly wasn&#8217;t trolling, and wasn&#8217;t even intended as a criticism per se; I appreciate what Raymond does, and wouldn&#8217;t dream of complaining!  It was merely an observation that although it&#8217;s a little throwaway sample program it&#8217;s falling in to the trap that has caused so many problems in the past.  My experience tells me that a lot of production code out there started life as a &quot;test project&quot;, and rather than start again things just get piled on top and before you know it it&#8217;s out the door.  Better to do it the &quot;right&quot; way from the start!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232703">
+				<div id="div-comment-232703" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232703">
+			December 6, 2004 at 11:00 am</a>		</div>
+
+		<p>I assumed that it was so obviously a hardcoded path for expository purposes that it didn&#8217;t require special remarks. I mean, who would write a real program that operates only on c:windowsclock.avi?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232713">
+				<div id="div-comment-232713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jerry Pisk</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232713">
+			December 6, 2004 at 11:10 am</a>		</div>
+
+		<p>&quot;I mean, who would write a real program that operates only on c:windowsclock.avi?&quot;</p>
+<p>The same whose programs don&#8217;t work if you install them into Program Files, because they can&#8217;t handle a space in a path. Same people who write inside of the windows directory during normal operation. Same people who close those WFP dialogs during an installation for you. You woudl not believe how many &quot;programmers&quot; use sample code without any modification and the hoops they go through to get around the issues they cause by doing that. I can easily see somebody replacing C:Windowsclock.avi with their file just to get their code working.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232723">
+				<div id="div-comment-232723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.loadngosoftware.com/content.aspx' rel='external nofollow' class='url'>Jay Lauffer</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232723">
+			December 6, 2004 at 11:40 am</a>		</div>
+
+		<p>I&#8217;m more interested in the details on the OleInitialize..  I&#8217;m sure there are huge books at Barnes &amp; Nobels that I could read for free while sitting on their comfy chairs, but I just have to ask about the whole Ole single threaded issue?  Heck I can&#8217;t even formulate the question&#8230;  why is it that apps initialized with OleInitialize need to be single threaded?  I mean I think I know how the DoDragDrop loop works, but what else is going on with OleInitialize that makes it so different from CoInitialize??  Also I&#8217;ve always used GiveFeedback with the DRAGDROP_S_USEDEFAULTCURSORS flag, but what if I didn&#8217;t what are my options?  That&#8217;s one I&#8217;ve been wondering for awhile.. </p>
+<p>To comment or not to comment on the hardcoded path?</p>
+<p>&quot;With half a smile and half a spurn,<br />
+<br />As housewifes do a fly.&quot;</p>
+<p>-Emily Dickinson</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232773">
+				<div id="div-comment-232773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://mikedimmick.blogspot.com' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232773">
+			December 6, 2004 at 2:47 pm</a>		</div>
+
+		<p>Jerry: I call it, &quot;the road to hell is paved with good intentions, one step at a time&quot;. Each small step is a hack, but the programmer is too tied in with the end goal to stop after a couple of hacks and work out a better approach.</p>
+<p>This sort of programmer sees an obstacle, and hacks out a way around it. They don&#8217;t stop to consider whether they should work round the issue; they have no consideration that there could be a good reason why the obstacle exists. Security? Reliability? Reproducibility? Pfah!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232783">
+				<div id="div-comment-232783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ian Nowland</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232783">
+			December 6, 2004 at 2:52 pm</a>		</div>
+
+		<p>Whilst Mat is correct in saying that there are always going to be programmers who take example code and run the wrong way with it, I believe his criticism here is off base. Raymond could make all his sample code bulletproof, but this needlessly complicates the &quot;meat&quot; of the sample with a bunch of extraneous detail, which &quot;good&quot; programmers will have to sift through to understand what is being demonstrated. It also wastes Raymond&#8217;s time.</p>
+<p>Hardcoded string values are spotted in 5 seconds in code reviews. If you work for someone who has so little respect for software engineering that they don&#8217;t have code reviews then no amount of effort by Raymond in writing samples you start from is ever going to make your code good.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232843">
+				<div id="div-comment-232843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232843">
+			December 6, 2004 at 9:11 pm</a>		</div>
+
+		<p>Re Jay:<br />
+<br />Apps using OleInitialize don&#8217;t need to single threaded &#8211; it just means that using an object in multiple threads (apartments) will require call marshaling, which is an expensive process to ensure that the object behaves as if it were only accessed from one thread.<br />
+<br />OleInitialize initiaizes several OLE subsystem, including the OLE clipboard, OLE drag-n-drop and the OLE shared menu. OleInitialize calls CoInitializeEx to do the dirty work of creating a single-threaded apartment for you.<br />
+<br />The options for CDropSource::GiveFeedback are to either return the special value as Raymond does, or to call SetCursor with whatever cursor you want.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232853">
+				<div id="div-comment-232853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.loadngo.biz/content.aspx' rel='external nofollow' class='url'>Jay Lauffer</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232853">
+			December 6, 2004 at 11:10 pm</a>		</div>
+
+		<p>Single-Threaded Apartments..</p>
+<p>I knew I should have posed the question better, why does OLE require a single threaded apartment?  I mean I can understand that with drag and drop you wouldn&#8217;t want the some other thread to alter the IDataObject implementor, I suppose that the clipboard might be the same way (it appears I&#8217;m answering my own question), but I&#8217;ve always thought there was more to the OLE single threaded-ness (like something down in the guts which could only be supported in a single threaded apartment)?</p>
+<p>Basically to implement drag and drop you have to place your main app thread into a single threaded apartment, then any other threads that you might spawn you can initialize into a multithreaded apartment (at your own risk), but this leaves you with that awful marshalling penalty.  It seems preferable to use a semaphore to protect your data object while in the drag and drop loop and maintain the advantages of the multithreaded apartment.  What am I missing (aside from all the moans and groans about the cost of synchronizing an object, and all that concern over putting the responsibility to protect the object in the lap of the implementor)?  A race condition?</p>
+<p>I just can&#8217;t get past this suspicion that somewhere in the guts of OLE is a tie-in to something so hideously grotesque that we developers are shielded from by the virtuous single threaded apartment.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-232863">
+				<div id="div-comment-232863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Moi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232863">
+			December 7, 2004 at 12:13 am</a>		</div>
+
+		<p>&quot;This is the first of a five-part series&quot;</p>
+<p>Would someone nudge me awake in a week or so, please :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-232893">
+				<div id="div-comment-232893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Euro</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-232893">
+			December 7, 2004 at 7:09 am</a>		</div>
+
+		<blockquote><p>
+  why does OLE require a single threaded apartment? </p>
+<p>I think that there are two reasons: First, when OLE was developed (OLE 2.0 &#8212; the COM-based version we still live with &#8212; came out in the Windows 3.1 era), there was no such thing as multiple threads, let alone multi-threaded apartments. But, perhaps MS could reimplement the code to be thread-neutral if it didn&#8217;t break any compatibility and if it made sense. However I believe it doesn&#8217;t make sense, because of the second reason:</p>
+<p>OLE&#8217;s purpose (remember, &quot;Object Linking and Embedding&quot;) is to allow one application to display and manipulate visual objects inside another application&#8217;s windows, and these GDI objects have thread affinity (can only be manipulated from the thread that created them). So, all the code that runs inside the OLE environment must run in a single threaded anyway. (Disclaimer; I&#8217;ve done a lot of COM, but little or no OLE so I might be off-base here)
+</p></blockquote>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-233233">
+				<div id="div-comment-233233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://andyandy.sprayblogg.no' rel='external nofollow' class='url'>Andreas H&#228;ber</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041206-00/?p=37133#comment-233233">
+			December 7, 2004 at 2:29 pm</a>		</div>
+
+		<p>Just wanted to point out a *minor* syntax error in the code:<br />
+<br />In the line &quot;if (!(grfKeyState &amp; (MK_LBUTTON | MK_RBUTTON))&quot; in CDropSource::QueryContinueDrag there should be one more &quot;)&quot; in the end.</p>
+<p>Thanks for the articles Raymond, I&#8217;m looking forward to the rest of the series :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,978 @@
+<html>
+<head>
+<title>How do I accept files to be opened via IDropTarget instead of on the command line?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How do I accept files to be opened via IDropTarget instead of on the command line?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 3, 2010 / year-entry #127</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>24</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Commenter Yaron wants to know how to use the new IDropTarget mechanism for receiving a list of files to open. (Also asked by Anthony Wieser as a comment to an article.) The MSDN documentation on Verbs and File Assocations mentions that DDE has been deprecated as a way of launching documents and that you should...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Commenter Yaron wants to know
+<a HREF="http://blogs.msdn.com/oldnewthing/pages/407234.aspx#1353948">
+how to use the new IDropTarget mechanism for receiving a list of files
+to open</a>.
+(Also asked by
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/03/20/8080229.aspx#8337835">Anthony Wieser</a> as a comment to an article.)
+The MSDN documentation on Verbs and File Assocations mentions that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2007/02/26/1763683.aspx">
+DDE has been deprecated as a way of launching documents</a>
+and that
+<a HREF="http://msdn.microsoft.com/en-us/library/cc144175.aspx">
+you should use the DropTarget method instead</a>.
+But what is the DropTarget method?
+(Note that the word <i>method</i> here is in the sense of
+<i>technique</i> and not in the C++ sense of <i>function that
+belongs to a class</i>.)
+</p>
+<p>
+The documentation in MSDN tells you what to do, but it does so
+very tersely. It says to create a <code>DropTarget</code>
+key under the verb key and create a <code>Clsid</code> string
+value whose data is the string version of the CLSID for your
+drop target.
+The documentation tells you to be careful in your
+<code>IDropTarget::<wbr>Drop</code>, so it stands to reason that
+<code>IDropTarget</code> is the interface that will be used.
+From context, therefore, you should expect that the shell is going to
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/07/24/8768095.aspx">
+simulate a drop</a> on your drop target.
+</p>
+<p>
+You can implement your drop target either as an in-process server
+or a local server.
+The in-process case is well-known;
+nearly all shell extensions are in-process.
+But using an in-process server for the DropTarget technique
+only solves half the problem:
+Sure, the <code>IDropTarget::<wbr>Drop</code> will take place and you will
+get your <code>IDataObject</code>,
+but you still have to transfer the file list from your shell extension
+running inside the
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/09/20/231739.aspx">
+context menu host</a>
+to your application.
+May as well let COM do the heavy lifting of marshalling the data.
+(Well, okay, maybe using COM is overkill.
+You might have a lighter weight way of getting the data across,
+but since that's out of scope for today's exercise, I'll leave it
+for you to figure out.)
+</p>
+<p>
+Okay, let's roll up our sleeves and get to it!
+It turns out that nearly all the work is just creating a COM local
+server.
+If you know how to do that already, then I apologize in advance
+for the oppressive boredom about to fall upon you.
+I'll try to remember to wake you up when something interesting
+is about to happen.
+Note also that I am not an expert on COM local servers,
+so if you find a discrepancy between what I write and information from people
+who actually know what they're doing, go with the people who
+know what they're doing.
+(Actually, that sentence pretty much applies in general to everything
+I write.)
+Indeed, I had never written a COM local server before now,
+so all of what you see here is the result of a crash course
+in COM local servers from reading the documentation.
+(Translation: You could've done this too.)
+</p>
+<p>
+Start by adding some header files and a forward reference.
+</p>
+<pre>
+#include &lt;shlobj.h&gt;
+#include &lt;shellapi.h&gt;
+#include &lt;new&gt; // for new(nothrow)
+
+void OpenFilesFromDataObject(IDataObject *pdto);
+</pre>
+<p>
+Next, I'm going to steal
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/05/28/8555658.aspx">
+the <code>Process&shy;Reference</code> class</a>
+which I had created some time ago.
+It's not the most efficient solution to the problem,
+but it works well enough, and it's a nice preparatory step in case
+a shell extension loaded into our process needs to take a process
+reference.
+We use the process reference object to keep track of our outstanding
+objects and locks.
+</p>
+<pre>
+ProcessReference *g_ppr;
+</pre>
+<p>
+Of course our custom drop target needs a class ID:
+</p>
+<pre>
+const CLSID CLSID_Scratch = { ... };
+</pre>
+<p>
+I leave it to you to fill in the <code>CLSID</code> structure
+from the output of <code>uuidgen -s</code>.
+</p>
+<p>
+Next, our simple drop target.
+COM servers need to keep track of the number of objects that
+have been created, so we'll piggyback off our existing process reference.
+</p>
+<pre>
+class SimpleDropTarget : public IDropTarget
+{
+public:
+ SimpleDropTarget() : m_cRef(1) { g_ppr-&gt;AddRef(); }
+ ~SimpleDropTarget() { g_ppr-&gt;Release(); }
+
+ // *** IUnknown ***
+ STDMETHODIMP QueryInterface(REFIID riid, void **ppv)
+ {
+  if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+    *ppv = static_cast&lt;IUnknown*&gt;(this);
+    AddRef();
+    return S_OK;
+  }
+  *ppv = NULL;
+  return E_NOINTERFACE;
+ }
+
+ STDMETHODIMP_(ULONG) AddRef()
+ {
+  return InterlockedIncrement(&amp;m_cRef);
+ }
+
+ STDMETHODIMP_(ULONG) Release()
+ {
+  LONG cRef = InterlockedDecrement(&amp;m_cRef);
+  if (cRef == 0) delete this;
+  return cRef;
+ }
+</pre>
+<p>
+Next come the methods of <code>IDropTarget</code>,
+none of which are particularly interesting.
+We just say that we are going to copy the data.
+</p>
+<pre>
+ // *** IDropTarget ***
+ STDMETHODIMP DragEnter(IDataObject *pdto,
+    DWORD grfKeyState, POINTL ptl, DWORD *pdwEffect)
+ {
+  *pdwEffect &amp;= DROPEFFECT_COPY;
+  return S_OK;
+ }
+
+ STDMETHODIMP DragOver(DWORD grfKeyState,
+   POINTL ptl, DWORD *pdwEffect)
+ {
+  *pdwEffect &amp;= DROPEFFECT_COPY;
+  return S_OK;
+ }
+
+ STDMETHODIMP DragLeave()
+ {
+  return S_OK;
+ }
+
+ STDMETHODIMP Drop(IDataObject *pdto, DWORD grfKeyState,
+    POINTL ptl, DWORD *pdwEffect)
+ {
+  <font COLOR=blue>OpenFilesFromDataObject(pdto);</font>
+  *pdwEffect &amp;= DROPEFFECT_COPY;
+  return S_OK;
+ }
+
+private:
+ LONG m_cRef;
+};
+</pre>
+<p>
+<b>People who know how COM servers work wake up</b>:
+When something is dropped on our drop target, we call
+<code>Open&shy;Files&shy;From&shy;Data&shy;Object</code>.
+That's actually not all that interesting, but at least it's
+nontrivial.
+<b>People who know how COM servers work can go back to sleep now</b>.
+</p>
+<p>
+The next part of the code is just setting up our class factory.
+</p>
+<pre>
+class SimpleClassFactory : public IClassFactory
+{
+public:
+ // *** IUnknown ***
+ STDMETHODIMP QueryInterface(REFIID riid, void **ppv)
+ {
+  if (riid == IID_IUnknown || riid == IID_IClassFactory) {
+    *ppv = static_cast&lt;IUnknown*&gt;(this);
+    AddRef();
+    return S_OK;
+  }
+  *ppv = NULL;
+  return E_NOINTERFACE;
+ }
+
+ STDMETHODIMP_(ULONG) AddRef()
+ {
+  return 2;
+ }
+
+ STDMETHODIMP_(ULONG) Release()
+ {
+  return 1;
+ }
+
+ // *** IClassFactory ***
+ STDMETHODIMP CreateInstance(IUnknown *punkOuter, REFIID riid, void **ppv)
+ {
+    *ppv = NULL;
+    if (punkOuter) return CLASS_E_NOAGGREGATION;
+    SimpleDropTarget *pdt = new(nothrow) SimpleDropTarget();
+    if (!pdt) return E_OUTOFMEMORY;
+    HRESULT hr = pdt-&gt;QueryInterface(riid, ppv);
+    pdt-&gt;Release();
+    return hr;
+ }
+
+ STDMETHODIMP LockServer(BOOL fLock)
+ {
+  if (!g_ppr) return E_FAIL; // server shutting down
+  if (fLock) g_ppr-&gt;AddRef(); else g_ppr-&gt;Release();
+  return S_OK;
+ }
+};
+
+SimpleClassFactory s_scf;
+</pre>
+<p>
+The <code>Lock&shy;Server</code> call takes advantage of our
+process reference object by forwarding lock and unlock
+calls into the reference count of the process reference object.
+This keeps our process running until the server is unlocked.
+</p>
+<p>
+Remember that COM rules specify that the class factory itself
+does not count as an outstanding COM object, so we don't use
+the same <code>m_punkProcess</code> trick that we did with
+our drop target.
+Instead, we just use a static object.
+</p>
+<p>
+<b>People who know how COM servers work wake up</b>:
+The COM server code is pretty much done.
+Now we're back to user interface programming.
+</p>
+<p>
+The next part of the code is just copied from our scratch program,
+with the following changes:
+</p>
+<pre>
+BOOL
+OnCreate(HWND hwnd, LPCREATESTRUCT lpcs)
+{
+    <font COLOR=blue>g_hwndChild = CreateWindow(
+        TEXT("listbox"), NULL, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, 0, 0,0, hwnd, (HMENU)1, g_hinst, 0);</font>
+    return TRUE;
+}
+</pre>
+<p>
+The list box is not an important part of the program.
+We'll just fill it with data to prove that we actually did something.
+</p>
+<pre>
+void OpenFilesFromDataObject(IDataObject *pdto)
+{
+ if (!g_hwndChild) { /* need to create a new main window */ }
+ FORMATETC fmte = { CF_HDROP, NULL, DVASPECT_CONTENT,
+                    -1, TYMED_HGLOBAL };
+ STGMEDIUM stgm;
+ if (SUCCEEDED(pdto-&gt;GetData(&amp;fmte, &amp;stgm))) {
+  HDROP hdrop = reinterpret_cast&lt;HDROP&gt;(stgm.hGlobal);
+  UINT cFiles = DragQueryFile(hdrop, 0xFFFFFFFF, NULL, 0);
+  for (UINT i = 0; i &lt; cFiles; i++) {
+   TCHAR szFile[MAX_PATH];
+   UINT cch = DragQueryFile(hdrop, i, szFile, MAX_PATH);
+   if (cch &gt; 0 &amp;&amp; cch &lt; MAX_PATH) {
+    ListBox_AddString(g_hwndChild, szFile);
+   }
+  }
+  ReleaseStgMedium(&amp;stgm);
+ }
+}
+</pre>
+<p>
+The <code>Open&shy;Files&shy;From&shy;Data&shy;Object</code> function does only
+enough work to prove that it actually got the list of file names.
+When we receive a data object from the simulated drop,
+we retrieve the <code>HDROP</code> and enumerate the files in it.
+For each file, we add it to the list box.
+</p>
+<p>
+There's some code I've not bothered to write: Namely, if
+a request to open some files comes in after the user closed
+our main window, we need to open a new main window.
+(Exercise: How can this happen?)
+</p>
+<p>
+Another difference between this program and real life is that in
+real life, your <code>Open&shy;Files&shy;From&shy;Data&shy;Object</code>
+would do some real work.
+<i>But wait</i>,
+if your function does any actual work,
+you should just <code>AddRef</code> the data object and return,
+so that the shell can return to interacting with the user.
+If you stop to do a lot of work before returning, the shell will
+lock up because it's waiting for your drop to complete.
+</p>
+<pre>
+// Version of OpenFilesFromDataObject that is more
+// appropriate for real life.
+
+void OpenFilesFromDataObject(IDataObject *pdto)
+{
+ if (!g_hwndChild) { /* need to create a new main window */ }
+ pdto-&gt;AddRef();
+ PostMessage(GetParent(g_hwndChild), WM_OPENFILES, 0,
+             reinterpret_cast&lt;LPARAM&gt;(pdto));
+}
+
+case WM_OPENFILES:
+ IDataObject *pdto = reinterpret_cast&lt;IDataObject*&gt;(lParam);
+ ... rest of code from the original OpenFilesFromDataObject ...
+ pdto-&gt;Release();
+ break;
+</pre>
+<p>
+In real life, you just <code>AddRef</code> the data object
+and then post a message to finish processing it later.
+The aim here is to release the shell thread as quickly as
+possible.
+When the posted message is received, we can
+extract the information from the data object at our leisure.
+<b>People who know how COM servers work can go back to sleep now</b>.
+</p>
+<p>
+Finally, we hook up our class factories to the main program:
+</p>
+<pre>
+int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
+                   LPSTR lpCmdLine, int nShowCmd)
+{
+    MSG msg;
+    HWND hwnd;
+
+    g_hinst = hinst;
+
+    if (!InitApp()) return 0;
+
+    if (SUCCEEDED(CoInitialize(NULL))) {/* In case we use COM */
+        <font COLOR=blue>HRESULT hrRegister;
+        DWORD dwRegisterCookie;
+
+        {
+            ProcessReference ref;
+            g_ppr = &amp;ref;
+
+            hrRegister = CoRegisterClassObject(CLSID_Scratch, &amp;s_scf,
+                  CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE,
+                  &amp;dwRegisterCookie);</font>
+
+            hwnd = CreateWindow(
+                TEXT("Scratch"),                /* Class Name */
+                TEXT("Scratch"),                /* Title */
+                WS_OVERLAPPEDWINDOW,            /* Style */
+                CW_USEDEFAULT, CW_USEDEFAULT,   /* Position */
+                CW_USEDEFAULT, CW_USEDEFAULT,   /* Size */
+                NULL,                           /* Parent */
+                NULL,                           /* No menu */
+                hinst,                          /* Instance */
+                0);                             /* No special parameters */
+
+            <font COLOR=blue>if (CompareStringA(LOCALE_INVARIANT, NORM_IGNORECASE,
+                 lpCmdLine, -1, "-Embedding", -1) != CSTR_EQUAL &amp;&amp;
+                CompareStringA(LOCALE_INVARIANT, NORM_IGNORECASE,
+                 lpCmdLine, -1, "/Embedding", -1) != CSTR_EQUAL) {
+                /* OpenFilesFromCommandLine(); */
+            }</font>
+
+            ShowWindow(hwnd, nShowCmd);
+
+            while (GetMessage(&amp;msg, NULL, 0, 0)) {
+                TranslateMessage(&amp;msg);
+                DispatchMessage(&amp;msg);
+            }
+            <font COLOR=blue>g_hwndChild = NULL;
+
+        } // wait for process references to die
+        g_ppr = NULL;
+
+        if (SUCCEEDED(hrRegister)) {
+            CoRevokeClassObject(dwRegisterCookie);
+        }</font>
+        CoUninitialize();
+    }
+
+    return 0;
+}
+</pre>
+<p>
+After creating our process reference,
+we register our class factory by calling
+<code>Co&shy;Register&shy;Class&shy;Object</code>.
+We do this even if not invoked by COM, because we want COM to
+be able to find us once we're up and running:
+If the user runs the application manually and then double-clicks
+an associated document, we want that document to be handed to us
+rather than having COM launch another copy of the program.
+</p>
+<p>
+After creating the window, we check if the command line is
+<code>-Embedding</code> or <code>/Embedding</code>.
+This is the magic command line switch which COM gives us
+when we are being launched as a local server.
+If we don't have that switch, then we're being launched
+with a file name on our command line, so proceed with
+"old school" command line parsing.
+(I didn't bother writing the
+<code>Open&shy;Files&shy;From&shy;Command&shy;Line</code>
+function since it is irrelevant to the topic.)
+</p>
+<p>
+After our message loop exits, we clear the <code>g_hwndChild</code>
+so <code>Open&shy;Files&shy;From&shy;Data&shy;Object</code>
+knows that there is no
+main window any more.
+In real life, we'd have to create a new main window and restart
+the message loop.
+</p>
+<p>
+Once all outstanding COM objects and server locks and process
+references are gone,
+we can tear down the process.
+We unregister the COM server (if we registered it)
+so that COM won't try to ask us to open any more documents.
+(COM will instead launch a new copy of the program.)
+</p>
+<p>
+And that's it.
+</p>
+<p>
+Oh wait, we also have to register this program so COM and the shell
+can find us.
+</p>
+<p>
+Registering the COM server is just a matter of setting the registry
+key
+</p>
+<pre>
+[HKCR\CLSID\{...}\LocalServer32]
+@="C:\\Path\\To\\scratch.exe"
+</pre>
+<p>
+You probably should also set a friendly name into
+<code>HKCR\<wbr>CLSID\<wbr>{...}</code> so people will have
+a clue what your server is for.</p>
+<p>
+<b>People who know how COM servers work wake up</b>:
+After we register our class with COM,
+we can register it with the shell.
+For demonstration purposes, we'll make our command a secondary
+verb on text files.
+</p>
+<pre>
+[HKCR\txtfile\shell\scratch\DropTarget]
+"Clsid"="{...}"
+</pre>
+<p>
+Wow, all we had to do was set two registry values and boom,
+we can now accept files via drop target.
+Multiselect a whole bunch of text files,
+right-click them,
+and then select "scratch".
+The shell sees that the verb is registered as a drop target,
+so it calls <code>Co&shy;Create&shy;Instance</code> on the <code>CLSID</code>
+you provided.
+COM looks up the <code>CLSID</code> in the registry and finds the
+path to your program.
+Your program runs with the <code>-Embedding</code> flag,
+registers its class factory, and awaits further instructions.
+COM asks your class factory to create a drop target,
+which it returns to the shell.
+The shell then performs the simulated drop,
+and when you get the <code>IDropTarget::<wbr>Drop</code>,
+your code springs into action and extracts all the files in the
+data object.
+</p>
+<p>
+Now that we have all this working, it's just one more tiny
+step to register your application's drop target so that
+it is invoked
+<a HREF="http://msdn.microsoft.com/en-us/library/cc144150.aspx">
+when the user drops a group of files on the
+EXE itself</a>
+(or on a shortcut to the EXE):
+</p>
+<pre>
+[HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\scratch.exe]
+"DropTarget"="{...}"
+</pre>
+<p>
+With this additional registration, grab that bunch of files
+and drop it on the <code>scratch.exe</code> icon.
+Instead of passing all those files on the command line
+(and possibly overflowing the command line limit),
+the shell goes through the same procedure as it did with the
+context menu to hand the list of files to your program
+via the data object.
+</p>
+<p>
+Nearly all of the work here was just managing the COM local server.
+The parts that had to do with the shell were actually quite small.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (24)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-829743">
+				<div id="div-comment-829743" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829743">
+			May 3, 2010 at 7:50 am</a>		</div>
+
+		<p>I have a few questions about a simulated drop (from both sides of the interface).</p>
+<p>Is there a way for the drop target to detect a simulated drop (vs a real drop with the mouse)?</p>
+<p>When the shell simulates a drop, does it call BOTH DragEnter and DragOver? What does it pass for key state, mouse point and effect?</p>
+<p>If I have to simulate a drop (let&#8217;s say I want to copy a file to an arbitrary IShellFolder), am I required to call DragEnter? What about DragOver? What mouse point to use?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829753">
+				<div id="div-comment-829753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Iain Clarke</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829753">
+			May 3, 2010 at 8:10 am</a>		</div>
+
+		<blockquote><p>
+  Is there a way for the drop target to detect a simulated drop (vs a real drop with the mouse)?
+</p></blockquote>
+<p>It wouldn&#8217;t be a very good simulation if there was!</p>
+<blockquote><p>
+  When the shell simulates a drop, does it call BOTH DragEnter and DragOver? What does it pass for key state, mouse point and effect?
+</p></blockquote>
+<p>In the spirit of Raymond, suck it and see! You could implement these interface members, and use OutputDebugString to check. &nbsp;That&#8217;s my usual approach to these things.</p>
+<p>As for you doing it&#8230; if you don&#8217;t want other programs detecting you&#8217;re a fake, it would be best to be as thorough as possible.</p>
+<p>Iain.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829763">
+				<div id="div-comment-829763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">640k</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829763">
+			May 3, 2010 at 8:16 am</a>		</div>
+
+		<p>And if I drop a file named &#8220;-Embedding&#8221;?</p>
+<div class=post>[<i>Then the file is opened. (Think about it.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829773">
+				<div id="div-comment-829773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Moi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829773">
+			May 3, 2010 at 8:23 am</a>		</div>
+
+		<blockquote><p>
+  And if I drop a file named &quot;-Embedding&quot;?
+</p></blockquote>
+<p>And if I want to do it in assembly?</p>
+<p>Seriously, what drives such questions?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829783">
+				<div id="div-comment-829783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829783">
+			May 3, 2010 at 8:40 am</a>		</div>
+
+		<p>@Iain:</p>
+<blockquote><p>
+  It wouldn&#8217;t be a very good simulation if there was!
+</p></blockquote>
+<p>Let&#8217;s say I&#8217;m writing a namespace extension. I want to detect when you drop a file at specific coordinates, or when you do a &quot;paste&quot; operation. For the first I have to use the mouse position, and for the second I have to ignore it. Would be nice to know which is the case.</p>
+<blockquote><p>
+  In the spirit of Raymond, suck it and see! You could implement these interface members, and use OutputDebugString to check. &nbsp;That&#8217;s my usual approach to these things.
+</p></blockquote>
+<p>I can argue that this is contrary to the &quot;Raymond spirit&quot;. This way I will start depending on some undocumented behavior, possibly subject to change in the next version. Imagine if DragOver is being called. I do some processing there instead of in DragEnter/Drop. Well, Windows 11 may stop calling it and I&#8217;m screwed. If the actual sequence is documented, I can write my code correctly and future-proof it. Or maybe to create a shortcut, the shell is telling me that both Shift and Ctrl are pressed, instead of sending DROPEFFECT_LINK (for compatibility with some popular accounting software). Depending on such observed, but undocumented behavior is dangerous and should be avoided if there is an alternative.</p>
+<blockquote><p>
+  As for you doing it&#8230; if you don&#8217;t want other programs detecting you&#8217;re a fake, it would be best to be as thorough as possible.
+</p></blockquote>
+<p>I don&#8217;t care if the program detects that I&#8217;m a fake (in fact it may be beneficial because of my first point). I want to paste a file (IDataObject) into a folder (IShellFolder with IDropTarget). There are multiple sequences I can use, but the only one that is guaranteed to work is the one that shell is using. That&#8217;s because (I&#8217;m assuming) the drop target has been tested with the shell&#8217;s fake drop. So the closer my behavior is to the shell, the better chances I have to not break anything.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829803">
+				<div id="div-comment-829803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829803">
+			May 3, 2010 at 10:11 am</a>		</div>
+
+		<p>&gt;&gt; And if I drop a file named &#8220;-Embedding&#8221;?</p>
+<p>&gt; </p>
+<p>&gt; Seriously, what drives such questions?</p>
+<p>I&#8217;m not sure if this was an attempt at knocking the technique or a legitimate question &#8211; on Unix systems, filenames that look like switches is a problem that comes up often enough (especially because the shell expands wildcards, so the user might not even be aware there&#8217;s such a file being passed on the command line) that programs often have a special switch (&#8220;&#8211;&#8220;) to indicate that everything that follows is a filename even if it looks like a switch/option.</p>
+<div class=post>[<i>The shell doesn&#8217;t pass relative paths (what would it be relative to?) so the question is moot. That&#8217;s why I wrote &#8220;think about it.&#8221; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829833">
+				<div id="div-comment-829833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829833">
+			May 3, 2010 at 11:15 am</a>		</div>
+
+		<p>Great post Raymond. I&#8217;m just wondering about one thing, in this line</p>
+<p>HDROP hdrop = reinterpret_cast&lt;HDROP&gt;(stgm.hGlobal);</p>
+<p>shouldn&#8217;t you use GlobalLock? Or does the shell guarantee its DataObject won&#8217;t bother you with ancient relics like movable memory blocks? If so, is that true for all DataObjects one gets from the shell?</p>
+<div class=post>[<i>The person who looks inside the HDROP must GlobalLock it as appropriate. But we&#8217;re not looking inside it here. We&#8217;re just operating on the opaque handle. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829843">
+				<div id="div-comment-829843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://windowssucks.wordpress.com/' rel='external nofollow' class='url'>WndSks</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829843">
+			May 3, 2010 at 11:56 am</a>		</div>
+
+		<p>&#8220;[HKLMSoftwareMicrosoftWindowsCurrentVersionApp Pathsscratch.exe]</p>
+<p>&#8221; </p>
+<p>And if this is a per user app with its COM stuff in HKCU? AFAIK App Paths is HKLM only for some stupid reason, no UAC-less install for you!</p>
+<div class=post>[<i>Sorry the solution isn&#8217;t 100% applicable to all situations. But at least it helps the other 99% of the programs out there. I like to think that&#8217;s worth something. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829863">
+				<div id="div-comment-829863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Pierre B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829863">
+			May 3, 2010 at 12:39 pm</a>		</div>
+
+		<p>I know this is not provided as 100% tested bug-free code, but for the sake of people who will undoubtedly copy and paste it, shouldn&#8217;t there be a test for Query failure; in the code:</p>
+<p>&nbsp; &nbsp;HRESULT hr = pdt-&gt;QueryInterface(riid, ppv);</p>
+<p>&nbsp; &nbsp;pdt-&gt;Release();</p>
+<p>?</p>
+<p>I know that it&#8217;s unlikely you will get queried about another interface not supported, but still, I think that Release() should be conditional.</p>
+<div class=post>[<i>The code is correct. If the QI fails, then hr is set to E_NOINTERFACE and the SimpleDropTarget is destroyed. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829893">
+				<div id="div-comment-829893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Anonymous Coward</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829893">
+			May 3, 2010 at 4:34 pm</a>		</div>
+
+		<p>Although I love articles about the deep stuff, I think articles like this are fine too once in a while, especially for people who are more susceptible to a hand on approach than to reading the docs (although they still should after they roughly understand what they&#8217;re doing). Besides, I&#8217;ve ran into command line length limits in the past, so this may come in handy someday, and given that the COM stuff can be handled by templates or a framework, I think this is actually easier than the antiquated command line interface.</p>
+<p>Seriously, it&#8217;s 2010, console support should be dropped. If people really want a console they can code one up themselves. ;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829913">
+				<div id="div-comment-829913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cheong</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829913">
+			May 3, 2010 at 5:57 pm</a>		</div>
+
+		<blockquote><p>
+  I&#8217;ll try to remember to wake you up when something interesting is about to happen.
+</p></blockquote>
+<p>That and the part you tell people sleep and wake now makes me giggle. :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829933">
+				<div id="div-comment-829933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sample</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829933">
+			May 3, 2010 at 7:46 pm</a>		</div>
+
+		<p>This sample should have been documented in the SDK 15 years ago. Why isn&#8217;t it?</p>
+<div class=post>[<i>Um, the feature didn&#8217;t exist 15 years ago. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829953">
+				<div id="div-comment-829953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harold</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829953">
+			May 3, 2010 at 8:37 pm</a>		</div>
+
+		<p>Amazing! I was just working on this very problem. Thanks Raymond.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829883">
+				<div id="div-comment-829883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829883">
+			May 3, 2010 at 4:13 pm</a>		</div>
+
+		<p>Pierre B: *ppv, not pdt, is set to the result of QueryInterface. &nbsp;The caller to CreateInstance owns *ppv if it is set, not us. &nbsp;We own pdt, so need to release it before return.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-829963">
+				<div id="div-comment-829963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">avek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829963">
+			May 3, 2010 at 11:51 pm</a>		</div>
+
+		<p>Maybe it&#8217;s nitpicking, but isn&#8217;t OleInitialize() required instead of CoInitialize() when messing with IDataObject?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-829983">
+				<div id="div-comment-829983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://wizou.fr' rel='external nofollow' class='url'>Wizou</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-829983">
+			May 4, 2010 at 1:17 am</a>		</div>
+
+		<p>I&#8217;m dubious about the App Paths registry entry..</p>
+<p>What if two programs in the system are named scratch.exe?</p>
+<p>Wouldn&#8217;t that registry entry redirect launching of all scratch.exe programs (target of file dropping) to launching the LocalServer32 entry instead?</p>
+<p>(actually I tested a bit, and indeed it seems to be affecting file dropping on all scratch.exe)</p>
+<p>You&#8217;d better choose carefully the name of your executable then..</p>
+<p>Why is there no way for the executable itself (before executing) to tell the shell that it supports DropTarget? (for example, a special resource entry)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-830013">
+				<div id="div-comment-830013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sample</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830013">
+			May 4, 2010 at 2:27 am</a>		</div>
+
+		<p>&gt; [Um, the feature didn&#8217;t exist 15 years ago. -Raymond]</p>
+<p>You are probably lying, but let&#8217;s pretend your not. Then replace 15 with 14 or &#8220;very long time ago&#8221;.</p>
+<div class=post>[<i>Support for DropTarget-based execution was added in Windows XP, much less than 15 years ago. And all the information in the article is documented; you just need to connect the dots. Sorry there isn&#8217;t a sample for every possible way of connecting dots. Sometimes you just need to connect them yourself. That&#8217;s why it&#8217;s called programming. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-830023">
+				<div id="div-comment-830023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Morten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830023">
+			May 4, 2010 at 3:38 am</a>		</div>
+
+		<p>You should invent and patent a markup language for articles like this. That would be a great tool to have in many technical works where the authors have only a foggy idea of who their target audience is*. Imagine an ebook transforming itself to your skillset. Brilliant.</p>
+<p>* What you saying? That authors should figure out what &quot;target audience&quot; means? Don&#8217;t be silly, that&#8217;s HARD WORK!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-830163">
+				<div id="div-comment-830163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830163">
+			May 4, 2010 at 1:51 pm</a>		</div>
+
+		<p>&quot;You are probably lying&quot;? I guess blogs get the audience they deserve &#8212; if the host self-diagnoses as having the social skills of a thermonuclear device, he&#8217;ll get likewise readers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-830213">
+				<div id="div-comment-830213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">The_Assimilator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830213">
+			May 5, 2010 at 2:22 am</a>		</div>
+
+		<p>@JM</p>
+<p>Having the social skills of a thermonuclear device does not imply that one is an idiot. Raymond clearly is not, while yourself and sample are.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-830233">
+				<div id="div-comment-830233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Goran</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830233">
+			May 5, 2010 at 4:30 am</a>		</div>
+
+		<p>Nice, thanks!</p>
+<p>Questions, please?</p>
+<p>How do I know that I should use this cast: reinterpret_cast&lt;HDROP&gt;(stgm.hGlobal)?</p>
+<p>Is it OK to use it if tymed is not TYMED_HGLOBAL? Or Is tymed guaranteed to be TYMED_HGLOBAL when IDataObject is coming from IDropTarget::Drop? Or does DragQueryFile know how to handle random hDrop? Or&#8230;?</p>
+<div class=post>[<i>Exercise: Study the rules for IDataObject, then apply those rules to the situation here. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-830573">
+				<div id="div-comment-830573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830573">
+			May 5, 2010 at 7:08 pm</a>		</div>
+
+		<p>[Exercise: Study the rules for IDataObject, then apply those rules to the situation here. -Raymond]</p>
+<p>Can anyone play this game? &nbsp;The FORMATETC tells you how GetData should pass back the HDROP. &nbsp;You specified TYMED_HGLOBAL, so the HDROP was given back in a HGLOBAL. &nbsp;If you&#8217;d asked for something from GetData that can&#8217;t fit in an HGLOBAL, it should return DV_E_FORMATETC. &nbsp;(In general, that is. &nbsp;I don&#8217;t know why you&#8217;d be asking for anything larger in the case under discussion.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-830583">
+				<div id="div-comment-830583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rick C</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830583">
+			May 5, 2010 at 7:13 pm</a>		</div>
+
+		<p>Oh, and I forgot to say: &nbsp;The documentation for GetData says that you can bitwise or multiple TYMED_* types, and the callee can pick which type to give back. &nbsp;I didn&#8217;t realize that before this, and it means that you would have to check what GetData returned in stgm.tymed. &nbsp;I wonder how many implementations of IDataObject don&#8217;t handle that nuance?</p>
+<p>Raymond, that little bit of knowledge alone makes the entire article worthwhile. &nbsp;Thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-830623">
+				<div id="div-comment-830623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JM</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20100503-00/?p=14183#comment-830623">
+			May 6, 2010 at 5:42 am</a>		</div>
+
+		<p>@The_Assimilator: In my book, &quot;you&#8217;re lying&quot; is about the worst thing you could say to a technical person, as it implies they&#8217;re putting their ego before their profession. I&#8217;m an idiot for calling someone out for being rude to the author of the blog in an unnecessary and unlikely manner? I&#8217;m not sure how that works, but I&#8217;ll choose to believe you just misunderstood what I wrote. Either that or your opinion is based on previous experience, in which case due apologies for whatever I did in the past&#8230;</p>
+<p>In any case, let&#8217;s drop it, I already regret commenting at all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

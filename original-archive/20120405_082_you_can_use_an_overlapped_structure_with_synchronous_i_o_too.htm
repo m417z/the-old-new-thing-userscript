@@ -1,0 +1,527 @@
+<html>
+<head>
+<title>You can use an OVERLAPPED structure with synchronous I/O, too</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>You can use an OVERLAPPED structure with synchronous I/O, too</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 5, 2012 / year-entry #83</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Even if you didn't open a file with FILE_FLAG_OVERLAPPED, you can still use the OVERLAPPED structure when you issue reads and writes. Mind you, the I/O will still complete synchronously, but you can take advantage of the other stuff that OVERLAPPED has to offer. Specifically, you can take advantage of the Offset and OffsetHigh members...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Even if you didn't open a file with
+<code>FILE_<wbr>FLAG_<wbr>OVERLAPPED</code>,
+you can still use the <code>OVERLAPPED</code> structure
+when you issue reads and writes.
+Mind you,
+the I/O will still complete synchronously,
+but you can take advantage of the other stuff
+that <code>OVERLAPPED</code> has to offer.
+</p>
+<p>
+Specifically, you can take advantage of the
+<code>Offset</code> and <code>OffsetHigh</code> members
+to issue the I/O against a file location different from
+the current file pointer.
+(This is a file pointer in the sense of
+<code>Set&shy;File&shy;Pointer</code>
+and not in the sense of the C runtime <code>FILE*</code>.)
+If your program does a lot of reads and writes to random locations
+in a file, using the synchronous <code>OVERLAPPED</code>
+structure saves you a call to
+<code>Set&shy;File&shy;Pointer</code> at each I/O.
+</p>
+<p>
+Let's illustrate this by writing some code to walk through
+a file format that contains a lot of offsets to other
+parts of the file:
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2010/10/18/10077133.aspx">
+The ICO file format</a>.
+First, the old-fashioned way:
+</p>
+<pre>
+#define <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2004/02/12/71851.aspx">UNICODE</a>
+#define _UNICODE
+#include &lt;windows.h&gt;
+
+#include &lt;pshpack1.h&gt;
+struct ICONDIRHEADER {
+    WORD idReserved;
+    WORD idType;
+    WORD idCount;
+};
+
+struct ICONDIRENTRY {
+    BYTE bWidth;
+    BYTE bHeight;
+    BYTE bColorCount;
+    BYTE  bReserved;
+    WORD  wPlanes;
+    WORD  wBitCount;
+    DWORD dwBytesInRes;
+    DWORD dwImageOffset;
+};
+#include &lt;poppack.h&gt;
+
+BOOL ReadBufferAt(__in HANDLE hFile,
+    __out_bcount(cbBuffer) void *pvBuffer,
+    DWORD cbBuffer,
+    DWORD64 offset)
+{
+ LARGE_INTEGER li;
+ DWORD cbRead;
+ li.QuadPart = offset;
+ return SetFilePointerEx(hFile, li, nullptr, FILE_BEGIN) &amp;&amp;
+        ReadFile(hFile, pvBuffer, cbBuffer, &amp;cbRead, nullptr) &amp;&amp;
+        cbBuffer == cbRead;
+}
+
+int __cdecl wmain(int argc, wchar_t **argv)
+{
+ HANDLE hFile = CreateFile(argv[1], GENERIC_READ,
+  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+  nullptr, OPEN_EXISTING, 0, nullptr);
+ if (hFile != INVALID_HANDLE_VALUE) {
+  ICONDIRHEADER hdr;
+  if (ReadBufferAt(hFile, &amp;hdr, sizeof(hdr), 0) &amp;&amp;
+      hdr.idReserved == 0 &amp;&amp; hdr.idType == 1) {
+   for (UINT uiIcon = 0; uiIcon &lt; hdr.idCount; uiIcon++) {
+    ICONDIRENTRY entry;
+    if (ReadBufferAt(hFile, &amp;entry, sizeof(entry),
+                     sizeof(hdr) + uiIcon * sizeof(entry))) {
+     void *pvData = LocalAlloc(LMEM_FIXED, entry.dwBytesInRes);
+     if (pvData) {
+      if (ReadBufferAt(hFile, pvData,
+                       entry.dwBytesInRes, entry.dwImageOffset)) {
+       // process one image in the icon
+      }
+      LocalFree(pvData);
+     }
+    }
+   }
+  }
+  CloseHandle(hFile);
+ }
+ return 0;
+}
+</pre>
+<p>
+Run this program with the name of an icon file on the command line,
+and nothing interesting happens because the program doesn't
+generate any output.
+But if you step through it, you can see that we start by
+reading the <code>ICON&shy;DIR&shy;HEADER</code>
+to verify that it's an icon and determine the number of images.
+We then loop through the images: For each one,
+we read the <code>ICON&shy;DIR&shy;ENTRY</code>
+(specifying the explicit file offset),
+then read the image data (again, specifying the explicit
+file offset).
+</p>
+<p>
+We use the <code>Read&shy;Buffer&shy;At</code> function
+to read data from the file.
+For each read, we first call <code>Set&shy;File&shy;Pointer</code>
+to position the file pointer at the byte we want to read,
+then call <code>Read&shy;File</code> to read it.
+</p>
+<p>
+Let's change this program to take advantage of our newfound knowledge:
+</p>
+<pre>
+BOOL ReadBufferAt(__in HANDLE hFile,
+    __out_bcount(cbBuffer) void *pvBuffer,
+    DWORD cbBuffer,
+    DWORD64 offset)
+{
+ OVERLAPPED o = { 0 };
+ o.Offset = static_cast&lt;DWORD&gt;(offset);
+ o.OffsetHigh = static_cast&lt;DWORD&gt;(offset &gt;&gt; 32);
+ DWORD cbRead;
+ return ReadFile(hFile, pvBuffer, cbBuffer, &amp;cbRead, &amp;o) &amp;&amp;
+        cbBuffer == cbRead;
+}
+</pre>
+<p>
+We merge the
+<code>Set&shy;File&shy;Pointer</code> call into the
+<code>Read&shy;File</code> by specifying the desired byte
+offset in the optional <code>OVERLAPPED</code> structure.
+The I/O will still complete synchronously
+(since we opened the handle synchronously),
+but we saved ourselves the hassle of having to call
+two functions when it could be done with just one.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-976813">
+				<div id="div-comment-976813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Skyborne</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976813">
+			April 5, 2012 at 7:10 am</a>		</div>
+
+		<p>The &quot;Set:FilePointer&quot; typo in the last paragraph catches my eye: are you using the Dvorak keyboard layout? &nbsp;Mostly-idle curiosity from a Dvorak user.</p>
+<div class="post">[<i>If you do a View-Source, you&#39;ll see that it was supposed to be a semicolon. Shift key slip. (Well you can&#39;t see it now because I fixed it.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-976823">
+				<div id="div-comment-976823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976823">
+			April 5, 2012 at 7:20 am</a>		</div>
+
+		<p>Relevant MSDN snippet: &quot;Considerations for working with synchronous file handles:</p>
+<ul>
+<li>If lpOverlapped is not NULL, the read operation starts at the offset that is specified in the OVERLAPPED structure and ReadFile does not return until the read operation is complete. The system updates the OVERLAPPED offset before ReadFile returns.&quot;</li>
+</ul>
+<p>Interesting&#8230; I learned something new!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-976833">
+				<div id="div-comment-976833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Koro</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976833">
+			April 5, 2012 at 8:51 am</a>		</div>
+
+		<p>Unrelated, but personally when I have to do random access to lots of offsets in a file, I will just memory-map it and do pointer arithmethic, and let the kernel do more efficient caching than having to do lots of kernel calls and copies around.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-976843">
+				<div id="div-comment-976843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976843">
+			April 5, 2012 at 9:32 am</a>		</div>
+
+		<p>@Koro: Every try to memory map a file bigger than 2GB on a 32 bit processor?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-976853">
+				<div id="div-comment-976853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Paul</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976853">
+			April 5, 2012 at 10:51 am</a>		</div>
+
+		<p>@Joshua &#8211; Have you ever actually memory mapped a file? &nbsp;You don&#39;t have to map in the whole thing at one time. &nbsp;CreateFileMapping creates a section object, and them MapViewOfFile actually maps in some range of the file specified by an offset and number of bytes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-976863">
+				<div id="div-comment-976863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Igor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976863">
+			April 5, 2012 at 11:00 am</a>		</div>
+
+		<p>Yes, but then you&#39;re back in the seeking/remapping business (if you need to cover the whole file).</p>
+<p>I&#39;m curious about the &quot;let the kernel do more efficient caching&quot; thing&#8230; is it necessarily the case?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even thread-even depth-1" id="comment-976923">
+				<div id="div-comment-976923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976923">
+			April 5, 2012 at 6:03 pm</a>		</div>
+
+		<p>This reading (and writing) in small random pieces is all fun and games, until your file is on a USB drive, or compressed. And then you get the painfully slow JPG file &quot;turn 90 degree&quot; operation in windows image viewer because of that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-976933">
+				<div id="div-comment-976933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976933">
+			April 5, 2012 at 6:04 pm</a>		</div>
+
+		<p>Another advantage of using OVERLAPPED is that the operation becomes thread-safe.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-976943">
+				<div id="div-comment-976943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-976943">
+			April 6, 2012 at 3:33 am</a>		</div>
+
+		<p>The bit-twiddling reminds me that I still hate the MAKELONG and HIWORD macros; my 16-bit compiler at the time implemented them using function calls. Oops.</p>
+<p>I can&#39;t imagine why the OVERLAPPED structure didn&#39;t use a LARGE_INTEGER structure.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-977003">
+				<div id="div-comment-977003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977003">
+			April 6, 2012 at 8:59 am</a>		</div>
+
+		<p>Neil: Back when the OVERLAPPED structure was being conceived, your average HD was probably 80MB. Creating a 4GB file would require tens of thousands of dollars worth of SCSI disk array. I can imagine that the average programmer would never be expected to even see such a file, let alone have to write a program to manipulate one. Obviously they didn&#39;t expect that 20+ years later we would all be downloading 4GB video files from our smartphones and such.</p>
+<p>Anyway, using a LARGE_INTEGER would make using the structure ever so slightly more complicated. I can easily imagine that they wanted to make it just a bit simpler for the 99.999% of programmers who would never have to worry about a 4GB file, while making it ever so slightly more work for the 0.001% of us who do have to be concerned about it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-977093">
+				<div id="div-comment-977093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JoakimA</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977093">
+			April 6, 2012 at 4:17 pm</a>		</div>
+
+		<p>I tried to post a comment the other day and now, but it&#39;s not getting through. Is there some kind of automatic spam filter or am I unlucky to be in a blacklisted IP range? Or are the comments just moderated?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-977103">
+				<div id="div-comment-977103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JoakimA</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977103">
+			April 6, 2012 at 4:20 pm</a>		</div>
+
+		<p>There is one thing regarding files opened as overlapped I&#39;ve been wondering:</p>
+<p>The ReadFile documentation says about the lpNumberOfBytesRead arameter</p>
+<p>&quot;Use NULL for this parameter if this is an asynchronous operation to avoid potentially erroneous results.&quot;. However, KB article 156932 says:</p>
+<p>&quot;If, on the other hand, an operation is completed immediately, then &amp;NumberOfBytesRead passed into ReadFile is valid for the number of bytes read. In this case, ignore the OVERLAPPED structure passed into ReadFile; do not use it with GetOverlappedResult or WaitForSingleObject.&quot;</p>
+<p>But the ReadFile documentation said I was supposed to pass in NULL for asynchronous operations. So what do I do if the operation on the file opened as overlapped finishes immediately? Do I follow the ReadFile documentation and pass in NULL, in which case I&#39;ll have to use GetOverlappedResult even though the KB article says I shouldn&#39;t? Or do I pass in a pointer as the KB article says and get the &quot;potentially erroneous results&quot; the ReadFile documentation speaks of? Got to love that warning&#8230; Also, what happens to the hEvent in OVERLAPPED when completing synchronously?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-977123">
+				<div id="div-comment-977123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">NeedInfo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977123">
+			April 6, 2012 at 5:37 pm</a>		</div>
+
+		<p>Can we <em>please</em> provide some API for telling whether a given HANDLE is open for synchronous IO? You can get this information with the NT native API, but poor mortals outside Microsoft can&#39;t figure out the same thing. Given a HANDLE of unspecified origin, then, these people <em>have</em> to use an OVERLAPPED structure, yet prepare for all IO to be done synchronously anyway.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-977163">
+				<div id="div-comment-977163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977163">
+			April 6, 2012 at 10:22 pm</a>		</div>
+
+		<p>NeedInfo: Is there any time when you shouldn&#39;t expect any particular I/O to be done synchronously?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-977303">
+				<div id="div-comment-977303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Glitchy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977303">
+			April 9, 2012 at 8:36 am</a>		</div>
+
+		<p>From my experience with synchronous use of OVERLAPPED is that its very buggy and glitchy.</p>
+<p>I always get nervous when i see code that use it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-977443">
+				<div id="div-comment-977443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/johnstonj_4000_inn_2D00_soft.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>johnstonj@inn-soft.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977443">
+			April 9, 2012 at 2:55 pm</a>		</div>
+
+		<p>@JoakimA: I was wondering about this same exact thing the other week. &nbsp;I&#39;d say the documentation and support articles are ambiguous; it is really not clear what one should do in this situation. &nbsp;You could always decompile or check the .NET Framework source code on this; they probably got it right.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-977523">
+				<div id="div-comment-977523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">@JoakimA</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977523">
+			April 10, 2012 at 4:43 am</a>		</div>
+
+		<p>I believe the canonical implementation reads like this (in Delphi):</p>
+<p>// Returns when &lt;BytesToRead&gt; bytes are read into &lt;Buffer&gt; or when the timer &lt;TimeoutTimer&gt; expires,</p>
+<p>// whatever comes first. The number of bytes read is returned.</p>
+<p>// I/O errors are reported as EOSError exception.</p>
+<p>function TTestObj.Read(TimeoutTimer: TWaitableTimer; out Buffer; BytesToRead: cardinal): cardinal;</p>
+<p>var</p>
+<p>&nbsp;Handles: array [0..1] of THandle;</p>
+<p>begin</p>
+<p>&nbsp;// ReadFile can complete immediately:</p>
+<p>&nbsp;if not Windows.ReadFile(FHandle, Buffer, BytesToRead, Result, @FOverlapped) then begin</p>
+<pre><code>Win32Check(Windows.GetLastError = ERROR_IO_PENDING, &amp;#39;ReadFile&amp;#39;);
+
+// ReadFile will complete asynchronous =&amp;gt; wait for it with a timeout:
+
+Handles[0] := FOverlapped.hEvent;
+
+Handles[1] := TimeoutTimer.Handle;
+
+case Windows.WaitForMultipleObjects(length(Handles), pointer(@Handles), false, INFINITE) of
+
+WAIT_OBJECT_0 + 0:  // ReadFile is complete
+
+ &amp;nbsp;{do nothing};
+
+WAIT_OBJECT_0 + 1:  // timeout is expired =&amp;gt; terminate the ReadFile operation:
+
+ &amp;nbsp;Win32Check( Windows.CancelIo(FHandle), &amp;#39;CancelIo&amp;#39;);
+
+else
+
+ &amp;nbsp;RaiseWin32Error(Windows.GetLastError, &amp;#39;WaitForMultipleObjects&amp;#39;);
+
+end;
+
+// Get the result of the ReadFile operation. ERROR_OPERATION_ABORTED means CancelIO was called, but even in this case,
+
+// we want to report the number of bytes read:
+
+if not Windows.GetOverlappedResult(FHandle, FOverlapped, Result, false) and (Windows.GetLastError &amp;lt;&amp;gt; ERROR_OPERATION_ABORTED) then
+
+ &amp;nbsp;Win32Check(false, &amp;#39;GetOverlappedResult/ReadFile&amp;#39;);
+</code></pre>
+<p>&nbsp;end;</p>
+<p>end;</p>
+<p>FHandle and FOverlapped are instance members. Win32Check() raises the EOSError exception when the condition (the first argument) is not true. &lt;Result&gt; is the implicit variable that represents the return value of the function.</p>
+<p>I use this code in a productive application without problems.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-977633">
+				<div id="div-comment-977633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JoakimA</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977633">
+			April 10, 2012 at 11:09 am</a>		</div>
+
+		<p>I dug into kernel32.dll a little, and the implementation is such that the overlapped struct is where the system service NtReadFile returns bytes read and final status. ReadFile then copies the number of bytes read into its return parameter if supplied and the operation completed synchronously. Otherwise it leaves 0 which it put in at the start. GetOverlappedResult will work regardless of whether the operation completed synchronously or not. This may be an implementation detail though, but this is how it is here in XP SP3 at least.</p>
+<p>@@JoakimA: That&#39;s similar to what I&#39;ve seen in sample code too. Though I think you should set wait=TRUE in your GetOverlappedResult because CancelIO only requests cancellation without waiting for it to finish. GetOverlappedResult may return ERROR_IO_PENDING otherwise, and things will break badly if the overlapped struct and/or buffer goes away before the operation completes.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1" id="comment-977853">
+				<div id="div-comment-977853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20120405-00/?p=7923#comment-977853">
+			April 11, 2012 at 5:26 pm</a>		</div>
+
+		<p>Gabe: Yea, SetFilePointer was designed the way it was for a similar reason. At least it fared much better than GetDiskFreeSpace.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

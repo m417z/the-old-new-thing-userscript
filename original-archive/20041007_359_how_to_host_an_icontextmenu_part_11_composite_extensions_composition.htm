@@ -1,0 +1,743 @@
+<html>
+<head>
+<title>How to host an IContextMenu, part 11 - Composite extensions - composition</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>How to host an IContextMenu, part 11 &#8211; Composite extensions &#8211; composition</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 7, 2004 / year-entry #360</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>6</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Okay, now that we have two context menu handlers we want to compose (namely, the "real" one from the shell namespace and a "fake" one that contains bonus commands we want to add), we can use merge them together by means of a composite context menu handler. The kernel of the composite context menu is...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Okay, now that we have two context menu handlers we want to compose
+(namely, the "real" one from the shell namespace and a "fake" one
+that contains bonus commands we want to add), we can use merge them
+together by means of a composite context menu handler.
+</p>
+<p>
+The kernel of the composite context menu is to multiplex multiple
+context menus onto a single context menu handler, using the menu identifer
+offsets to route the commands.
+</p>
+<p>
+Everything else is just typing.
+</p>
+<pre>
+class CCompositeContextMenu : public IContextMenu3
+{
+public:
+  // *** IUnknown ***
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv);
+  STDMETHODIMP_(ULONG) AddRef();
+  STDMETHODIMP_(ULONG) Release();
+
+  // *** IContextMenu ***
+  STDMETHODIMP QueryContextMenu(HMENU hmenu,
+                          UINT indexMenu, UINT idCmdFirst,
+                          UINT idCmdLast, UINT uFlags);
+  STDMETHODIMP InvokeCommand(
+                          LPCMINVOKECOMMANDINFO lpici);
+  STDMETHODIMP GetCommandString(
+                          UINT_PTR    idCmd,
+                          UINT        uType,
+                          UINT      * pwReserved,
+                          LPSTR       pszName,
+                          UINT        cchMax);
+
+  // *** IContextMenu2 ***
+  STDMETHODIMP HandleMenuMsg(
+                          UINT uMsg,
+                          WPARAM wParam,
+                          LPARAM lParam);
+
+  // *** IContextMenu3 ***
+  STDMETHODIMP HandleMenuMsg2(
+                          UINT uMsg,
+                          WPARAM wParam,
+                          LPARAM lParam,
+                          LRESULT* plResult);
+
+  // Constructor
+  static HRESULT Create(IContextMenu **rgpcm, UINT cpcm,
+                        REFIID riid, void **ppv);
+
+private:
+
+  HRESULT Initialize(IContextMenu **rgpcm, UINT cpcm);
+  CCompositeContextMenu() : m_cRef(1), m_rgcmi(NULL), m_ccmi(0) { }
+  ~CCompositeContextMenu();
+
+  struct CONTEXTMENUINFO {
+    IContextMenu *pcm;
+    UINT cids;
+  };
+
+  HRESULT ReduceOrdinal(UINT_PTR *pidCmd, CONTEXTMENUINFO **ppcmi);
+
+private:
+  ULONG m_cRef;
+  CONTEXTMENUINFO *m_rgcmi;
+  UINT m_ccmi;
+};
+</pre>
+<p>
+The local structure <code>CONTEXTMENUINFO</code> contains
+information about each of the context menus that are part of
+our composite.  We need to have the context menu pointer itself,
+as well as the number of menu identifiers consumed by that
+context menu by its
+<code><a HREF="http://msdn.microsoft.com/library/en-us/shellcc/platform/shell/reference/ifaces/icontextmenu/QueryContextMenu.asp"
+>IContextMenu::QueryContextMenu</a></code> handler.
+We'll see why as we implement this class.
+</p>
+<pre>
+HRESULT CCompositeContextMenu::Initialize(
+    IContextMenu **rgpcm, UINT cpcm)
+{
+  m_rgcmi = new CONTEXTMENUINFO[cpcm];
+  if (!m_rgcmi) {
+    return E_OUTOFMEMORY;
+  }
+
+  m_ccmi = cpcm;
+  for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+    CONTEXTMENUINFO *pcmi = &amp;m_rgcmi[icmi];
+    pcmi-&gt;pcm = rgpcm[icmi];
+    pcmi-&gt;pcm-&gt;AddRef();
+    pcmi-&gt;cids = 0;
+  }
+
+  return S_OK;
+}
+</pre>
+<p>
+Since a C++ constructor cannot fail, there are various
+conventions for how one handles failure during construction.
+One convention, which I use here, is to put the bulk of
+the work in an <code>Initialize</code> method, which can
+return an appropriate error code if the initialization fails.
+</p>
+<p>
+(Note that here I am assuming a non-throwing <code>new</code> operator.)
+</p>
+<p>
+Our initialization function allocates a bunch of
+<code>CONTEXTMENUINFO</code> structures and copies the
+<code>IContextMenu</code> pointers (and <code>AddRef</code>s them)
+for safekeeping.  (Note that the <code>m_ccmi</code> member is
+not set until after we know that the memory allocation succeeded.)
+</p>
+<p>
+The destructor therefore undoes these operations.
+</p>
+<pre>
+CCompositeContextMenu::~CCompositeContextMenu()
+{
+  for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+    m_rgcmi[icmi].pcm-&gt;Release();
+  }
+  delete[] m_rgcmi;
+}
+</pre>
+<p>
+(If you don't understand the significance of the <code>[]</code>,
+<a HREF="/oldnewthing/archive/2004/02/03/66660.aspx">
+here's a refresher</a>.)
+</p>
+<p>
+The <code>Create</code> pattern you saw last time, so this
+shouldn't be too surprising.
+</p>
+<pre>
+HRESULT CCompositeContextMenu::Create(IContextMenu **rgpcm, UINT cpcm,
+                                      REFIID riid, void **ppv)
+{
+  *ppv = NULL;
+
+  HRESULT hr;
+  CCompositeContextMenu *self = new CCompositeContextMenu();
+  if (self) {
+    if (SUCCEEDED(hr = self-&gt;Initialize(rgpcm, cpcm)) &amp;&amp;
+        SUCCEEDED(hr = self-&gt;QueryInterface(riid, ppv))) {
+      // success
+    }
+    self-&gt;Release();
+  } else {
+    hr = E_OUTOFMEMORY;
+  }
+  return hr;
+}
+</pre>
+<p>
+And then the standard COM bookkeeping.
+</p>
+<pre>
+HRESULT CCompositeContextMenu::QueryInterface(REFIID riid, void **ppv)
+{
+  IUnknown *punk = NULL;
+  if (riid == IID_IUnknown) {
+    punk = static_cast&lt;IUnknown*&gt;(this);
+  } else if (riid == IID_IContextMenu) {
+    punk = static_cast&lt;IContextMenu*&gt;(this);
+  } else if (riid == IID_IContextMenu2) {
+    punk = static_cast&lt;IContextMenu2*&gt;(this);
+  } else if (riid == IID_IContextMenu3) {
+    punk = static_cast&lt;IContextMenu3*&gt;(this);
+  }
+
+  *ppv = punk;
+  if (punk) {
+    punk-&gt;AddRef();
+    return S_OK;
+  } else {
+    return E_NOINTERFACE;
+  }
+}
+
+ULONG CCompositeContextMenu::AddRef()
+{
+  return ++m_cRef;
+}
+
+ULONG CCompositeContextMenu::Release()
+{
+  ULONG cRef = --m_cRef;
+  if (cRef == 0) delete this;
+  return cRef;
+}
+</pre>
+<p>
+Now we reach our first interesting method:
+<code>IContextMenu::QueryContextMenu</code>:</p>
+<pre>
+HRESULT CCompositeContextMenu::QueryContextMenu(
+    HMENU hmenu, UINT indexMenu, UINT idCmdFirst,
+    UINT idCmdLast, UINT uFlags)
+{
+  UINT idCmdFirstOrig = idCmdFirst;
+  UINT cids = 0;
+
+  for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+    CONTEXTMENUINFO *pcmi = &amp;m_rgcmi[icmi];
+    HRESULT hr = pcmi-&gt;pcm-&gt;QueryContextMenu(hmenu,
+                    indexMenu, idCmdFirst, idCmdLast, uFlags);
+    if (SUCCEEDED(hr)) {
+      pcmi-&gt;cids = (USHORT)hr;
+      cids += pcmi-&gt;cids;
+      idCmdFirst += pcmi-&gt;cids;
+    }
+  }
+
+  return MAKE_HRESULT(SEVERITY_SUCCESS, 0, cids);
+}
+</pre>
+<p>
+We ask each contained context menu
+in turn to add its commands to the context menu.  Here is
+where you see one of the reasons for the return value of the
+<code>IContextMenu::QueryContextMenu</code> method.
+By telling tells the container how many menu identifiers
+you used, the container knows how many are left for others.
+The container then returns the total number of menu identifiers
+consumed by all of the context menus.
+</p>
+<p>
+Another reason for the return value of the
+<code>IContextMenu::QueryContextMenu</code> method
+is seen in the next helper method:
+</p>
+<pre>
+HRESULT CCompositeContextMenu::ReduceOrdinal(
+    UINT_PTR *pidCmd, CONTEXTMENUINFO **ppcmi)
+{
+  for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+    CONTEXTMENUINFO *pcmi = &amp;m_rgcmi[icmi];
+    if (*pidCmd &lt; pcmi-&gt;cids) {
+      *ppcmi = pcmi;
+      return S_OK;
+    }
+    *pidCmd -= pcmi-&gt;cids;
+  }
+  return E_INVALIDARG;
+}
+</pre>
+<p>
+This method takes a menu offset and figures out which
+of the contained context menus it belongs to,
+using the return value from
+<code>IContextMenu::QueryContextMenu</code> to decide
+how to divide up the identifier space.
+The <code>pidCmd</code> parameter is in/out.
+On entry, it's the menu offset for the composite
+context menu; on exit, it's the menu offset for
+the contained context menu that is returned via
+the <code>ppcmi</code> parameter.
+</p>
+<p>
+The <code>IContextMenu::InvokeCommand</code> is probably
+the most complicated, since it needs to support the
+four different ways of dispatching the command.
+</p>
+<pre>
+HRESULT CCompositeContextMenu::InvokeCommand(
+                            LPCMINVOKECOMMANDINFO lpici) {
+
+  CMINVOKECOMMANDINFOEX* lpicix =
+                reinterpret_cast&lt;CMINVOKECOMMANDINFOEX*&gt;(lpici);
+  BOOL fUnicode = lpici-&gt;cbSize &gt;= sizeof(CMINVOKECOMMANDINFOEX) &amp;&amp;
+                  (lpici-&gt;fMask &amp; CMIC_MASK_UNICODE);
+  UINT_PTR idCmd = fUnicode ? reinterpret_cast&lt;UINT_PTR&gt;(lpicix-&gt;lpVerbW)
+                            : reinterpret_cast&lt;UINT_PTR&gt;(lpici-&gt;lpVerb);
+
+  if (!IS_INTRESOURCE(idCmd)) {
+    for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+      HRESULT hr = m_rgcmi-&gt;pcm-&gt;InvokeCommand(lpici);
+      if (SUCCEEDED(hr)) {
+        return hr;
+      }
+    }
+    return E_INVALIDARG;
+  }
+
+  CONTEXTMENUINFO *pcmi;
+  HRESULT hr = ReduceOrdinal(&amp;idCmd, &amp;pcmi);
+  if (FAILED(hr)) {
+      return hr;
+  }
+
+  LPCWSTR pszVerbWFake;
+  LPCWSTR *ppszVerbW = fUnicode ? &amp;lpicix-&gt;lpVerbW : &amp;pszVerbWFake;
+  LPCSTR pszVerbOrig = lpici-&gt;lpVerb;
+  LPCWSTR pszVerbWOrig = *ppszVerbW;
+
+  lpici-&gt;lpVerb = reinterpret_cast&lt;LPCSTR&gt;(idCmd);
+  *ppszVerbW = reinterpret_cast&lt;LPCWSTR&gt;(idCmd);
+
+  hr = pcmi-&gt;pcm-&gt;InvokeCommand(lpici);
+
+  lpici-&gt;lpVerb = pszVerbOrig;
+  *ppszVerbW = pszVerbWOrig;
+
+  return hr;
+}
+</pre>
+<p>
+After some preliminary munging to find the command identifier,
+we dispatch the invocation in three steps.
+</p>
+<p>
+First, if the command is being dispatched as a string, then
+this is the easiest case.  We loop through all the contained
+context menus asking each one if it recognizes the command.
+Once one does, we are done.  And if nobody does, then we
+shrug and say we don't know either.
+</p>
+<p>
+Second, if the command being dispatched is an ordinal,
+we ask <code>ReduceOrdinal</code> to figure out which contained
+context menu handler it belongs to.
+</p>
+<p>
+Third, we rewrite the <code>CMINVOKECOMMANDINFO</code> structure
+so it is suitable for use by the contained context menu handler.
+This means changing the <code>lpVerb</code> member and possibly the
+<code>lpVerbW</code> member to contain the new menu offset relative
+to the contained context menu handler rather than being relative
+to the container.
+This is complicated slightly by the fact that the Unicode verb
+<code>lpVerbW</code> might not exist.  We hide that behind a
+<code>pszVerbWFake</code> local variable which stands in if
+there is no genuine <code>lpVerbW</code>.
+</p>
+<p>
+Okay, now that you see the basic idea behind distributing the
+method calls to the appropriate contained context menu, the
+rest should be comparatively easy.
+</p>
+<pre>
+HRESULT CCompositeContextMenu::GetCommandString(
+                            UINT_PTR    idCmd,
+                            UINT        uType,
+                            UINT      * pwReserved,
+                            LPSTR       pszName,
+                            UINT        cchMax)
+{
+  HRESULT hr;
+  if (!IS_INTRESOURCE(idCmd)) {
+    for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+      hr = m_rgcmi[icmi].pcm-&gt;GetCommandString(idCmd,
+                        uType, pwReserved, pszName, cchMax);
+      if (hr == S_OK) {
+        return hr;
+      }
+    }
+    if (uType == GCS_VALIDATEA || uType == GCS_VALIDATEW) {
+      return S_FALSE;
+    }
+    return E_INVALIDARG;
+  }
+
+  CONTEXTMENUINFO *pcmi;
+  if (FAILED(hr = ReduceOrdinal(&amp;idCmd, &amp;pcmi))) {
+    return hr;
+  }
+
+  return pcmi-&gt;pcm-&gt;GetCommandString(idCmd, uType,
+                        pwReserved, pszName, cchMax);
+}
+</pre>
+<p>
+The <code>GetCommandString</code> method follows the same
+three-step pattern as <code>InvokeCommand</code>.
+</p>
+<p>
+First, dispatch any string-based commands by calling each
+contained context menu handler until somebody accepts it.
+If nobody does, then reject the command.
+(Note the special handling of <code>GCS_VALIDATE</code>,
+which expects <code>S_FALSE</code> rather than an error code.)
+</p>
+<p>
+Second, if the command is specified by ordinal, ask
+<code>ReduceOrdinal</code> to figure out which contained
+context menu handler it belongs to.
+</p>
+<p>
+Third, pass the reduced command to the applicable contained
+context menu handler.
+</p>
+<p>
+The last methods are made easier by a little helper function:
+</p>
+<pre>
+HRESULT IContextMenu_HandleMenuMsg2(
+            IContextMenu *pcm, UINT uMsg, WPARAM wParam,
+            LPARAM lParam, LRESULT* plResult)
+{
+  IContextMenu2 *pcm2;
+  IContextMenu3 *pcm3;
+  HRESULT hr;
+  if (SUCCEEDED(hr = pcm-&gt;QueryInterface(
+                    IID_IContextMenu3, (void**)&amp;pcm3))) {
+    hr = pcm3-&gt;HandleMenuMsg2(uMsg, wParam, lParam, plResult);
+    pcm3-&gt;Release();
+  } else if (SUCCEEDED(hr = pcm-&gt;QueryInterface(
+                    IID_IContextMenu2, (void**)&amp;pcm2))) {
+    if (plResult) *plResult = 0;
+    hr = pcm2-&gt;HandleMenuMsg(uMsg, wParam, lParam);
+    pcm2-&gt;Release();
+  }
+  return hr;
+}
+</pre>
+<p>
+This helper function takes an <code>IContextMenu</code>
+interface pointer and tries to invoke
+<code>IContextMenu3::HandleMenuMsg2</code>; if that fails,
+then it tries <code>IContextMenu2::HandleMenuMsg</code>; and
+if that also fails, then it gives up.
+</p>
+<p>
+With this helper function, the last two methods are a piece of cake.
+</p>
+<pre>
+HRESULT CCompositeContextMenu::HandleMenuMsg(
+            UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+  LRESULT lres;   // thrown away
+  return HandleMenuMsg2(uMsg, wParam, lParam, &amp;lres);
+}
+</pre>
+<p>
+The <code>IContextMenu2::HandleMenuMsg</code> method is just
+a forwarder to the <code>IContextMenu3::HandleMenuMsg2</code>
+method:
+</p>
+<pre>
+HRESULT CCompositeContextMenu::HandleMenuMsg2(
+            UINT uMsg, WPARAM wParam, LPARAM lParam,
+            LRESULT* plResult)
+{
+  for (UINT icmi = 0; icmi &lt; m_ccmi; icmi++) {
+    HRESULT hr;
+    if (SUCCEEDED(hr = IContextMenu_HandleMenuMsg2(
+                    m_rgcmi[icmi].pcm, uMsg, wParam, lParam,
+                    plResult))) {
+      return hr;
+    }
+  }
+  return E_NOTIMPL;
+}
+</pre>
+<p>
+And the <code>IContextMenu3::HandleMenuMsg2</code> method
+merely walks through the list of context menu handlers,
+asking each one whether it wishes to handle the command,
+stopping when one finally does.
+</p>
+<p>
+Armed with this composite menu class, we can show it off
+in our sample program by compositing the "real" context menu
+with our <code>CTopContextMenu</code>, thereby showing
+how you can combine multiple context menus into one big
+context menu.
+</p>
+<pre>
+HRESULT GetCompositeContextMenuForFile(HWND hwnd,
+            LPCWSTR pszPath, REFIID riid, void **ppv)
+{
+  *ppv = NULL;
+  HRESULT hr;
+
+  IContextMenu *rgpcm[2] = { 0 };
+  if (SUCCEEDED(hr = GetUIObjectOfFile(hwnd, pszPath,
+                        IID_IContextMenu, (void**)&amp;rgpcm[0])) &amp;&amp;
+      SUCCEEDED(hr = CTopContextMenu::Create(
+                        IID_IContextMenu, (void**)&amp;rgpcm[1])) &amp;&amp;
+      SUCCEEDED(hr = CCompositeContextMenu::Create(rgpcm, 2, riid, ppv))) {
+      // yay
+  }
+  if (rgpcm[0]) rgpcm[0]-&gt;Release();
+  if (rgpcm[1]) rgpcm[1]-&gt;Release();
+
+  return hr;
+}
+</pre>
+<p>
+This function builds the composite by creating the two
+contained context menu handlers, then creating a composite
+context menu that contains both of them.  We can use this
+function by making the same one-line tweak to the
+<code>OnContextMenu</code> function that we tweaked last time:
+</p>
+<pre>
+void OnContextMenu(HWND hwnd, HWND hwndContext, int xPos, int yPos)
+{
+  POINT pt = { xPos, yPos };
+  if (pt.x == -1 &amp;&amp; pt.y == -1) {
+    pt.x = pt.y = 0;
+    ClientToScreen(hwnd, &amp;pt);
+  }
+
+  IContextMenu *pcm;
+  if (SUCCEEDED(<font COLOR=blue>GetCompositeContextMenuForFile(
+                    hwnd, L"C:\\Windows\\clock.avi",
+                    IID_IContextMenu, (void**)&amp;pcm)</font>)) {
+    ...
+</pre>
+<p>
+Notice that with this composite context menu, the menu help text
+that we update in our window title tracks across both the
+original file context menu and our "Top" context menu.
+Commands from either half are also invoked successfully.
+</p>
+<p>
+The value of this approach over the method from
+<a HREF="/oldnewthing/archive/2004/10/04/237507.aspx">
+part&nbsp;9</a>
+is that you no longer have to coordinate the customization of
+the context menu between two pieces of code.  Under the previous
+technique, you had to make sure that the code that updated the
+menu help text was in sync with the code that added the custom
+commands.
+</p>
+<p>
+Under the new method, all the customizations are kept in one
+place (in the "Top" context menu which is inside the
+composite context menu), so that the window procedure doesn't need
+to know what customizations have taken place.
+This becomes more valuable if there are multiple points at which
+context menus are displayed, some uncustomized, others customized
+in different ways.  Centralizing the knowledge of the customizations
+simplifies the design.
+</p>
+<p>
+Okay, I think that's enough on context menus for now.
+I hope you've gotten a better understanding of how they work,
+how you can exploit them, and most importantly, how you can
+perform meta-operations on them with techniques like composition.
+</p>
+<p>
+There are still some
+other things you can do with context menus, but I'm going to leave you
+to experiment with them on your own.  For example, you can use
+<a HREF="http://msdn.microsoft.com/library/en-us/shellcc/platform/shell/reference/ifaces/icontextmenu/getcommandstring.asp">
+the IContextMenu::GetCommandString method</a> to walk
+the menu and obtain a language-independent command mame
+for each item.
+This is handy if you want to, say, remove the "delete" option:
+You can look for the command whose language-independent name
+is "delete".  This name does not change when the user changes
+languages; it will always be in English.
+</p>
+<p>
+<a HREF="/oldnewthing/archive/2004/09/28/235242.aspx">
+As we've noticed before</a>, you need to be aware
+that many context menu handlers don't implement
+the IContextMenu::GetCommandString method fully,
+so there will likely be commands that you simply cannot get
+a name for.  Them's the breaks.
+</p>
+<p>
+[Editing errors corrected, 11am.]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (6)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-215343">
+				<div id="div-comment-215343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633#comment-215343">
+			October 7, 2004 at 9:42 am</a>		</div>
+
+		<hr />
+<p>Since a C++ constructor cannot fail, there are various conventions for how one handles failure during construction. One convention, which I use here, is to put the bulk of the work in an Initialize method, which can return an appropriate error code if the initialization fails.<br />
+<br />&#8212;&#8212;&#8212;</p>
+<p>Actually, the way you fail a C++ ctor is to throw an exception.  It will unwind the stack properly and will destroy appropriate obects if you throw in the middle of a ctor initialization.</p>
+<p>By putting your work in Initialize methods, you run the risk of not having fully formed objects, so that if an exception happens in between your ctor and initialize, your dtor could crash, causing all sorts of badness.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-215353">
+				<div id="div-comment-215353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.codeproject.com/script/articles/list_articles.asp?userid=152' rel='external nofollow' class='url'>Mike Dunn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633#comment-215353">
+			October 7, 2004 at 10:07 am</a>		</div>
+
+		<p>I&#8217;ll read the full post during my lunch break, but after a quick skim I&#8217;m confused by your CCompositeContextMenu::QueryInterface. If you do these steps:<br />
+<br />  IUnknown* punk;<br />
+<br />  punk = static_cast&lt;IContextMenu*&gt;(this);<br />
+<br />  *ppv = punk;<br />
+<br />Won&#8217;t the first assignment counteract the cast, since by C++ rules the rvalue gets converted to an IUnknown*? ((IContextMenu*)this) is going to be a different value than ((IUnknown*)this), so wouldn&#8217;t *ppv end up pointing at the wrong place in the vtbl?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-215363">
+				<div id="div-comment-215363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633#comment-215363">
+			October 7, 2004 at 10:50 am</a>		</div>
+
+		<p>It&#8217;s great to use a throwing model if your entire program follows it, but COM does not allow exceptions to be thrown across the COM boundary.</p>
+<p>Mike: I discussed this yesterday in a comment.</p>
+<p><a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/10/06/238630.aspx#239019" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/10/06/238630.aspx#239019</a></p>
+<p>The double-cast works due to the rules for COM object layout.  COM requires that</p>
+<p>(void*)(IBaseInterface*)(IDerivedInterface*)p == (void*)(IDerivedInterface*)p</p>
+<p>In other words, the implicit cast to IUnknown is required by COM rules not to change the numeric value of p.</p>
+<p>Most C++ compilers for Windows will conform to COM object layout rules if you set the right compiler flags or use the right macros.</p>
+<p><a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/10/05/238050.aspx" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/10/05/238050.aspx</a><br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-239113">
+				<div id="div-comment-239113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/2005/01/04/346274.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633#comment-239113">
+			January 4, 2005 at 10:00 am</a>		</div>
+
+		<p>Building a new enumerator by combining existing ones.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-357853">
+				<div id="div-comment-357853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.ailight.jp/blog/sha256/archive/2006/03/23/11241.aspx' rel='external nofollow' class='url'>社本＠ワック Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633#comment-357853">
+			March 22, 2006 at 1:33 pm</a>		</div>
+
+		<p>IContextMenu のホスト方法 &#8211; Shell</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-401273">
+				<div id="div-comment-401273" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://notgartner.com/posts/744.aspx' rel='external nofollow' class='url'>Community Blogs</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20041007-00/?p=37633#comment-401273">
+			July 16, 2006 at 11:16 am</a>		</div>
+
+		<p>I&#8217;ve been following in awe the series of posts (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) by Raymond Chen about</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

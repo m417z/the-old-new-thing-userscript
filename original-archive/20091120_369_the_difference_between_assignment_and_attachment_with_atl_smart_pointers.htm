@@ -1,0 +1,515 @@
+<html>
+<head>
+<title>The difference between assignment and attachment with ATL smart pointers</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The difference between assignment and attachment with ATL smart pointers</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 20, 2009 / year-entry #370</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>15</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Last time, I presented a puzzle regarding a memory leak. Here's the relevant code fragment: CComPtr<IStream> pMemoryStream; CComPtr<IXmlReader> pReader; UINT nDepth = 0; //Open read-only input stream pMemoryStream = ::SHCreateMemStream(utf8Xml, cbUtf8Xml); The problem here is assigning the return value of SHCreateMemStream to a smart pointer instead of attaching it. The SHCreateMemStream function creates a memory...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Last time,
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2009/11/19/9924950.aspx">
+I presented a puzzle regarding a memory leak</a>.
+Here's the relevant code fragment:
+</p>
+<pre>
+<font COLOR=red>CComPtr&lt;IStream&gt; pMemoryStream;</font>
+CComPtr&lt;IXmlReader&gt; pReader;
+UINT nDepth = 0;
+
+//Open read-only input stream
+<font COLOR=red>pMemoryStream = ::SHCreateMemStream(utf8Xml, cbUtf8Xml);</font>
+</pre>
+<p>
+The problem here is assigning the return value of
+<code>SHCreateMemStream</code> to a smart pointer
+instead of attaching it.
+</p>
+<p>
+The <code>SHCreateMemStream</code> function creates a memory stream
+and returns a pointer to it.
+That pointer has a reference count of one,
+in accordance with COM rules that a function
+<a HRef="http://msdn.microsoft.com/en-us/library/ms692481.aspx">
+which produces a reference calls <code>AddRef</code>,
+and the responsibility is placed upon the recipient
+to call <code>Release</code></a>.
+The assignment operator for <code>CComPtr&lt;T&gt;</code> is a copy operation:
+It <code>AddRef</code>s the pointer and saves it.
+You're still on the hook for the reference count of the original pointer.
+</p>
+<pre>
+ATLINLINE ATLAPI_(IUnknown*) AtlComPtrAssign(IUnknown** pp, IUnknown* lp)
+{
+        if (lp != NULL)
+                lp-&gt;AddRef();
+        if (*pp)
+                (*pp)-&gt;Release();
+        *pp = lp;
+        return lp;
+}
+
+template &lt;class T&gt;
+class CComPtr
+{
+public:
+        ...
+
+        T* operator=(T* lp)
+        {
+                return (T*)AtlComPtrAssign((IUnknown**)&amp;p, lp);
+        }
+</pre>
+<p>
+Observe that assigning a <code>T*</code> to a <code>CComPtr&lt;T&gt;</code>
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/04/06/108395.aspx">
+<code>AddRef</code>s the incoming pointer</a>
+and
+<code>Release</code>s the old pointer (if any).
+When the <code>CComPtr&lt;T&gt;</code> is destructed, it will release
+the pointer, undoing the <code>AddRef</code> that was performed by
+the assignment operator.
+In other words, assignment followed by destruction has a net effect
+of zero on the pointer you assigned.
+The operation behaves like a copy.
+</p>
+<p>
+Another way of putting a pointer into a <code>CComPtr&lt;T&gt;</code>
+is with the <code>Attach</code> operator.
+This is a transfer operation:
+</p>
+<pre>
+        void Attach(T* p2)
+        {
+                if (p)
+                        p-&gt;Release();
+                p = p2;
+        }
+</pre>
+<p>
+Observe that there is no <code>AddRef</code> here.
+When the <code>CComPtr&lt;T&gt;</code> is destructed,
+it will perform the <code>Release</code>,
+which doesn't undo any operation performed by the <code>Attach</code>.
+Instead, it releases the reference count held by the original pointer
+you attached.
+</p>
+<p>
+Let's put this in a table, since people seem to like tables:
+</p>
+<table BORDER=1 BORDERCOLOR=black STYLE="border-collapse: collapse"
+       CELLPADDING=3>
+<tr>
+<th>Operation</th>
+<th>Behavior</th>
+<th>Semantics</th>
+</tr>
+<tr>
+<td>Attach()</td>
+<td>Takes ownership</td>
+<td>Transfer semantics</td>
+</tr>
+<tr>
+<td>operator=()</td>
+<td>Creates a new reference</td>
+<td>Copy semantics</td>
+</tr>
+</table>
+<p>
+You use the <code>Attach</code> method when you want to assume
+responsibility for releasing the pointer (ownership transfer).
+You use the assignment operator when you want the original pointer
+to continue to be responsible for its own release (no ownership transfer).
+</p>
+<p>
+There is also a <code>Detach</code> method which is the opposite of
+<code>Attach</code>:
+Detaching a pointer from the <code>CComPtr&lt;T&gt;</code>
+means "I am taking over responsibility for releasing this pointer."
+The <code>CComPtr&lt;T&gt;</code> gives you its pointer and then forgets
+about it; you're now on your own.
+</p>
+<p>
+The memory leak in the code fragment above occurs because the
+assignment operator has copy semantics, but we wanted transfer
+semantics,
+since we want the smart pointer to take the responsibility for
+releasing the pointer when it is destructed.
+</p>
+<pre>
+pMemoryStream.Attach(::SHCreateMemStream(utf8Xml, cbUtf8Xml));
+</pre>
+<p>
+The <code>CComPtr&lt;T&gt;::operator=(T*)</code> method
+is definitely one of the more dangerous methods in the
+<code>CComPtr&lt;T&gt;</code> repertoire,
+because it's so easy to assign a pointer to a smart pointer
+without giving it a moment's thought.
+(Another dangerous method is the
+<code>T** CComPtr&lt;T&gt;::operator&()</code>,
+but at least that has an assertion to try to catch the bad usages.
+Even nastier is
+<a HREF="http://blogs.msdn.com/jaredpar/archive/2009/11/04/type-safety-issue-when-assigning-ccomptr-t-instances.aspx">
+the secret QI'ing assignment operator</a>.)
+I have to say that there is merit to
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2004/04/06/108395.aspx#108407">
+Ben Hutchings' recommendation</a> simply not to allow a simple pointer
+to be assigned to a smart pointer, precisely because the semantics are
+easily misunderstood.
+(The boost library, for example, follows Ben's recommendation.)
+</p>
+<p>
+Here's another exercise based on what you've learned:
+</p>
+<blockquote CLASS=q>
+<p>
+Application Verifier told us that we have a memory leak,
+and we traced it back to the
+function <code>GetTextAsInteger</code>.
+</p>
+<pre>
+BSTR GetInnerText(IXMLDOMNode *node)
+{
+    BSTR bstrText = NULL;
+    node-&gt;get_text(&amp;bstrText);
+    return bstrText;
+}
+
+DWORD GetTextAsInteger(IXMLDOMNode *node)
+{
+    DWORD value = 0;
+
+    CComVariant innerText = GetInnerText(node);
+    hr = VariantChangeType(&amp;innerText, &amp;innerText, 0, VT_UI4);
+    if (SUCCEEDED(hr))
+    {
+        value = V_UI4(&amp;innerText);
+    }
+
+    return value;
+}
+</pre>
+<p>
+Obviously, the problem is that we passed the same input and output
+pointers to <code>VariantChangeType</code>,
+causing the output integer to overwrite the input <code>BSTR</code>,
+resulting in the leak of the <code>BSTR</code>.
+But when we fixed the function, we still got the leak:
+</p>
+<pre>
+DWORD GetTextAsInteger(IXMLDOMNode *node)
+{
+    DWORD value = 0;
+
+    CComVariant innerText = GetInnerText(node);
+    <font COLOR=blue>CComVariant textAsValue;</font>
+    hr = VariantChangeType(&amp;innerText, &amp;<font COLOR=blue>textAsValue</font>, 0, VT_UI4);
+    if (SUCCEEDED(hr))
+    {
+        value = V_UI4(&amp;<font COLOR=blue>textAsValue</font>);
+    }
+
+    return value;
+}
+</pre>
+<p>
+Is there a leak in the <code>VariantChangeType</code> function itself?
+</p>
+</blockquote>
+<p>
+Hint: It is in fact explicitly documented that the output parameter
+to <code>VariantChangeType</code> can be equal to the input parameter,
+which results in an in-place conversion.
+There was nothing wrong with the original call to
+<code>VariantChangeType</code>.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (15)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-787933">
+				<div id="div-comment-787933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-787933">
+			November 20, 2009 at 7:10 am</a>		</div>
+
+		<p>The answer to this is right there in the docs (<a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/5b5cad6s%28VS.80%29.aspx" rel="nofollow">http://msdn.microsoft.com/en-us/library/5b5cad6s%28VS.80%29.aspx</a>):</p>
+<p>CComVariant&amp; operator =(LPCOLESTR lpszSrc);</p>
+<p>lpszSrc [in] The character string to be assigned to the CComVariant object. You can pass a zero-terminated wide (Unicode) character string to the LPCOLESTR version of the operator or an ANSI string to the LPCSTR version. In either case, the string is converted to a Unicode BSTR allocated using SysAllocString. The type of the CComVariant object will be VT_BSTR.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-787943">
+				<div id="div-comment-787943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.samholloway.co.uk/' rel='external nofollow' class='url'>Sam Holloway</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-787943">
+			November 20, 2009 at 7:21 am</a>		</div>
+
+		<p>This is one of the reasons why we prefer to use Microsoft&#8217;s _com_ptr_t instead &#8211; the semantics of the operator= are more &#8216;natural&#8217; and it&#8217;s more difficult for the novice to get it wrong.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-787953">
+				<div id="div-comment-787953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://adamrosenfield.com' rel='external nofollow' class='url'>Adam Rosenfield</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-787953">
+			November 20, 2009 at 7:56 am</a>		</div>
+
+		<p>Exact same problem the hint to yesterday&#8217;s puzzle (<a rel="nofollow" target="_new" href="http://blogs.msdn.com/oldnewthing/archive/2008/06/23/8640472.aspx" rel="nofollow">http://blogs.msdn.com/oldnewthing/archive/2008/06/23/8640472.aspx</a>): the BSTR decays into an LPCOLESTR, so CComVariant::operator= makes a copy of the BSTR and the original BSTR is leaked.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-787963">
+				<div id="div-comment-787963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-787963">
+			November 20, 2009 at 10:59 am</a>		</div>
+
+		<p>One of my favorite uses for the new move semantics in C++0x is getting to write:</p>
+<p>spFoo1(std::move(spFoo2));</p>
+<p>instead of</p>
+<p>spFoo1.Attach(spFoo2.Detach());</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-787983">
+				<div id="div-comment-787983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cooney</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-787983">
+			November 20, 2009 at 1:52 pm</a>		</div>
+
+		<blockquote><p>
+  One of my favorite uses for the new move semantics in C++0x is getting to write:
+</p></blockquote>
+<p>this looks interesting &#8211; got a link?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-787993">
+				<div id="div-comment-787993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Kyle</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-787993">
+			November 20, 2009 at 2:05 pm</a>		</div>
+
+		<blockquote><p>
+  &gt; One of my favorite uses for the new move semantics in C++0x is getting to write:</p>
+<p>  this looks interesting &#8211; got a link?
+</p></blockquote>
+<p>See <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/C%2B%2B0x#Rvalue_reference_and_move_semantics" rel="nofollow">http://en.wikipedia.org/wiki/C%2B%2B0x#Rvalue_reference_and_move_semantics</a> for details&#8230;it&#8217;s kind of a mind twister, tho.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-788003">
+				<div id="div-comment-788003" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.parkscomputing.com/' rel='external nofollow' class='url'>Paul M. Parks</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788003">
+			November 20, 2009 at 2:07 pm</a>		</div>
+
+		<p>@Cooney: For more info, and details on the VS2010 implementation:</p>
+<p><a rel="nofollow" target="_new" href="http://blogs.msdn.com/vcblog/archive/2009/02/03/rvalue-references-c-0x-features-in-vc10-part-2.aspx" rel="nofollow">http://blogs.msdn.com/vcblog/archive/2009/02/03/rvalue-references-c-0x-features-in-vc10-part-2.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-788013">
+				<div id="div-comment-788013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bekenn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788013">
+			November 20, 2009 at 2:15 pm</a>		</div>
+
+		<p>@Cooney: From Stroustrup himself: <a rel="nofollow" target="_new" href="http://www2.research.att.com/~bs/C++0xFAQ.html#rval" rel="nofollow">http://www2.research.att.com/~bs/C++0xFAQ.html#rval</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-788023">
+				<div id="div-comment-788023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788023">
+			November 20, 2009 at 3:46 pm</a>		</div>
+
+		<p>How do you look for memory leaks using Application Verifier? I have a simple program that leaks:</p>
+<p>CoInitialize(NULL);</p>
+<p>void *ptr=CoTaskMemAlloc(100);</p>
+<p>CoUninitialize();</p>
+<p>but the Verfier doesn&#8217;t say anything.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-788043">
+				<div id="div-comment-788043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Yuhong Bao</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788043">
+			November 20, 2009 at 10:23 pm</a>		</div>
+
+		<p>”Even nastier is the secret QI&#8217;ing assignment operator.“</p>
+<p>Yea, it is like late-binding in Visual Basic, only that VB makes errors more obvious.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-788073">
+				<div id="div-comment-788073" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Marvin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788073">
+			November 21, 2009 at 2:32 am</a>		</div>
+
+		<p>Your are wrong about Boost. It allows conversion from the raw pointer. You still can convert but just have to type the pointer class name again. Take a look at</p>
+<p><a rel="nofollow" target="_new" href="http://www.boost.org/doc/libs/1_40_0/libs/smart_ptr/intrusive_ptr.html" rel="nofollow">http://www.boost.org/doc/libs/1_40_0/libs/smart_ptr/intrusive_ptr.html</a></p>
+<p>This is Boost&#8217;s smart pointer that would work with COM. It doesn&#8217;t address the real issue that there is no single way to &quot;convert&quot; to begin with. For a COM smart pointer there should not be any direct conversion from the raw one.</p>
+<p>If you were talking about shared_ptr then this is a different beast that has very different semantics from the COM case. The whole issue of whether to attach or copy never arises there since count is external to the object. In other words the pointer always has the reference and &quot;Attach&quot; is impossible to begin with.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-788083">
+				<div id="div-comment-788083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788083">
+			November 21, 2009 at 8:58 am</a>		</div>
+
+		<p>AtlComPtrAssign could crash if releasing the old value causes the destruction of the CComPtr object.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-788223">
+				<div id="div-comment-788223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pm100</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788223">
+			November 23, 2009 at 10:38 am</a>		</div>
+
+		<p>thank heavens for CLR / c# / .net</p>
+<p>I dont have to worry about this stuff anymore, or at least almost :-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-788293">
+				<div id="div-comment-788293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JohnQPublic</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788293">
+			November 23, 2009 at 4:21 pm</a>		</div>
+
+		<p>&lt;i&gt;</p>
+<p>thank heavens for CLR / c# / .net</p>
+<p>I dont have to worry about this stuff anymore, or at least almost :-)</p>
+<p>&lt;/i&gt;</p>
+<p>Now it&#8217;s buried deeply enough that when something goes wrong, you&#8217;ve not got the tools to find it :(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-788493">
+				<div id="div-comment-788493" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://dmnewbie.blogspot.com' rel='external nofollow' class='url'>B.Y.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20091120-00/?p=15953#comment-788493">
+			November 24, 2009 at 10:10 am</a>		</div>
+
+		<p>This is the problem with features like smart pointers. You have to spent so much time to figure out tips and tricks and who knows what, you&#8217;re much better off if you just keep things simple and be diligent and use regular pointers. Well, I guess if people did that memory leaks wouldn&#8217;t be a big problem to begin with.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

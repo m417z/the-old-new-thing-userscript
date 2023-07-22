@@ -1,0 +1,777 @@
+<html>
+<head>
+<title>Lock-free algorithms: The singleton constructor</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Lock-free algorithms: The singleton constructor</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>April 6, 2011 / year-entry #83</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>25</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The first half may be familiar to many (most?) readers, but there's an interesting exercise at the bottom. A very useful pattern for the Interlocked* functions is lock-free lazy initialization via Interlocked­Compare­Exchange­Pointer­Release. Yes, that's a really long function name, but it turns out every part of it important. Widget *g_pwidCached; Widget *GetSingletonWidget() { Widget *pwid...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The first half may be familiar to many (most?) readers,
+but there's an interesting exercise at the bottom.
+</p>
+<p>
+A very useful pattern for the Interlocked* functions is
+lock-free lazy initialization via
+<code>Interlocked&shy;Compare&shy;Exchange&shy;Pointer&shy;Release</code>.
+Yes, that's a really long function name, but it turns out
+every part of it important.
+</p>
+<pre>
+Widget *g_pwidCached;
+
+Widget *GetSingletonWidget()
+{
+ Widget *pwid = g_pwidCached;
+ if (!pwid) {
+  pwid = new(nothrow) Widget();
+  if (pwid) {
+   Widget *pwidOld = reinterpret_cast&lt;Widget*&gt;
+       (InterlockedCompareExchangePointerRelease(
+          &amp;reinterpret_cast&lt;PVOID&amp;&gt;(g_pwidCached),
+          pwid, NULL));
+   if (pwidOld) {
+    delete pwid; // lost the race - destroy the redundant copy
+    pwid = pwidOld; // use the old one
+   }
+  }
+ }
+ return pwid;
+}
+</pre>
+<p>
+This is a double-check lock, but without the locking.
+Instead of taking lock when doing the initial construction,
+we just let it be a free-for-all over who gets to create the
+object.
+If five threads all reach this code at the same time,
+sure, let's create five objects.
+After everybody creates what they think is the winning object,
+they called
+<code>Interlocked&shy;Compare&shy;Exchange&shy;Pointer&shy;Release</code>
+to attempt to update the global pointer.
+</p>
+<p>
+The parts of the name of the
+<code>Interlocked&shy;Compare&shy;Exchange&shy;Pointer&shy;Release</code>
+function
+work like this:
+</p>
+<ul>
+<li><code>Interlocked</code>: The operation is atomic.
+    This is important to avoid two threads successfully updating
+    the value of <code>g_pwidCached</code>.
+</li>
+<li><code>Compare</code>: The value in <code>g_pwidCached</code>
+    is compared against <code>NULL</code>.
+</li>
+<li><code>Exchange</code>:
+    If the values are equal, then
+    <code>g_pwidCached</code> is set to <code>pwid</code>.
+    This, combined with the comparison, ensures that only one
+    thread gets to set the value of <code>g_pwidCached</code>.
+</li>
+<li><code>Pointer</code>:
+    The operations are on pointer-sized data.
+</li>
+<li><code>Release</code>:
+    The operation takes place with
+    <a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/10/03/8969397.aspx">
+    release semantics</a>.
+    This is important to ensure that the <code>pwid</code> we created
+    is fully-constructed before we publish its pointer to other
+    processors.
+</li>
+</ul>
+<p>
+This technique is suitable when it's okay to let multiple threads
+try to create the singleton (and have all the losers destroy
+their copy).
+If creating the singleton is expensive or has unwanted
+side-effects, then you don't want to use the free-for-all algorithm.
+</p>
+<p>
+Bonus reading:
+</p>
+<ul>
+<li>
+    <a HREF="http://msdn.microsoft.com/en-us/library/aa363808.aspx">
+    One-Time Initialization</a>
+    helper functions save you from having to write all this code
+    yourself.
+    They deal with all the synchronization and memory barrier
+    issues, and support both the one-person-gets-to-initialize
+    and the free-for-all-initialization models.
+</li>
+<li>
+    <a HREF="http://www.bluebytesoftware.com/blog/2007/06/09/ALazyInitializationPrimitiveForNET.aspx">
+    A lazy initialization primitive for .NET</a>
+    provides a C# version of the same.
+</li>
+</ul>
+<p>
+Okay, now here's the interesting exercise.
+This is an actual problem I helped out with,
+although details have been changed for expository purposes.
+</p>
+<blockquote CLASS=q>
+<p>
+We have a data structure which manages a bunch of singleton objects,
+let's say that they are instances of a structure
+called <code>ITEMCONTROLLER</code> and they are keyed by a 32-bit ID.
+We're looking for design suggestions on making it thread-safe.
+The existing code goes like this (pseudocode):
+</p>
+<pre>
+struct ITEMCONTROLLER;
+struct SINGLETONINFO {
+ DWORD dwId;
+ ITEMCONTROLLER *(*pfnCreateController)();
+};
+
+class SingletonManager {
+public:
+ // rgsi is an array that describes how to create the objects.
+ // It's a static array, with csi in the range 20 to 50.
+ SingletonManager(const SINGLETONINFO *rgsi, UINT csi)
+               : m_rgsi(rgsi), m_csi(csi),
+                 m_rgcs(NULL), m_ccs(0), m_ccsAlloc(0) { }
+ ~SingletonManager() { ... }
+ ITEMCONTROLLER *Lookup(DWORD dwId);
+
+private:
+ struct CREATEDSINGLETON {
+  DWORD dwId;
+  ITEMCONTROLLER *pic;
+ };
+
+private:
+ const SINGLETONINFO *m_rgsi;
+ int m_csi;
+
+ // Array that describes objects we've created
+ CREATEDSINGLETON *m_rgcs;
+ int m_ccs;
+};
+
+ITEMCONTROLLER *SingletonManager::Lookup(DWORD dwId)
+{
+ int i;
+
+ // See if we already created one
+ for (i = 0; i < m_ccs; i++) {
+  if (m_rgcs[i].dwId == dwId)
+   return m_rgcs[i].pic;
+ }
+
+ // Not yet created - time to create one
+ ITEMCONTROLLER *pic;
+ for (i = 0; i < m_rgsi; i++) {
+  if (m_rgsi[i].dwId == dwId) {
+   pic = m_rgsi[i].pfnCreateController();
+   break;
+  }
+ }
+ if (pic == NULL) return;
+
+ ... if m_rgcs == NULL then allocate it and update m_ccsAlloc
+ ... else realloc it bigger and update m_ccsAlloc
+
+ // append to our array so we can find it next time
+ m_rgcs[m_ccs].dwId = dwId;
+ m_rgcs[m_ccs].pic  = pic;
+ m_ccs++;
+
+ return pic;
+}
+</pre>
+<p>
+In words, the <code>SingletonManager</code> takes an array
+of <code>SINGLETONINFO</code> structures, each of which
+contains an ID and a function to call to create the object
+with that ID.
+To look up an entry, we first check if we already created one;
+if so, then we just return the existing one.
+Otherwise, we create the object (using <code>pfnCreateController</code>)
+and add it to our array of created objects.
+</p>
+<p>
+Our initial inclination is to put a critical section around
+the entire <code>Lookup</code> function, but maybe there's
+something more clever we can do here.
+Maybe a
+<a HREF="http://msdn.microsoft.com/en-us/library/aa904937.aspx">
+slim reader-writer lock</a>?
+</p>
+<p></m_ccs;></p>
+</blockquote>
+<p>
+<b>Bonus chatter</b>:
+Although it's the case on Windows that
+<a HREF="http://blogs.msdn.com/oldnewthing/archive/2008/10/03/8969397.aspx">
+the plain versions of the interlocked functions impose both acquire
+and release semantics</a>,
+other platforms may not follow Windows' lead.
+In particular,
+on the XBOX360 platform, the plain versions of the interlocked
+functions impose <u>neither</u> acquire nor release semantics.
+I don't know what the rules are for Windows CE.
+</p>
+<p>
+<b>Erratum</b>:
+I once knew but subsequently forgot that the
+singleton pattern described in this article
+(with the <code>InterlockedCompareExchangePointer</code>)
+is
+<a HREF="http://www.cs.umd.edu/~pugh/java/memoryModel/AlphaReordering.html">
+not safe on some CPU architectures</a>.
+An additional <code>MemoryBarrier()</code> needs to be inserted
+after the fetch of the single pointer to ensure that indirections
+through it will retrieve the new values and not any cached old values:
+</p>
+<pre>
+Widget *GetSingletonWidget()
+{
+ Widget *pwid = g_pwidCached;
+ if (!pwid) {
+  ...
+ } <font COLOR=blue>else {
+  // Ensure that dereferences of pwid access new values and not old
+  // cached values.
+  MemoryBarrier();</font>
+ }
+ return pwid;
+}
+</pre>
+<p>
+The discussion of lock-free algorithms continues
+(with probably more errors!) next time.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (25)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-905883">
+				<div id="div-comment-905883" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Walker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905883">
+			April 6, 2011 at 7:49 am</a>		</div>
+
+		<p>Re the name of InterlockedÂ­CompareÂ­ExchangeÂ­PointerÂ­Release: I have nothing at all against long names, if every part is descriptive. &nbsp;Some people who don&#39;t like long names tell me that the names take too long to type. &nbsp;As if their coding speed is limited by how fast they can type, which is a disturbing thought. &nbsp;These are some of the same people who love cryptic table aliases in T-SQL, and can&#39;t write a JOIN statement without them. &nbsp;Sorry, I am digressing&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-905893">
+				<div id="div-comment-905893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905893">
+			April 6, 2011 at 7:57 am</a>		</div>
+
+		<p>Whoa, good call on noting that the plain Interlocked* functions have neither acquire nor release semantics on the Xbox 360, I was not aware of that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-905913">
+				<div id="div-comment-905913" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jim Lyon</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905913">
+			April 6, 2011 at 9:02 am</a>		</div>
+
+		<p>The erratum, the note about XBox360 semantics, and the general chatter should be enough to scare people away from this style of programming, unless absolutely necessary.</p>
+<p>When asked whether one could do better than a critical section around the above code, my first question would be &quot;How many times per second is this function being called?&quot; If fewer than hundreds, a critical section is certainly fine. It may be fine up into the thousands of calls per second. Above that, I would completely refactor the function in question. (Any bets on whether absolutely every caller passes a constant dwId?).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-905923">
+				<div id="div-comment-905923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">tobi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905923">
+			April 6, 2011 at 9:21 am</a>		</div>
+
+		<p>I would be interested in what is the point of nothrow. Surely we would not want a NULL widget returned and instead fail the entire algorithm?</p>
+<div class="post">[<i>I find it interesting how everybody is quibbling about unimportant implementation details and not the point of the article. This usually means that <a href="http://en.wikipedia.org/wiki/Parkinson&#39;s_Law_of_Triviality" rel="nofollow">the topic is too advanced</a>. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-905933">
+				<div id="div-comment-905933" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905933">
+			April 6, 2011 at 9:32 am</a>		</div>
+
+		<p>I wrote this once, without the interlock. The object was a singleton only to reduce memory and load time (object takes ~100ms to load) and there was a garbage collector, so the worst case was a few were loaded when only one load was necessary.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-905953">
+				<div id="div-comment-905953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905953">
+			April 6, 2011 at 10:03 am</a>		</div>
+
+		<p>The use of realloc pretty much requires that you need to protect the whole thing with a lock, and in this case I think a read/write lock would work fine. Acquire a shared lock for the &quot;See if we already created one&quot; part, then release it. If you make it to &quot;Not yet created &#8211; time to create one&quot;, you need to acquire an exclusive lock.</p>
+<p>Note that since the lock is released between the two parts of the algorithm, the second part will have to make sure that the item it&#39;s trying to create wasn&#39;t created already. Ideally you would have an upgradable R/W lock for this, but Slim Reader/Writer (SRW) Locks don&#39;t support that feature.</p>
+<p>Also, no mention of .NET lazy initialization would be complete without a mention of the [new for 4.0] Lazy&lt;T&gt;: <a rel="nofollow" target="_new" href="http://msdn.microsoft.com/en-us/library/dd642331.aspx" rel="nofollow">msdn.microsoft.com/&#8230;/dd642331.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-905993">
+				<div id="div-comment-905993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905993">
+			April 6, 2011 at 11:27 am</a>		</div>
+
+		<p>Oh, and I forgot to mention: your example code has a serious bug &#8212; you forgot to initialize g_pwidCached to 0. It may contain random trash, and therefore pass the if (!pwid) test. Worse, it might only do that in release builds. </p>
+<div class="post">[<i>The C++ language specification disagrees with you. &quot;3.6.2: Objects with static storage duration shall be zero-initialized.&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906053">
+				<div id="div-comment-906053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906053">
+			April 6, 2011 at 12:10 pm</a>		</div>
+
+		<p>Sadly, I used to use one compiler that didn&#39;t guarantee implicit static initialization to 0.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-905873">
+				<div id="div-comment-905873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905873">
+			April 6, 2011 at 7:17 am</a>		</div>
+
+		<p>You seem to love reinterpret_cast too much. A hint for you: it&#39;s a cast of last resort, for cases where static_cast would not work. It&#39;s the most unsafest cast, and you don&#39;t give the compiler any chance to detect your mistakes. Even C-style cast is safer sometimes.</p>
+<div class="post">[<i>Was not aware that you could static_cast a void* to a T*. I use reinterpret_cast to emphasize &quot;no bits changing &#8211; I&#39;m just reinterpreting them.&quot; -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906063">
+				<div id="div-comment-906063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">scott</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906063">
+			April 6, 2011 at 2:22 pm</a>		</div>
+
+		<p>My assumption is that it is not too expensive to create the singleton.</p>
+<p>int ccs = m_ccs;</p>
+<p>ITEMCONTROLLER *oldpic = InterlockedCompareExchangeRelease(</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&amp;reinterpret_cast&lt;PVOID &amp;&gt;(m_rgcs[ccs].pic),</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;pic, NULL);</p>
+<p>if (oldpic) {</p>
+<p>delete pic;</p>
+<p>pic = m_rgcs[ccs].pic;</p>
+<p>} else {</p>
+<p>m_rgcs[ccs].dwId = dwId;</p>
+<p>InterlockedIncrementRelease(&amp;m_ccs);</p>
+<p>}</p>
+<p>return pic;</p>
+<div class="post">[<i>What if thread A asks for item dwId=1 and thread B asks for item dwId=2. Thread A&#39;s exchange succeeds. Thread B tries to exchange and fails, so it grabs the item from the array (which is for dwId=1) and returns it. Oops, we gave the wrong object to thread B. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906083">
+				<div id="div-comment-906083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mihailik</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906083">
+			April 6, 2011 at 2:30 pm</a>		</div>
+
+		<p>Surely in .NET one wouldn&#39;t want a luxury of built-in Lazy&lt;T&gt; class, neither indeed should one lazily rely on the guarantees of the runtime in &#39;static readonly&#39; construct.</p>
+<p>One should look for something vintage instead. At least 4 years old I mean.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906093">
+				<div id="div-comment-906093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Grigoriev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906093">
+			April 6, 2011 at 2:41 pm</a>		</div>
+
+		<p>This exercise contains two tasks:</p>
+<p>1. Finding/allocating a slot for the dwId. Iterate over the array until you find dwId or zero (or a reserved no-id value, if zero is a valid ID). If found dwId, go to step 2. If zero, try to do InterlockedCompareExchange to set it to dwId. If succeeded, step 2. Else, if the slot is taken, continue iteration.</p>
+<p>2. Fetching or creating the object, now that we found/claimed the slot. See the solution in the first half of this article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906103">
+				<div id="div-comment-906103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nksingh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906103">
+			April 6, 2011 at 2:46 pm</a>		</div>
+
+		<p>It seems like if the number of possible singleton ID&#39;s is small (in the 20s), the m_rgcs array should be statically sized in the constructor and pre-mapped to the singleton IDs. That is, you can pre-fill the m_rgcs[i].dwId field. &nbsp;You can then use the m_rgcs[i].pic field pointer to decide whether to create the object or not using the Windows InitOnce API or Raymond&#39;s code snippet above (which I believe is correct).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-905903">
+				<div id="div-comment-905903" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Billy O'Neal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905903">
+			April 6, 2011 at 8:34 am</a>		</div>
+
+		<p>Alex,</p>
+<p>You need to use reinterpret_cast in order to do the reference conversions Raymond is doing here. You can replace the one *around* the call to InterlockedCompareExchangePointerRelease with a static cast, but it really doesn&#39;t matter. The largest reason for reinterpret_cast being dangerous is that it allows platform specific conversions; but InterlockedCompareExchangePointerRelease is only going to compile on one platform (Windows) anyway, so there&#39;s really no large reason to avoid using it here. Considering both static_cast *and* reinterpret_cast will allow conversions from that void * into any other pointer type without difficulty.</p>
+<p>Billy3</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-905983">
+				<div id="div-comment-905983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-905983">
+			April 6, 2011 at 11:22 am</a>		</div>
+
+		<p>I am opposed to this style of programming in general, largely because it leads to maintainability headaches. Developers of singleton classes tend to expect that only one instance of the class will ever exist. </p>
+<p>What&#39;s wrong with this much simpler variation?:</p>
+<p>Widget *GetSingletonWidget()</p>
+<p>{</p>
+<p>&nbsp;static Widget *pwid = new Widget();</p>
+<p>&nbsp;return pwid;</p>
+<p>}</p>
+<p>Any compiler worth its salt will a) ensure that this is atomic, and b) that it only incurs the overhead of a lock once when the object is first created (modulo any concurrent calls to the function during that first initialization). </p>
+<div class="post">[<i>Prior to C++0x, the compiler is not obligated to ensure atomicity. (In fact, earlier versions of the C++ language <a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/03/08/85901.aspx" rel="nofollow">required the code to *not* be threadsafe</a>.) Also, the technique does not generalize: It doesn&#39;t help you with the exercise, for example. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-906123">
+				<div id="div-comment-906123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906123">
+			April 6, 2011 at 7:43 pm</a>		</div>
+
+		<p>&amp;reinterpret_cast&lt;PVOID&amp;&gt;(g_pwidCached),</p>
+<p>Um, ew. &nbsp;Can that be right?</p>
+<p>(1) can you cast a foo* to a void*&amp; ?</p>
+<p>(2) can you take the address of the result of cast?</p>
+<p>(3) surely &amp;g_pwidCached suffices (since the cast to void* is implicit?)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-906133">
+				<div id="div-comment-906133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906133">
+			April 6, 2011 at 7:46 pm</a>		</div>
+
+		<p>&gt; surely &amp;g_pwidCached suffices (since the cast to void* is implicit?)</p>
+<p>No&#8230; casting to void* is implicit but casting to void** is not. &amp;reinterpret_cast&lt;PVOID&amp;&gt;(g_pwidCached) is by no means more ugly than (void**)&amp;g_pwidCached.</p>
+<div class="post">[<i>I prefer to cast through void*&amp; because the cast is more obviously valid: You&#39;re taking a pointer to a widget and reinterpreting it as a generic pointer. Whereas it&#39;s not as obviously valid (to me) that you can take a pointer to a pointer to a widget and cast it to a pointer to a generic pointer. (Especially once you start throwing consts into the mix.)  But that&#39;s probably just me. Then again, it&#39;s my blog. On your blog, you can use (void**). -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906163">
+				<div id="div-comment-906163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Thorsten</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906163">
+			April 7, 2011 at 3:03 am</a>		</div>
+
+		<p>Sorry if this turns out to be a double post, but I thought I had posted it a few hours ago and it still hasn&#39;t shown up:</p>
+<p>The singleton manager can easily be implemented in a thread-safe, lock-free way by turning the array into a single linked list. Because items are only added and never removed during the lifetime of the singleton manager we don&#39;t even need to bother about defending against the ABA problem.</p>
+<p>In fact, I just recently implemented something similar (excuse the pascal, but I guess most developers should be able to read it):</p>
+<p>type</p>
+<p>&nbsp;TnxObjectExtender = class(TObject)</p>
+<p>&nbsp;private</p>
+<p>&nbsp; &nbsp;oeExtendedObject : TObject;</p>
+<p>&nbsp; &nbsp;oeNextExtender &nbsp; : TnxObjectExtender;</p>
+<p>&nbsp; &nbsp;constructor Create(aExtendedObject: TObject; aNextExtender: TnxObjectExtender);</p>
+<p>&#8230;</p>
+<p>&nbsp;end;</p>
+<p>&nbsp;TnxObjectExtenderFactory = class(TObject)</p>
+<p>&nbsp;private</p>
+<p>&#8230;</p>
+<p>&nbsp;public</p>
+<p>&#8230;</p>
+<p>&nbsp; &nbsp;class function Get&lt;T: TnxObjectExtender&gt;(aObject: TObject; out aExtender: T): Boolean; inline; static;</p>
+<p>&#8230;</p>
+<p>&nbsp;end;</p>
+<p>class function TnxObjectExtenderFactory.InternalGetOrCreate(aObject: TObject; aClassInfo: Pointer): TnxObjectExtender;</p>
+<p>var</p>
+<p>&nbsp;HiddenField : PPointer;</p>
+<p>&nbsp;Head &nbsp; &nbsp; &nbsp; &nbsp;: TnxObjectExtender;</p>
+<p>&nbsp;PrevHead &nbsp; &nbsp;: TnxObjectExtender;</p>
+<p>&nbsp;Current &nbsp; &nbsp; : TnxObjectExtender;</p>
+<p>&nbsp;NewExtender : TnxObjectExtender;</p>
+<p>begin</p>
+<p>&nbsp;If not Assigned(aObject) then</p>
+<p>&nbsp; &nbsp;Exit(nil);</p>
+<p>&nbsp;HiddenField := GetHiddenField(aObject);</p>
+<p>&nbsp;NewExtender := nil;</p>
+<p>&nbsp;try</p>
+<p>&nbsp; &nbsp;Head := nil;</p>
+<p>&nbsp; &nbsp;repeat</p>
+<p>&nbsp; &nbsp; &nbsp;{remember the the previous head, to shortcut the loop below}</p>
+<p>&nbsp; &nbsp; &nbsp;PrevHead := Head;</p>
+<p>&nbsp; &nbsp; &nbsp;Head := HiddenField^;</p>
+<p>&nbsp; &nbsp; &nbsp;{catch if the object is already in the process of being destroyed}</p>
+<p>&nbsp; &nbsp; &nbsp;if Head = Pointer($FFFFFFFF) then</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;Error(reInvalidPtr);</p>
+<p>&nbsp; &nbsp; &nbsp;{check if we already got an extender of that type} &nbsp;</p>
+<p>&nbsp; &nbsp; &nbsp;Current := Head;</p>
+<p>&nbsp; &nbsp; &nbsp;while Assigned(Current) do begin</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;if Current.ClassInfo = aClassInfo then</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{found it, we are done}</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;Exit(Current);</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;Current := Current.oeNextExtender;</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;if Current = PriorHead then</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{we already checked these the last time through, stop here&#8230;}</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;Current := nil;</p>
+<p>&nbsp; &nbsp; &nbsp;end;</p>
+<p>&nbsp; &nbsp; &nbsp;{didn&#39;t find it}</p>
+<p>&nbsp; &nbsp; &nbsp;if not Assigned(NewExtender) then</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;{first time, create the new extender}</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;NewExtender := TnxObjectExtenderClass(ClassInfoToClass(aClassInfo)).Create(aObject, Head)</p>
+<p>&nbsp; &nbsp; &nbsp;else</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;{we already created a new extender but weren&#39;t successful in adding it,</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp; just fix up the next pointer and try again}</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;NewExtender.oeNextExtender := Head;</p>
+<p>&nbsp; &nbsp; &nbsp;Current := NewExtender;</p>
+<p>&nbsp; &nbsp; &nbsp;if LockedCompareExchange(HiddenField^, Pointer(Current), Pointer(Head)) &lt;&gt; Head then</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;{somone else was faster, loop}</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;Current := nil</p>
+<p>&nbsp; &nbsp; &nbsp;else</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;{success, make sure the new extender that has been inserted doesn&#39;t get freed}</p>
+<p>&nbsp; &nbsp; &nbsp; &nbsp;NewExtender := nil; &nbsp; &nbsp;</p>
+<p>&nbsp; &nbsp;until Assigned(Current);</p>
+<p>&nbsp; &nbsp;Result := Current;</p>
+<p>&nbsp;finally</p>
+<p>&nbsp; &nbsp;if Assigned(NewExtender) then begin</p>
+<p>&nbsp; &nbsp; &nbsp;NewExtender.oeNextExtender := nil;</p>
+<p>&nbsp; &nbsp; &nbsp;NewExtender.oeExtendedObject := nil;</p>
+<p>&nbsp; &nbsp; &nbsp;NewExtender.Free;</p>
+<p>&nbsp; &nbsp;end;</p>
+<p>&nbsp;end;</p>
+<p>end;</p>
+<p>Given that this blog software is bound to mangle the code above, here is a more readable version: <a rel="nofollow" target="_new" href="http://pastebin.com/ymNWZu2Z" rel="nofollow">http://pastebin.com/ymNWZu2Z</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906243">
+				<div id="div-comment-906243" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">tobi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906243">
+			April 7, 2011 at 7:42 am</a>		</div>
+
+		<p>&quot;I find it interesting how everybody is quibbling about unimportant implementation details and not the point of the article.&quot; Yet you are discussing the correct way to cast a pointer! I think there is nothing wrong with going a bit off topic and following what is interesting. However I&#39;m guest at your place and will respect your rules. If the blog software supports making comments invisible you could punish off topic messages by hiding them and inserting a message for the author. I would like that.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906173">
+				<div id="div-comment-906173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906173">
+			April 7, 2011 at 3:50 am</a>		</div>
+
+		<p>It&#39;s possible to avoid reinterpret_cast by making g_pwidCached a void pointer, and then you only have to deal with a few static casts. But that&#39;s just me quibbling about unimportant implementation details.</p>
+<p> Widget *pwid = static_cast&lt;Widget*&gt;(g_pwidCached);</p>
+<p> if (!pwid) {</p>
+<p> &nbsp;pwid = new(nothrow) Widget();</p>
+<p> &nbsp;if (pwid) {</p>
+<p> &nbsp; Widget *pwidOld = static_cast&lt;Widget*&gt;</p>
+<p> &nbsp; &nbsp; &nbsp; (InterlockedCompareExchangePointerRelease(</p>
+<p> &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&amp;g_pwidCached, pwid, NULL));</p>
+<div class="post">[<i>Also delete static_cast&lt;Widget*&gt;(g_pwidCached); Things get messier if g_pwidCached is a smart pointer with an overloaded operator&amp;. It boils down to whether it&#39;s better to cast each time you use it or to cast each time you initialize it. I prefer the latter because you know you&#39;re doing something funky when you&#39;re initializing it, whereas you&#39;re not accustomed to having to take special action when just using it. Perhaps union { void *pv; Widget *pwid; } would be cleaner. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906203">
+				<div id="div-comment-906203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906203">
+			April 7, 2011 at 7:24 am</a>		</div>
+
+		<p>[I prefer to cast through void*&amp; because the cast is more obviously valid: You&#39;re taking a pointer to a widget and reinterpreting it as a generic pointer. Whereas it&#39;s not as obviously valid (to me) that you can take a pointer to a pointer to a widget and cast it to a pointer to a generic pointer. (Especially once you start throwing consts into the mix.) But that&#39;s probably just me. Then again, it&#39;s my blog. On your blog, you can use (void**). -Raymond]</p>
+<p>Yep, it&#39;s your blog, and you can use whatever style you wish. &nbsp;Personally, I think the cast to (void**) is clearer, because on all of the platforms that I write code for, all pointers are the same size. &nbsp;It&#39;s guaranteed by the C/C++ standards that sizeof(void*) &gt;= sizeof(T*) for all T, but there are some less common systems where equality does not hold for all types T.</p>
+<p>For example, if you were writing code for Win16, then near pointers are 16 bits whereas void* is a far pointer and is 32 bits. &nbsp;So don&#39;t try to use this code on Win16, since the Interlocked functions require DWORDs, and sizeof(near pointer) != sizeof(DWORD).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906313">
+				<div id="div-comment-906313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ray Trent</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906313">
+			April 7, 2011 at 9:40 am</a>		</div>
+
+		<p>Hmm&#8230; learn something new every day about the zero-initialization thing&#8230;</p>
+<p>Anyway, the reason I said &quot;any compiler worth its salt&quot; is that if static initialization is not guaranteed to be atomic by every compiler you use (when compiled with multithreaded options and linked with multithreaded libraries) then the *correct* solution is to throw away the compiler and get a reasonable one. Massively complicating your code to solve problems with inferior tools is a huge waste of time and a giant barrier to maintainability. </p>
+<p>VC++ does this right (any reasonable modern version). </p>
+<p>And it does generalize, you just have to put the static inside the controller function for creating the singleton class. Please tell me that creation functions for singleton classes can reasonably assume only one object of the class needs to be created. It does mean you need a different factory function for each class&#8230; but we&#39;re talking about C++ here, right?</p>
+<div class="post">[<i>It doesn&#39;t generalize to the controller, because the objects are singletons *with respect to a specific SingletonManager*. There can be more than one SingletonManager. After all, if this were for process-global singletons, then you wouldn&#39;t need a manager at all. Just make each object implement its own static singleton. (I guess I will have to elaborate on this in a separate article since one-sentence explanations aren&#39;t cutting it.) -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906363">
+				<div id="div-comment-906363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906363">
+			April 7, 2011 at 12:39 pm</a>		</div>
+
+		<p>&quot;An additional MemoryBarrier() needs to be inserted after the fetch of the single pointer to ensure that indirections through it will retrieve the new values and not any cached old values&quot;</p>
+<p>With the singleton pattern shown here, how can there be &quot;old values&quot; and &quot;new values&quot;? g_pwidCached is NULL initially, and once assigned a non-NULL value, it never changes.</p>
+<p>AFAICS, the barrier should only be required if the pointer can change from one non-NULL value to another non-NULL value, as in read-copy-update (RCU) for example.</p>
+<div class="post">[<i>Did you read the linked article?</p>
+<p><code>Widget::Widget() : m_Burgle(2011) { }<br />int *pi = new int(42); // pi = 0x10000, say<br />delete pi; // memory freed<br />Widget *pwid = GetSingletonWidget(); // pwid = 0x10000 (memory reused)<br />print(pwid-&gt;m_Burgle);</code></p>
+<p>This might print 42 because the CPU had cached that the value 42 was stored at 0x10000. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-906413">
+				<div id="div-comment-906413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KT</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906413">
+			April 7, 2011 at 11:38 pm</a>		</div>
+
+		<p>Ah, thanks for the clarification. (On first read I thought you meant old values obtained through an old g_pwidCached pointer value.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-906543">
+				<div id="div-comment-906543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">js</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20110406-00/?p=11023#comment-906543">
+			April 9, 2011 at 6:34 pm</a>		</div>
+
+		<p>The Alpha example is a fascinating one. It&#39;s amazing that they sold a processor that can reorder dependent reads. Unlike every other memory reordering I can think of, this is one where you can&#39;t really understand it as a reordering of the instruction stream, since doing so violates causality! You really just have to think about it in terms of how a cache is implemented, and then it doesn&#39;t seem so strange, just annoying.</p>
+<p>Thankfully, modern explicitly don&#39;t reorder dependent reads. The bizarro Alpha days are over.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

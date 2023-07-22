@@ -1,0 +1,424 @@
+<html>
+<head>
+<title>Semaphores don't have owners</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Semaphores don&#8217;t have owners</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 23, 2005 / year-entry #359</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>16</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Unlike mutexes and critical sections, semaphores don't have owners. They merely have counts. The ReleaseSemaphore function increases the count associated with a semaphore by the specified amount. (This increase might release waiting threads.) But the thread releasing the semaphore need not be the same one that claimed it originally. This is different from mutexes and...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Unlike mutexes and critical sections,
+semaphores don't have owners.
+They merely have counts.
+</p>
+<p>
+<a HREF="http://msdn.microsoft.com/library/en-us/dllproc/base/releasesemaphore.asp">
+The <code>ReleaseSemaphore</code> function</a>
+increases the count associated with a semaphore
+by the specified amount.
+(This increase might release waiting threads.)
+But the thread releasing the semaphore need not be the same
+one that claimed it originally.
+This is different from mutexes and critical sections,
+which require that the claiming thread also be the releasing one.
+</p>
+<p>
+<a HREF="http://groups-beta.google.com/group/microsoft.public.win32.programmer.kernel/msg/1719b379039097fc">
+Some people use semaphores in a mutex-like manner</a>:
+They create a semaphore with initial count&nbsp;1 and
+use it like this:
+</p>
+<pre>
+WaitForSingleObject(hSemaphore, INFINITE);
+... do stuff ..
+ReleaseSemaphore(hSemaphore, 1, NULL);
+</pre>
+<p>
+If the thread exits (or crashes) before it manages to release the semaphore,
+the semaphore counter is not automatically restored.
+Compare mutexes, where the mutex is released if the owner thread
+terminates while holding it.
+For this pattern of usage, a mutex is therefore preferable.
+</p>
+<p>
+A semaphore is useful if the conceptual ownership of a resource
+can cross threads.
+</p>
+<pre>
+WaitForSingleObject(hSemaphore, INFINITE);
+... do some work ..
+... continue on a background thread ...
+HANDLE hThread = CreateThread(NULL, 0, KeepWorking, ...);
+if (!hThread) {
+  ... abandon work ...
+  ReleaseSemaphore(hSemaphore, 1, NULL); // release resources
+}
+
+DWORD CALLBACK KeepWorking(void* lpParameter)
+{
+  ... finish working ...
+  ReleaseSemaphore(hSemaphore, 1, NULL);
+  return 0;
+}
+</pre>
+<p>
+This trick doesn't work with a mutex or critical section because
+mutexes and critical sections have owners, and only the owner can
+release the mutex or critical section.
+</p>
+<p>
+Note that if the <code>KeepWorking</code> function exits and
+forgets to release the semaphore, then the counter is not
+automatically restored.  The operating system doesn't know that
+the semaphore "belongs to" that work item.
+</p>
+<p>
+Another common usage pattern for a semaphore is the opposite of
+the resource-protection pattern: It's the resource-generation
+pattern.  In this model the semaphore count normally is zero,
+but is incremented when there is work to be done.
+</p>
+<pre>
+... produce some work and add it to a work list ...
+ReleaseSemaphore(hSemaphore, 1, NULL);
+
+// There can be more than one worker thread.
+// Each time a work item is signalled, one thread will
+// be chosen to process it.
+DWORD CALLBACK ProcessWork(void* lpParameter)
+{
+  for (;;) {
+    // wait for work to show up
+    WaitForSingleObject(hSemaphore, INFINITE);
+    ... retrieve a work item from the work list ...
+    ... perform the work ...
+  }
+  // NOTREACHED
+}
+</pre>
+<p>
+Notice that in this case, there is not even a conceptual
+"owner" of the semaphore, unless you count the work item itself
+(sitting on a work list data structure somewhere)
+as the owner.  If the <code>ProcessWork</code> thread exits,
+you do <strong>not</strong> want the semaphore to be released
+automatically; that would mess up the accounting.
+A semaphore is an appropriate object in this case.
+</p>
+<p>
+(A higher performance version of the producer/consumer semaphore
+is the
+<a HREF="http://msdn.microsoft.com/library/en-us/fileio/base/i_o_completion_ports.asp">
+I/O completion port</a>.)
+</p>
+<p>
+Armed with this information, see if you can answer
+<a HREF="http://groups.google.com/groups?selm=5ca11246.0110092312.1a40ca2e@posting.google.com">
+this person's question</a>.
+</p>
+<p>
+[Raymond is currently away; this message was pre-recorded.]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (16)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-323763">
+				<div id="div-comment-323763" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323763">
+			November 23, 2005 at 10:25 am</a>		</div>
+
+		<p>I think SEM_UNDO is mainly designed to implement mutex behavior. That said, I have run into this problem before, and ended up just writing a program to call ReleaseSemaphore. I can&#8217;t think of any other solution that doesn&#8217;t involve some sort of SemaphoreManager Service.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-323773">
+				<div id="div-comment-323773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gopal Sagar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323773">
+			November 23, 2005 at 10:35 am</a>		</div>
+
+		<p>That (very first piece of pseudocode) is an ugly use of semaphore. Why would you want to do that? I have found CriticalSection highly useful for this purpose. In order to avoid the &#8216;forgetting-to-release&#8217; problem, I always wrap the CriticalSection &#8211; or CriticalSection containing class object &#8211; in a local on-the-stack object that has EnterCriticalSection in its constructor and LeaveCriticalSection in the destructor. Highly effective.</p>
+<p>I was also told (but have not verified it) that CriticalSections are faster and cheaper than Mutexes.</p>
+<p>For me, the best use of semaphore is when one or more threads wait for work, as in the last piece of pseudocode in the article.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-323783">
+				<div id="div-comment-323783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Moasat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323783">
+			November 23, 2005 at 10:53 am</a>		</div>
+
+		<p>To answer &quot;this person&#8217;s question&quot; &#8211; one way might be to have a separate thread that will wait on the Process or Thread handle that &quot;owns&quot; the semaphore.  Then, if the handle of the process or thread gets signaled, the waiting thread would know to release the semaphore.  This may not be the most elegant solution, just something off the top of my head.  You wouldn&#8217;t want too many of these threads just sitting around waiting though.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-323833">
+				<div id="div-comment-323833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323833">
+			November 23, 2005 at 12:40 pm</a>		</div>
+
+		<ul>
+<li>Why you should always check return values &#8211;
+<p>I recently debugged an app where the author attempted to take a CriticalSection on thread and A relase it on thread B.  He wasn&#8217;t checking the return type of LeaveCriticalSection and had no idea that it was failing.  Subsequent attempts to enter the CriticalSection would always succeed because thread A was still the owner.  The net result was that he had no synchronization.</li>
+</ul>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-323843">
+				<div id="div-comment-323843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">E@</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323843">
+			November 23, 2005 at 12:48 pm</a>		</div>
+
+		<p>&quot;If the thread exits (or crashes) before it manages to release the semaphore, the semaphore counter is not automatically restored. Compare mutexes, where the mutex is released if the owner thread terminates while holding it. For this pattern of usage, a mutex is therefore preferable.&quot;</p>
+<p>It seems to me that if your thread is exiting (without releasing) or crashing, you&#8217;re already in a seriously bad place and the locking semantics are the least of your concerns&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-323853">
+				<div id="div-comment-323853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323853">
+			November 23, 2005 at 1:01 pm</a>		</div>
+
+		<p>Hi Raymond.  It looks like the resource-protection pattern you demonstrated could also be done using event objects, right?</p>
+<p><a rel="nofollow" target="_new" href="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/dllproc/base/event_objects.asp" rel="nofollow">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/dllproc/base/event_objects.asp</a></p>
+<p>Although admittedly, I have only used the .NET wrapper classes (AutoResetEvent and ManualResetEvent).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-323863">
+				<div id="div-comment-323863" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">X</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323863">
+			November 23, 2005 at 1:04 pm</a>		</div>
+
+		<p>Adam &#8211; you can&#8217;t check the return of LeaveCriticalSection because the return type is void!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-323873">
+				<div id="div-comment-323873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Dunn</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323873">
+			November 23, 2005 at 2:27 pm</a>		</div>
+
+		<p>A design that I&#8217;m fond of &#8211; when all the data is in one process &#8211; is to use messages to wake up a worker thread. The thread creates a msg queue and then blocks in GetMessage(). When some work needs to be done, the main thread calls PostThreadMessage() to wake up the worker, passing an item ID or whatever the thread needs to retrieve the work item. Once the work is done, the thread blocks again in GetMessage().<br />
+<br />Cleanup is simple: PostThreadMessage(WM_QUIT).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dean-harding even thread-even depth-1" id="comment-323923">
+				<div id="div-comment-323923" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Dean+Harding' rel='external nofollow' class='url'>Dean Harding</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323923">
+			November 23, 2005 at 6:41 pm</a>		</div>
+
+		<p>Mike: But using a semphore means Windows takes care of picking which thread to run, rather than having to do some sort of &quot;load balancing&quot; manually.</p>
+<p>E@: Just because one thread crashes doesn&#8217;t always mean the whole process should exit &#8211; a robust server should be able to continue to function regardless. But that would not be possible if you haven&#8217;t properly managed your resources.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-323953">
+				<div id="div-comment-323953" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jonathan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323953">
+			November 24, 2005 at 2:48 am</a>		</div>
+
+		<p>Mike: That&#8217;s what completion ports are for.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-323963">
+				<div id="div-comment-323963" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">gnobal</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323963">
+			November 24, 2005 at 3:18 am</a>		</div>
+
+		<p>OFF TOPIC:</p>
+<p>Raymond, your name was mentioned in a CodeProject article. I thought the name mentions with regards to .NET Framework 2.0 performance is kind of funny:<br />
+<br /><a rel="nofollow" target="_new" href="http://www.codeproject.com/useritems/CSharpBenchmark.asp" rel="nofollow">http://www.codeproject.com/useritems/CSharpBenchmark.asp</a><br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-323983">
+				<div id="div-comment-323983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">AC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-323983">
+			November 24, 2005 at 5:34 am</a>		</div>
+
+		<p>Matt: As far as I understand, under some limitations, both resource protection and resource generation can be done with events. So the examples that really demonstrate the needs for semaphores should be more complicated than the ones in article (specifying how many threads can do which peace of the code concurrently etc)?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-324033">
+				<div id="div-comment-324033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Martin James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-324033">
+			November 24, 2005 at 8:28 am</a>		</div>
+
+		<p>I have tested/used several different classes of Producer-Consumer queue.</p>
+<p>Semaphore-based queues are reliable and easy to understand for newbie multiThreaders, though slowish because a Wagnerian ring-cycle kernel call is always required for every push/pop, something that is avoidable with some other queue classes.  Another factor is that, if there are consumers waiting, a producer does not know which consumer thread will be made ready by its push and so cannot directly supply its object to the consumer target address &#8211; it has to put the object onto the queue and a consumer has to, later, retrieve it, (slow).  OTOH, the single wait-object allows consumer threads to use the semaphore handle in WaitForMultipleObject calls and so can wait on other resources as well as the queue. </p>
+<p>A Windows message queue has the crippling constraint of only allowing a single thread to wait &#8211; the one that created it. This is fine for the intended purpose of such queues, but pretty useless for general-purpose inter-thread comms where a pool of work threads want to wait on one queue, or a queue of pooled objects is shared by many threads.   In addition, getMessage has no direct timemout and requires an additional Windows timer to be created to emulate that functionality.</p>
+<p>I have tried some queue classes that use a single event upon which all consumers wait.  This works.. for a time. In a test app that uses a non-INFINITE timeout in the &#8216;pop&#8217; call, the app deadlocks after some seconds of heavy load.  Direct substitution of a semaphore queue  in the same app eliminates the deadlock.</p>
+<p>The only form of event-based P-C queue that I have found consistently reliable has a seperate event allocated for every consumer that needs to wait.  Such an approach has other advantages, but reliability is the most important :)</p>
+<p>As for IOCP queues, they are even slower than either a semaphore queue or a WMQ, never mind  faster queue classes.  Worse, creating more than about four of them in one app causes &#8216;incidents&#8217; under heavy load.  One IOCP queue in a server, for which it was originally designed, is fine, else&#8230;</p>
+<p>Rgds,<br />
+<br />Martin</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-324103">
+				<div id="div-comment-324103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">memet</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-324103">
+			November 24, 2005 at 11:32 am</a>		</div>
+
+		<p>Martin:<br />
+<br />&gt; I have tried some queue classes that use a single event upon which all consumers wait. This works.. for a time. In a test app that uses a non-INFINITE timeout in the &#8216;pop&#8217; call, the app deadlocks after some seconds of heavy load. Direct substitution of a semaphore queue in the same app eliminates the deadlock. </p>
+<p>Have you tried determining why the deadlock occurs? (with a petri net or some sort of abstract analysis). How can you be sure that the semaphore eliminates the deadlock? Maybe it would still occur on a multi-proc system?<br />
+<br /> I&#8217;m also kind of curious why it happens in the first place.<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-324213">
+				<div id="div-comment-324213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matin James</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-324213">
+			November 24, 2005 at 1:55 pm</a>		</div>
+
+		<p>I do not know why the deadlock occurred. The test app simply circulated objects around between producer threads, consumer threads and a pool of objects.  I am afraid I cannot recollect how many  producers/consumers there were, the value of timeout set on the pool queue &#8216;getObject&#8217; or any other paraemters. The various queue types were easily swapped around since they were all descended from one abstract &#8216;Tmailbox&#8217; class and created virtually using a class type.  After a few seconds of flat-out operation with the simple one-event queue, the object transfer rate dropped to zero, as did CPU use.  Changing the queue class to a semaphore-based queue, but no other parameters, allowed the app to run all night with no deadlocks and no lost or duplicated objects.  I did not pursue the matter further.</p>
+<p>I would not like to publish the one-event code because it is not mine.  The semaphore queue is as simple as might be expected &#8211; a &#8216;classic&#8217; queue class protected by a CS and a semaphore for the consumers to wait on.</p>
+<p>The effect of different processor toplogies was not investigated.</p>
+<p>I agree that it would have been &#8216;nice&#8217; to understand the precise failure mechanism, but the aim of my testing was to find the best queue class for my apps.  The single-event-based queue was very simple and, had it worked OK, I would have used it for less-demanding apps and/or demos where code simplicity was more important than performance, but with the failure on test I just dumped it.  In it&#8217;s defense, I have to add that, if an INFINITE timeout was specified, it worked fine.</p>
+<p></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-354053">
+				<div id="div-comment-354053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/03/13/550402.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20051123-14/?p=33233#comment-354053">
+			March 13, 2006 at 10:00 am</a>		</div>
+
+		<p>For the same reason that PulseEvent is fundamentally flawed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

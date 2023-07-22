@@ -1,0 +1,711 @@
+<html>
+<head>
+<title>A concrete illustration of practical running time vs big-O notation</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>A concrete illustration of practical running time vs big-O notation</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 12, 2009 / year-entry #174</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>29</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">One of the five things every Win32 programmer needs to know is that memory latency can throw your big-O computations out the window. Back in 2003, I ran into a concrete example of this. Somebody started with the algorithm presented in Fast Algorithms for Sorting and Searching Strings by Jon L. Bentley and Robert Sedgewick, implemented...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+One of the
+<a HREF="https://channel9.msdn.com/Showpost.aspx?postid=116704">
+five things every Win32 programmer needs to know</a>
+is that memory latency
+can throw your big-<i>O</i> computations out the window.
+Back in 2003, I ran into a concrete example of this.
+</p>
+<p>
+Somebody started with the algorithm presented in
+<a HREF="http://www.cs.princeton.edu/~rs/strings/">
+<i>Fast Algorithms for Sorting and Searching Strings</i></a>
+by
+<a HREF="http://www.cs.bell-labs.com/cm/cs/pearls/">
+Jon L.&nbsp;Bentley</a>
+and
+<a HREF="http://www.cs.princeton.edu/~rs/">
+Robert Sedgewick</a>,
+implemented it in C#, and compared the performance
+against a <code>HashTable</code>, <code>TernaryTree</code>
+and <code>SortedList</code>.
+Surprisingly, the hash table won on insertion and retrieval of
+tens of thousands of randomly-generated strings.
+Why?
+</p>
+<p>
+Remember, big-<i>O</i> notation hides the constants,
+and those constants can get pretty big.
+What's more, the impact of those constants is critical
+for normal-sized workloads.
+The big-<i>O</i> notation allows you to compare algorithms
+when the data sets become extremely large,
+but you have to keep the constants in mind
+to see when the balance tips.
+</p>
+<p>
+The central point of my presentation at the PDC was
+that complexity analysis typically ignores memory bandwidth effects
+and assumes that all memory accesses perform equally.
+This is rarely true in practice.
+As we saw, leaving L2 is a big hit on performance,
+and accessing the disk is an even greater hit.
+</p>
+<p>
+The tree doesn't rebalance,
+so inserting strings in alphabetical order
+will result in a bad search tree.
+(They do call this out in their paper.)
+To locate a <i>k</i>-character string,
+Bentley-Sedgewick traverses at least <i>k</i> pointers, usually more.
+("How much more" depends on how many prefixes are shared.
+More shared prefixes = more pointers traversed.)
+It also requires <i>k</i>(<i>4p</i>) bytes of memory to store that string,
+where <i>p</i> is the size of a pointer.
+Remember those pesky constants.
+High constant factor overhead starts to kill you
+when you have large datasets.
+</p>
+<p>
+More on those constants:
+Complexity analysis assumes that
+an add instruction executes in the same amount of time as a memory access.
+This is not true in practice,
+but the difference is a bounded constant factor,
+so it can be ignored for big-<i>O</i> purposes.
+Note, however, that that constant often exceeds
+one million if you take a page fault.
+One million is a big constant.
+</p>
+<p>
+Going back to memory bandwidth effects:
+At each node, you access one character and one pointer.
+So you use only 6 bytes out of a 64-byte cache line.
+You're wasting 90% of your bus bandwidth and you will certainly fall out of L2.
+</p>
+<p>
+Bentley-Sedgewick says that this is beaten out
+by not traversing the entire string being searched for in the case of a miss.
+<i>I.e., their algorithm is tuned for misses</i>.
+If you expect most of your probes to be misses, this can be a win.
+(The entire string is traversed on a hit,
+of course, so there is no gain for hits.)
+</p>
+<p>
+Note also that this "cost" for traversing the string on a miss
+is overstated due to memory bandwidth effects.
+The characters in a string are contiguous,
+so traversing the string costs you only <i>L</i>/64 cache lines,
+where <i>L</i> is the length of the string,
+and one potential page fault,
+assuming your string is less than 4KB.
+Traversing the tree structure costs you at least <i>L</i> cache lines
+and probably more depending on your branching factor,
+as well as <i>L</i> potential page faults.
+</p>
+<p>
+Let's look at the testing scenario again.
+The testing was only on hits,
+so the improved performance on misses was overlooked entirely.
+What's more,
+the algorithm takes advantage of strings with common prefixes,
+but the testing scenario used randomly-generated strings,
+which generates a data set opposite from the one the algorithm
+was designed for,
+since randomly-generated strings are spread out across the problem space
+instead of being clustered with common prefixes.
+</p>
+<p>
+Those are some general remarks; here are some performance notes
+specific to the CLR.</p>
+<p>
+I don't know whether it does or not, but
+I would not be surprised if <code>System.String.GetHashCode</code>
+caches the hash value in the string,
+which would mean that the cost of computing the hash
+is shared by everybody who uses it in a hashing operation.
+(Therefore, if you count the cost incurred only by the algorithm,
+hashing is free.)</p>
+<p>
+Note also that Bentley-Sedgewick's <code>insert()</code> function
+stores the object back into the tree in the recursive case.
+Most of the time, the value being stored is the same
+as the value that was already there.
+This dirties the cache line for no reason
+(forcing memory bandwidth to be wasted on a flush)
+and&mdash;particularly
+<a HREF="http://msdn2.microsoft.com/en-us/library/ms973837.aspx">
+painful for the CLR</a>&mdash;you hit
+the
+<a HREF="http://citeseer.ist.psu.edu/hosking92comparative.html">
+write barrier</a>
+and end up dirting a whole boatload of
+<a HREF="http://portal.acm.org/citation.cfm?doid=66068.66077">
+cards</a>.
+A very small change avoids this problem:
+Change
+</p>
+<pre>
+    p-&gt;eqkid = insert(p-&gt;eqkid, ++s); 
+</pre>
+<p>
+to
+</p>
+<pre>
+    Tptr newkid = insert(p-&gt;eqkid, ++s);
+    if (p-&gt;eqkid != newkid) p-&gt;eqkid = newkid;
+</pre>
+<p>
+(and similarly in the other branches).
+"This code is short but subtle, and worth careful study."  How very true.
+</p>
+<p>
+Note also that if you use their "sleazy hack" of
+coercing a string to a <code>Tptr</code>,
+you had to have changed the type of <code>eqkid</code> from
+<code>Tptr</code> to <code>object</code>.
+This introduces a CLR type-check into the inner loop.
+Congratulations, you just tubed the inner loop performance.
+</p>
+<p>
+Now go to the summary at the end of the article.</p>
+<ol>
+<li>"Ternary trees do not incur extra overhead
+    for insertion or successful searches."
+    I'm not sure what "extra" means here,
+    but hash tables have the same behavior.</p>
+<li>"Ternary trees are usually substantially faster
+    than hashing for unsuccessful searches."
+    Notice that they are optimized for misses.</p>
+<li>"Ternary trees gracefully grow and shrink;
+    hash tables need to be rebuilt after large size changes."
+    True, but the CLR hashtable does this so you
+    don't have to. Somebody wrote it for you.</p>
+<li>"Ternary trees support advanced searches
+    such as partial-match and near-neighbor search."
+    These operations weren't tested.</p>
+<li>"Ternary trees support many other operations,
+    such as traversal to report items in sorted order."
+    These operations weren't tested either.
+</ol>
+<p>
+Notice that the article doesn't claim that ternary trees
+are faster than hashing for successful searches.
+So if that's all you're testing, you're testing the wrong thing.
+One of the big benefits of ternary trees
+is the new operations available (4 and 5),
+but if you're not going to perform those operations,
+then you ended up paying for something you don't use.
+</p>
+<p>
+There are several morals of the story.
+</p>
+<ol>
+<li>Constants are important.
+<li>Memory bandwith is important.
+<li>Performance optimizations for unmanged code
+    do not necessarily translate to managed code.</p>
+<li>What are you really testing?
+</ol>
+<p>
+Mind you, Bentley and Sedgewick are not morons.  They know all this.
+</p>
+<p>
+[Typo fixed 11am, thanks Nathan_works and Jachym Kouba.]</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (29)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-nathan_works even thread-even depth-1" id="comment-745553">
+				<div id="div-comment-745553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/nathan_works' rel='external nofollow' class='url'>nathan_works</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745553">
+			June 12, 2009 at 10:15 am</a>		</div>
+
+		<p>It also requires k(4k) bytes of memory to store that string, where p is the size of a pointer.</p>
+<p>Assuming that should be P(4K) ? (end result: 4PK and not 4K^2 ?)</p>
+<p>I&#8217;m curious how many times you, Raymond, have needed to implement any of the shiny algorithms presented in say, the &lt;i&gt;other&lt;/i&gt; CLR (Cormen/Leiserson/Rivest, now with Stein I see) Introduction to Algorithms book..</p>
+<p>As an apps programmer, you do pay attention to not purposefully write O(N^2) or O(N!) type algorithms, and careful use of STL or CLR containers can help.. But too many fancy algorithms aren&#8217;t easily maintained, given the time to understand what the algorithm is doing versus the pressure to fix the !@#$@ bug. KISS works for apps, but perhaps not for the OS..</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-745583">
+				<div id="div-comment-745583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Colin Blair</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745583">
+			June 12, 2009 at 10:52 am</a>		</div>
+
+		<p>Anyone who finds this post interesting should also check Delay&#8217;s recent blog entry on a Sedgewick design: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/delay/archive/2009/06/02/maintaining-balance-a-versatile-red-black-tree-implementation-for-net-via-silverlight-wpf-charting.aspx" rel="nofollow">http://blogs.msdn.com/delay/archive/2009/06/02/maintaining-balance-a-versatile-red-black-tree-implementation-for-net-via-silverlight-wpf-charting.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-745603">
+				<div id="div-comment-745603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tom</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745603">
+			June 12, 2009 at 11:08 am</a>		</div>
+
+		<p>Software development is about maintaining an acceptable balance between speed of development, code maintenance and customer satisfaction. &nbsp;Most people focus on the first two to the detriment of the latter, leading to the &quot;software slow? &#8212; throw more hardware it at&quot; solution to performance problems. &nbsp;Indeed, the faster that software and features are developed, the better things seem &#8212; at least to those selling the software! &nbsp;But if you think about it, the cost of one software developer squeezing out a few seconds from his program is insignificant compared to the amortized cost of the users (assuming to have more than a handful) waiting for the program to run over the program&#8217;s expected lifetime.</p>
+<p>As at least three notable people have mentioned, software gets twice as slow every twelve months while processor speeds double every eighteen months. &nbsp;It&#8217;s a losing battle! &nbsp;And it certainly explains why the software I ran on my 8086 PC seems just as fast as today&#8217;s software. &nbsp;Why isn&#8217;t today&#8217;s software faster?</p>
+<p>Raymond points out a very good reason: people assume memory accesses are uniform when they are not. &nbsp;This mistaken assumption leads to the selection of algorithms that look good in theory but perform terribly in practice. &nbsp;The non-uniformity of memory access requires the developers looking for performance must choose algorithms and data structures that take advantage of the non-uniformity to squeeze the maximum out of the hardware. &nbsp;For something like Windows Kernel, the GDI or the Windows Shell, performance is critical. &nbsp;Not only does it save time for millions of users around the world, but it also helps sell more units if the OS is snappy and people don&#8217;t have to wait.</p>
+<p>Now, I&#8217;m not saying that a developer needs to eek out a few microseconds from something like MSN Messenger (or is it Office Communicator?). &nbsp;There&#8217;s no point as it is I/O bound, especially from the user&#8217;s side. &nbsp;But anything that is CPU bound and takes more than two seconds to complete should probably be a good candidate for optimization. &nbsp;Yes, I said two seconds! &nbsp;Think back to those studies that were done that if a web pages takes more than 1.5 seconds to load, people switch to something else. &nbsp;That&#8217;s the attention span of today&#8217;s computer users.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-745653">
+				<div id="div-comment-745653" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Wyatt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745653">
+			June 12, 2009 at 11:59 am</a>		</div>
+
+		<blockquote><p>
+  I don&#8217;t know whether it does or not, but I would not be surprised if System.String.GetHashCode caches the hash value in the string
+</p></blockquote>
+<p>Not according to reflector. &nbsp;If you think about it, it would require increasing the size of every string by 4 bytes, most of which will never be hashed. &nbsp;Not good for overall system performance.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-745673">
+				<div id="div-comment-745673" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">George</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745673">
+			June 12, 2009 at 12:21 pm</a>		</div>
+
+		<p>Moral 1 reminds me of one of Rob Pike&#8217;s notes on C programming.</p>
+<p>&quot;Fancy algorithms tend to run more slowly on small data sets than simple algorithms. They tend to have a large constant factor in O(n) analysis, and n is usually small. So don&#8217;t get fancy unless Rule 2 indicates that n is big enough.&quot;</p>
+<p>(From <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Unix_philosophy#Pike:_Notes_on_Programming_in_C" rel="nofollow">http://en.wikipedia.org/wiki/Unix_philosophy#Pike:_Notes_on_Programming_in_C</a>)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk odd alt thread-odd thread-alt depth-1" id="comment-745773">
+				<div id="div-comment-745773" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745773">
+			June 12, 2009 at 1:54 pm</a>		</div>
+
+		<p>Different people have different interests, but &#8230; THIS is the kind of article that I find fascinating. &nbsp;Thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-745793">
+				<div id="div-comment-745793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jachym Kouba</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745793">
+			June 12, 2009 at 2:04 pm</a>		</div>
+
+		<p>[[ It also requires k(4k) bytes of memory to store that string, where p is the size of a pointer. ]]</p>
+<p>Hi Raymond, I believe you made a little typo there :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-745823">
+				<div id="div-comment-745823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ERock</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745823">
+			June 12, 2009 at 2:30 pm</a>		</div>
+
+		<p>Wouldn&#8217;t this just further illustrate how Computer Science isn&#8217;t interchangeable with Software Engineering?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-745873">
+				<div id="div-comment-745873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua Muskovitz</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745873">
+			June 12, 2009 at 4:30 pm</a>		</div>
+
+		<p>Is there a functioning link to the &quot;5 things&quot; video? The page referenced doesn&#8217;t still have a functioning video stream. :-(</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-745983">
+				<div id="div-comment-745983" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Tomas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745983">
+			June 12, 2009 at 7:49 pm</a>		</div>
+
+		<p>@Tom: You&#8217;re way overanalyzing the situation. &nbsp;Assuming that memory access is uniform is about 499th on a list of the top 500 performance issues in software today. &nbsp;And programmer productivity is enormously important. &nbsp;What are all those users going to do in those accumulated two seconds? &nbsp;Spend two extra seconds browsing the web, probably. &nbsp;Or take an extra coffee break. &nbsp;Whereas if the programmer spends five weeks prematurely optimizing, that&#8217;s five weeks of features that will be missing from the product.</p>
+<p>@naaa: Watch some of today&#8217;s effects extravangas with the sound off sometime. &nbsp;You&#8217;ll be shocked at how unrealistic the special effects look (this also says something about how important a contribution sound makes to a movie). &nbsp;The current fetish for sweeping camera movements give the effects shots a completely different tempo and style to the live action.</p>
+<p>If done right, photochemical effects can look absolutely convincing. &nbsp;See 2001: A Space Odyssey, or the drydock scenes of Star Trek: The Motion Picture &#8212; they&#8217;re carefully crafted to look like someone is really out in space with a camera, shooting the footage of these giant spaceships. &nbsp;Compare to Star Treks 2-4, which were done by a different company (ILM) and really look cheesy in comparison.</p>
+<p>And yes, ILM did the Indiana Jones trilogy. &nbsp;And the effects looked cartoonish. &nbsp;But for those movies, perhaps that&#8217;s actually a good thing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-745733">
+				<div id="div-comment-745733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">naaa</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-745733">
+			June 12, 2009 at 1:04 pm</a>		</div>
+
+		<p>&gt;&gt; Why isn&#8217;t today&#8217;s software faster? </p>
+<p>It does things you couldn&#8217;t even imagine on the 8086. Really. And it was soooo slower. Really.</p>
+<p>It&#8217;s just that at the time it was &quot;just fast enough&quot;, and now is still &quot;just fast enough&quot;.</p>
+<p>It&#8217;s like graphics.. you ask someone about the original Prince of Persia graphics and they would say it is fantastic. Lemmings graphics was fantastic. Heck, Eye of the beholder gfx was fantastic and probably even Monkey Island I gfx was. Really, they *were* at the time.. now they suck.</p>
+<p>The same for movies. Watch 70-80s sci-fi or Indiana Jones or whatever.. suck.</p>
+<p>The past is always remembered better than it was.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746013">
+				<div id="div-comment-746013" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746013">
+			June 12, 2009 at 9:10 pm</a>		</div>
+
+		<p>Our typical use-case is 1 context struct, and 1 is always required, and there is no upper limit. &nbsp;I suggested we just define one instance in the data segment, and allocate the others as necessary. &nbsp;Locate the context nearby other frequently-accessed data to potentially realize gains like cache-hits, eliminate a node in the list of allocations&#8230;</p>
+<p>The other person disliked this because it was &quot;cleaner&quot; and &quot;safer&quot; to just always allocate the contexts, instead of special casing on the first instance, and I had no numbers to prove there was a performance benefit, so we always allocate contexts.</p>
+<p>Do you think it would be worth the effort to try and measure the differences between the two approaches? &nbsp;</p>
+<p>Is it good engineering to think along the lines of reducing memory allocations and where data is located, or is it an example of overly-engineering or needlessly optimization? &nbsp;</p>
+<p>Thanks. &nbsp;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746023">
+				<div id="div-comment-746023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Josh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746023">
+			June 12, 2009 at 9:58 pm</a>		</div>
+
+		<p>Wouldn&#8217;t &nbsp;&#8216;newer&#8217; data structures optimized for cache hits be ideal in this case? Why optimize for cache misses?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746033">
+				<div id="div-comment-746033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joseph Koss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746033">
+			June 12, 2009 at 10:08 pm</a>		</div>
+
+		<p>Begin the rise of the <a rel="nofollow" target="_new" href="http://en.wikipedia.org/wiki/Cache-oblivious_algorithm" rel="nofollow">http://en.wikipedia.org/wiki/Cache-oblivious_algorithm</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746083">
+				<div id="div-comment-746083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Randall</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746083">
+			June 13, 2009 at 11:18 am</a>		</div>
+
+		<p>Makes me wonder how B+trees and other &quot;paged&quot; structures perform. &nbsp; There are challenges to doing them efficiently in managed code (c# has no placement new, right?), and I guess the practical question is whether your working set fits in RAM &#8212; if very little fits in RAM, B+trees FTW (bigger pages -&gt; fewer seeks), but if it does fit, there are probably lots of log(n) structures that are faster. &nbsp;</p>
+<p>It surprises me a little that collections (seem to) be written in regular managed code, rather than C or C++ that knows how to talk to the garbage collector. &nbsp;Maybe there&#8217;s just no performance gain, or maybe the latter approach is pretty much un-implementable.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746093">
+				<div id="div-comment-746093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt [C++ MVP]</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746093">
+			June 13, 2009 at 11:31 am</a>		</div>
+
+		<p>@Randall</p>
+<p>C++/CLI programs can opt out of the garbage collector by allocating from native heaps (actually you can do that from C# or VB.NET, but it&#8217;s far more work). &nbsp;But there&#8217;s no control over the garbage collector, if you allocate from the managed memory pool then you get the exact same behavior as every other managed language. &nbsp;There is no placement new with managed instances, as a consequence of enforced strong typing of objects (which is used to provide type safety guarantees, but is also enforced on the managed pool even when accessed type-unsafely).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746103">
+				<div id="div-comment-746103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Maybe remove this post</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746103">
+			June 13, 2009 at 11:54 am</a>		</div>
+
+		<p>If you care about memory you can model it with big Oh as well. You and t-a-w show a fundamental misunderstanding of the purpose of big Oh notation.</p>
+<p>Big Oh is a generalization so you can understand how the algorithm scales. Everyone knows you throw away the constant so you can easily label the COMPLEXITY (NOT THE RUNTIME) of the algorithm.</p>
+<p>I suggest you go read wikipedia or some other source you trust about big Oh you can actually understand how it is used. It is obvious to me from this quote &quot; HashTable, TernaryTree and SortedList. Surprisingly, the hash table won on insertion and retrieval of tens of thousands of randomly-generated strings. Why?&quot; You have no idea what you&#8217;re talking about. Why is it surprising the hashtable won? It has near O(1) insertion and access big Ohs, while sortedlist and ternarytree have at least O(log(N)) for each access.</p>
+<p>This simple example pulled from your own text demonstrates your fundamental misunderstanding of big Oh. Also the fact that you didn&#8217;t bother to model memory either in big Oh shows how unaware you are of it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746143">
+				<div id="div-comment-746143" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://larrywatanabe.blogspot.com' rel='external nofollow' class='url'>Larry Watanabe</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746143">
+			June 13, 2009 at 3:48 pm</a>		</div>
+
+		<p>I&#8217;m confused about the surprise about this result &#8212; hashing is O(1), and search/sorting in any tree is O(logN). Why wouldn&#8217;t hashing be faster? The surprise would be if the tree was faster, even for small datasets. I can see linear search in an array being faster for small datasets, but hashing, done correctly (good key generation, sufficient size hash table, good re-mapping functions) should be faster than trees across a wide variety of data set sizes.</p>
+<p>Am I missing something?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746153">
+				<div id="div-comment-746153" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">yme</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746153">
+			June 13, 2009 at 5:01 pm</a>		</div>
+
+		<p>Hashing <em>strings</em> isn&#8217;t O(1); strings can be arbitrarily long.</p>
+<p>The time required to find a string in a hash table doesn&#8217;t increase with the number of items in the table, but it does increase with the length of the string you&#8217;re looking for, because first you have to compute its hash, and to do that you have to process the entire string.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746163">
+				<div id="div-comment-746163" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.tapuchim.com' rel='external nofollow' class='url'>configurator</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746163">
+			June 13, 2009 at 6:25 pm</a>		</div>
+
+		<p>@yme: I was just about to say that.</p>
+<p>Hashing strings can never be free; since the hash code treats every byte in the string (it must, to be effective), the entire string is processed. And the hash is never cached with CLR strings.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746173">
+				<div id="div-comment-746173" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mario</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746173">
+			June 13, 2009 at 9:53 pm</a>		</div>
+
+		<p>@yme: nobody ever claimed that hasing is free&#8230; but when you analyze a sorting algorithm the size of the instance is given by the number of elements you must sort, not their respective lengths. In this context, the hashing step becomes a constant (it takes the same time to hash a particular string when you are sorting a string array of 10 or 10000 elements).</p>
+<p>As I see it, this is exactly what Raymond&#8217;s moral #1 says: Constants are important.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746223">
+				<div id="div-comment-746223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jolyon Smith</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746223">
+			June 14, 2009 at 7:08 pm</a>		</div>
+
+		<p>@naaa/Tomas:</p>
+<p>I as going to say more or less the same thing which boils down to&#8230;.</p>
+<p>Sure if you reference movies from a certain period with crap/cheesy effects you may think you have proven that movies from that period ALL had crap/cheesy effects.</p>
+<p>But you haven&#8217;t. &nbsp;You&#8217;ve simply proven that EVERY period of history is filled with products (of any/all types, not just movies) that are produced by people happy to accept &quot;just good enough&quot; as &quot;good enough&quot;.</p>
+<p>The human capacity to not only accept but reward the barely adequate is boundless.</p>
+<p>In movies specifically, seamless/undetectable FX, even CGI, is not always the goal &#8211; style plays a part too.</p>
+<p>I refer you to Dark City and The Matrix, both produced at around the same time and both taking a very different approach to their FX.</p>
+<p>Some might naively say that Dark City was &quot;cheap&quot;, but they are missing the stylistic points.</p>
+<p>But there is nothing stylish about software running slowly on modern hardware.</p>
+<p>Windows 7 vs Vista proves that it&#8217;s not some immutable law of the universe that software HAS to get slower in order to progress, or that &quot;prettier&quot; has to come at the cost of performance.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mike-dimmick even thread-even depth-1" id="comment-746303">
+				<div id="div-comment-746303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Mike+Dimmick' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746303">
+			June 15, 2009 at 7:58 am</a>		</div>
+
+		<p>Strings in .NET are immutable. This is so that you can safely pass them around between threads without fear that they&#8217;re going to change &#8211; and without requiring the extensive locking or &#8216;lock-free&#8217; synchronization (still requires memory barriers, so you&#8217;re stalling a core somewhere) to manage mutable strings in multiple threads. To keep this behaviour, .NET would have to compute the hash code when the string was constructed, an unnecessary overhead considering most strings aren&#8217;t hashed.</p>
+<p>I guess the plan of checking the value and, if not set, recomputing it, then writing the hash out, is also possible, but in effect you&#8217;ve not saved anything much since parallel rehashing then recomputes the hash multiple times. How often is the same string object rehashed, anyway? Strings compiled into the code are interned, true, but it doesn&#8217;t search for an interned string object with the same character sequence when you construct an arbitrary string, it just creates a new one.</p>
+<p>All in all, sounds like an &#8216;optimisation&#8217; that&#8217;s really a pessimisation for the 99% case.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746313">
+				<div id="div-comment-746313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">a lurker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746313">
+			June 15, 2009 at 8:24 am</a>		</div>
+
+		<p>Good article; I like to read about how Big-O isn&#8217;t really the end of the story.</p>
+<p>Btw, typo (I think): &#8220;So if that&#8217;s all your testing&#8221;</p>
+<div class=post>[<i>Fixed, thanks. -Raymond</i>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746593">
+				<div id="div-comment-746593" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://kohlerm.blogspot.com/' rel='external nofollow' class='url'>Markus Kohler</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746593">
+			June 16, 2009 at 3:53 am</a>		</div>
+
+		<p>Serveral people here claimed it&#8217;s obvious that Strings to not cache the hash.</p>
+<p>It&#8217;s not obvious why this is not done. Java for example caches the hash. the hash is compute lazily, at the first time it is needed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746603">
+				<div id="div-comment-746603" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://kohlerm.blogspot.com/' rel='external nofollow' class='url'>Markus Kohler</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746603">
+			June 16, 2009 at 3:58 am</a>		</div>
+
+		<p>Note also that Tries/Ternary tries can consume much less memory compared to HashTables depending on how much the Strings have in common</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-dwalker-wk even thread-even depth-1" id="comment-746793">
+				<div id="div-comment-746793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/DWalker' rel='external nofollow' class='url'>DWalker</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746793">
+			June 16, 2009 at 1:13 pm</a>		</div>
+
+		<p>Dark City! &nbsp;Great, great movie.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-746843">
+				<div id="div-comment-746843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joseph Koss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746843">
+			June 16, 2009 at 5:08 pm</a>		</div>
+
+		<p>Note that it is also possible to use a hash table to implement a tree. The early-out arguement in favor of tree&#8217;s is moot because of this.</p>
+<p>One general methodology leverages zobrist-style hashing to generate a nodes hashed address within the table, while another directly computes a heap-like numerical address and then hashes that value.</p>
+<p>This does not change the fact that hash tables cause lots of cache misses if the hash function is considered &quot;good.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-746943">
+				<div id="div-comment-746943" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BC</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20090612-00/?p=17913#comment-746943">
+			June 16, 2009 at 8:34 pm</a>		</div>
+
+		<p>&quot;Wouldn&#8217;t &nbsp;&#8216;newer&#8217; data structures optimized for cache hits be ideal in this case? Why optimize for cache misses?&quot;</p>
+<p>I misspoke, I meant page-swaps, not cache-hits.</p>
+<p>If the &quot;context-we-always-need&quot; is on the same physical page as &quot;tables-we-always-use&quot;, then we would swap in just one page (table+context) vs. 2 pages (table+pointer and pointed-to-context). &nbsp;</p>
+<p>Raymond&#8217;s article jogged my memory on this conversation. &nbsp;If &quot;constants are important&quot; then it seems we would be doubling the number of page-swaps. &nbsp;If &quot;memory bandwidth is important&quot;, then it seems like it would be a good idea to define the &quot;context-we-always-need&quot; next to the &quot;tables-we-always-use&quot; &#8211; just in principle, no measuring required.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

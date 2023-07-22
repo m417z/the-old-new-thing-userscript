@@ -1,0 +1,729 @@
+<html>
+<head>
+<title>The case of the hung Explorer window</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The case of the hung Explorer window</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>August 5, 2016 / year-entry #163</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>30</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Decoding the deadlock.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A Windows Insider reported that Explorer stopped
+responding whenever they opened their
+Downloads folder.
+</p>
+<p>
+We were able to obtain a memory dump during the
+hang, and observed that most threads were waiting
+for the loader lock.
+The loader lock was being held by this thread:
+</p>
+<pre>
+ntdll!RtlpWaitOnCriticalSection
+ntdll!RtlpEnterCriticalSectionContended
+GdiPlus!GdiplusStartupCriticalSection::{ctor}
+GdiPlus!GdiplusStartup
+ShellExtension+...
+ShellExtension+...
+ShellExtension+...
+ntdll!LdrpCallInitRoutine
+ntdll!LdrpInitializeNode
+ntdll!LdrpInitializeGraphRecurse
+ntdll!LdrpInitializeGraph
+ntdll!LdrpPrepareModuleForExecution
+ntdll!LdrpLoadDllInternal
+ntdll!LdrpLoadDll
+ntdll!LdrLoadDll
+KERNELBASE!LoadLibraryExW
+[...]
+combase!CoCreateInstanceEx
+combase!CoCreateInstance
+windows_storage!_SHCoCreateInstance
+windows_storage!CRegFolder::_CreateCachedRegFolder
+windows_storage!CRegFolder::_CreateCachedRegFolder
+windows_storage!CRegFolder::_BindToItem
+windows_storage!CRegFolder::BindToObject
+windows_storage!CShellItem::_BindToHandlerLegacy
+windows_storage!CShellItem::BindToHandler
+[...]
+explorerframe!CNscEnumTask::InternalResumeRT
+explorerframe!CRunnableTask::Run
+</pre>
+<p>
+This thread was waiting on a GDI+ critical section,
+which was being held here:
+</p>
+<pre>
+KERNELBASE!WaitForSingleObjectEx
+GdiPlus!BackgroundThreadShutdown
+GdiPlus!InternalGdiplusShutdown
+GdiPlus!GdiplusShutdown
+shell32!CGraphicsInit::~CGraphicsInit
+shell32!CImageFactory::{dtor}
+shell32!CImageFactory::`scalar deleting destructor'
+shell32!CImageFactory::Release
+shell32!IsImageSizeSufficientForRequestedSize
+shell32!_ExtactIconFromImage
+shell32!_ExtractIconsFromImage
+shell32!ExtractIconsUsingResourceManager
+shell32!_ExtractIcons
+shell32!SHDefExtractIconW
+[...]
+windows_storage!CLoadSystemIconTask::InternalResumeRT
+windows_storage!CRunnableTask::Run
+windows_storage!CShellTask::TT_Run
+windows_storage!CShellTaskThread::ThreadProc
+windows_storage!CShellTaskThread::s_ThreadProc
+</pre>
+<p>
+It should now be clear what the problem is.
+</p>
+<p>
+On the second thread,
+GDI+ is shutting down because its last client
+decided to uninitialize it.
+(In this case, the last client was the system
+image list, which extracting the
+icon for a Store app,
+and Store app icons are PNG files,
+which is why GDI+ entered the picture.)
+</p>
+<p>
+GDI+ is waiting for its worker thread to
+exit so it can finish cleaning up.
+</p>
+<p>
+Just at this moment,
+the folder tree
+was populating itself on the first thread,
+and it found a third party shell extension.
+It dutifully loaded the third party shell
+extension (because that's what shell extensions
+are for),
+and that shell extension, as part of its
+<code>DLL_<wbr>PROCESS_<wbr>ATTACH</code>
+tried to initialize GDI+.
+</p>
+<p>
+Here comes the deadlock.
+</p>
+<p>
+GDI+ was prepared for this possibility
+that somebody would try to initialize GDI+
+while GDI+ was already in the process of
+shutting itself down.
+It solves this problem by making the shutdown
+run to completion (seeing as it already started),
+and then starting a new initialization pass.
+</p>
+<p>
+That shutdown is waiting for a worker thread
+to finish up and exit.
+But the thread cannot exit until it sends out
+its <code>DLL_<wbr>THREAD_<wbr>DETACH</code>
+notifications.
+And since DLL notifications are serialized,
+the <code>DLL_<wbr>THREAD_<wbr>DETACH</code>
+cannot be sent until the
+<code>DLL_<wbr>PROCESS_<wbr>ATTACH</code>
+completes.
+But the
+<code>DLL_<wbr>PROCESS_<wbr>ATTACH</code>
+for the third party shell extension is
+waiting for GDI+.
+There's our deadlock.
+</p>
+<p>
+The root cause for this is that the third
+party shell extension is initializing GDI+
+inside its
+<code>DLL_<wbr>PROCESS_<wbr>ATTACH</code>.
+This is already highly suspect even
+without any
+special insight into GDI+,
+and the suspicious are confirmed
+in the documentation for
+<code>GdiplusStartup</code>:
+</p>
+<blockquote CLASS=q><p>
+Do not call <b>GdiplusStartup</b> or
+<b>GdiplusShutdown</b> in <code>DllMain</code>
+or in any function that is called by DllMain.
+</p>
+</blockquote>
+<p>
+My guess is that the vendor who wrote this
+shell extension thinks that the rule doesn't
+apply to them because they passed
+<code>SuppressBackgroundThread = true</code>,
+thinking that by removing the background thread,
+they successfully avoided any
+deadlocks with another thread.
+It didn't occur to them that the other thread
+might not be the GDI+ background thread.
+</p>
+<p>
+It also didn't occur to them that GDI+
+might <i>already be initialized</i>
+with a background thread.
+Furthermore, suppose the component that
+initialized GDI+ first (with a background thread)
+uninitialized GDI+ first.
+That call to
+<code>GdiplusShutdown</code>
+will not shut down GDI+ because there
+is still an outstanding client.
+And then when their DLL unloads,
+they call
+<code>GdiplusShutdown</code>,
+and that will cause a true shutdown
+of GDI+,
+which includes shutting down that background
+thread that they thought they had suppressed.&sup1;
+</p>
+<p>
+So basically it was a bad idea all around.
+</p>
+<p>
+I transferred this issue to the application
+compatibility team for outreach to the vendor,
+who happens to be a major corporation,
+so hopefully they can spare some developers
+to fix the deadlock.
+</p>
+<p>
+<b>Bonus chatter</b>:
+Identifying the vendor was a bit tricky
+because of the extremely vague DLL name.
+</p>
+<p>
+<b>Bonus chatter</b>:
+When I originally composed the email
+with my analysis of the bug,
+I wrote
+<i>application compatibility outrage</i>
+instead of
+<i>application compatibility outreach</i>.
+Unfortunately,
+I caught the mistake before hitting Send.
+</p>
+<p>
+&sup1;Closer investigation shows that my guess
+was incorrect.
+The code that calls <code>GdiplusStartup</code>
+leaves the background thread enabled,
+so I have no idea how this ever worked
+in isolation.
+It "works" only because the calls to
+<code>GdiplusStartup</code> and
+<code>GdiplusShutdown</code> are
+no-op
+because somebody else initialized GDI+ first,
+and is still using GDI+ at the time they unload.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (30)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1259105">
+				<div id="div-comment-1259105" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259105">
+			August 5, 2016 at 7:07 am</a>		</div>
+
+		<p>Well, sure, it&#8217;s a bad way to write their code. But what&#8217;s the alternative? Understand windows conventions? **Read** the documentation?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1259175">
+				<div id="div-comment-1259175" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">guest</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259175">
+			August 5, 2016 at 9:55 am</a>		</div>
+
+		<p>Of course not.  The best alternative is to use an undocumented hook to bend the OS so that your bad code actually works.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1259185">
+				<div id="div-comment-1259185" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259185">
+			August 5, 2016 at 10:45 am</a>		</div>
+
+		<p>And that is, of course, what Microsoft does all the time, which explains why Windows is so buggy and hangs or bluescreens every five minutes. On the other hand, Microsoft only allows the outsider developers access to a meager subset of the APIs, so their work is more difficult and their applications can&#8217;t compete with Microsoft&#8217;s ones; which justifies, for example, why a certain open source office suite is slower than Microsoft Office. Or, at least, that is what the conspiranoic theory says :-) .</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4" id="comment-1259195">
+				<div id="div-comment-1259195" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Mike Caron</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259195">
+			August 5, 2016 at 10:51 am</a>		</div>
+
+		<p>If only M$ allows us to use their secret RenderOfficeDocument platform API, then everyone else could be fast too!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-4 parent" id="comment-1259205">
+				<div id="div-comment-1259205" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259205">
+			August 5, 2016 at 10:55 am</a>		</div>
+
+		<p>Old troll is old; this was once true but cleaned up around year 2000.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1259216">
+				<div id="div-comment-1259216" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Antonio Rodríguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259216">
+			August 5, 2016 at 11:13 am</a>		</div>
+
+		<p>Not so old. Recently, a Linux user approached me after a computer history talk, and explained that Windows was so vulnerable to malware because &#8220;it didn&#8217;t have file level security control&#8221;. More than a decade after the Win9X family was phased out. Those are the same people that say that &#8220;Android isn&#8217;t Linux&#8221;, because, you know, Linux can&#8217;t have viruses, right? In both cases, they forget that malware developers will always target the dominant platform, and that no matter how secure an OS is, you can always sneak through the app store&#8217;s validation and trick the user into downloading/installing your trojan.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1259805">
+				<div id="div-comment-1259805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259805">
+			August 11, 2016 at 5:27 am</a>		</div>
+
+		<p>I&#8217;m not sure what relevance your Linux user anecdote has.</p>
+<p>What version of windows are you running that bluescreens or hangs every five minutes? Even trying to develop applications on Windows 95 wasn&#8217;t that bad.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4 parent" id="comment-1259355">
+				<div id="div-comment-1259355" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">roeland</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259355">
+			August 7, 2016 at 9:48 pm</a>		</div>
+
+		<p>Ha ha ha.</p>
+<p>I once tried to use &#8220;a certain open source office suite&#8221; on Linux to make a scatter plot of a large amount of points (IIRC few 100,000 of them). It totally locked up the entire desktop for a few *minutes* trying to render that graph. Then I started a windows VM and opened Excel, which rendered the same graph in half a second.</p>
+<p>I should have tried &#8220;a certain open source office suite&#8221; on the VM. Maybe it would have needed a few minutes to render that graph as well, but at least I don&#8217;t think it would have locked up the entire desktop.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-maxdiplomat even depth-5" id="comment-1259485">
+				<div id="div-comment-1259485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/tremors08' rel='external nofollow' class='url'>tremors08</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259485">
+			August 9, 2016 at 4:53 am</a>		</div>
+
+		<p>The open source suite would have run out of GDI objects (this is a poor attempt at a joke based on my recent VB6 experience)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1259115">
+				<div id="div-comment-1259115" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Christian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259115">
+			August 5, 2016 at 7:13 am</a>		</div>
+
+		<p>What does this background thread do? How does GDI+ interact with event loops?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jeremytais even thread-even depth-1 parent" id="comment-1259125">
+				<div id="div-comment-1259125" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259125">
+			August 5, 2016 at 7:35 am</a>		</div>
+
+		<p>One thing that has always bothered me about DLLs is some sort of convenient place where you can put all of your complex initialization code.  Something like:  Ok, you are attached to the process, the loader lock is released go wild with your initialization.  (I suspect someone can tell my why that is a bad idea, but it seems like it would solve most of these DllMain issues that come up over and over).</p>
+<p>It seems like the two main approaches are explicit secondary initialization (like GDI+) or some sort of lazy initialization that you insert at the start of all of the functions you export from the DLL.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1259165">
+				<div id="div-comment-1259165" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259165">
+			August 5, 2016 at 9:48 am</a>		</div>
+
+		<p>In my experience, complex DLL initialization is hardly ever necessary.  When designing your entry points, if you require two entry points to share complex, internal state, then force the user to pass it in for you.  For example:</p>
+<p>state = CreateState();<br />
+Func1(state, a, b, c);<br />
+Func2(state, d, e, f);<br />
+DestroyState(state);</p>
+<p>(And be sure to mimic my stellar naming conventions in all your production code.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-2 parent" id="comment-1259215">
+				<div id="div-comment-1259215" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259215">
+			August 5, 2016 at 10:58 am</a>		</div>
+
+		<p>1) Start a thread in DllMain DLL_PROCESS_ATTACH (the thread is immediately blocked by the loader lock&#8230;)<br />
+2) After you exit from DllMain the loader will release the loader lock; your thread now runs.<br />
+3) Have your normal API functions wait for the thread to finish. The &#8220;obvious&#8221; way is a manual reset event; however there are faster ways like flag-event.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1259235">
+				<div id="div-comment-1259235" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259235">
+			August 5, 2016 at 11:37 am</a>		</div>
+
+		<p>What happens when your DLL is unloaded while the thread is still running?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1259295">
+				<div id="div-comment-1259295" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dpff</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259295">
+			August 6, 2016 at 7:54 am</a>		</div>
+
+		<p>That&#8217;s when API FreeLibraryAndExitThread should be used: <a href="https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20131105-00/?p=2733</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-jeremytais odd alt depth-3 parent" id="comment-1259255">
+				<div id="div-comment-1259255" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/SimonRev' rel='external nofollow' class='url'>SimonRev</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259255">
+			August 5, 2016 at 12:13 pm</a>		</div>
+
+		<p>Of course, MSDN has a handy list of things not to do in dllMain, one of which is &#8220;Call CreateThread&#8221;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1259315">
+				<div id="div-comment-1259315" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259315">
+			August 6, 2016 at 1:50 pm</a>		</div>
+
+		<p>That seems like one of those times where you can violate the guidelines if you know what you&#8217;re doing I guess. </p>
+<p>Yes if you try to wait on the thread in your DLL_PROCESS_ATTACH, you just got yourself a deadlock, but if you don&#8217;t, this seems perfectly fine (with all the usual caveats for using threads of course).</p>
+<p>Personally I prefer the same solution as Peter does: Not only does it avoid having to do any complicated things in DLL_PROCESS_ATTACH, it also simplifies handling of concurrency in many cases.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-joe_woodbury odd alt depth-2" id="comment-1259325">
+				<div id="div-comment-1259325" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/JoeWoodbury' rel='external nofollow' class='url'>JoeWoodbury</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259325">
+			August 6, 2016 at 4:50 pm</a>		</div>
+
+		<p>This sounds simple with one DLL, but what if you have several, all trying to do complex initialization with each other?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1259135">
+				<div id="div-comment-1259135" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">fm</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259135">
+			August 5, 2016 at 8:04 am</a>		</div>
+
+		<p>It&#8217;s a tragedy that Windows doesn&#8217;t have a good way to name &amp; shame when poorly coded third party libraries screw things up. Once nice thing is that recent versions of Windows handle display driver crashes very well &amp; show the name of the driver, so when your display blinks you get a message saying &#8220;Nvidia display driver stopped working&#8221;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1259145">
+				<div id="div-comment-1259145" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Koro</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259145">
+			August 5, 2016 at 8:24 am</a>		</div>
+
+		<p>I&#8217;m surprised Store apps load their icons using GDI+. It was my understanding that it was being phased out in favor of WIC.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-raykoopa even depth-2" id="comment-1259365">
+				<div id="div-comment-1259365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ray+Koopa' rel='external nofollow' class='url'>Ray Koopa</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259365">
+			August 8, 2016 at 5:49 am</a>		</div>
+
+		<p>So far as I get it, the ListView is still a control drawn with GDI</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1259155">
+				<div id="div-comment-1259155" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adrian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259155">
+			August 5, 2016 at 9:39 am</a>		</div>
+
+		<p>Running other people&#8217;s code in your process is always dangerous.  At some point, I expect Explorer is going to have to come up with a process-isolation scheme for shell extensions, or extensions will have to be certified and signed the way drivers are.  The web browsers have all made significant moves in either eliminating third-party plugins and/or relegating that code to separate processes.  It&#8217;s a lot of work to do process isolation and reliable interprocess communication, but it goes a long way to making software more robust.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2" id="comment-1259176">
+				<div id="div-comment-1259176" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">The_D0lph1n</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259176">
+			August 5, 2016 at 10:35 am</a>		</div>
+
+		<p>I think Explorer has a limited form of extension process isolation using the COM Surrogate.<br />
+There&#8217;s a post on this blog about the COM Surrogate from 2009: <a href="https://blogs.msdn.microsoft.com/oldnewthing/20090212-00/?p=19173/" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/20090212-00/?p=19173/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1259245">
+				<div id="div-comment-1259245" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.silverbacknetworks.tech' rel='external nofollow' class='url'>Josh B</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259245">
+			August 5, 2016 at 11:51 am</a>		</div>
+
+		<p>I&#8217;ve done nearly the same thing for the same reason, only it was happening occasionally when opening the open/save dialog boxes. I ran into a wall when I reached Nvidia&#8217;s shell extension. Since I can&#8217;t very well uninstall Nvidia&#8217;s drivers, and things stop working if you try to just unregister the extension, I just lived with the occasional app hang.</p>
+<p>Fortunately, all of my hanging Explorer problems just went away after moving to Win10. I don&#8217;t know if Win10&#8217;s Explorer is more robust, or Nvidia just put a little more into QA this time around, but it&#8217;s nice having a consistently functional system again.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1259265">
+				<div id="div-comment-1259265" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Andomar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259265">
+			August 5, 2016 at 3:42 pm</a>		</div>
+
+		<p>This brings back memories of being a Windows C++ programmer in the 1990s.  I suppose no vendor can get shell extensions right. The complexity is beyond ludicrous.</p>
+<p>If you invite vendors to do multi-threaded programming. you should accept responsibility for what must inevitably follow.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1259545">
+				<div id="div-comment-1259545" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259545">
+			August 9, 2016 at 9:58 am</a>		</div>
+
+		<p>No matter what you do, someone will call you an idiot. &#8220;You&#8217;re an idiot for not making Explorer extensible.&#8221; &#8220;You&#8217;re an idiot for making Explorer extensible.&#8221; Or are you saying, &#8220;Explorer should be extensible, but in order to reduce the complexity for extension authors, Explorer should be a single-threaded program.&#8221;?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1259275">
+				<div id="div-comment-1259275" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Sven Eberhardt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259275">
+			August 5, 2016 at 8:01 pm</a>		</div>
+
+		<p>What puzzles with all these loader lock problems: Why isn&#8217;t there a special flag to LoadLibrary which alters the loading behaviour to: &#8220;Do all your system initialization within the loader lock and then release the lock BEFORE calling DllMain&#8221;.</p>
+<p>The lock may be needed to ensure no other threads in the loading process call into the library before it&#8217;s fully initialized. But applications like Explorer, which potentially load a lot of 3rd party libraries, could use their own synchronization methods to make sure no calls into library happen before the DllMain function actually returned.</p>
+<p>Alternatively, there could be a second DllMain function that is called outside the loader lock but before LoadLibrary returns in the parent process. Dlls could put any initialization that requires locks there. Of course they&#8217;d need to check manually if the function finished before accepting any outside calls from other threads.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev odd alt thread-odd thread-alt depth-1" id="comment-1259345">
+				<div id="div-comment-1259345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259345">
+			August 7, 2016 at 9:01 pm</a>		</div>
+
+		<p>OK guys, a helpful advice for you.</p>
+<p>If you ever want to have your plug-in (or COM provider) DLL run a thread, do it as:</p>
+<p>1. Have your DLL link or load explicitly a second (private) DLL. The second DLL should actually contain the thread code. The second DllMain should start the thread (don&#8217;t use any API which waits for the thread to start, though). The second DLL gives the thread handle to the first DLL. First of second DLL should take an extra reference to the second DLL.</p>
+<p>2. When your plugin (first) DLL needs to unload, it should give the thread a signal to stop (by setting an event and/or a boolean flag), and to either explicit FreeLibrary or implicit unlink because of unload. </p>
+<p>3. When the thread ultimately needs to exit, it should call FreeLibraryAndExitThread on the DLL2.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1259375">
+				<div id="div-comment-1259375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Eric Bouchard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259375">
+			August 8, 2016 at 6:20 am</a>		</div>
+
+		<p>Thanks, this really helped me find out what was causing the Download folder to take too much time to populate (about 20 seconds).  Turns out it was a third party icon overlay extension which I disabled in the registry.</p>
+<p>Funny thing is when I opened the download folder using the real path (c:\users\username\downloads) instead of the shortcut path (This PC &gt; Downloads) the folder would be populated instantly.<br />
+Only when I used the shortcut Downloads under This PC that was taking too much time to populate the list.  I wonder why there was a difference ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1259415">
+				<div id="div-comment-1259415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.honestillusion.com' rel='external nofollow' class='url'>James Curran</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160805-00/?p=94035#comment-1259415">
+			August 8, 2016 at 11:19 am</a>		</div>
+
+		<p>I wonder if this explains why, when I try to display the Downloads folder, Explorer suddenly gets extremely slow.  It doesn&#8217;t hang &#8212; I can click on a different folder and it works fine &#8212; but for Downloads, the file list displays slowly and the green progress bar displays across the top.   Clicking a column header to sort does nothing.  (The folder only has about 300 files)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

@@ -1,0 +1,516 @@
+<html>
+<head>
+<title>Comparing WaitOnAddress with futexes (futexi? futexen?)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Comparing WaitOnAddress with futexes (futexi? futexen?)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>June 1, 2017 / year-entry #128</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>19</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Two different ways of creating a synchronization object out of nothing.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Linux has a synchronization primitive called a <i>futex</i>
+which is similar to Windows's <code>Wait&shy;On&shy;Address</code>
+in that both let you create a synchronization object out of nothing.
+(Well, okay, you need to set aside some memory.)
+</p>
+<p>
+The basic operations on a futex depend on what color glasses
+you're wearing.
+If you are wearing
+<a HREF="http://man7.org/linux/man-pages/man2/futex.2.html">
+syscall-colored glasses</a>,
+then the basic operations are WAIT and WAKE.
+But we're going to wear
+<a HREF="http://man7.org/linux/man-pages/man7/futex.7.html">
+user-mode-colored glasses</a>,
+in which the basic operations are UP and DOWN.
+(In futex-speak, "up" and "down" are verbs.
+And you thought Microspeak was weird.)
+</p>
+<p>
+Conceptually, a futex is a 32-bit variable that acts
+like a semaphore with a maximum count of 1.
+</p>
+<p>
+To initialize a futex, set it to 0 if you want it to be initially
+unavailable, or 1 if you want it to be initially available.
+</p>
+<p>"Downing" a futex is what you do when you want to wait for the futex
+to become available.
+Atomically decrement the futex, and if the result is 0, then
+you have successfully claimed the futex.
+Otherwise, call into the kernel to wait for the futex to become available.
+(This isn't perfectly accurate, but bear with me.)
+</p>
+<p>
+"Upping" a futex is what you do when you want to make the futex available.
+Atomically increment the futex, and if the result is 1, then
+there are no waiters, and you're done.
+Otherwise, set it to 1 explicitly (indicating that the futex is now free)
+and call into the kernel to tell it to release the waiting threads.
+(It is an error to "up" a futex that is already available.)
+</p>
+<p>
+In theory, the values of a futex correspond to these states:
+</p>
+<ul>
+<li>
+1 means that the futex is available.
+</li>
+<li>
+0 means that the futex is unavailable, and there are no waiters.
+</li>
+<li>
+A negative number means that the futex is unavailable,
+and the number of waiters is the negative of the value.
+For example, a value of &minus;2 means that there are two waiters.
+</li>
+</ul>
+<p>
+In practice, however, any negative number means that the futex
+is unavailable.
+The actual number of waiting threads is kept in the kernel.
+The actual rule for "downing" a futex is that if you down it to
+a negative number, you should set the futex to &minus;1 and
+then call into the kernel.
+Forcing the value to &minus;1 avoids underflow if more than 2
+billion threads wait on the futex.&sup1;
+</p>
+<p>
+A futex, therefore, is a lightweight version of an auto-reset event.
+There is at most one token, and the only operations are
+to claim the token (waiting as necessary for a token to
+become available) and to release the token.
+</p>
+<p>
+An obvious
+difference between futexes and <code>Wait&shy;On&shy;Address</code>
+is that a futex mimics an auto-reset event (or a single-token semaphore,
+which is basically the same thing),
+whereas <code>Wait&shy;On&shy;Address</code> can be used to mimic
+a large number of things depending on how you use it.
+</p>
+<p>
+A notable
+difference between futexes and <code>Wait&shy;On&shy;Address</code>
+is that the contents of the futex are not your choice;
+the contents are controlled by the rules for futexes.
+If you have other information you want to keep track of,
+you need to keep it somewhere outside the futex.
+On the other hand,
+<code>Wait&shy;On&shy;Address</code> lets you put anything you
+want in the memory,
+and it is typically some central bookkeeping information
+that you would have needed to keep track of anyway.
+</p>
+<p>
+A big difference is that futexes work across processes
+(via shared memory),
+whereas <code>Wait&shy;On&shy;Address</code> works only within
+a process.
+</p>
+<p>
+Here's a summary table,
+because people like tables.
+</p>
+<table BORDER=1 STYLE="border-collapse: collapse"
+       BORDERCOLOR=black CELLPADDING=3>
+<tr>
+<th></th>
+<th>futex</th>
+<th>Wait&shy;On&shy;Address</th>
+</tr>
+<tr>
+<td>Size</td>
+<td>4 bytes</td>
+<td>1, 2, 4, or 8 bytes (your choice)</td>
+</tr>
+<tr>
+<td>Contents</td>
+<td>Controlled by futex</td>
+<td>Controlled by you</td>
+</tr>
+<tr>
+<td>Access</td>
+<td>Must use atomic primitives</td>
+<td>No restrictions</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>Can be cross-process</td>
+<td>Limited to a single process</td>
+</tr>
+<tr>
+<td ROWSPAN=2>Operations</td>
+<td>"Down" (wait for object)</td>
+<td>Wait for value to change</td>
+</tr>
+<tr>
+<td>"Up" (release object, wake waiters)</td>
+<td>Wake waiters</td>
+</tr>
+<tr>
+<td>Acts like</td>
+<td>Event (or single-token semaphore)</td>
+<td>Whatever you want</td>
+</tr>
+<tr>
+<td>Spurious wakes?</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+</table>
+<p>
+Both primitives enter kernel mode only if they need to wait or wake.
+If there is no contention, then both primitives operate entirely
+in user mode.</p>
+<p>
+&sup1;
+If you can get 2 billion threads to wait on a futex,
+then I'm both impressed and disappointed.
+Impressed that you were able to create 2 billion threads
+in the first place,
+and disappointed that you have a futex so hot that you managed
+to get 2 billion threads waiting on it.
+You should fix that.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (19)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1 parent" id="comment-1298305">
+				<div id="div-comment-1298305" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298305">
+			June 1, 2017 at 7:11 am</a>		</div>
+
+		<p>As index -&gt; indices, so futex -&gt; futices.</p>
+<p>(For the nitpickers, yes, indexes is a word a word in your dictionary, but no, it&#8217;s not the plural of index; it&#8217;s a conjugation of &#8220;to index&#8221;, as in &#8220;she indexes&#8221;.</p>
+<p>I now eagerly wait for Skitt&#8217;s Law to strike&#8230;)</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1298306">
+				<div id="div-comment-1298306" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">laonianren</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298306">
+			June 1, 2017 at 7:46 am</a>		</div>
+
+		<p>I have Windows 3.1 (a licensed copy for which I still have the floppies!) installed in DOSBox just so I can run my ancient copy of the NSOED.  And it says:</p>
+<p>index n. / Pl. indexes, (esp. technical) indices</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-mngoldeneagle even depth-3" id="comment-1298345">
+				<div id="div-comment-1298345" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298345">
+			June 1, 2017 at 9:04 am</a>		</div>
+
+		<p>Lesson learned: oral language does not play nicely with pedants.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2 parent" id="comment-1298365">
+				<div id="div-comment-1298365" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Roman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298365">
+			June 1, 2017 at 11:43 am</a>		</div>
+
+		<p>The &#8220;ex&#8221; in &#8220;futex&#8221; isn&#8217;t from &#8220;index&#8221;, though. &#8220;Futex&#8221; stands for &#8220;fast user-space mutex&#8221; and &#8220;mutex&#8221; stands for &#8220;mutual exclusion&#8221;. So your reasoning doesn&#8217;t apply.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1298405">
+				<div id="div-comment-1298405" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298405">
+			June 2, 2017 at 1:57 am</a>		</div>
+
+		<p>&#8220;Index&#8221;, &#8220;mutual&#8221; and &#8220;exclusion&#8221; all come from Latin roots (indicō, mūtuus, excludere), so I posit that it is entirely appropriate that &#8220;mutex&#8221; take a plural form in the same style as &#8220;index&#8221; (and &#8220;appendix&#8221;, fwiw).</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1298426">
+				<div id="div-comment-1298426" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dirk Gently</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298426">
+			June 2, 2017 at 3:59 am</a>		</div>
+
+		<p>&#8220;Mutex&#8221; is a portmanteau of latin words, but it&#8217;s not a latin word itself, so the unusual latin plural should not apply to it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1298445">
+				<div id="div-comment-1298445" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Karellen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298445">
+			June 2, 2017 at 7:12 am</a>		</div>
+
+		<p>So what other, more commonly (correctly) used, plural form for English words ending in &#8220;-&lt;vowel&gt;x&#8221; would you suggest instead?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-mngoldeneagle odd alt depth-5" id="comment-1298455">
+				<div id="div-comment-1298455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/MNGoldenEagle' rel='external nofollow' class='url'>MNGoldenEagle</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298455">
+			June 2, 2017 at 7:27 am</a>		</div>
+
+		<p>@karellen: English grammar patterns are more traditionally informed by the etymological roots of the word than the construction of the word itself.  When the roots are non-obvious, mixed, or simply non-existent, then different grammatical patterns may be applied across a population.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm even depth-5" id="comment-1299465">
+				<div id="div-comment-1299465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1299465">
+			June 10, 2017 at 3:12 pm</a>		</div>
+
+		<p>Karellen, I&#8217;d say we have a couple choices, -es (boxes, foxes, axes, taxes, annexes, equinoxes, fixes, sexes, hexes), and -en (oxen).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4" id="comment-1298665">
+				<div id="div-comment-1298665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dirk Gently</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298665">
+			June 5, 2017 at 4:14 am</a>		</div>
+
+		<p>wiktionary says the plural of mutex is mutexes. This makes sense to me, as &#8220;-ices&#8221; ending is only applied to latin words. Other online dictionaries I found didn&#8217;t have an entry for &#8220;mutex&#8221;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-alegrigoriev even depth-2" id="comment-1298505">
+				<div id="div-comment-1298505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/alegr1' rel='external nofollow' class='url'>alegr1</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298505">
+			June 3, 2017 at 5:16 am</a>		</div>
+
+		<p>Do they speak English or Latin in What?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-wndsks odd alt thread-odd thread-alt depth-1" id="comment-1298326">
+				<div id="div-comment-1298326" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298326">
+			June 1, 2017 at 8:22 am</a>		</div>
+
+		<p>These atomic and locks post are always good! Were there a lot of kernel changes required to support the new stuff in Vista? And before that, keyed event was the only real change?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1298335">
+				<div id="div-comment-1298335" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Bradley</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298335">
+			June 1, 2017 at 9:00 am</a>		</div>
+
+		<p>&#8220;Forcing the value to −1 avoids underflow if more than 2 billion threads wait on the futex.&#8221;</p>
+<p>Thanks, now everyone is looking at me strange because I burst out laughing in the office.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1298395">
+				<div id="div-comment-1298395" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298395">
+			June 1, 2017 at 4:06 pm</a>		</div>
+
+		<p>Well considering that requires not less than 16TB RAM &#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-1298375">
+				<div id="div-comment-1298375" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://www.kickstarter.com/projects/129274931/asynchronicity-shell' rel='external nofollow' class='url'>Joshua Schaeffer</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298375">
+			June 1, 2017 at 2:12 pm</a>		</div>
+
+		<p>Did this really deserve a patent? I&#8217;m confused what the innovation is here.<br />
+<a href="https://www.google.com/patents/US20120144406" rel="nofollow">https://www.google.com/patents/US20120144406</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2 parent" id="comment-1298385">
+				<div id="div-comment-1298385" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298385">
+			June 1, 2017 at 3:37 pm</a>		</div>
+
+		<p>I just listed an entire table full of interesting things.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1298415">
+				<div id="div-comment-1298415" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">GWO</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298415">
+			June 2, 2017 at 2:00 am</a>		</div>
+
+		<p>Besides, patents are not granted based on being interesting, they&#8217;re for novelty and non-obviousness.  If no-one else thought of using the synchronisation object to store extra state, then it novel. And if a patent examiner then decides its not obvious, it gets a patent.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1298585">
+				<div id="div-comment-1298585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Hasturkun</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298585">
+			June 4, 2017 at 7:28 am</a>		</div>
+
+		<p>I think your description of futex is incorrect.</p>
+<p>As far as I can tell from the documentation of the futex(2) syscall, the only case where the contents of the futex are specified is when using PI futexes, in all other cases the contents are yours to do as you like.</p>
+<p>It seems to me that the user mode documentation is only giving an example usage, as shown in the <a href="http://man7.org/linux/man-pages/man7/futex.7.html#NOTES" rel="nofollow">futex(7) notes</a>:</p>
+<blockquote><p>This man page illustrates the most common use of the futex(2) primitives; it is by no means the only one.</p></blockquote>
+<p>The futex itself behaves much like WaitOnAddress does, with the addition of some other operations such as FUTEX_CMP_REQUEUE.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1298615">
+				<div id="div-comment-1298615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20170601-00/?p=96265#comment-1298615">
+			June 4, 2017 at 2:05 pm</a>		</div>
+
+		<p>Linux &#8220;userspace&#8221; futexes have this nice property that they can be unlocked when one process crashes out while holding a futex in a shared memory segment. (Yes, the programmer has to bother to set this up to make it work.) I&#8217;ve since learned this isn&#8217;t as entirely desirable as one would hope as now on acquiring lock the code must check for corruption due to other process being interrupted at any point. But still&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

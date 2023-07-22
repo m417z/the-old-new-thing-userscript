@@ -1,0 +1,285 @@
+<html>
+<head>
+<title>What happened in real-mode Windows when somebody did a longjmp into a discardable segment?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What happened in real-mode Windows when somebody did a longjmp into a discardable segment?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 3, 2014 / year-entry #3</td></tr>
+<tr><td><b>Tags:</b></td><td>history</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>14</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">During the discussion of how real-mode Windows handled return addresses into discarded segments, Gabe wondered, "What happens when somebody does a long­jmp into a discardable segment?" I'm going to assume that everybody knows how long­jmp traditionally works so I can go straight to the analysis. The reason long­jmp is tricky is that it has to...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>During the discussion of  <a href="http://blogs.msdn.com/b/oldnewthing/archive/2012/06/29/10325295.aspx"> how real-mode Windows handled return addresses into discarded segments</a>, Gabe wondered, "What happens when <a href="http://blogs.msdn.com/b/oldnewthing/archive/2012/06/29/10325295.aspx#10326356"> somebody does a <code>long&shy;jmp</code> into a discardable segment</a>?"</p>
+<p> I'm going to assume that everybody knows how <code>long&shy;jmp</code> traditionally works so I can go straight to the analysis. </p>
+<p> The reason <code>long&shy;jmp</code> is tricky is that it has to jump to a return address that isn't on the stack. (The return address was captured in the <code>jmp_<wbr>buf</wbr></code>.) If that segment got relocated or discarded, then the jump target is no longer valid. It would have gotten patched to a return thunk if it were on the stack, but since it's in a <code>jmp_<wbr>buf</wbr></code>, the stack walker didn't see it, and the result is a return address that is no longer valid. (There is a similar problem if the data segment or stack segment got relocated. Exercise: Why don't you have to worry about the data segment or stack segment being discarded?) </p>
+<p> Recall that when a segment got discarded, all return addresses which pointed into that segment were replaced with return thunks. I didn't mention it explicitly in the original discussion, but there are three properties of return thunks which will help us here: </p>
+<ul>
+<li> It is safe to invoke a return thunk even if the associated code segment is in memory. All that happens is that the "ensure the segment is present" step is a nop, and the return thunk simply continues with its work of recovering the original state. </li>
+<li> It is safe to abandon a return thunk without needing to do any special cleanup. All the state used by the return thunk is stored in the patched stack itself, so if you want to abandon a return thunk, all you need to do is free the stack space. </li>
+<li> It is safe to reuse a return thunk. Since they are statically allocated, you can use them over and over as long as the associated code segment has not been freed. </li>
+</ul>
+<p> The first property (idempotence of the return thunk) is no accident. It's required behavior in order for return thunks to work at all! After all, if the segment was loaded (say by a direct call or some <i>other</i> return thunk), then the return thunk needs to say, "Well, I guess that was easy," and simply skip the "load the target segment" step. (It still needs to do the rest of the work, of course.) </p>
+<p> The second property (abandonment) is also no accident. An application might decide to exit without returning all the way to <code>Win&shy;Main</code> (the equivalent of calling <code>Exit&shy;Process</code> instead of returning from <code>Win&shy;Main</code>). This would abandon all the stack frames between the exit point and the <code>Win&shy;Main</code>. </p>
+<p> The third property (reuse) is a happy accident. (Well, it was probably designed in for the purpose we're about to put it to right here.) </p>
+<p> Okay, now let's look at the jump buffer again. If you've been following along so far, you may have guessed the solution: Pre-patch the return address as if it had already been discarded. If it turns out that the segment was discarded, then the return thunk will restore it. If the segment is present (either because it was never discarded, or because it was discarded and reloaded, possibly at a new address), the return thunk will figure out where the code is and jump to it. </p>
+<p> Actually, since the state is being recorded in a <code>jmp_<wbr>buf</wbr></code>, the tight space constraints of stack patching do not apply here. If it turns out you need 20 bytes of memory to record this information, then go ahead and make your <code>jmp_<wbr>buf</wbr></code> 20 bytes. You don't have to try to make it all fit inside an existing stack frame. </p>
+<p> The <code>jmp_<wbr>buf</wbr></code> therefore doesn't have to try to play the crazy air-squeezing games that stack patching did. It can record the return thunk, the handles to the data and stack segments, and the return IP without any encoding at all. And in fact, the <code>long&shy;jmp</code> function doesn't need to invoke the return thunk directly. It can just extract the segment number after the initial <code>INT 3Fh</code> and pass that directly to the segment loader. </p>
+<p> (There is a little hitch if the address being returned to is fixed; in that case, there is no return thunk. But that just makes things easier: The lack of a return thunk means that the return address cannot be relocated, so there is no patching needed at all!) </p>
+<p> This magic with return thunks and segment reloading is internal to the operating system, so the core <code>set&shy;jmp</code> and <code>long&shy;jmp</code> functionality was provided by the kernel rather than the C runtime library in a pair of functions called <code>Catch</code> and <code>Throw</code>. The C runtime's <code>set&shy;jmp</code> and <code>long&shy;jmp</code> functions merely forwarded to the kernel versions. </p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (14)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1097433">
+				<div id="div-comment-1097433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">9k08</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097433">
+			January 3, 2014 at 7:56 am</a>		</div>
+
+		<p>It continues to amaze me how much real mode Windows tried to accomplish with so little to work with&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1097443">
+				<div id="div-comment-1097443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097443">
+			January 3, 2014 at 8:18 am</a>		</div>
+
+		<p>Well there&#39;s two more functions to add to the list of what to expect as platform functions:</p>
+<p>we now have: div, _ldiv, memcpy, memmove, memset, sbrk, setjmp, longjmp</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1097453">
+				<div id="div-comment-1097453" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Theo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097453">
+			January 3, 2014 at 9:28 am</a>		</div>
+
+		<p>After all the work that had to be done before this, it&#39;s quaint to see that in this case it was basically a none-issue.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1097463">
+				<div id="div-comment-1097463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">CarlD</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097463">
+			January 3, 2014 at 10:21 am</a>		</div>
+
+		<p>It is fun to remember the pains we went through &quot;way back when&quot;. &nbsp;Having implemented an overlay manager for 16 bit CP/M back in the days before Windows, we had to solve all these same problems &#8211; and came up with very similar solutions.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1097483">
+				<div id="div-comment-1097483" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken Hagan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097483">
+			January 3, 2014 at 1:28 pm</a>		</div>
+
+		<p>@9k08: Agreed, but you tell that to the kids these days and they just don&#39;t believe you.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1097503">
+				<div id="div-comment-1097503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">jonwil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097503">
+			January 4, 2014 at 2:31 am</a>		</div>
+
+		<p>I do wonder if the special kernel functions were publicly documented (allowing other compiler vendors to use them where necessary), &quot;documented&quot; (in that some compiler vendors and others were given the info and/or it existed out there but not officially) or kept secret so only Microsoft had proper working code.</p>
+<p>Even today its (to the best of my knowledge) not possible to find official documentation describing how the machinery behind __declspec(thread) or win32 SEH works (the relavent code is not included in the CRT source with any version of Visual Studio I have ever seen)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1097523">
+				<div id="div-comment-1097523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097523">
+			January 4, 2014 at 8:59 am</a>		</div>
+
+		<p>@ionwil: Try looking in the PE file format specifications.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao odd alt thread-odd thread-alt depth-1" id="comment-1097533">
+				<div id="div-comment-1097533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097533">
+			January 4, 2014 at 2:13 pm</a>		</div>
+
+		<p>@jonwil: Ah, reminds me of this: <a rel="nofollow" target="_new" href="http://antitrust.slated.org/www.iowaconsumercase.org/011607/0000/PX00342.pdf">antitrust.slated.org/&#8230;/PX00342.pdf</a></p>
+<p>I don&#39;t think &quot;Open Tools&quot; with documentation for things like InitTask, InitApp, and WaitEvent came until 1991.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-yuhong-bao even thread-even depth-1" id="comment-1097543">
+				<div id="div-comment-1097543" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Yuhong+Bao' rel='external nofollow' class='url'>Yuhong Bao</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097543">
+			January 4, 2014 at 2:29 pm</a>		</div>
+
+		<p>@jonwil: In fact, it also reminds me of how Skywing described how Windows x64 SEH implemented setjmp/longjmp as a &quot;layering violation&quot;:</p>
+<p><a rel="nofollow" target="_new" href="http://www.nynaeve.net/?p=105">http://www.nynaeve.net/?p=105</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1097553">
+				<div id="div-comment-1097553" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">poizan42</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097553">
+			January 4, 2014 at 4:13 pm</a>		</div>
+
+		<p>@Jushua: Well according to <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/ms686708(v=vs.85).aspx:" rel="nofollow" target="_new">msdn.microsoft.com/&#8230;/ms686708(v=vs.85).aspx:</a></p>
+<p>You should not directly access this structure. To access the values of the TlsSlots and TlsExpansionSlots members, call TlsGetValue.</p>
+<p>It seems like someone at Microsoft thinks that third party compilers should not be allowed to generate as efficient code as Microsoft&#39;s own compilers.</p>
+<div class="post">[<em>The &quot;you&quot; in that sentence is &quot;you, the application writer.&quot; Selected parts of the TEB are documented for compiler authors. But most people reading MSDN are not compiler authors. If you are a compiler author, then you already have the &quot;extra stuff just for compiler authors&quot; document because you also need to know about all sorts of stuff that isn&#39;t interesting to an application author, like the rules on code generation so the exception unwinder will know how to unwind your stack. There are other categories of specialty software like accessibility tools vendors and anti-malware software vendors. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1097563">
+				<div id="div-comment-1097563" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Danny</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097563">
+			January 4, 2014 at 6:59 pm</a>		</div>
+
+		<p>Ahhh, long jump in a discardable segment &#8211; the best way to write an undetected polymorphic virus. Then SoftIce came along and those discardable segments were accessible for a debugger.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1097623">
+				<div id="div-comment-1097623" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Damien</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097623">
+			January 5, 2014 at 11:39 pm</a>		</div>
+
+		<p>Exercise: Why don&#39;t you have to worry about the data segment or stack segment being discarded?</p>
+<p>I was thinking along the lines, and then went back and read the original article that started this all off &#8211; code segments could only *be* discarded because it was easy to regenerate the content of those segments &#8211; just reload the code from disk. Data and stack segments were updatable and never got discarded.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1097973">
+				<div id="div-comment-1097973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097973">
+			January 7, 2014 at 3:07 am</a>		</div>
+
+		<p>For those of you who are still annoyed that Firefox doesn&#39;t follow comment links, the squeaky wheel finally got too much for me and I&#39;ve submitted a patch. Expect to see it working in Firefox 29.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1097993">
+				<div id="div-comment-1097993" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Deduplicator</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20140103-00/?p=2173#comment-1097993">
+			January 7, 2014 at 4:34 am</a>		</div>
+
+		<p>I cannot find the original Microsoft document which started this series way back when. Can it still be found on the web?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

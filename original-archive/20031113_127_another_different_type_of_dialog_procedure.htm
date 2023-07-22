@@ -1,0 +1,343 @@
+<html>
+<head>
+<title>Another different type of dialog procedure</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Another different type of dialog procedure</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 13, 2003 / year-entry #128</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20031113-00/?p=41843</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>4</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">The other method of using a window-procedure-like dialog box is to change the rules of the game. Normally, the window procedure for a dialog box is the DefDlgProc function, which calls the dialog procedure and then takes action if the dialog procedure indicated that it desired the default action to take place. The dialog procedure...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+The other method of using a window-procedure-like dialog box is
+to change the rules of the game.
+Normally, the window procedure for a dialog box is
+the <code>DefDlgProc</code> function, which calls the dialog
+procedure and then takes action if the dialog procedure indicated
+that it desired the default action to take place.
+</p>
+<p>
+The dialog procedure is subservient to <code>DefDlgProc</code>,
+providing advice when requested.
+The kernel of the idea for this technique is to "turn the tables".
+Make <code>DefDlgProc</code> be the one who gives advice and you
+be the one that asks for the advice when you want it.
+</p>
+<p>
+We do this by making the window procedure be our own function
+which decides whether or not it wants the default action to happen.
+If so, it calls <code>DefDlgProc</code> to do it, after giving
+the dialog a dummy dialog procedure that always says "Just do the
+default".
+</p>
+<p>
+Here's the flow diagram:
+</p>
+<pre>
+Message delivered
+-&gt; WLWndProc
+   -&gt; your WLDlgProc
+      decide what to do
+      want to do the default action
+      -&gt; DefDlgProc
+         -&gt; dummy dialog procedure
+         &lt;- always returns FALSE
+         DefDlgProc does default action
+      &lt;- returns result of default behavior
+      you do other stuff (perhaps modify
+      default behavior after it occurred)
+   &lt;- returns result
+&lt;- returns result
+</pre>
+<p>
+To do this, we need to register a custom dialog class.
+You always wondered what that was for: Now you know.
+</p>
+<pre>
+BOOL
+InitApp(void)
+{
+  WNDCLASS wc;
+
+  wc.style = CS_DBLCLKS | CS_SAVEBITS | CS_BYTEALIGNWINDOW;
+  wc.lpfnWndProc = WLWndProc;
+  wc.cbClsExtra = 0;
+  wc.cbWndExtra = DLGWINDOWEXTRA + sizeof(WLDLGPROC);
+  wc.hInstance = g_hinst;
+  wc.hIcon = NULL;
+  wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+  wc.hbrBackground = NULL;
+  wc.lpszMenuName = NULL;
+  wc.lpszClassName = TEXT("WLDialog");
+
+  if (!RegisterClass(&wc)) return FALSE;
+
+  return TRUE;
+}
+</pre>
+<p>
+This creates a new window class called "WLDialog" which we will use
+as our custom dialog class. When you create a custom dialog class, you
+must set the cbWndExtra to DLGWINDOWEXTRA bytes, plus any additional
+bytes you wish to use for yourself.  We need to store an extra
+WLDLGPROC, so we add that in.
+</p>
+<p>
+To use our custom dialog procedure, the dialog template must use the
+"CLASS" keyword to specify the custom dialog class:</p>
+<pre>
+1 DIALOGEX DISCARDABLE  0, 0, 200,200
+STYLE DS_SHELLFONT | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+CLASS "WLDialog"
+CAPTION "sample"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    DEFPUSHBUTTON "&Bye", IDCANCEL, 7,4,50,14, WS_TABSTOP
+END
+</pre>
+<p>
+This is exactly the same as a regular dialog box template, except
+that there is a "CLASS" entry which specifies that this dialog box
+should use our new class.  Paralleling the <code>DialogBoxParam</code>
+function we have our own:
+</p>
+<pre>
+typedef LRESULT (CALLBACK* WLDLGPROC)(HWND, UINT, WPARAM, LPARAM);
+
+struct WLDIALOGINFO {
+  WLDLGPROC wldp;
+  LPARAM lParam;
+};
+
+INT_PTR
+WLDialogBoxParam(HINSTANCE hinst, LPCTSTR pszTemplate,
+  HWND hwndParent, WLDLGPROC wldp, LPARAM lParam)
+{
+  WLDIALOGINFO wldi = { wldp, lParam };
+  return DialogBoxParam(hinst, pszTemplate,
+           hwndParent, WLDlgProc, (LPARAM)&amp;wldi);
+}
+</pre>
+<p>
+This packages up the WndProc-Like dialog procedure and its reference
+data so we can recover it in our window procedure:
+</p>
+<pre>
+LRESULT CALLBACK
+WLWndProc(HWND hdlg, UINT uiMsg, WPARAM wParam, LPARAM lParam)
+{
+  if (uiMsg == WM_INITDIALOG) {
+    WLDIALOGINFO *pwldi = (WLDIALOGINFO*)lParam;
+    SetWindowLongPtr(hdlg, DLGWINDOWEXTRA, (LONG_PTR)pwldi->wldp);
+    lParam = pwldi->lParam;
+  }
+  WLDLGPROC wldp = (WLDLGPROC)GetWindowLongPtr(hdlg, DLGWINDOWEXTRA);
+  if (wldp) {
+    return wldp(hdlg, uiMsg, wParam, lParam);
+  } else {
+    return DefDlgProc(hdlg, uiMsg, wParam, lParam);
+  }
+}
+</pre>
+<p>
+This is the window procedure for the custom dialog.  When the
+<code>WM_INITDIALOG</code> message comes in, we recover the original
+parameters to <code>WLDialogBoxParam</code>.
+The <code>WLDLGPROC</code> we save in the extra bytes we reserved,
+and the original <code>LPARAM</code> becomes the <code>lParam</code>
+that we pass to the <code>WLDLGPROC</code>.  Then for each message
+that comes in, we pass the message and its parameters directly to
+the <code>WLDLGPROC</code> and return the value directly.
+No <code>DWLP_MSGRESULT</code> necessary.
+</p>
+<p>
+The last piece of the puzzle is the dialog procedure we actually hand
+to the dialog manager:
+</p>
+<pre>
+INT_PTR CALLBACK
+WLDlgProc(HWND hdlg, UINT uiMsg, WPARAM wParam, LPARAM lParam)
+{
+  return FALSE;
+}
+</pre>
+<p>
+All it says is, "Do the default thing."
+</p>
+<p>
+Okay so let's write yet another version of our sample program,
+using this new architecture:
+</p>
+<pre>
+LRESULT CALLBACK SampleWLDialogProc(
+HWND hdlg, UINT uiMsg, WPARAM wParam, LPARAM lParam)
+{
+  switch (uiMsg) {
+  case WM_INITDIALOG:
+    break;
+
+  case WM_COMMAND:
+    switch (GET_WM_COMMAND_ID(wParam, lParam)) {
+    case IDCANCEL:
+      MessageBox(hdlg, TEXT("Bye"), TEXT("Title"), MB_OK);
+      EndDialog(hdlg, 1);
+      break;
+    }
+    break;
+
+  case WM_SETCURSOR:
+    if (LOWORD(lParam) == HTCAPTION) {
+      SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+      return TRUE;
+    }
+    break;
+  }
+
+  return DefDlgProc(hdlg, uiMsg, wParam, lParam);
+}
+
+int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
+                   LPSTR lpCmdLine, int nShowCmd)
+{
+  InitApp();
+  WLDialogBoxParam(hinst, MAKEINTRESOURCE(1),
+            NULL, SampleWLDialogProc, 0);
+  return 0;
+}
+</pre>
+<p>
+In this style of WndProc-Like dialog, we just write our
+dialog procedure as if it were a window procedure,
+calling <code>DefDlgProc()</code> to perform default behavior.
+And to get this new behavior, we use <code>WLDialogBoxParam</code>
+instead of <code>DialogBoxParam</cODE>
+</p>
+<p>
+So now I've developed two quite different
+ways you can write WndProc-Like dialog procedures.
+You may not like either one of them, so go ahead and write a third
+way if you prefer.  But at least I hope you
+learned a little more about how Windows works.
+</body></p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (4)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-131133">
+				<div id="div-comment-131133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031113-00/?p=41843#comment-131133">
+			November 13, 2003 at 3:03 pm</a>		</div>
+
+		<p>Thanks for the insight Raymond.  I think I prefer this method somewhat (seems more intuitive to me).  It&#8217;s nice to know someone&#8217;s listening :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-145813">
+				<div id="div-comment-145813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://webclass.ru' rel='external nofollow' class='url'>Al</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031113-00/?p=41843#comment-145813">
+			February 18, 2004 at 3:34 am</a>		</div>
+
+		<p>Thank you!<br />
+<br />After hours of digging I finally found some really useful info about DIALOG templates in rc files and about custom window classes. I needed all that for my dialog application.<br />
+<br />Your article helped me a lot, thanks!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-568063">
+				<div id="div-comment-568063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.shugye.com/2007/11/why-do-we-even-have-the-defwindowproc-function-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%88%91%e4%bb%ac%e9%9c%80%e8%a6%81defwindowproc-%e5%87%bd%e6%95%b0-48.html' rel='external nofollow' class='url'>Why do we even have the DefWindowProc function? 为什么我们需要DefWindowProc 函数 &laquo; Cloudsun&#8217;s Daily Review</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031113-00/?p=41843#comment-568063">
+			November 17, 2007 at 10:18 am</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://www.shugye.com/2007/11/why-do-we-even-have-the-defwindowproc-function-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%88%91%e4%bb%ac%e9%9c%80%e8%a6%81defwindowproc-%e5%87%bd%e6%95%b0-48.html" rel="nofollow">http://www.shugye.com/2007/11/why-do-we-even-have-the-defwindowproc-function-%e4%b8%ba%e4%bb%80%e4%b9%88%e6%88%91%e4%bb%ac%e9%9c%80%e8%a6%81defwindowproc-%e5%87%bd%e6%95%b0-48.html</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-701973">
+				<div id="div-comment-701973" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://geeks.netindonesia.net/blogs/lontong/archive/2009/01/18/win32-tiny-tip-on-using-common-controls.aspx' rel='external nofollow' class='url'>LonTonG</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20031113-00/?p=41843#comment-701973">
+			January 18, 2009 at 2:18 am</a>		</div>
+
+		<p>It&amp;#39;s important to know that you need to call InitCommonControlsEx function with INITCOMMONCONTROLSEX</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

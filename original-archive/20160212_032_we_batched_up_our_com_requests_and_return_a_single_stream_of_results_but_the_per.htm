@@ -1,0 +1,432 @@
+<html>
+<head>
+<title>We batched up our COM requests and return a single stream of results, but the performance is still slow</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>We batched up our COM requests and return a single stream of results, but the performance is still slow</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>February 12, 2016 / year-entry #33</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20160212-00/?p=93013</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>5</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Your stream marshaled by reference.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer had a performance problem with an interface that
+connected to a service:
+The design was too chatty.
+("Chatty" is a technical term that means "Too much time is spent
+communicating back and forth, often at the expense of actual work.")
+The original design went like this:
+</p>
+<pre>
+// All error checking deleted for expository purposes.
+void
+GetIdsAndNamesOfEverythingInContainer(IContainer* container)
+{
+  CComPtr&lt;IIEnumItem&gt; enumerator;
+  container-&gt;GetEnumerator(&amp;enumerator);
+  for (CComPtr&lt;IItem&gt; item;
+       enumerator-&gt;Next(&amp;item) == S_OK;
+       item.Release()) {
+    UINT id;
+    item-&gt;GetId(&amp;id);
+    CComHeapPtr&lt;wchar_t&gt; name;
+    item-&gt;GetName(&amp;name);
+    AddToUI(id, name);
+  }
+}
+</pre>
+<p>
+If there are 10,000 items, then the number of trips to the server
+comes out to
+</p>
+<table BORDER="0">
+<tr>
+<th>Line</th>
+<th>Calls to server</th>
+</tr>
+<tr>
+<td><code>Get&shy;Enumerator</code></td>
+<td ALIGN="right">1</td>
+</tr>
+<tr>
+<td><code>Next</code></td>
+<td ALIGN="right">10,001</td>
+</tr>
+<tr>
+<td><code>Get&shy;Id</code></td>
+<td ALIGN="right">10,000</td>
+</tr>
+<tr>
+<td><code>Get&shy;Name</code></td>
+<td ALIGN="right">10,000</td>
+</tr>
+<tr>
+<td><code>item-&gt;Release</code></td>
+<td ALIGN="right">10,000</td>
+</tr>
+<tr>
+<td><code>enumerator-&gt;Release</code></td>
+<td ALIGN="right">1</td>
+</tr>
+<tr>
+<td COLSPAN="2">
+<hr>
+    </td>
+</tr>
+<tr>
+<td>Total</td>
+<td ALIGN="right">40,003</td>
+</tr>
+</table>
+<p>
+If every call to the server takes one millisecond to complete,
+that's forty seconds spent collecting the IDs and names of all
+the items.
+(In this particular case, the server was local,
+but the high level of chattiness made the problem noticeable
+even for a local server.)
+</p>
+<p>
+They reduced the chattiness by adding a special
+<code>Get&shy;Ids&shy;And&shy;Names&shy;Of&shy;All&shy;Children</code>
+method to
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2006/04/07/570801.aspx">
+perform a bulk operation</a>.
+On the server side, it collects all the information and serializes
+it into a stream,
+then it returns the stream to the client.
+The client can then deserialize the data from the stream.
+Something like this:
+</p>
+<pre>
+// All error checking deleted for expository purposes.
+void
+GetIdsAndNamesOfEverythingInContainer(IContainer* container)
+{
+  // Issue the bulk request for the IDs and names of all children.
+  CComPtr&lt;IIStream&gt; stream;
+  container-&gt;GetIdsAndNamesOfAllChildren(&amp;stream);
+
+  // Now parse out the results.
+
+  // First thing in the stream is the number of items.
+  ULONG bytesRead;
+  UINT count;
+  stream-&gt;Read(&amp;count, sizeof(count), &amp;bytesRead);
+
+  // For each item, read the ID and name
+  for (UINT i = 0; i &lt; count; i++) {
+    UINT id;
+    stream-&gt;Read(&amp;id, sizeof(id), &amp;bytesRead);
+
+    // The string is preceded by a character count.
+    UINT length;
+    stream-&gt;Read(&amp;length, sizeof(length), &amp;bytesRead);
+
+    // Yes, there is an integer overflow here - like I said,
+    // I removed error checking for expository purposes.
+    UINT byteLength = (length + 1) * sizeof(wchar_t);
+    CComHeapPtr&lt;wchar_t&gt; name(CoTaskMemAlloc(byteLength));
+    ZeroMemory(name, byteLength);
+
+    stream-&gt;Read(name.m_pData, byteLength, &amp;bytesRead);
+
+    AddToUI(id, name);
+  }
+}
+</pre>
+<p>
+But the operation was still slow.
+</p>
+<p>
+Let's study how chatty this new design is:
+</p>
+<table BORDER="0">
+<tr>
+<th>Line</th>
+<th>Calls to server</th>
+</tr>
+<tr>
+<td><code>Get&shy;Ids&shy;And&shy;Names</code></td>
+<td ALIGN="right">1</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for count</td>
+<td ALIGN="right">1</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for Id</td>
+<td ALIGN="right">10,000</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for length</td>
+<td ALIGN="right">10,000</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for string</td>
+<td ALIGN="right">10,000</td>
+</tr>
+<tr>
+<td><code>IStream::Release</code></td>
+<td ALIGN="right">1</td>
+</tr>
+<tr>
+<td COLSPAN="2">
+<hr>
+    </td>
+</tr>
+<tr>
+<td>Total</td>
+<td ALIGN="right">30,003</td>
+</tr>
+</table>
+<p>
+It's still ridiculously chatty!
+(We traded calls to <code>Next</code> and <code>Release</code>
+for a single call to get the length in the inner loop,
+but the other calls are still there.)
+</p>
+<p>
+The problem is that the stream is marshaled by reference.
+When the COM marshaler returns the stream, it returns a proxy
+that talks back to the stream on the server.
+COM doesn't have any special knowledge about how you're
+using the stream.
+If you issue a read on the stream, COM marshal the read
+call back to the original object so that it can perform
+the read,
+which may consist of generating data on the fly or
+calling out to other objects,
+and it will certainly update the position of the stream pointer.
+Or maybe the stream on the server is constantly
+changing, so the read needs to retrieve the current data
+in the stream,
+even if it changed after the call to
+<code>Get&shy;Ids&shy;And&shy;Names&shy;Of&shy;All&shy;Children</code>
+returned.
+</p>
+<p>
+The solution here is to bring domain-specific knowledge to the table.
+We know that the stream being returned is immutable,
+and it's not being shared with anybody.
+Indeed, once the server generates the output stream and returns it
+to the client, the server throws the stream away!
+What we want to happen is to transfer the <i>contents</i>
+of the stream to the client,
+so that the client gets a clone of the stream.
+Once that's done, all the stream operations on the client can be performed
+without having to talk back to the server.
+</p>
+<p>
+One solution is to make the stream <i>marshal by value</i>
+by implementing <i>IMarshal</i> and providing a custom
+marshaler.
+Marshaling by value is common for immutable objects,
+because you can just transfer the object's state to the
+client, and then you're done.
+The client can talk to its local copy of the object
+instead of having to go back to the server all the time.
+</p>
+<p>
+Another solution is to make the marshaling by value explicit
+by returning a block of memory rather than a COM object.
+Annotating your interface to indicate this is rather tricky,
+using the wacky
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2009/09/23/9898230.aspx">
+<code>size_is(, ...)</code> syntax</a>,
+where there is nothing between the open parenthesis and the comma.
+Once the client gets the raw buffer,
+it can parse the buffer directly, or it can
+create an <code>IStream</code> wrapper around it.
+(You might choose to create an <code>IStream</code> wrapper so that
+you minimize change to code that you've already spent
+time writing and debugging.)
+</p>
+<p>
+Here's the revised table once we marshal the buffer by value,
+so that all of the <code>IStream</code> operations can be performed
+on the client side.
+</p>
+<table BORDER="0">
+<tr>
+<th>Line</th>
+<th>Calls to server</th>
+</tr>
+<tr>
+<td><code>Get&shy;Ids&shy;And&shy;Names</code></td>
+<td ALIGN="right">1</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for count</td>
+<td ALIGN="right">0</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for Id</td>
+<td ALIGN="right">0</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for length</td>
+<td ALIGN="right">0</td>
+</tr>
+<tr>
+<td><code>IStream::Read</code> for string</td>
+<td ALIGN="right">0</td>
+</tr>
+<tr>
+<td><code>IStream::Release</code></td>
+<td ALIGN="right">0</td>
+</tr>
+<tr>
+<td COLSPAN="2">
+<hr>
+    </td>
+</tr>
+<tr>
+<td>Total</td>
+<td ALIGN="right">1</td>
+</tr>
+</table>
+<p>
+<b>Bonus reading</b>:
+<a HREF="http://blogs.msdn.com/b/larryosterman/archive/2010/05/26/what-does-size-is-mean-in-an-idl-file.aspx">
+Larry Osterman explains some of the nuances</a>
+of <code>size_is</code> and <code>length_is</code>.
+</p>
+<p>
+<b>Update</b>: Math is hard. Let's go shopping.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (5)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-aadsso-1live-com00033fff8041058c even thread-even depth-1 parent" id="comment-1226762">
+				<div id="div-comment-1226762" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Steven+Don' rel='external nofollow' class='url'>Steven Don</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160212-00/?p=93013#comment-1226762">
+			February 12, 2016 at 7:26 am</a>		</div>
+
+		<p>Uhm, unless my basic arithmetic is off, the total on the second version would be 30,003, not 40,003. Still bad, just not *as* bad.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor odd alt depth-2" id="comment-1226813">
+				<div id="div-comment-1226813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160212-00/?p=93013#comment-1226813">
+			February 12, 2016 at 9:41 am</a>		</div>
+
+		<p>Oops. Math is hard. Let&#8217;s go shopping.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fredericmagnyf even thread-odd thread-alt depth-1 parent" id="comment-1226771">
+				<div id="div-comment-1226771" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Medinoc' rel='external nofollow' class='url'>Medinoc</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160212-00/?p=93013#comment-1226771">
+			February 12, 2016 at 7:40 am</a>		</div>
+
+		<p>What about returning a SAFEARRAY of records? That should work too, wouldn&#8217;t it?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1226781">
+				<div id="div-comment-1226781" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160212-00/?p=93013#comment-1226781">
+			February 12, 2016 at 8:50 am</a>		</div>
+
+		<p>Yes, and the base technique used in the same: size_is.  Just that instead it refers to a struct field instead of a method argument, and it&#8217;s automation compatible.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1226841">
+				<div id="div-comment-1226841" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">henke37</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20160212-00/?p=93013#comment-1226841">
+			February 13, 2016 at 3:06 am</a>		</div>
+
+		<p>Incidentally, are there any default COM classes that already do this efficient marshaling of streams?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

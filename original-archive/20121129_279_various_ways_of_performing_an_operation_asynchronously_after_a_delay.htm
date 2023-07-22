@@ -1,0 +1,580 @@
+<html>
+<head>
+<title>Various ways of performing an operation asynchronously after a delay</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Various ways of performing an operation asynchronously after a delay</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>November 29, 2012 / year-entry #280</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>23</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Okay, if you have a UI thread that pumps messages, then the easiest way to perform an operation after a delay is to set a timer. But let's say you don't have a UI thread that you can count on. One method is to burn a thread: #define ACTIONDELAY (30 * 60 * 1000) //...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+Okay, if you have a UI thread that pumps messages, then the easiest
+way to perform an operation after a delay is to set a timer.
+But let's say you don't have a UI thread that you can count on.
+</p>
+<p>
+One method is to burn a thread:
+</p>
+<pre>
+#define ACTIONDELAY (30 * 60 * 1000) // 30 minutes, say
+
+DWORD CALLBACK ActionAfterDelayProc(void *)
+{
+ Sleep(ACTIONDELAY);
+ Action();
+ return 0;
+}
+
+BOOL PerformActionAfterDelay()
+{
+ DWORD dwThreadId;
+ HANDLE hThread = CreateThread(NULL, 0, ActionAfterDelayProc,
+                               NULL, 0, &amp;dwThreadId);
+ BOOL fSuccess = hThread != NULL;
+ if (hThread) {
+  CloseHandle(hThread);
+ }
+ return fSuccess;
+}
+</pre>
+<p>
+Less expensive is to borrow a thread from the thread pool:
+</p>
+<pre>
+BOOL PerformActionAfterDelay()
+{
+ return QueueUserWorkItem(ActionAfterDelayProc, NULL,
+                          <a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2005/07/22/441785.aspx">WT_EXECUTELONGFUNCTION</a>);
+}
+</pre>
+<p>
+But both of these methods hold a thread hostage for the
+duration of the delay.
+Better would be to consume a thread only when the action is
+in progress.
+For that, you can use a thread pool timer:
+</p>
+<pre>
+void CALLBACK ActionAfterDelayProc(void *lpParameter, BOOLEAN)
+{
+ HANDLE *phTimer = static_cast&lt;HANDLE *&gt;(lpParameter);
+ Action();
+ DeleteTimerQueueTimer(NULL, *phTimer, NULL);
+ delete phTimer;
+}
+
+BOOL PerformActionAfterDelay()
+{
+ BOOL fSuccess = FALSE;
+ HANDLE *phTimer = new(std::nothrow) HANDLE;
+ if (phTimer != NULL) {
+  if (CreateTimerQueueTimer(
+     phTimer, NULL, ActionAfterDelayProc, phTimer,
+     ACTIONDELAY, 0, WT_EXECUTEONLYONCE)) {
+   fSuccess = TRUE;
+  }
+ }
+ if (!fSuccess) {
+  delete phTimer;
+ }
+ return fSuccess;
+}
+</pre>
+<p>
+The timer queue timer technique is complicated by the
+fact that we want the timer to self-cancel, so it needs
+to know its handle, but we don't know the handle until
+after we've scheduled it, at which point it's too late
+to pass the handle as a parameter.
+In other words, we'd ideally like to create the timer,
+and then once we get the handle, go back in time and
+pass the handle as the parameter to
+<code>Create&shy;Timer&shy;Queue&shy;Timer</code>.
+Since the Microsoft Research people haven't yet
+perfected their time machine, we solve this problem
+by passing the handle by address:
+The 
+<code>Create&shy;Timer&shy;Queue&shy;Timer</code>
+function fills the address with the timer,
+so that the callback function can read it back out.
+</p>
+<p>
+In practice, this additional work is no additional work at all,
+because you're already passing some data to the callback
+function, probably an object or at least a pointer to a structure.
+You can stash the timer handle inside that object.
+In our case, our object is just the handle itself.
+If you prefer to be more explicit:
+</p>
+<pre>
+struct ACTIONINFO
+{
+ HANDLE hTimer;
+};
+
+void CALLBACK ActionAfterDelayProc(void *lpParameter, BOOLEAN)
+{
+ ACTIONINFO *pinfo = static_cast&lt;ACTIONINFO *&gt;(lpParameter);
+ Action();
+ DeleteTimerQueueTimer(NULL, pinfo-&gt;hTimer, NULL);
+ delete pinfo;
+}
+
+BOOL PerformActionAfterDelay()
+{
+ BOOL fSuccess = FALSE;
+ ACTIONINFO *pinfo = new(std::nothrow) ACTIONINFO;
+ if (pinfo != NULL) {
+  if (CreateTimerQueueTimer(
+     &amp;pinfo-&gt;hTimer, NULL, ActionAfterDelayProc, pinfo,
+     ACTIONDELAY, 0, WT_EXECUTEONLYONCE)) {
+   fSuccess = TRUE;
+  }
+ }
+ if (!fSuccess) {
+  delete pinfo;
+ }
+ return fSuccess;
+}
+</pre>
+<p>
+The threadpool functions were redesigned in Windows Vista
+to allow for greater reliability and predictability.
+For example, the operations of creating a timer and setting it
+into action are separated so that you can preallocate your
+timer objects (inactive) at a convenient time.
+Setting the timer itself cannot fail (assuming valid parameters).
+This makes it easier to handle error conditions since all the
+errors happen when you preallocate the timers,
+and you can deal with the problem up front,
+rather than proceeding ahead for a while
+and then realizing,
+"Oops, I wanted to set that timer but I couldn't.
+Now how do I report the error and unwind all the work that I've done so far?"
+(There are other new features, like <i>cleanup groups</i> that let
+you clean up multiple objects with a single call,
+and being able to associate an execution environment with a library,
+so that the DLL is not unloaded while it still has active thread pool
+objects.)
+</p>
+<p>
+The result is, however, a bit more typing, since there are now two steps,
+creating and setting.
+On the other hand,
+the new threadpool callback is explicitly passed the
+<code>PTP_<wbr>TIMER</code>, so we don't have to play any
+weird time-travel games to get the handle to the callback,
+like we did with
+<code>Create&shy;Timer&shy;Queue&shy;Timer</code>.
+</p>
+<pre>
+void CALLBACK ActionAfterDelayProc(
+    PTP_CALLBACK_INSTANCE, PVOID, PTP_TIMER Timer)
+{
+ Action();
+ CloseThreadpoolTimer(Timer);
+}
+
+BOOL PerformActionAfterDelay()
+{
+ BOOL fSuccess = FALSE;
+ PTP_TIMER Timer = CreateThreadpoolTimer(
+                      ActionAfterDelayProc, NULL, NULL);
+ if (Timer) {
+  LONGLONG llDelay = -ACTIONDELAY * 10000LL;
+  FILETIME ftDueTime = { (DWORD)llDelay, (DWORD)(llDelay &gt;&gt; 32) };
+  SetThreadpoolTimer(Timer, &amp;ftDueTime, 0, 0); // never fails!
+  fSuccess = TRUE;
+ }
+ return fSuccess;
+}
+</pre>
+<p>
+Anyway, that's a bit of a whirlwind tour of some of the ways
+of arranging for code to run after a delay.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (23)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-wndsks even thread-even depth-1" id="comment-1023203">
+				<div id="div-comment-1023203" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/skSdnW' rel='external nofollow' class='url'>skSdnW</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023203">
+			November 29, 2012 at 7:14 am</a>		</div>
+
+		<p>Why do these APIs have threadpool in their name, why not just timerpool? Smells like a leaky abstraction.</p>
+<p>Thanks for posting samples for both the new and old API, I know some of us tend to nag about it.</p>
+<p>OT: I guess I should not vote on this post so you guys don&#39;t accuse me of being the childish down-voter :/</p>
+<div class="post">[<em>Because they are &quot;thread pool tasks triggered by time.&quot; As opposed to &quot;thread pool tasks triggered by signals&quot; or &quot;thread pool tasks that don&#39;t need a trigger&quot;. You can manage them just like any other thread pool tasks. If they were a separate timer pool, then you couldn&#39;t (say) put a timer-triggered task and a plain task in the same task group. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023223">
+				<div id="div-comment-1023223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/raceprouk_4000_hotmail.co.uk/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>raceprouk@hotmail.co.uk</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023223">
+			November 29, 2012 at 7:27 am</a>		</div>
+
+		<p>@WndSks: The threads can be used for things other than timers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023233">
+				<div id="div-comment-1023233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023233">
+			November 29, 2012 at 7:27 am</a>		</div>
+
+		<p>The lowercase p in Threadpool really bothers me for some reason. &nbsp;Seems like most other frameworks, including .NET, camel-case it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023253">
+				<div id="div-comment-1023253" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Adam Rosenfield</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023253">
+			November 29, 2012 at 7:35 am</a>		</div>
+
+		<p>Yo dawg, I heard you like timers, so I put a timer in your timer-queue.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023263">
+				<div id="div-comment-1023263" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/stephen.horn_4000_volition_2D00_inc.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>stephen.horn@volition-inc.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023263">
+			November 29, 2012 at 7:43 am</a>		</div>
+
+		<p>@WndSks: I think we can be pretty sure you aren&#39;t xpclient, because you didn&#39;t try to argue that everything is wrong and it would be all better if only someone had done it any other way.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-xpclientgmail-com odd alt thread-odd thread-alt depth-1" id="comment-1023293">
+				<div id="div-comment-1023293" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/xpclient' rel='external nofollow' class='url'>xpclient</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023293">
+			November 29, 2012 at 7:55 am</a>		</div>
+
+		<p>I never claimed everything MS do is wrong. I just want a backward compatible design of the UI and features of the Windows OS so the user doesn&#39;t have to make feature compromises. It was a coincidence that I changed my user name and then noticed all the commotion! Whatever I learnt about UX, I learnt from using Windows 95-XP where it was a logical evolution and then suddenly MS lost their minds and started re-imagining throwing out lots of good bits as well which is why I had to co-develop Classic Shell.</p>
+<div class="post">[<em>What is the significance of the &quot;Msft&quot; as the start of your handle? If you&#39;re a Microsoft employee, then you&#39;ve been violating the company&#39;s social media policies all this time by not clearly identifying yourself as a Microsoft employee and not using your real name. If you&#39;re not a Microsoft employee, then you&#39;re violating this blog&#39;s rules of &quot;no misrepresentation&quot; (and possibly the site&#39;s ToS on false identity). -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023313">
+				<div id="div-comment-1023313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Aleksej</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023313">
+			November 29, 2012 at 8:46 am</a>		</div>
+
+		<p>Doesn&#39;t examples with CreateTimerQueueTimer have a race condition: ActionAfterDelayProc can call DeleteTimerQueueTimer before timer handle is assigned to a variable in the thread calling CreateTimerQueueTimer function? I mean if the ACTIONDELAY is small and Action is fast and the originating thread is pre-empted.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023323">
+				<div id="div-comment-1023323" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ChrisR</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023323">
+			November 29, 2012 at 9:13 am</a>		</div>
+
+		<p>@Aleksej: &nbsp;Presumably CreateTimerQueueTimer is implemented in such a way that the output timer handle is set prior to the timer function being called.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-xpclientgmail-com even thread-even depth-1" id="comment-1023333">
+				<div id="div-comment-1023333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/xpclient' rel='external nofollow' class='url'>xpclient</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023333">
+			November 29, 2012 at 9:37 am</a>		</div>
+
+		<p>I didn&#39;t know that. I changed it back. (Sigh)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023343">
+				<div id="div-comment-1023343" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023343">
+			November 29, 2012 at 10:30 am</a>		</div>
+
+		<p>I&#39;ve always found the biggest headache with delayed tasks is shutdown. &nbsp;What happens in Raymond&#39;s first example when the process exits before ActionAfterDelayProc completes? &nbsp;If you&#39;re lucky, then nothing. &nbsp;If you&#39;re unlucky, then Action() will run right after the CRT unitializes but just before Windows kills your threads. &nbsp;The resulting crash is guaranteed debugging hilarity. ;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits even thread-even depth-1" id="comment-1023353">
+				<div id="div-comment-1023353" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023353">
+			November 29, 2012 at 11:28 am</a>		</div>
+
+		<p>@Peter your shutdown path needs to call DeleteTimerQueueTimer for all created timer-queue timers, or call DeleteTimerQueueEx to delete them all at once.</p>
+<p>But yes, close attention must always be paid to shutdown.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-maurits odd alt thread-odd thread-alt depth-1" id="comment-1023363">
+				<div id="div-comment-1023363" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Maurits+%5BMSFT%5D' rel='external nofollow' class='url'>Maurits [MSFT]</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023363">
+			November 29, 2012 at 11:31 am</a>		</div>
+
+		<p>In particular the problem with Raymond&#39;s first example is here:</p>
+<p>if (hThread) {</p>
+<p>&nbsp;CloseHandle(hThread);</p>
+<p>Now you have an orphaned thread running for a long time with no way to stop it.</p>
+<p>One approach is to stash the thread handle somewhere and call WaitForSingleObject(m_hThread, INFINITE) on the shutdown path, but there are others.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023403">
+				<div id="div-comment-1023403" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/jolyon.smith_4000_hotmail.com/ProfileUrlRedirect.ashx' rel='external nofollow' class='url'>jolyon.smith@hotmail.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023403">
+			November 29, 2012 at 3:47 pm</a>		</div>
+
+		<p>@ChrisR: &nbsp;Assume makes an ass of u and me. &nbsp;Presume makes the ass look pre-tentious. &nbsp;;)</p>
+<p>(just making a funny &#8211; but more seriously there is always a chance that any assumption might prove false, even if it is dressed up as a presumption) &nbsp;:)</p>
+<p>@Raymond re xpclient: &nbsp;Maybe &quot;Msft&quot; was for &quot;Misfit&quot; rather than &quot;Microsoft&quot; ? &nbsp;And how does the &quot;misrepresentation&quot; requirement fit alongside allowing non-actual identity ? &nbsp;Presumably if xpclient is using Win 7 then he falls foul even of this clause ? &nbsp;Just asking. &nbsp;:)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023413">
+				<div id="div-comment-1023413" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">JustSomeGuy</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023413">
+			November 29, 2012 at 7:09 pm</a>		</div>
+
+		<p>Wow, unless you have a desperate need to preserve threads, I&#39;d be opting for the &quot;borrow a thread from the thread pool&quot; version. That seems to me to be the easiest solution. Options that involve me typing in 26 lines of code when 3 will do the trick give me the shivers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023423">
+				<div id="div-comment-1023423" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Drak</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023423">
+			November 29, 2012 at 10:23 pm</a>		</div>
+
+		<p>It could be because it&#39;s early on Friday morning, but I can&#39;t for the life of me think of a scenario where I would want to do something asynchronously after a delay&#8230; Does anyone have an example?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023433">
+				<div id="div-comment-1023433" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023433">
+			November 30, 2012 at 12:49 am</a>		</div>
+
+		<p>@Drak: Checking to see if any non-critical updates are available for your app? You might want to let the user get started before kicking off lots of work in the background.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023443">
+				<div id="div-comment-1023443" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Strangely</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023443">
+			November 30, 2012 at 3:30 am</a>		</div>
+
+		<p>In the timer queue timer example, I think that PerformActionAfterDelay can attempt to delete a 0 pointer if new returns 0&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-gregm odd alt thread-odd thread-alt depth-1" id="comment-1023473">
+				<div id="div-comment-1023473" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/GregM' rel='external nofollow' class='url'>GregM</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023473">
+			November 30, 2012 at 6:47 am</a>		</div>
+
+		<p>&quot;PerformActionAfterDelay can attempt to delete a 0 pointer if new returns 0&#8230;&quot;</p>
+<p>&#8230;which is perfectly okay, though new should normally throw a std::bad_alloc exception rather than returning nullptr.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023463">
+				<div id="div-comment-1023463" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023463">
+			November 30, 2012 at 6:19 am</a>		</div>
+
+		<p>JustSomeGuy: If you will only ever have *one* or *a few* timers going simultaneously, it&#39;s not a big deal. It&#39;s unlikely that you have so many threads that adding just a few more will put you over the limit.</p>
+<p>However, you have to remember that by default each thread will chew up 1MB of address space. That means you can only fit around 2000 of them in a standard 32-bit process, and that&#39;s only if you&#39;re not doing much else.</p>
+<p>If you&#39;re just waiting for your one connection to a server to time out, go for it. But if you&#39;re writing a server, it&#39;s pretty foolish to waste a thread, a couple pages of RAM, and a huge chunk of VM just so you can disconnect clients that have hung on for too long.</p>
+<p>It&#39;s hard to imagine something sadder than a server whose scalability is limited by the timers used to get rid of clients after their maximum connection time is up! Of course if that&#39;s your approach to timers, there&#39;s probably something else limiting your server&#39;s scalability.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023633">
+				<div id="div-comment-1023633" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Strangely</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023633">
+			December 1, 2012 at 2:25 am</a>		</div>
+
+		<p>GregM: my understanding must be wildly out of date. How is it &#39;perfectly okay&#39; to call delete on a 0 pointer? (My ten second experiment crashes, as expected.)</p>
+<div class="post">[<em>5.3.5(2) says &quot;the value of the operand of delete may be a null pointer value.&quot; -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023683">
+				<div id="div-comment-1023683" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Strangely</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023683">
+			December 2, 2012 at 6:02 am</a>		</div>
+
+		<p>Thanks, especially for the reference; I don&#39;t seem to be as badly out of date as I first suspected.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1023713">
+				<div id="div-comment-1023713" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Drak</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023713">
+			December 2, 2012 at 10:19 pm</a>		</div>
+
+		<p>@Matt: thank you for the example.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1023723">
+				<div id="div-comment-1023723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">hagenp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20121129-00/?p=5953#comment-1023723">
+			December 3, 2012 at 4:24 am</a>		</div>
+
+		<p>&quot;Since the Microsoft Research people haven&#39;t yet perfected their time machine,&quot;</p>
+<p>What???? Still not???? Fire them buggers!!</p>
+<p>;-)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

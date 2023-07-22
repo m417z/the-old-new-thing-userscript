@@ -1,0 +1,717 @@
+<html>
+<head>
+<title>The format of string resources</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>The format of string resources</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>January 30, 2004 / year-entry #43</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>34</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Unlike the other resource formats, where the resource identifier is the same as the value listed in the *.rc file, string resources are packaged in "bundles". There is a rather terse description of this in Knowledge Base article Q196774. Today we're going to expand that terse description into actual code. The strings listed in the...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>Unlike the other resource formats, where the resource identifier
+is the same as the value listed in the *.rc file, string resources
+are packaged in "bundles".
+There is a rather terse description of this in
+<a HREF=http://support.microsoft.com/support/kb/articles/q196/7/74.asp>
+Knowledge Base article Q196774</a>.
+Today we're going to expand that terse description into actual code.</p>
+<p>
+The strings listed in the *.rc file are grouped together in
+bundles of sixteen.  So the first bundle contains strings
+0 through 15, the second bundle contains strings 16 through 31,
+and so on.  In general, bundle N contains strings (N-1)*16
+through (N-1)*16+15.
+</p>
+<p>
+The strings in each bundle are stored as <b>counted</b> UNICODE strings,
+not null-terminated strings. If there are gaps in the numbering,
+null strings are used.  So for example if your string table
+had only strings 16 and 31, there would be one bundle (number 2),
+which consists of string 16, fourteen null strings, then string 31.
+</p>
+<p>
+(Note that this means there is no way to tell the difference
+between "string 20 is a string that has length zero" and
+"string 20 doesn't exist".)
+</p>
+<p>
+The LoadString function is rather limiting in a few ways:</p>
+<ul>
+<li>You can't pass a language ID. If your resources are multilingual,
+    you can't load strings from a nondefault language.</p>
+<li>You can't query the length of a resource string.
+</ul>
+<p>
+Let's write some functions that remove these limitations.
+</p>
+<pre>
+LPCWSTR FindStringResourceEx(HINSTANCE hinst,
+ UINT uId, UINT langId)
+{
+ // Convert the string ID into a bundle number
+ LPCWSTR pwsz = NULL;
+ HRSRC hrsrc = FindResourceEx(hinst, RT_STRING,
+                     MAKEINTRESOURCE(uId / 16 + 1),
+                     langId);
+ if (hrsrc) {
+  HGLOBAL hglob = LoadResource(hinst, hrsrc);
+  if (hglob) {
+   pwsz = reinterpret_cast&lt;LPCWSTR&gt;
+              (LockResource(hglob));
+   if (pwsz) {
+    // okay now walk the string table
+    for (int i = 0; i < uId & 15; i++) {
+     pwsz += 1 + (UINT)*pwsz;
+    }
+    UnlockResource(pwsz);
+   }
+   FreeResource(hglob);
+  }
+ }
+ return pwsz;
+}
+</pre>
+<p>
+After converting the string ID into a bundle number,
+we find the bundle, load it, and lock it.  (That's
+an awful lot of paperwork just to access a resource.
+It's a throwback to the Windows 3.1 way of managing
+resources; more on that in a future entry.)
+</p>
+<p>
+We then walk through the table skipping over the
+desired number of strings until we find the one we want.
+The first WCHAR in each string entry is the length of
+the string, so adding 1 skips over the count and
+adding the count skips over the string.
+</p>
+<p>
+When we finish walking, pwsz is left pointing to the
+counted string.
+</p>
+<p>
+With this basic function we can create fancier functions.
+</p>
+<p>
+The function FindStringResource is a simple wrapper
+that searches for the string in the default thread language.
+</p>
+<pre>
+LPCWSTR FindStringResource(HINSTANCE hinst, UINT uId)
+{
+ return FindStringResourceEx(hinst, uId,
+     MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL));
+}
+</pre>
+<p>
+The function GetResourceStringLengthEx returns the length
+of the corresponding string, including the null terminator.
+</p>
+<pre>
+UINT GetStringResourceLengthEx(HINSTANCE hinst,
+ UINT uId, UINT langId)
+{
+ LPCWSTR pwsz = FindStringResourceEx
+                       (hinst, uId, langId);
+ return 1 + (pwsz ? *pwsz : 0);
+}
+</pre>
+<p>
+And the function AllocStringFromResourceEx loads the entire
+string resource into a heap-allocated memory block.
+</p>
+<pre>
+LPWSTR AllocStringFromResourceEx(HINSTANCE hinst,
+ UINT uId, UINT langId)
+{
+ LPCWSTR pwszRes = FindStringResourceEx
+                       (hinst, uId, langId);
+ if (!pwszRes) pwszRes = L"";
+ LPWSTR pwsz = new WCHAR[(UINT)*pwszRes+1];
+ if (pwsz) {
+   pwsz[(UINT)*pwszRes] = L'\0';
+   CopyMemory(pwsz, pwszRes+1,
+              *pwszRes * sizeof(WCHAR));
+ }
+ return pwsz;
+}
+</pre>
+<p>
+(Writing the non-Ex functions
+GetStringResourceLength and AllocStringFromResource
+is left as an exercise.)
+</p>
+<p>
+Note that we must explicitly null-terminate the string
+since the string in the resource is not null-terminated.
+Note also that
+the string returned by AllocStringFromResourceEx
+must be freed with delete[].  For example:</p>
+<pre>
+LPWSTR pwsz = AllocStringFromResource(hinst, uId);
+if (pwsz) {
+  ... use pwsz ...
+  <font COLOR=red>delete[]</font> pwsz;
+}
+</pre>
+<p>
+Mismatching vector "new[]" and scalar "delete" is an error
+I'll talk about in a future entry.
+</p>
+<p><b>Exercise</b>: Discuss how the /n flag to rc.exe affects
+these functions.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (34)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-140033">
+				<div id="div-comment-140033" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frederik Slijkerman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140033">
+			January 30, 2004 at 9:06 am</a>		</div>
+
+		<p>It would be nicer to return a std::wstring from AllocStringFromResource(), so you don&#8217;t have to use delete[] at all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140043">
+				<div id="div-comment-140043" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Reuben Harris</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140043">
+			January 30, 2004 at 9:38 am</a>		</div>
+
+		<p>The VC6 resource compiler doesn&#8217;t like strings with more than 256 characters, and will truncate those that are and give you a warning. This can be annoying if you&#8217;re doing verbose UI labels, such as a wizard page.</p>
+<p>Is this a restriction of the way Win32 expects resource strings to be stored, or is rc.exe just dim?</p>
+<p>(Great blog by the way&#8230; I&#8217;ve just read through your archive and have fallen into at least half the traps you warn about!)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140053">
+				<div id="div-comment-140053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dan Crevier</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140053">
+			January 30, 2004 at 9:49 am</a>		</div>
+
+		<p>Doesn&#8217;t AllocStringFromResourceEx suffer from the integer overflow problems you&#8217;ve been talking about recently?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140063">
+				<div id="div-comment-140063" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">runtime</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140063">
+			January 30, 2004 at 10:23 am</a>		</div>
+
+		<p>Windows CE&#8217;s LoadString() resource API has a nice &quot;underdocumented&quot; feature to use resource strings without allocating extra memory or copying strings. According to Douglas Boling&#8217;s book &quot;Programming Microsoft Windows CE&quot;, if you pass a NULL lpBuffer parameter to LoadString(), the API will return a read-only pointer to the string. Since the resource strings are not null-terminated, the string length is stored in the word preceeding the start of the resource string.</p>
+<p>The book also says you can request that resource strings be stored as null-terminated strings if you invoke the resource compiler with the -r command line switch. I don&#8217;t know if that feature is Windows CE specific.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140083">
+				<div id="div-comment-140083" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.codeproject.com/script/articles/list_articles.asp?userid=152' rel='external nofollow' class='url'>Mike Dunn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140083">
+			January 30, 2004 at 11:03 am</a>		</div>
+
+		<p>One of my favorite tricks for loading strings is to use the little-known CString (MFC or WTL) constructor trick:</p>
+<p>CString str ((LPCTSTR) IDS_SOME_STRING);</p>
+<p>Then you can make a macro to do that on the fly:</p>
+<p>#define _S(id) (CString(LPCTSTR(id)))</p>
+<p>and use it inline, such as:</p>
+<p>MessageBox ( _S(IDS_BAD_ERROR), _S(IDS_MSGBOX_TITLE), MB_ICONERROR );</p>
+<p>Of course, the _S definition above is only for release mode. In debug mode, it&#8217;s a real function that does a LoadString and asserts if the string can&#8217;t be loaded.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140023">
+				<div id="div-comment-140023" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.extragroup.de/weblog/hmk/archives/000427.html' rel='external nofollow' class='url'>HMK's Spurious Thoughts</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140023">
+			January 30, 2004 at 11:41 am</a>		</div>
+
+		<p>The Old New Thing talks about format of string resources (Windows)&#8230;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140093">
+				<div id="div-comment-140093" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">B.Y.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140093">
+			January 30, 2004 at 12:22 pm</a>		</div>
+
+		<p>Since the EXE is always mapped into memory, if they designed the format so that strings are always terminated with a zero, can&#8217;t you can get read-only pointers to the strings without the need to allocate memory ?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140103">
+				<div id="div-comment-140103" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140103">
+			January 30, 2004 at 3:00 pm</a>		</div>
+
+		<p>Dan: No, it doesn&#8217;t.  Because the size is coming from a short (0 &#8211; 65535), that gets cast to a UINT (0 &#8211; 2^32-1), and then has 1 added.  There&#8217;s no way to overflow the allocator because 2 * 65536 &lt; 2^32 &#8211; 1.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140113">
+				<div id="div-comment-140113" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">runtime</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140113">
+			January 30, 2004 at 3:02 pm</a>		</div>
+
+		<p>BY, you would think so, but maybe Microsoft wanted to save the &quot;wasted&quot; space of the null-terminator character? I bet 90% of the time, resource strings are used without modification. Microsoft should have optimized this common case with an API that just returned an easy to use, zero-copy, read-only pointer to the null-terminated resource string.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140123">
+				<div id="div-comment-140123" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.codeproject.com/script/articles/list_articles.asp?userid=152' rel='external nofollow' class='url'>Mike Dunn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140123">
+			January 30, 2004 at 6:05 pm</a>		</div>
+
+		<p>runtime &#8211; remember that when these APIs were designed and written, they had to work on machines with 4 MB of RAM (the lowest Win95 would run in). That&#8217;s four MEGAbytes. Lots of null bytes hanging around can add up if there are a lot of strings in the string table.<br />
+<br />Sure, now we don&#8217;t give it a second thought when a .NET app requires a 20MB download and uses 40MB of memory (that&#8217;s what SharpReader is at right now on my system). In 1993/94/95, things were a *lot* different.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140133">
+				<div id="div-comment-140133" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140133">
+			January 30, 2004 at 9:01 pm</a>		</div>
+
+		<p>Frederick: There was a discussion of std::wstring in previous blog comments: <a target="_new" href="http://weblogs.asp.net/oldnewthing/archive/2004/01/21/61101.aspx" rel="nofollow">http://weblogs.asp.net/oldnewthing/archive/2004/01/21/61101.aspx</a></p>
+<p>I wrote these functions as if they were part of the Platform SDK. This means no language-specific constructs, and certainly no compiler-specific constructs.  (std::wstring is not guaranteed to be compatible from one compiler to the next or even from one compiler VERSION to the next. The contract for std::wstring is at the source code level, not the ABI.)</p>
+<p>B.Y.: Try solving the exercise.</p>
+<p>runtime/Mike Dunn: I actually have a discussion of the historical basis for resource formats scheduled for a future entry. It&#8217;s even weirder than you think.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140213">
+				<div id="div-comment-140213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">asdf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140213">
+			January 31, 2004 at 11:17 am</a>		</div>
+
+		<p>new is a language specific construct. And a non-throwing new is a compiler-specific construct (or a standards compliant compiler with exceptions disabled via a flag).</p>
+<p>Using /n it looks like the string length gets reported 1 WCHAR longer than it actually is.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140223">
+				<div id="div-comment-140223" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.codeproject.com/script/articles/list_articles.asp?userid=152' rel='external nofollow' class='url'>Mike Dunn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140223">
+			January 31, 2004 at 11:47 am</a>		</div>
+
+		<p>Note: there&#8217;s a bug in the for loop in FindStringResourceEx(), the condition should be &quot;i &lt; (uId &amp; 15)&quot;</p>
+<p>Raymond, I noticed that FindStringResourceEx() returns a pointer to the block of memory occupied by the resource, but you call UnlockResource() and FreeResource(), which presumably might free that memory. Is this safe?<br />
+<br />OTOH, the docs on LockResource() say: &quot;The pointer returned by LockResource is valid until the module containing the resource is unloaded.&quot; That implies that UnlockResource/FreeResource can&#8217;t free the memory because it would break LockResource().  So who&#8217;s right?</p>
+<p>As for the exercise, adding /n doesn&#8217;t break your functions, it just makes them allocate one extra WCHAR. When the strings are 0-terminated, the lengths are increased as well, so the code to walk the strings and find a particular one still works.<br />
+<br />The code assumes string table entries are not 0-terminated. They become 0-terminated with /n, so the string returned by AllocStringFromResourceEx() has two 0 chars at the end. Mostly harmless.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140233">
+				<div id="div-comment-140233" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140233">
+			January 31, 2004 at 2:58 pm</a>		</div>
+
+		<p>Yeah, I broke my own rule with new[]; I should have used LocalAlloc.</p>
+<p>Good catch on the precedence bug.</p>
+<p>UnlockResource and FreeResource are NOPs on Win32. More information to come in that promised future blog entry.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140283">
+				<div id="div-comment-140283" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dru</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140283">
+			January 31, 2004 at 11:06 pm</a>		</div>
+
+		<p>How is the landId used?</p>
+<p>I couldn&#8217;t find a good reference to that<br />
+<br />on my MSDN CD via FindResourceEx?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140313">
+				<div id="div-comment-140313" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140313">
+			February 1, 2004 at 5:18 am</a>		</div>
+
+		<p>Like the documentation says, it specifies the language of the resource you want to access. You can use the LANGUAGE directive in the *.rc file to provide resources in multiple languages.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140333">
+				<div id="div-comment-140333" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Frederik Slijkerman</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140333">
+			February 1, 2004 at 5:36 am</a>		</div>
+
+		<p>The best solution might be to introduce a new function ReleaseStringFromResource that would take the pointer from AllocStringFromResourceEx and free it properly, with delete[] or whatever.</p>
+<p>That way, you also reserve the right to change the allocation mechanism without breaking backwards compatibility.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140503">
+				<div id="div-comment-140503" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.dimmick.demon.co.uk' rel='external nofollow' class='url'>Mike Dimmick</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140503">
+			February 2, 2004 at 2:39 am</a>		</div>
+
+		<p>UnlockResource is a total no-op in the current SDK headers &#8211; it&#8217;s a macro which evaluates the argument, then discards the result.</p>
+<p>LockResource is a slightly more substantial no-op, because it&#8217;s implemented as a function. However, the implementation is basically:</p>
+<p>PVOID LockResource(HGLOBAL hGlob)<br />
+<br />{<br />
+<br />  return (PVOID) hGlob;<br />
+<br />}</p>
+<p>(dumpbin /disasm is your friend&#8230;)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-140693">
+				<div id="div-comment-140693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lonnie McCullough</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140693">
+			February 2, 2004 at 7:51 pm</a>		</div>
+
+		<p>I have a question about the MAKELANGID macro (actually about langids in general).  What is the difference between (LANG_NEUTRAL, SUBLANG_NEUTRAL) and (LANG_NEUTRAL, SUBLANG_DEFAULT)?  Will the first map to the second if there are resources present in the user&#8217;s default language?  Is there an algorithm for falling back from the user&#8217;s language to other languges in the resource file?  I guess I&#8217;m just not sure how all this stuff is really handled and would like to know more (trying to do internationalization the right way if at all possible).  Even a pointer to a resource would help greatly in clearing up the confusion in my head over how NEUTRAL,NEUTRAL contrasts with NEUTRAL,DEFAULT.  Thanks for the great blog.</p>
+<p>Go Pats!!!</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-140753">
+				<div id="div-comment-140753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-140753">
+			February 2, 2004 at 9:35 pm</a>		</div>
+
+		<p>Lonnie: I&#8217;m going to have to defer on your question. I am not an internationalization expert and I wouldn&#8217;t want to give the wrong answer.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-141523">
+				<div id="div-comment-141523" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/0001/01/01/66159.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-141523">
+			February 8, 2004 at 12:04 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-141533">
+				<div id="div-comment-141533" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/archive/0001/01/01/66660.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-141533">
+			February 8, 2004 at 12:06 pm</a>		</div>
+
+		
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-145793">
+				<div id="div-comment-145793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">David Kemp</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-145793">
+			February 18, 2004 at 2:11 am</a>		</div>
+
+		<p>Lonnie:<br />
+<br />(LANG_NEUTRAL, SUBLANG_NEUTRAL) = Language Neutral<br />
+<br />(LANG_NEUTRAL, SUBLANG_DEFAULT) = User&#8217;s Default Language<br />
+<br />A language neutral string is different from one in a user&#8217;s default language.<br />
+<br />You can mark a resource as Language Neutral by using &quot;LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL&quot; in the resource file.<br />
+<br />I&#8217;d imagine you&#8217;d want to make a distinction between Language Neutral and the Default Language of your application tho. For example, you might want to default to American English if you don&#8217;t have resources for the user&#8217;s prefered language, but you might want to check the system&#8217;s default language first. You&#8217;d want to use Language for resources that are truly Language Neutral (so, probably never, as I&#8217;d doubt such a thing exists)<br />
+<br />[The MSDN reference for MAKELANGID is:<br />
+<br /><a target="_new" href="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/intl/nls_97vo.asp" rel="nofollow">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/intl/nls_97vo.asp</a>]</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-145833">
+				<div id="div-comment-145833" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-145833">
+			February 18, 2004 at 7:09 am</a>		</div>
+
+		<p>Examples of language-neutral resources would be most icons and bitmaps. These are things that don&#8217;t change regardless of the language. (Of course you have to make sure your icon/bitmap doesn&#8217;t contain locale-sensitive imagery.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-146783">
+				<div id="div-comment-146783" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">floyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-146783">
+			February 21, 2004 at 6:57 am</a>		</div>
+
+		<p>Raymond Chen: &quot;Examples of language-neutral resources would be most icons and bitmaps. These are things that don&#8217;t change regardless of the language.&quot;</p>
+<p>I&#8217;d have to disagree here. Although you cannot translate images in the same way as text resources, there are still potential language specific facets. Just think about bitmaps with text on them. With this being an exception that is easily perceived there are also less obvious nuances: a green coloured UI element would signal a successful operation to those living in western civilizations &#8212; if your product ships to asian countries you would rather change this colour to red.</p>
+<p>.f</p>
+<p>p.s.: Thanks a lot for sharing your experience. I stumbled across your blog today, almost by accident, and I like it already :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-146793">
+				<div id="div-comment-146793" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-146793">
+			February 21, 2004 at 8:02 am</a>		</div>
+
+		<p>True, bitmaps with text and culturally-dependnet images would need to be localized. But I ruled that out in my parenthetical.</p>
+<p>It&#8217;s a good idea to avoid locale-sensitive bitmaps because professional translators tend not also to be accomplished graphic artists.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-146803">
+				<div id="div-comment-146803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">floyd</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-146803">
+			February 21, 2004 at 8:48 am</a>		</div>
+
+		<p>Don&#8217;t get me wrong, I wasn&#8217;t going to challange you in any way. I merely meant to illustrate that it isn&#8217;t always as easy as it may appear to decide whether a resource is language-dependent. I would agree with you, that locale-dependent images are generally a bad idea, unless you have tool-support to track those as well as good reasons to go for that approach in the first place.</p>
+<p>I just didn&#8217;t want anyone reading this thread take it as a fact that images are generally locale-independent. With that said, I also have a not so obvious string resource that is in fact language-independent: let&#8217;s say you are writing an image processing application and need to support CMY color space &#8212; if you translate Cyan-Magenta-Yellow into local names, you will run into major trouble when it comes to printing your work.</p>
+<p>Anyway, I&#8217;m not an expert in this field either. But with all those bits and pieces I picked up along the way the only thing I can say is this: localization is a beast to master.</p>
+<p>.f</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-146813">
+				<div id="div-comment-146813" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-146813">
+			February 21, 2004 at 8:57 am</a>		</div>
+
+		<p>Agreed. Designing your code to be localizable is a lot of work and contains many pitfalls.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-188303">
+				<div id="div-comment-188303" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://weblogs.asp.net/oldnewthing/' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-188303">
+			June 28, 2004 at 3:37 pm</a>		</div>
+
+		<p>Commenting on this entry has been closed.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-301583">
+				<div id="div-comment-301583" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://www.hardwarefetish.com/blog/archives/132-LoadString-C++-Klasse.html' rel='external nofollow' class='url'>hardwarefetish.com</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-301583">
+			August 28, 2005 at 6:14 am</a>		</div>
+
+		<p>Um eine WIN32-Applikation in mehreren Sprachversionen zu lokalisieren,<br />
+<br />gibt es neben den lokalisierten Forms auch die String tables, die sich in den Programmresourcen befinden.<br />
+<br />Wenn man sein Programm also mehrsprachig gestalten will, sind alle hardcoi</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-380573">
+				<div id="div-comment-380573" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/michkap/archive/2006/05/13/596971.aspx' rel='external nofollow' class='url'>Sorting It All Out</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-380573">
+			May 13, 2006 at 1:17 pm</a>		</div>
+
+		<p>The SZ (a.k.a. Steffen) asked in the suggestion box: </p>
+<p>What is the prefered way to select the &amp;quot;most&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-409893">
+				<div id="div-comment-409893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/oldnewthing/archive/2006/08/17/704232.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-409893">
+			August 17, 2006 at 10:00 am</a>		</div>
+
+		<p>No really, you can&#8217;t.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-525383">
+				<div id="div-comment-525383" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blogs.msdn.com/michkap/archive/2007/07/13/3852677.aspx' rel='external nofollow' class='url'>Sorting It All Out</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-525383">
+			July 13, 2007 at 5:46 pm</a>		</div>
+
+		<p>Serdar asked: Hi, Is it possible to call GetLocaleInfo in a different language? What I’m trying to do</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-600213">
+				<div id="div-comment-600213" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://blog.nektra.com/main/2008/02/12/windows-live-messenger-internals/' rel='external nofollow' class='url'>Nektra Advanced Computing Blog &raquo; Blog Archive &raquo; Windows Live Messenger Internals</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20040130-00/?p=40813#comment-600213">
+			February 12, 2008 at 3:35 pm</a>		</div>
+
+		<p>PingBack from <a rel="nofollow" target="_new" href="http://blog.nektra.com/main/2008/02/12/windows-live-messenger-internals/" rel="nofollow">http://blog.nektra.com/main/2008/02/12/windows-live-messenger-internals/</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

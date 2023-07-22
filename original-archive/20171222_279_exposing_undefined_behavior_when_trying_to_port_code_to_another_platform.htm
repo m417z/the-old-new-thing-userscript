@@ -1,0 +1,962 @@
+<html>
+<head>
+<title>Exposing undefined behavior when trying to port code to another platform</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Exposing undefined behavior when trying to port code to another platform</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 22, 2017 / year-entry #280</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>38</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Oops, that wasn't allowed after all.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A developer was porting some old Visual Studio code to
+another platform and found that the code was behavior
+strangely.
+Here's a simplified version of the code:
+</p>
+<pre>
+class refarray
+{
+public:
+    refarray(int length)
+    {
+        m_array = new int*[length];
+        for (int i = 0; i &lt; length; i++) {
+            m_array[i] = NULL;
+        }
+    }
+
+    int&amp; operator[](int i)
+    {
+        return *m_array[i];
+    }
+
+    ... other members not relevant here...
+
+private:
+    int** m_array;
+};
+</pre>
+<p>
+This class is an array of references to integers.
+Each slot starts out uninitialized,
+but you can use methods (not shown here)
+to make each slot point to a particular integer,
+and you use the array indexing operator to access
+the referenced integer.
+(You can tell this is old code because it's
+not using <code>unique_ptr</code> or
+<code>reference_wrapper</code>
+or <code>nullptr</code>.)
+</p>
+<p>
+Here's some typical code that didn't work:
+</p>
+<pre>
+refarray frameCounts(NUM_RENDERERS);
+
+void refresh(int* frameCount)
+{
+    .. a bunch of refresh code ..
+    if (frameCount != NULL) ++*frameCount;
+}
+
+void refresh_and_count(int i)
+{
+    refresh(&amp;frameCounts[i]);
+}
+</pre>
+<p>
+The <code>refresh</code> function performs a refresh
+and if the pointer is non-null, it assumes it's a frame
+count and increments it.
+The <code>refresh_</code><code>and_</code><code>count</code>
+function uses the
+<code>refresh</code> function to
+perform an update and then increment the optional frame counter
+stored in the <code>frameCounts</code> object.
+</p>
+<p>
+The developer found that if the slot was not set,
+the code crashed with a null pointer access violation
+at the <code>++*frameCount</code>,
+despite the code explicitly checking
+<code>if (frameCount != NULL)</code> immediately prior.
+</p>
+<p>
+Further investigation showed that the code worked fine
+with optimization disabled,
+but once they started turning on optimizations,
+the null pointer check stopped working.
+</p>
+<p>
+The developer fell into the trap of the null reference,
+or more generally, the fact that undefined behavior
+can have strange effects.
+</p>
+<p>
+In the C++ language, there is no such thing as a null reference.
+All references are to valid objects.
+The expression
+<code>frameCounts[i]</code> produces a reference,
+and therefore
+the expression <code>&amp;frameCounts[i]</code> can never
+legally produce a null pointer.
+The compiler optimized out the null test because it could
+prove that the resulting pointer could never legally be null.
+</p>
+<p>
+The code worked on the very old of Visual Studio because
+very old Visual Studio compilers did not implement this
+optimization.
+They generated the pointer and redundantly tested it against null,
+even though the only way to generate such a null pointer was
+to break one of the rules of the language.
+</p>
+<p>
+The new compiler on that other platform took advantage of the
+optimization: After one level of inlining, the compiler noticed
+that the pointer could not be null, so it removed the test.
+</p>
+<p>
+The fix is to repair the code so it doesn't generate null references.
+</p>
+<p>
+I know that people will complain that the compiler should not
+be removing reundant tests, because the person who wrote the code
+presumably wrote the redundant tests for a reason.
+Or at least if the compiler removed the redundant test,
+it should emit a warning:
+"Removing provably false test."
+</p>
+<p>
+But on the other hand, surely you would want the compiler
+to optimize out the test when you call it like this:
+</p>
+<pre>
+int counter;
+void something()
+{
+    refresh(&amp;counter);
+}
+</pre>
+<p>
+This is another case where the pointer passed to
+<code>refresh</code> is provably
+non-null.
+Do you want the compiler to generate the test anyway?
+If not, then it would presumably generate the
+"Removing provably false test" warning.
+Your code would probably generate tons of instances of this
+warning,
+and none of your options look appealing.
+</p>
+<p>
+One option is to
+duplicate the <code>refresh</code> function
+into one version that supports a null pointer (and performs the test),
+and another version that requires a non-null pointer
+(and doesn't perform the test).
+This sort of change can quickly infect your entire code,
+because callers of <code>refresh</code> might in turn need to
+split into two versions,
+and pretty soon you have two versions of half of your program.
+</p>
+</p>
+<p>The other option is to suppress the warning.
+</p>
+<p>
+In practice, you're probably going to go for the second option.
+</p>
+<p>
+But
+there's clearly no point in the compiler team implementing a
+warning that everybody suppresses.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (45)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1318446">
+				<div id="div-comment-1318446" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">ErikF</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318446">
+			December 22, 2017 at 8:56 am</a>		</div>
+
+		<p>Diagnostics that only show up at higher warning levels seems alright to me: There are already lots of those now (ANSI compliance warnings come to mind.) If the warning is usually going to be suppressed *and* is annoying or difficult to implement, then I agree that it might not hit the -100 test.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1318455">
+				<div id="div-comment-1318455" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://stackoverflow.com/users/1708801/shafik-yaghmour' rel='external nofollow' class='url'>Shafik Yaghmour</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318455">
+			December 22, 2017 at 9:24 am</a>		</div>
+
+		<p>Other compilers have been performing this optimization for a while as we can see from the blog post &#8220;Finding Undefined Behavior Bugs by Finding Dead Code&#8221; which talks about the infamous Linux null pointer check removal: <a href="https://blog.regehr.org/archives/970" rel="nofollow">https://blog.regehr.org/archives/970</a> it is interesting to see the MSVC is finally starting to exploit some of these undefined behavior as well.</p>
+<p>The assumption that there is no undefined behavior can lead to plenty of interesting and non-intuitive optimizations such as turning an finite loop infinite: <a href="https://stackoverflow.com/q/32506643/1708801" rel="nofollow">https://stackoverflow.com/q/32506643/1708801</a> I know a lot of people find aggressive loop optimization is be too aggressive: <a href="https://stackoverflow.com/questions/24296571/why-does-this-loop-produce-warning-iteration-3u-invokes-undefined-behavior-an?noredirect=1&#038;lq=1#comment37567459_24297811" rel="nofollow">https://stackoverflow.com/questions/24296571/why-does-this-loop-produce-warning-iteration-3u-invokes-undefined-behavior-an?noredirect=1&#038;lq=1#comment37567459_24297811</a></p>
+<p>I feel like the communities response here has been building better tools to catch these problems such as static analysis and dynamic analysis such as UBSan:<a href="https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html" rel="nofollow">https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html</a> and ASan: <a href="https://clang.llvm.org/docs/AddressSanitizer.html" rel="nofollow">https://clang.llvm.org/docs/AddressSanitizer.html</a> . I feel like these tools make a large difference. For dynamic analysis though it assumes you have testing and good coverage which is usually problematic for legacy code.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1318485">
+				<div id="div-comment-1318485" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318485">
+			December 22, 2017 at 2:28 pm</a>		</div>
+
+		<p>I see nothing in Raymond&#8217;s post that says that new Visual C++ compilers optimize in the presence of UB.  There&#8217;s a statement that (a) old Visual C++ compilers did not, and (b) an unnamed compiler on another platform does.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1318505">
+				<div id="div-comment-1318505" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://stackoverflow.com/users/1708801/shafik-yaghmour' rel='external nofollow' class='url'>Shafik Yaghmour</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318505">
+			December 22, 2017 at 4:08 pm</a>		</div>
+
+		<p>You may be correct, I read the statement  &#8220;very old Visual Studio compilers did not implement this optimization&#8221; as implying the newer versions did but I guess rereading it, it does seem ambiguous.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1318515">
+				<div id="div-comment-1318515" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://stackoverflow.com/users/1708801/shafik-yaghmour' rel='external nofollow' class='url'>Shafik Yaghmour</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318515">
+			December 22, 2017 at 4:33 pm</a>		</div>
+
+		<p>I was also thinking about this blog post: <a href="https://blogs.msdn.microsoft.com/vcblog/2016/05/04/new-code-optimizer/" rel="nofollow">https://blogs.msdn.microsoft.com/vcblog/2016/05/04/new-code-optimizer/</a> where they said visual C++ would start taking advantage of signed overflow undefined behavior and remembered a more general statement about exploiting undefined behavior.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-2" id="comment-1318665">
+				<div id="div-comment-1318665" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Dave</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318665">
+			December 24, 2017 at 4:22 pm</a>		</div>
+
+		<p>Let me guess, the other compiler would be gcc?  The compiler where the developers seem to delight in demonstrating how much smarter they are than you in terms of using valid but highly unlikely interpretations of the C standard to break your code?  For example the fact that your code could be running on a one&#8217;s-complement machine like a CDC-6600 from 1965, and therefore the semantics of two&#8217;s-complement arithmetic don&#8217;t apply, so they can remove checks and break your code&#8217;s arithmetic because if you squint at the C standard just right, they&#8217;re allowed to do it.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1318465">
+				<div id="div-comment-1318465" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Matteo Italia</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318465">
+			December 22, 2017 at 10:26 am</a>		</div>
+
+		<p>Related:<br />
+<a href="http://blog.llvm.org/2011/05/what-every-c-programmer-should-know_14.html?m=1" rel="nofollow">http://blog.llvm.org/2011/05/what-every-c-programmer-should-know_14.html?m=1</a></p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1318605">
+				<div id="div-comment-1318605" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318605">
+			December 24, 2017 at 6:33 am</a>		</div>
+
+		<p>That is a really valuable link, particularly for those of us who think wwe are smart enough to know all the gotchas.</p>
+<p>At least, <i>I</i> thought I was (more or less) smart enough, but I now realise that I just got lucky when programming with C.  And yes, I &#8220;took care&#8221; over integer overflow, dereferencing pointers, array bounds, etc, but I still think I got lucky.</p>
+<p>One interesting observation is that <i>you don&#8217;t even need to change platforms</i> to get bit.  A simple update to the order in which your compiler of choice performs optimisations is quite capable of exposing a very nasty bug &#8230;</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1318646">
+				<div id="div-comment-1318646" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318646">
+			December 24, 2017 at 3:43 pm</a>		</div>
+
+		<p>&gt;One interesting observation is that you don’t even need to change platforms to get bit. A simple update to the order in which your &gt;compiler of choice performs optimisations is quite capable of exposing a very nasty bug …</p>
+<p>I use latest gcc/clang and msvc on a project which started as C before being ported to C++ and is supported on Windows/MacOS/Linux (it has been ported to practically all operating systems at one time or another).</p>
+<p>Keeping all of those compilers happy means you have to fix a lot of your code early.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1318466">
+				<div id="div-comment-1318466" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://stackoverflow.com/users/1708801/shafik-yaghmour' rel='external nofollow' class='url'>Shafik Yaghmour</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318466">
+			December 22, 2017 at 11:30 am</a>		</div>
+
+		<p>Somewhat related, there may be rare cases where you want the compiler to assume it is safe to dereference null pointers such as in embedded systems where 0 may be a valid address, gcc uses -fno-delete-null-pointer-checks: <a href="https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html#index-fdelete-null-pointer-checks" rel="nofollow">https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html#index-fdelete-null-pointer-checks</a></p>
+<p>See this twitter thread for some interesting details: <a href="https://twitter.com/myrrlyn/status/940365445957279744" rel="nofollow">https://twitter.com/myrrlyn/status/940365445957279744</a></p>
+<p>This is an interesting since we see that what may be considered valid optimizations can get in the way of what is valid code in some architectures and the working around it really painful. clang does not respect -fno-delete-null-pointer-checks and so you either have to use volatile which works but not sure it will work in the future or do pointer laundering use __attribute__((optnone)): <a href="https://twitter.com/shafikyaghmour/status/940451354631290880" rel="nofollow">https://twitter.com/shafikyaghmour/status/940451354631290880</a> neither of which is documented but seem to work. </p>
+<p>It is a lot of hoops to jump through to work around the optimizer :-(</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1318535">
+				<div id="div-comment-1318535" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MiiNiPaa</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318535">
+			December 23, 2017 at 3:44 am</a>		</div>
+
+		<p>In cases when 0 is a valid address, null pointer might be represented by another byte sequence. For example address 0xFFFFFFFF might be used to denote null pointer. In this case foo == 0 (or implementation-specific foo == reinterpret_cast(-1)) would check for null pointer (one with value 0xFFFFFFFF) , and foo == reinterpret_cast(0) would check for pointer with value 0x00.</p>
+<p>In short, pointer with integer representation 0 is not guaranteed to be null pointer, likewise void* foo = 0; does not guaranteed to give you pointer with integer representation of 0.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1318565">
+				<div id="div-comment-1318565" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318565">
+			December 23, 2017 at 9:51 am</a>		</div>
+
+		<p>Don&#8217;t use non-zero as NULL. You will be really upset when memset() or calloc() doesn&#8217;t set pointers to NULL. People don&#8217;t code defensively against this one anymore.</p>
+<p>Also, 0xFFFFFFFF might be a good address as well.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1318585">
+				<div id="div-comment-1318585" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">MiiNiPaa</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318585">
+			December 23, 2017 at 10:18 am</a>		</div>
+
+		<p>Well, there are other approaches. Like storing all addresses offset by some value. This way null pointer 0x0 might have physical address 0xFFFFFF000 and to access physical address 0x0 you need pointer value 0x1000. Of course you will have to pay cost of single addition for each pointer dereference (without optimisations)&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3 parent" id="comment-1318586">
+				<div id="div-comment-1318586" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Cesar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318586">
+			December 23, 2017 at 4:18 pm</a>		</div>
+
+		<p>AFAIK, it&#8217;s mandated by POSIX that all-bits-zero be treated as a NULL pointer.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4" id="comment-1318865">
+				<div id="div-comment-1318865" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318865">
+			December 27, 2017 at 8:52 am</a>		</div>
+
+		<p>But this comment thread is specifically talking about embedded systems which have something located at address zero.  For these systems, the POSIX rules do not apply, only the C (or C++) language specification.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1318595">
+				<div id="div-comment-1318595" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318595">
+			December 23, 2017 at 8:51 pm</a>		</div>
+
+		<p>&gt;In cases when 0 is a valid address, null pointer might be represented by another byte sequence.</p>
+<p>NULL (&amp; nullptr when comparing to a pointer) you can&#8217;t now and even in the time when you could, nobody did.</p>
+<p>There are no invalid addresses, you have to pick one. Why not pick the one that</p>
+<p>1. everyone else has picked previously, so you have free compatibility.<br />
+2. has fast checks built into the cpu (zero/non zero)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1318475">
+				<div id="div-comment-1318475" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">M Hotchin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318475">
+			December 22, 2017 at 11:56 am</a>		</div>
+
+		<p>Seems to me like a better place to check would be in operator[], with an ASSERT say.  As you say, a NULL reference is illegal anyway, so only hitting the ASSERT in DEBUG seems like a reasonable thing.  The devs *do* run their debug builds, right?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2" id="comment-1318486">
+				<div id="div-comment-1318486" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318486">
+			December 22, 2017 at 3:05 pm</a>		</div>
+
+		<p>I suspect that the original programmer was deliberately returning null references, not realizing that they were illegal.</p>
+<p>I was kind of hoping Raymond would explain how the code should be corrected, though I suppose it depends too much on the context.  Could you return a reference to a class that behaves as a nullable int?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1318495">
+				<div id="div-comment-1318495" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">HiTechHiTouch</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318495">
+			December 22, 2017 at 3:59 pm</a>		</div>
+
+		<p>I&#8217;d put in a strong vote for a warning message anytime optimization does something &#8220;unusual&#8221;.  </p>
+<p>Yes, I may suppressed it 99% of the time, but I occasionally do run with <i>every</i>/ message enabled and wade through the listing looking for gold.  More than once this has lead me to a problem I would have blown off as &#8220;doesn&#8217;t occur&#8221; without the compiler&#8217;s help in understanding my code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1318525">
+				<div id="div-comment-1318525" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Alex Guteniev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318525">
+			December 23, 2017 at 12:46 am</a>		</div>
+
+		<p>Warnings about omitted null checks are really impractical if you also consider multiple inheritance.</p>
+<p>Compiler has to adjust pointer when casting from derived to non-first base or vise versa.<br />
+This adjustment should be skipped if pointer is null.</p>
+<p>So there are a lot of such implicit null pointer checks.</p>
+<p>They can be skipped, however, if you cast a reference or for &#8220;this&#8221; when you call base class method.<br />
+Most compiler would skip checks for references, for &#8220;this&#8221; the checks would be skipped in all the compilers.</p>
+<p>Having warnings would really make a lot of noise, you won&#8217;t be digging thru them anyway.</p>
+<p>A warning that is really useful here is warning about indirected null pointer. Compilers typically don&#8217;t make them, unless such indirections directly visible, but most static analysis tools would make such warning.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even thread-odd thread-alt depth-1 parent" id="comment-1318545">
+				<div id="div-comment-1318545" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318545">
+			December 23, 2017 at 6:22 am</a>		</div>
+
+		<p>I didn&#8217;t understand the provability part.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1318615">
+				<div id="div-comment-1318615" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318615">
+			December 24, 2017 at 8:07 am</a>		</div>
+
+		<p>I think the &#8220;provably not null&#8221; part is actually the whole point of the post.  I&#8217;m sure I&#8217;ll get this wrong, but here goes.</p>
+<p>To take the second case first, it&#8217;s clear that passing the address of <b>counter</b> will not result in dereferencing a null pointer, because <b>counter</b> is declared in global space/on the stack.  Therefore the address is provably not null.  In which case any warning at the point of invoking <b>refresh</b> will be otiose.</p>
+<p>&#8230; which is probably not the part of &#8220;provability&#8221; that you take issue with.  So, returning to the first part of the post, we note that the &#8220;provability&#8221; only occurs with optimisation switched on.  And, critically, it shows up, in Raymond&#8217;s words, &#8220;<i>with one level of inlining</i>.&#8221;  Actually I think it would show up with more levels, but it&#8217;s far more obvious when we limit inlining to a single level.</p>
+<p>I&#8217;m not sure, but I suspect the single level here inlines the <b>refresh</b> function. (See &#8220;one option &#8230; another option.&#8221;)  Now, imagine you are (one particular optimisation phase of!) the compiler.  Imagine you are performing this optimisation.  Do you have any other information? Sure you do! You&#8217;re passing the address of an int-reference that is returned by <b>operator[]</b>.  Now, you can&#8217;t take the address of a null int-reference, because there&#8217;s no such thing as a null int-reference: that&#8217;s undefined behavior.  So the compiler is free to deduce that it isn&#8217;t passing a null pointer.  And since it&#8217;s inlining, it isn&#8217;t crossing a function boundary, and since it therefore isn&#8217;t changing scope, it is free to elide the null check, because that null check is &#8220;provably&#8221; unnecessary <i>within the scope defined by the inline</i>.</p>
+<p>The key here is that you need that single level of inlining to elide the scopes of the &#8220;caller&#8221; and the &#8220;called&#8221; functions.  Within the scope of the combined, inlined, function, <b>and this scope is all that the optimiser will see</b>, it is <b>provably</b> the case that you will not get a null pointer, in which case why bother with the check?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3 parent" id="comment-1318625">
+				<div id="div-comment-1318625" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318625">
+			December 24, 2017 at 8:55 am</a>		</div>
+
+		<p>Assuming I&#8217;m mostly right about that (I don&#8217;t have to be completely right), the &#8220;provability&#8221; issue resolves to the following assertion:</p>
+<p>If any part of your program (including external libraries!) can possibly result in &#8220;undefined behavior,&#8221; then every single bit of your program can result in &#8220;undefined behavior.&#8221; And, frankly, because undefined behavior is undefined, it definitionally does not matter when that behavior manifests itself, and there is therefore nothing to be gained by tracking the precise line of code down.</p>
+<p>&#8220;Unfortunately,&#8221; this assertion is baked in to C (and C++).  I use scare quotes, but I shouldn&#8217;t.  C purposefully eschews all the run-time checks that Java, C#, etc, implement, because it was purposefully designed to run fast on very limited hardware.  In this individual (C++) case, the compiler could warn about returning an int-reference from an array that might include a null &#8230; but that&#8217;s not really the point.  It&#8217;s just shifting the blame for whatever undefined behavior ensues.  There is literally an <i>unbounded</i> set of examples where the same behavior can be &#8220;optimised in,&#8221; because there&#8217;s a practical limit to how far the compiler can go when trying to detect the original source of the problem.</p>
+<p>In this case it&#8217;s the design error of initializing all the elements of the array to the sentinel NULL, and then not performing the relevant check within the class.  But it could be just about anything.  Imagine that the class allows a caller to mutate the elements of the array.  Boom! Same issue.  Try tracking that one down.  Casts, volatile variables, signed int overflows &#8230; not in this case, but in general, the overhead would be enormous, and not really detectable across library boundaries, and generally to no good purpose at all.</p>
+<p>So, you&#8217;re left with C, which is (almost) a practical necessity when writing operating systems.  Or C++ with STL and RAII, which mitigates a lot of these issues (because you wouldn&#8217;t idiomatically return a reference to something; you&#8217;d either copy it or move it.  Or more idiomatically still, use an iterator &#8212; at least, in this case, you could return <b>end()</b> if you hit a null).</p>
+<p>Or, for embedded systems, I am increasingly coming to believe that C is a nightmare both for robustness and for security (because, again, &#8220;undefined behavior&#8221;).  I would tentatively suggest Rust as a better alternative.  But the market says &#8220;C,&#8221; so we&#8217;re stuck with it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1318635">
+				<div id="div-comment-1318635" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318635">
+			December 24, 2017 at 10:45 am</a>		</div>
+
+		<p>I watch Rust. The day may come when C waxes old and Rust supplants it.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-5" id="comment-1318645">
+				<div id="div-comment-1318645" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318645">
+			December 24, 2017 at 11:28 am</a>		</div>
+
+		<p>Rust never sleeps &#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4" id="comment-1318656">
+				<div id="div-comment-1318656" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">smf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318656">
+			December 24, 2017 at 3:58 pm</a>		</div>
+
+		<p>&gt;If any part of your program (including external libraries!) can possibly result in “undefined behavior,” then every single bit of<br />
+&gt; your program can result in “undefined behavior.” And, frankly, because undefined behavior is undefined, it definitionally does<br />
+&gt; not matter when that behavior manifests itself, and there is therefore nothing to be gained by tracking the precise line of code down.</p>
+<p>That is very passive aggressive. It&#8217;s also not consistently applied, C++ doesn&#8217;t (or didn&#8217;t) mandate 2&#8217;s complement so relying on bit patterns in numbers is (was) undefined behaviour.</p>
+<p>Pretty much all software would be converted to int main() { return 0; } if all undefined behaviour caused code to be removed.</p>
+<p>Clever people can be dumb.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-4 parent" id="comment-1318725">
+				<div id="div-comment-1318725" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">not important</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318725">
+			December 25, 2017 at 4:09 pm</a>		</div>
+
+		<p>Hello &#8211;<br />
+Thanks DoubleDay for taking the time to write these lengthly explanations &#8211; some programmers write comments on their Christmas vacation, and other programmers read comments on their Christmas vacation :)</p>
+<p>I am still confused (dense)&#8230;. Part of your comment expresses my confusion: &#8220;the compiler could warn about returning an int-reference from an array that might include a null … but that’s not really the point. &#8221; Well, if returning an int-reference might include a null, doesn&#8217;t this means that the &#8220;provably&#8221; part of the compiler optimization is not &#8220;provable&#8221;? And that it was a mistake to remove the check? Still grappling with this one&#8230;</p>
+<p>Hope you are having a great holiday!</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1318745">
+				<div id="div-comment-1318745" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318745">
+			December 25, 2017 at 5:27 pm</a>		</div>
+
+		<p>In this context, a statement (such as &#8220;pointer x will never be null&#8221;) is considered &#8220;provable&#8221; if the compiler can prove that if the program is valid, then the statement is true.  In this particular case the programmer is obliged by the language specification to ensure that a null pointer is never returned via a reference, and if the programmer has failed to do so, then the program is invalid; this is traditionally considered to be the programmer&#8217;s fault, not the compiler&#8217;s fault.</p>
+<p>The key point I think is that C++ lacks the design features of more modern languages such as Rust, so it isn&#8217;t possible for the compiler to prove whether or not the program is valid.  Nor can the compiler perform important optimizations without having to depend on the assumption that the program is in fact valid, so there&#8217;s an unavoidable trade-off between ease of programming and performance.  I believe there is still a fairly broad consensus that the emphasis should mostly be on performance, though there is certainly room for debate and different compilers do vary in just how aggressively they optimize.</p>
+<p>Ideally, as Peter suggests, we would drop C and C++ entirely in favour of Rust or some other modern language(s).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even depth-3 parent" id="comment-1318675">
+				<div id="div-comment-1318675" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318675">
+			December 25, 2017 at 12:31 am</a>		</div>
+
+		<p>Thanks for taking the time to write all this. I appreciate it.</p>
+<p>You appear to have understood what I have: The code defines a scattered array (aptly named &#8220;refarray&#8221;) on heap, using the pointer logic, and perhaps memory allocation commands that are deliberately not shown here. The scattered array is memory-managed using a packed array of pointers. But also refarray redefines its own bracket operator so that a[1] would mean what normally *a[1] would. (Wasn&#8217;t it better to define a packed array on the heap with only one pointer to it?) Next, another set of referencing and dereferencing occurs when the array field is passed to the <code>refresh</code> function.</p>
+<p>What really tripped me up was the &#8220;provably&#8221; word. It appears this word is used in a localized Microsoft sense, not the global sense. (There are lots of terms that Microsoft has redefined for its own use, despite their different global meaning. My favorite example is &#8220;boot volume&#8221;, which usually ends up not containing the bootloader, and &#8220;system volume&#8221;, which usually does not contain the systemroot.) In a global sense, when you try to prove something using, e.g., Euclidean geometry principles, it isn&#8217;t called a proof when your problem is a non-Euclidean geometry space. It is called a mistake. Likewise, if the compiler try to prove something using the wrong bracket operators (from a different operator space), it is no longer a proof; it is a mistake. Add it to the fact the compiler is not trying to prove anything; it is compiling an app, not a theorem. Hence, what it is doing is optimization, albeit with wrong information.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-4 parent" id="comment-1318685">
+				<div id="div-comment-1318685" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318685">
+			December 25, 2017 at 1:27 am</a>		</div>
+
+		<p>This is not specific to Microsoft.</p>
+<p>Optimizing means removing code that is not required for the program to run as written.</p>
+<p>All optimizing compilers use proofs that certain code structures must be unnecessary.<br />
+&#8211; If it cannot be proven that a certain piece of code is unnecessary, then the code is necessary, and thus cannot be optimised.</p>
+<p>The proofs were worked out by the compiler designer and they implemented checks that find the situations where they apply.</p>
+<p>A core tenet of optimization is that undefined behaviour is not permitted happen in any program, therefore the compiler can assume the programmer has arranged the reality external to the current code unit to ensure that any path that would be undefined can&#8217;t happen.</p>
+<p>Eg if the caller would be undefined for value zero, value zero cannot ever be passed. Thus any further checks for &#8220;Is it zero?&#8221; aren&#8217;t necessary and can be removed &#8211; they&#8217;ve already been done.<br />
+When called in a different context the zero-check is necessary, so the compiler leaves the check in that time.<br />
+It can do that by inlining (perhaps only inlining the check) or by having two versions of the function.</p>
+<p>Problems occur when the programmer made a mistake and did invoke undefined behaviour.<br />
+&#8211; the most common is probably omitting explicit sequence points, so the compiler is free to re-order operations to use fewer registers etc.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-fleet-command even depth-5" id="comment-1318775">
+				<div id="div-comment-1318775" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318775">
+			December 26, 2017 at 2:20 am</a>		</div>
+
+		<p>Oh, you are using the &#8220;proof&#8221; word correctly, alright.</p>
+<p>And if you believe the article is using it correctly, well, I got confused. What&#8217;re you gonna do? Sue me?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt depth-4" id="comment-1318695">
+				<div id="div-comment-1318695" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318695">
+			December 25, 2017 at 4:23 am</a>		</div>
+
+		<p>As far as I can see, it doesn&#8217;t matter which bracket operator it is, because no bracket operator can legally return a null reference.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-4" id="comment-1318875">
+				<div id="div-comment-1318875" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">voo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318875">
+			December 27, 2017 at 10:52 am</a>		</div>
+
+		<p>&#8220;In a global sense, when you try to prove something using, e.g., Euclidean geometry principles, it isn’t called a proof when your problem is a non-Euclidean geometry space. &#8221;<br />
+No, the way proof is used here is perfectly valid. </p>
+<p>Mathematicians do this all day long: Sqrt(x^2) = x  if x e R and x &gt; 0.  If you use that equivalence in the context of a negative or complex number you&#8217;ll get the wrong result (just think of all those fun examples of proving 1=0 by dividing by zero). You can do exactly the same in C, except that your input isn&#8217;t restricted to positive numbers but to all programs that are valid according to the standard.</p>
+<p>If you don&#8217;t follow that you might end up with 1=0 or a removed null check &#8211; in both cases it&#8217;s your own fault.</p>
+<p>That said, there&#8217;s no good reason for having that much undefined behavior in a modern language these days, but the consequences are really perfectly logical.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1318686">
+				<div id="div-comment-1318686" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Giuseppe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318686">
+			December 25, 2017 at 2:50 am</a>		</div>
+
+		<p>The real problem is that programmers (human beings, fragile and fallible) usually think &#8220;locally&#8221; when they implement functions. &#8220;refresh&#8221;, by a &#8220;local&#8221; point of view, &#8220;contractually must&#8221; check for NULL. What is the purpose of a programming language? Translate in machine code the programmer&#8217;s &#8220;wish&#8221; or generate the most optimized code assuming that the programmer is omniscient? Or, let&#8217;s suppose that &#8220;refresh&#8221; comes from a third-party library. The function&#8217;s documentation would say &#8220;if the pointer is NULL, the function does nothing&#8221; and the &#8220;naive&#8221; guy who uses it assumes that the contract is &#8220;true&#8221;&#8230; In my opinion, the inheritance of C language (&#8220;the programmer knows what he is doing&#8221;) has been formally extended, but substantially disowned: &#8220;the compiler knows better than the programmer itself what the programmer wants to do&#8221;.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1318735">
+				<div id="div-comment-1318735" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318735">
+			December 25, 2017 at 4:36 pm</a>		</div>
+
+		<p>The behaviour you&#8217;re describing would violate the standard and a compiler that behaved in that manner would be broken.  </p>
+<p>What actually happens is that the compiler removes the test only in the case where it can prove that the function isn&#8217;t being called by external code.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-3 parent" id="comment-1318785">
+				<div id="div-comment-1318785" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Giuseppe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318785">
+			December 26, 2017 at 2:51 am</a>		</div>
+
+		<p>Please consider this: you are editing your program and decide to move the function &#8220;refresh&#8221; from one source file to another one&#8230; This simple and common operation is enough to change the program&#8217;s behavior in a very counterintuitive way. Of course, I am getting the part of devil&#8217;s advocate. My point is that we should accept that our brain/culture/mindset is focused on the &#8220;literal&#8221; sense of single lines of code or short group of them, and that there are things whose optimization should be avoided. Programming languages are meant to help our limited mind to focus on the problem: we use named variables because they help us think about &#8220;things&#8221; instead of &#8220;numbers&#8221;, we use OOP because it maps (quite) well the way our mind classifies the world&#8230; When a programming language withdraws this model, it betrays its mission.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-4 parent" id="comment-1318795">
+				<div id="div-comment-1318795" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318795">
+			December 26, 2017 at 6:55 am</a>		</div>
+
+		<p>Not quite, Giuseppe.<br />
+The compiler does this because it allows the programmer to think locally, yet still get maximum performance.</p>
+<p>The programmer always writes &#8220;if null do this, otherwise do that.&#8221; &#8211; thinking locally.</p>
+<p>The compiler however can look at everywhere the function is actually used, and remove the path that cannot ever happen *at each location*.</p>
+<p>So when called from A, it&#8217;s turning a reference into a pointer so it cannot ever be null.<br />
+When called from B, it&#8217;s passing null so it cannot ever be not-null.<br />
+And from C it could be either so the check is kept.</p>
+<p>If the programmer then uses the function in a new place, or changes an existing one, the compiler again classifies this as being A, B or C and does the appropriate optimisation.</p>
+<p>Make sense?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-5" id="comment-1318805">
+				<div id="div-comment-1318805" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Giuseppe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318805">
+			December 26, 2017 at 9:07 am</a>		</div>
+
+		<p>Yes, of course it make sense, by a technical point of view. What I am trying to say is that compilers are to becoming &#8220;too smart&#8221;. I know perfectly that the code in example is wrong because it generates a null reference by redefining &#8220;[]&#8221; operator the wrong way. But I also observe that the programmer who added the test deleted by the compiler, could have done it (naively?) to protect himself against errors exactly like the one that eventually happened. And, yes, this sort of self-protection should anyway disappear in non-debug compilations, in an ideal and perfect world. But I don&#8217;t agree to put the the whole blame on programmer. I my opinion, the compiler in this case was too &#8230; optimistic: it trusted too much in programmer by assuming that the one who wrote the code had a perfect &#8220;global&#8221; view of his code.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-5" id="comment-1318806">
+				<div id="div-comment-1318806" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Richard</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318806">
+			December 26, 2017 at 9:22 am</a>		</div>
+
+		<p>In the example the programmer broke the rules &#8211; operator [] returns a reference, and the pointer to a reference cannot be nullptr &#8211; QED.</p>
+<p>Most modern compilers warn or error if you overload operators to return invalid types. We don&#8217;t know whether this compiler did warn &#8211; or if the programmer explicitly disabled the warning.<br />
+I&#8217;ve seen that in quite a lot of production code, and usually it ends very badly.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-5" id="comment-1318945">
+				<div id="div-comment-1318945" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318945">
+			December 27, 2017 at 6:31 pm</a>		</div>
+
+		<p>I do think there are cases where over-aggressive optimization can cause a program to fail in a way that makes it unnecessarily difficult to track down the original (perhaps very subtle) bug.  I don&#8217;t think this is one of them.</p>
+<p>In fact, depending on how you interpret the intent of the code shown in Raymond&#8217;s example, the optimization may have helped the programmer by turning a bug that was being silently ignored (probably resulting in more subtle misbehaviour that might be extremely hard to track down) into a crash with a fairly obvious cause.</p>
+<p>Even if you assume that the null pointers were intentional (this is my guess) then the crash would still have helped the programmer identify a bug (and learn an important language rule) that they might otherwise have remained entirely unaware of.  Annoying, no doubt, but not all bad.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-the-wench even thread-odd thread-alt depth-1 parent" id="comment-1318696">
+				<div id="div-comment-1318696" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Monochrome+Wench' rel='external nofollow' class='url'>Monochrome Wench</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318696">
+			December 25, 2017 at 5:44 am</a>		</div>
+
+		<p>Some people seem a little confused. It&#8217;s provable because operator[] returns a reference to an int which according to the specification must be valid. Passing a NULL as a this pointer generates the same sort of undefined behaviour. The compiler assumes it&#8217;s not a null pointer, and it is free to optimize checks away without violating the specifications. And because the null check is in a separate inlined function there is no reason for the compiler to emit a warning for the superfluous null check.</p>
+<p>Most programmers probably aren&#8217;t aware of all the details of the C++ specifications so when they try something like this and it works they assume it&#8217;s ok. Obviously they can lead to &#8220;random&#8221; crashes if it&#8217;s rarely called code and it works in debug builds but not release builds and there is no proper code testing procedures.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-1318845">
+				<div id="div-comment-1318845" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318845">
+			December 27, 2017 at 8:11 am</a>		</div>
+
+		<p>Plunging once again into an area where I am not an expert (one of so many): yes, I believe you&#8217;ve expressed <i>this particular issue</i> correctly.</p>
+<p>Two observations, however: one technical, and one blog-related.  And both issues are, as it were, related.</p>
+<p>The technical issue is that programmers (including me) naively believe that The Compiler (Or The Compiler/Linker, or I suppose in many cases you could even include The Runtime) has a world view that encompasses, well, the entire world.  At various stages in the pipeline this is not necessarily so.  In particular, it is not true when what, for want of a better term, I will call a &#8220;scope boundary&#8221; is crossed.</p>
+<p>Now, in C/C++, you cross a scope boundary <i>immediately</i> you use an external library (or even one of your own).  Neither the compiler nor the linker has <i>any way</i> of knowing that the thing on the other side can (or cannot) be proven not to exhibit undefined behavior.  Consider, for example, a case where <b>operator []</b> is defined in a separate compilation unit.  All you get is the header.  All the header tells you is that you can &#8220;reliably&#8221; get a reference to an int.  See below for how this is related to Raymond&#8217;s point.</p>
+<p>Taking this one step further: people (including me) <i>assume</i> that the type-checker part of the compiler &#8212; which can manifest itself as an arbitrarily long set of rules, arranged in an arbitrary and non-predictable order, just to make things interesting &#8212; has a universal world view.  Which it doesn&#8217;t.</p>
+<p>And here is where I go beyond my pay level and start waving my hands around.  Basically, unless you place a bound on how far you are going to go, your type-checking system (in a language that does not provably forbid undefined behavior) is subject to the Halting Problem.  And, even short of that, it&#8217;s a practical impossibility to design such a type-checking system that guarantees, say, O(n log n) behavior.  Therefore, in practise, your type-checking system will &#8212; as here &#8212; accept a part of the code, inlined to one degree, as here, and apply the rules it knows about.  One convenient (&#8220;provable&#8221;) rule is, as here, that <b>operator[]</b> for this class will never return a null int-reference.  It is provable because the <b>language specification</b> guarantees it.</p>
+<p>Now, it&#8217;s obvious to humans (with a bit of thought) that in this case it can.  But it isn&#8217;t obvious in the domain of the type-checker.  In fact, it is, by design (see Halting Problem), invisible.</p>
+<p>And now back to Raymond&#8217;s blog.  Let&#8217;s not concretize the problem at hand to the particular example that Raymond has provided.  This is a pedagogical example only (although it might well occur with some compilers and some programs in some form of real life).</p>
+<p>The point is, as I said above &#8212; in a language like C or C++, once you take &#8220;scope boundaries&#8221; into account, and that scope boundary can even cross &#8220;module&#8221; boundaries, then there is <b>no obvious way</b> that the compiler can warn you about this sort of issue without plastering the stupid warning all over the place and creating more false negatives than the human mind can comfortably comprehend.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-3" id="comment-1318846">
+				<div id="div-comment-1318846" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Peter Doubleday</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318846">
+			December 27, 2017 at 8:26 am</a>		</div>
+
+		<p>Which probably isn&#8217;t helpful enough.  OK, let&#8217;s resolve the issue to the following question:</p>
+<p>&#8220;Why did the compiler choose to erase the null check?&#8221;</p>
+<p>Because <b>you</b> told it to do that.  You asked for optimisation.  This is an optimisation.  It follows the rules of the language standard.</p>
+<p>What you asked for, you got.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1318935">
+				<div id="div-comment-1318935" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Harry Johnston</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318935">
+			December 27, 2017 at 6:18 pm</a>		</div>
+
+		<p>Note that optimizations may also be performed at link time, in which case functions in different modules are still in the same scope.  I think it would also be legal for a C++ compiler to be designed so that it looks at all the source modules (including libraries) at once, rather than having separate compile-and-then-link steps.  I&#8217;ve never heard of any, probably because of the performance implications, but it is theoretically possible.</p>
+<p>This doesn&#8217;t really affect what you&#8217;re saying, mind you, since in most cases it would still be impossible for the compiler to reliably tell whether or not the program is following the rules.</p>
+<p>(What the compiler could perhaps have usefully done in this particular instance is to automatically insert an assertion into debug builds that will fire if a null pointer is ever returned as a reference.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1318835">
+				<div id="div-comment-1318835" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">LePiaf</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20171222-00/?p=97635#comment-1318835">
+			December 27, 2017 at 2:17 am</a>		</div>
+
+		<p>Has anyone been able to reproduce this behavior?<br />
+I tried: clang/gcc with -O3, and microsoft 15.5 with /O2</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

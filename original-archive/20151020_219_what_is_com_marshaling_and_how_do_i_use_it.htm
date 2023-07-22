@@ -1,0 +1,660 @@
+<html>
+<head>
+<title>What is COM marshaling and how do I use it?</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>What is COM marshaling and how do I use it?</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>October 20, 2015 / year-entry #220</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>25</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">COM has this concept called "marshaling", with one L. Basically, marshaling is the mechanism by which an object that is accessible to one apartment can be made accessible to another apartment. Incomplete backgrounder on apartments: In COM, an apartment is a collection of threads that are treated as equivalent from a COM standpoint. The details...</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+COM has this concept called "marshaling",
+with one L.
+Basically, marshaling is the mechanism by which an object that is
+accessible to one apartment can be made accessible to another apartment.</p>
+<p>
+<b>Incomplete backgrounder on apartments</b>:
+In COM, an apartment is a collection of threads that are treated as
+equivalent from a COM standpoint.
+The details of apartments aren't important for today's discussion,
+so let's assume that all the apartments in question are
+single-threaded apartments (STA).
+Single-threaded apartments, as you might guess from their name,
+are apartments that consist of a single
+thread.
+In this world, the concepts of thread and apartment line up one-to-one,
+which makes discussion easier.
+</p>
+<p>
+<b>Incomplete backgrounder on threading models</b>:
+Each COM object declares how it deals with threads.
+The most common cases are
+<i>apartment model objects</i>,&sup1;
+which can be used only on the thread that
+they were created on,
+and
+<i>free-threaded objects</i>,
+which can be used from any thread.
+Free-threaded objects are easier to use,
+but
+apartment model objects are much, much easier to write,
+since you don't have any of that troublesome multi-threading
+to deal with.
+</p>
+<p>
+Okay, back to marshaling.
+</p>
+<p>
+Since the rules for apartment model objects is that they can
+be accessed only from the thread on which they were created,
+you need to do some extra work if you want to access them from
+another thread:
+You need to
+<a href="http://blogs.msdn.com/b/oldnewthing/archive/2014/10/16/10565024.aspx">
+hire a lackey</a>.
+COM calls this lackey a "proxy".
+When you invoke a method on the proxy object,
+the call is routed back to the originating apartment,
+the method executes on its original apartment,
+and then the results are routed back to original caller.
+(And if any of the parameters to the method are themselves
+objects, then COM needs to create proxies for those objects, too!)
+Marshaling is a mechanism for creating proxies.&sup2;
+</p>
+<p>
+<b>What if I need to marshal an object to another thread
+(same process or different process), and I already have
+access to an object in the destination thread?</b>
+</p>
+<p>
+The easy way to do this is to
+take advantage of the parenthetical remark
+up above:
+If you already have an interface pointer to an object in another apartment,
+you can define a marshalable interface that accepts an interface
+pointer.
+For example, if you need to pass a widget to another object,
+you probably already have a method on that other object called
+<code>IMumble::<wbr>Colorize&shy;Widget</wbr></code>
+that takes a widget and some other parameters.
+Just call the method from your originating apartment.
+The implementation of
+<code>IMumble::<wbr>Colorize&shy;Widget</wbr></code>
+will receive a pointer to the proxy,
+and it can use the proxy to access the original widget.
+It can event
+retain that pointer (with an appropriate
+<code>Add&shy;Ref</code>, of course) to communicate with the
+original widget even after the method returns.
+</p>
+<p>
+Of course, this creates a chicken-and-egg problem:
+In order to get my object to another apartment,
+I need access to an object on that apartment.
+In other words, once you have one object operating across apartments,
+you can use it to get more objects to operate across apartments.
+But how do you marshal the <i>first</i> object?
+</p>
+<p>
+<b>What if I need to marshal an object from one thread
+to another thread in the same process, and I don't have a friendly
+object on the other thread yet?</b>
+</p>
+<p>
+You can use
+<a href="http://msdn.microsoft.com/en-us/library/dn269839%28v=vs.85%29.aspx">
+the
+<code>Ro&shy;Get&shy;Agile&shy;Reference</code> function</a>.
+You give it an interface accessible to the current apartment,
+and the
+<code>Ro&shy;Get&shy;Agile&shy;Reference</code> function
+returns you an
+<code>IAgile&shy;Reference</code> interface pointer
+that figures out how to create proxies so you don't have to.
+What makes the agile reference special is that
+it is free-threaded:
+You can share the pointer freely among apartments.&sup3;
+To gain access to the original interface pointer, call
+<code>IAgile&shy;Reference::<wbr>Resolve</wbr></code>.
+Note, of course, that the pointer that comes out of
+<code>IAgile&shy;Reference::<wbr>Resolve</wbr></code>
+is valid only in the apartment in which you called
+<code>IAgile&shy;Reference::<wbr>Resolve</wbr></code>.
+</p>
+<p>
+In the case of passing an object to a newly-created thread,
+you would do something like this:
+</p>
+<ul>
+<li>Calling thread calls
+    <code>Ro&shy;Get&shy;Agile&shy;Reference</code>
+    and gets an agile reference.
+</li>
+<li>Calling thread creates the background thread and passes it
+    the agile reference pointer, transferring to the background thread
+    the obligation to release the agile reference.
+    (If the calling thread could not create the background thread,
+    then it needs to release the agile reference itself
+    since it was unable to transfer the obligation.)
+</li>
+<li>The background thread calls
+    <code>Co&shy;Initialize[Ex]</code>.
+</li>
+<li>The background thread takes the agile reference and calls
+    <code>IAgile&shy;Reference::<wbr>Resolve</wbr></code> to recover
+    the original object.
+</li>
+<li>The background thread releases the agile reference, since it
+    doesn't need it any more.
+</li>
+</ul>
+<p>
+<b>What if I need to marshal an object from one process to another?</b>
+</p>
+<p>
+Again, the easy way is to pass the object as a parameter to a method
+on an object you already have in the destination process.
+</p>
+<p>
+<b>But what if those mechanisms aren't available to me?</b>
+</p>
+<p>
+The
+<code>Ro&shy;Get&shy;Agile&shy;Reference</code> function
+was introduced in Windows&nbsp;8.1,
+so it may not be available to you.
+And maybe you don't have an object in the destination process
+that you can use as a foothold.
+We'll
+<a href="http://blogs.msdn.com/b/oldnewthing/archive/2015/10/21/10649190.aspx">
+look at the mechanism that operates
+under the covers</a>
+(and answer some more questions)
+over the next couple of days.
+</p>
+<p>
+&sup1; This unfortunate reuse of the word <i>apartment</i>
+has been the source of significant confusion.
+A better name would have been something like
+<i>fixed-threaded objects</i>.
+</p>
+<p>
+&sup2;
+Of course, this entire discussion assumes that the interface
+in question is marshalable.
+Otherwise, you get
+<a href="http://blogs.msdn.com/b/oldnewthing/archive/2004/12/13/281910.aspx">
+the mysterious <code>E_NO&shy;INTERFACE</code></a>.
+</p>
+<p>
+&sup3; Note that I didn't say that you can share the pointer
+freely among <i>threads</i>.
+The threads you share the pointer with must still belong to apartments.
+For single-threaded apartments, that means calling
+<code>Co&shy;Initialize</code> or
+<code>Co&shy;Initialize&shy;Ex</code> with the
+<code>COINIT_<wbr>APARTMENT&shy;THREADED</wbr></code> flag.
+For multi-threaded apartments, this means calling
+<code>Co&shy;Initialize&shy;Ex</code> with the
+<code>COINIT_<wbr>MULTI&shy;THREADED</wbr></code> flag
+somewhere in the process.&#8308;
+</p>
+<p>
+&#8308; Preferably, you called
+<code>Co&shy;Initialize&shy;Ex</code> with the
+<code>COINIT_<wbr>MULTI&shy;THREADED</wbr></code> flag
+on the thread itself.
+It is technically legal to call it from some other thread,
+but then
+<a href="http://blogs.msdn.com/b/oldnewthing/archive/2013/04/19/10412399.aspx">
+you're using the implicit MTA</a>,
+and that has its own problems.
+</p></p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (25)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-1197711">
+				<div id="div-comment-1197711" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rich</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197711">
+			October 20, 2015 at 7:25 am</a>		</div>
+
+		<p>Honest to God who the heck thought this up?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197701">
+				<div id="div-comment-1197701" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ivo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197701">
+			October 20, 2015 at 8:21 am</a>		</div>
+
+		<p>Is there an easy way to debug such code that marshals a call to another thread? Assuming it goes to the same process, of course. I tried stepping inside such call once and it led into the guts of COM.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197691">
+				<div id="div-comment-1197691" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">dalek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197691">
+			October 20, 2015 at 9:06 am</a>		</div>
+
+		<p>@Ivo</p>
+<p>This will probably depend on your definition of easy :)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197681">
+				<div id="div-comment-1197681" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ken Hagan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197681">
+			October 20, 2015 at 9:55 am</a>		</div>
+
+		<p>@Rich: The backgrounders are very incomplete, understandably, but if you think of processes instead of threads then the apparent complexity is no more than you might expect. Until you have a helper of some description in the target process, you can&#39;t call into it. Marshaling is just a system-supplied helper for this task.</p>
+<p>Once the helper is there, you have run-time support for aspect-oriented programming (such as transparent remote procedure calls and/or ACID transactions), so it&#39;s all worthwhile.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197661">
+				<div id="div-comment-1197661" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Josh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197661">
+			October 20, 2015 at 11:21 am</a>		</div>
+
+		<p>I think this is supposed to be &quot;even&quot;</p>
+<p>It can event retain that pointer </p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197651">
+				<div id="div-comment-1197651" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197651">
+			October 20, 2015 at 11:28 am</a>		</div>
+
+		<p>I have heard of STA and MTA. &nbsp;Are there corresponding &quot;things&quot; that are not apartments (houses, condos, etc.)? &nbsp;IOW, what is &quot;apartment&quot; a member of?</p>
+<div class="post">[<em>An &quot;apartment&quot; is a group of threads. I guess you could say that they are therefore members of a process. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even thread-even depth-1" id="comment-1197641">
+				<div id="div-comment-1197641" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197641">
+			October 20, 2015 at 2:05 pm</a>		</div>
+
+		<p>I have a question: What is the use of COM anyway? I keep hearing about it and it seems like a super-complex way of doing what I do anyway, with security risk coming as a free bonus. But what&#39;s the upside to all this complexity?</p>
+<p>I tried Wikipedia but it just confused me.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197621">
+				<div id="div-comment-1197621" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Gabe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197621">
+			October 20, 2015 at 3:03 pm</a>		</div>
+
+		<p>Fleet Command: COM is used when you have a situation where you need objects that need to be able to communicate.</p>
+<p>Default C++ objects can&#39;t be used because the in-memory layout is not specified, there are no clear rules about memory management, there&#39;s no way to access an object that isn&#39;t in your address space (in another process or on another computer), there&#39;s no way to call methods that weren&#39;t known to you at compile time, and so on.</p>
+<p>You can solve some of those problems yourself, but if you decided to solve all of them, you&#39;d end up with something similar to COM.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even thread-even depth-1" id="comment-1197611">
+				<div id="div-comment-1197611" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197611">
+			October 20, 2015 at 3:23 pm</a>		</div>
+
+		<p>@Gabe: Thanks a lot. :)</p>
+<p>I keep forgetting that a lot of things that I don&#39;t use and don&#39;t understand have something to do with C++ and its nature. I could not understand the buffer overrun attack for years (because everyone kept telling it in a language-agnostic way) until someone told me how things in C++ were. (I remember feeling miserable.)</p>
+<p>But I already have &quot;objects that communicate&quot;, using SOAP. Can&#39;t C++ use SOAP? Or maybe I don&#39;t understand &quot;communicate&quot; correctly here. Er&#8230; Interfaces? Or named pipes? Or is it delegates?</p>
+<div class="post">[<em>You have two modules in your process, written at different times, with different compilers, using different runtime libraries. How would you use SOAP to get module X to create an object from module Y and call methods on it? -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197601">
+				<div id="div-comment-1197601" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197601">
+			October 20, 2015 at 3:45 pm</a>		</div>
+
+		<p>@Fleet Command: </p>
+<p>Well, the SOAP spec was partially authored by Don Box, who, at the time didn&#39;t work for Microsoft (he does not, I think), but was probably the most well known non-MSFT COM expert of the 1990s. &nbsp;So, SOAP was, in some ways, the result of lessons learned from COM. &nbsp;A lot of what is in the .NET Framework is the result of lessons learned from COM (.NET started life as the next version of COM+).</p>
+<p>COM (and DCOM &#8211; distributed COM) relies on a binary (binary-rather than text, not binary-as in two) communication mechanism to allow disparate bits of code to talk to each other. &nbsp;Under the covers, it looks a lot like C++ vtables, but that&#39;s just an implementation detail. &nbsp;Any language that can lay things out in the appropriate way can use COM to have the code it produces communicate to other COM implementations. &nbsp;It may be hard to believe, but one of the great selling points of COM (apartments and threading-models and all) was its simplicity (particularly in comparison to CORBA &#8211; the other big &quot;object RPC&quot; standard in the 1990s.</p>
+<p>The other thing to remember about COM is that a chunk of its oddities are the result of it providing a path for VB programmers to be able to do some pretty amazing things. &nbsp;In particular, VB (traditional VB, not VB.NET) was basically a single-threaded language with an initially closed type system. &nbsp;COM opened up the type system (the underlying type system in late-90s VB was COM) and provided a way for VB programmers to write components that could plug into massively multi-threaded environments (like browsers, web apps, etc.). &nbsp;The oddball apartment and marshaling mechanisms provide the path for that multi-threading capability.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197591">
+				<div id="div-comment-1197591" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">itaish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197591">
+			October 20, 2015 at 4:46 pm</a>		</div>
+
+		<p>Since the suggestion box doesn&rsquo;t seem to work (last post from 2010) I&rsquo;m posting here a quick, off-topic, follow up on your 2003 post &ldquo;Why isn&#39;t my time zone highlighted on the world map?&rdquo;.</p>
+<p>I thought it would be nice to note that 20 years later, with Windows 10, Microsoft returned the time zone map feature (well, sort of) in the Alarms &amp; Clock UWP app ;-)</p>
+<div class="post">[<em>There is no time zone map (no highlight). It just has some popular cities. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command odd alt thread-odd thread-alt depth-1" id="comment-1197581">
+				<div id="div-comment-1197581" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197581">
+			October 20, 2015 at 4:50 pm</a>		</div>
+
+		<p>@Brian: Thanks a lot. That&#39;s probably one of the most valuable comments I&#39;ve read. It all makes sense too. After all, the 1990s thinking was what made PCs like lumbering giants that were fast in action but slow in pace.</p>
+<p>Oh, and by the way, Don Box joined Microsoft in 2002 and is still there. He was transferred to entertainment unit in 2011. (And, yes, I researched these just now.)</p>
+<p>@Raymond: I understand what you say is a rhetorical question that means &quot;You can&#39;t use SOAP to get module X to create an object from module Y and call methods on it.&quot; Well, no, but it is far simpler than that. I&#39;d link to Module Y via &quot;use&quot; keyword. I&#39;d call the class constructor by name and receive an object pointer to its instance. And then I call the object method. Now, I assume all of this is impossible in C++, right?</p>
+<div class="post">[<em>It requires that modules X and Y both be written in the same language, compiled from the same header files, with the same version of the same compiler, linked to the same runtime library. If you can enforce that, then great. But it&#39;s not very interoperable. For example, if you change a class, you have to recompile all modules that use it. If you decide to upgrade to a newer version of the compiler, you have to recompile the entire app. Anybody who writes a plug-in for your app must use exactly the same compiler that your app is written in. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-fleet-command even thread-even depth-1" id="comment-1197571">
+				<div id="div-comment-1197571" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Fleet+Command' rel='external nofollow' class='url'>Fleet Command</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197571">
+			October 20, 2015 at 5:14 pm</a>		</div>
+
+		<p>@Raymond: Oh, yes, I just remembered this particular Microsoft C++ problem you are talking about. Wow. Using ffmpeg or VLC with Visual C++ must be torture then. So, in essence, you are saying that COM implemented the plug-in infrastructure that C++ lacked up to that point. Go, COM!</p>
+<div class="post">[<em>Plug-ins, or just getting two apps written independently to interoperate. Also, it implemented a model for thread safety. It may not be a model you would have chosen, but it was better than no model at all. (ffmpeg and VLC solve the interop problem by using flat C, and not supporting cross-process use. Not sure how they deal with threading.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197561">
+				<div id="div-comment-1197561" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Joshua</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197561">
+			October 20, 2015 at 8:48 pm</a>		</div>
+
+		<p>[(ffmpeg and VLC &#8230;. Not sure how they deal with threading.)]</p>
+<p>Sanely, like most .NET objects. The objects don&#39;t care what thread so long as there&#39;s no more than one thread at once.</p>
+<div class="post">[<em>That makes it easy for the object, but hard for the clients. (If one client hands the object to another component, it really needs to hand <span style="text-decoration:underline;">two</span> things to the other component. One is the shared object. And the other is a synchronization policy so that the two components won&#39;t try to use the object at the same time.) -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197551">
+				<div id="div-comment-1197551" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Euro Micelli</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197551">
+			October 20, 2015 at 8:52 pm</a>		</div>
+
+		<p>@Rich (and to some extent @FleetCommand):</p>
+<p>These things exist to solve real problems. My experience with COM &#8211; time and time again &#8211; has been that I look at some aspect of it, I tell myself &quot;bonkers, that&#39;s too complex&quot;, I ask myself how *I* would approach the same problem the simplest possible way&#8230; and assuming I manage to be smart enough to think it through, I invariably end up reinventing the same solution. I have the utmost respect for the people that created and maintain COM: they know what they doing.</p>
+<p>(I still try to follow that mental process because it teaches me &quot;why&quot; something was designed the way it is)</p>
+<p>We&#39;ve been talking about the COM infrastructure and API, but the same thing goes also for all the rules of COM usage and implementation. They are there to protect us. Just because someone doesn&#39;t understand why a rule exist doesn&#39;t mean they get to ignore it (and yet, many try).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197541">
+				<div id="div-comment-1197541" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">nikos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197541">
+			October 21, 2015 at 5:20 am</a>		</div>
+
+		<p>you forgot to mention CoMarshalInterThreadInterfaceInStream, that works on windows prior to 8.1</p>
+<div class="post">[<em>I didn&#39;t forget. I said that the topic will continue next time. -Raymond</em>]</div>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197511">
+				<div id="div-comment-1197511" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Rich</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197511">
+			October 21, 2015 at 8:22 am</a>		</div>
+
+		<p>@Nikos: Silly of him! How could anybody forget CoMarshalInterThreadInterfaceInStream?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197501">
+				<div id="div-comment-1197501" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">McBucket</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197501">
+			October 21, 2015 at 8:37 am</a>		</div>
+
+		<p>@nikos: your wish is granted: <a rel="nofollow" target="_new" href="http://blogs.msdn.com/b/oldnewthing/archive/2015/10/21/10649190.aspx">blogs.msdn.com/&#8230;/10649190.aspx</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197481">
+				<div id="div-comment-1197481" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197481">
+			October 21, 2015 at 9:08 am</a>		</div>
+
+		<p>Thanks, Raymond. &nbsp;I never knew if there was an &quot;apartment&quot; threading model and some other, non-apartment threading model. &nbsp;Now I know.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197431">
+				<div id="div-comment-1197431" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197431">
+			October 21, 2015 at 9:27 am</a>		</div>
+
+		<p>@Rich, COM has a huge historic baggage, it&#39;s not like your question deserves a one-line answer. &nbsp;Definitely, it wasn&#39;t all thought out to be what it became.</p>
+<p>@Raymond, interesting that the MSDN article for RoGetAgileReference is under &quot;Archive&quot; in the topic hierarchy, what gives? &nbsp;Quoting:</p>
+<p>&quot;Archived articles</p>
+<p>This section of the Library contains archived articles. Some articles cover deprecated or superseded technologies, and some cover niche subject areas that you may still find interesting.&quot;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197391">
+				<div id="div-comment-1197391" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197391">
+			October 21, 2015 at 10:39 am</a>		</div>
+
+		<p>Apartments used to be groups of threads when you only had STA and MTA, but then came the NA.</p>
+<p>Here are my two cents (pick your currency):</p>
+<p>A COM apartment is a top-level context for COM objects. &nbsp;There is a sub-level of object contexts in COM+, but I won&#39;t cover COM+ here.</p>
+<p>A COM object is bound to an apartment, its lifetime depends on the apartment&#39;s lifetime. &nbsp;The kind of apartment it supports depends on its ThreadingModel configuration (either in the registry or in an assembly manifest) and on the caller&#39;s current apartment. &nbsp;See this MSDN article (Threading Model Attribute): <a rel="nofollow" target="_new" href="https://msdn.microsoft.com/en-us/library/windows/desktop/ms681753(v=vs.85).aspx">msdn.microsoft.com/&#8230;/ms681753(v=vs.85).aspx</a></p>
+<p>An STA (single-threaded apartment) takes one and only one thread that pumps window messages, its lifetime depends on that thread being in the STA. &nbsp;There can be any amount of STAs.</p>
+<p>The Main STA is the first STA ever created. &nbsp;It&#39;s the apartment for objects that don&#39;t declare a ThreadingModel.</p>
+<p>The Host STA is the STA created by COM&#39;s infrastructure. &nbsp;It&#39;s created when a no-ThreadingModel or an Apartment object is created in a non-STA.</p>
+<p>It&#39;s bad practice to exit the thread or post a quit message while running under the Host STA.</p>
+<p>The Main STA and the Host STA may be the same.</p>
+<p>An MTA (multithreaded apartment) takes one or more threads, its lifetime depends on the existence of at least one thread in the MTA. &nbsp;Since Windows 8, its lifetime can be extended with CoIncrementMTAUsage/CoDecrementMTAUsage. &nbsp;There can be at most one MTA.</p>
+<p>A host MTA thread is an MTA thread created by COM&#39;s infrastructure. &nbsp;It may be created from a thread pool when no MTA thread is available to create an MTA object or to handle its method calls. &nbsp;Since Windows 7, COM uses the default thread pool, but you can change that with IGlobalOptions.</p>
+<p>When the MTA is alive, every thread that is not in an apartment is implicitly in the MTA. &nbsp;However, relying on this behavior means you&#39;re subject to sudden unexpected apartment changes allowed by the next call to CoInitialize[Ex].</p>
+<p>An NA (neutral apartment) is an apartment that doesn&#39;t require thread exclusivity, its lifetime is not documented, but it must be at least as long as the last contained object&#39;s final release, and it may exist indefinitely once created. &nbsp;There can be at most one NA.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197381">
+				<div id="div-comment-1197381" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">John Doe</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197381">
+			October 21, 2015 at 10:39 am</a>		</div>
+
+		<p>(second cent, comments must be under 3072 characters):</p>
+<p>Threads may enter an STA or an MTA with CoInitialize[Ex]. &nbsp;The thread can either reinforce this with CoInitialize[Ex] or leave the apartment with as many calls to CoUninitialize as previous successful calls to CoInitialize[Ex]. &nbsp;It can then enter an apartment again.</p>
+<p>A thread must be in an apartment to be considered a COM thread. &nbsp;Failing to enter an apartment commonly exposes errors in calls to CoCreateInstance[Ex] or CoGetClassObject.</p>
+<p>A thread can only run under the NA apartment through activation (in the class factory) or through the created object&#39;s methods.</p>
+<p>Avoid having to wait for multiple handles. &nbsp;When implementing a Both object, a Neutral object or an object with the free-threaded marshaler, consider using CoWaitForMultipleHandles instead of developing your own function that dispatches to WaitForMultipleObjectsEx or MsgWaitForMultipleObjectsEx.</p>
+<p>A thread that pumps window messages should only enter an STA. &nbsp;In an MTA, idle threads in the pool, inter-apartment calls and CoWaitForMultipleHandles block the thread, so window messages are not processed and after a while Windows may consider the application as not responding.</p>
+<p>The current apartment may be none, STA, main STA, MTA, implicit MTA, NA over STA, NA over main STA, NA over MTA and NA over implicit MTA.</p>
+<p>Calls across apartments require marshaling. &nbsp;A common workaround is to aggregate the the FTM (free-threaded marshaler) and declare the ThreadingModel of an object as Both. &nbsp;An NA object has a lightweight proxy or stub that doesn&#39;t perform in-process marshaling, although it performs apartment enter and exit logic. &nbsp;The advantage of NA&#39;s proxy/stubs is that it simply works across apartments without having to deal with every object reference through manual marshaling or the GIT (global interface table).</p>
+<p>An object that aggregates the FTM still belongs to the apartment where it was created, so if that apartment ceases to exist and you still hold a reference to the object, consequences of further using the object are undefined.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197341">
+				<div id="div-comment-1197341" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Brian</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197341">
+			October 21, 2015 at 4:05 pm</a>		</div>
+
+		<p>@John Doe:</p>
+<p>Ah, that&#39;s the COM I remember &#8211; so simple and easy to remember :)</p>
+<p>However, one usually works within a framework that is already established and for which there are strict rules. &nbsp;As long as you aren&#39;t mucking with that framework or messing with the rules, programming in COM (particularly in a framework with good smart pointers) isn&#39;t that difficult.</p>
+<p>Several times in the past 10 years, I&#39;ve had people explain their plug-in mechanism to me. &nbsp;It would usually include a universal naming mechanism, a factory-based object creation system (using that name), an interface-based &quot;interface&quot; to the objects, and a formal way of defining object lifetime. &nbsp;Sometimes it included a way to marshal calls across threads (a la Windows Forms&#39; Control.Invoke). &nbsp;At the end of the explanation, I&#39;d often say &quot;congrats, you just re-invented COM yet again&quot;.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1197271">
+				<div id="div-comment-1197271" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">DWalker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197271">
+			October 22, 2015 at 8:48 am</a>		</div>
+
+		<p>@John Doe: &nbsp;Thanks for that comprehensive explanation. &nbsp;</p>
+<p>@Brian: &nbsp;I have seen that kind of thing happen with other technologies. &nbsp;You think &quot;wow, that&#39;s complex, I can do a better job&quot;, and (as you said earlier) you end up doing the same thing.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1197081">
+				<div id="div-comment-1197081" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">KISS</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151020-00/?p=91321#comment-1197081">
+			October 24, 2015 at 10:34 pm</a>		</div>
+
+		<p>This is what you get when you never deprecate a single feature from a framework optimized for 16-bit real-mode windows.</p>
+<p>@Euro Micelli</p>
+<p>No, adding interop with BASIC isn&#39;t &quot;they know what they doing&quot;. That&#39;s bloat.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+

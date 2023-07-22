@@ -1,0 +1,392 @@
+<html>
+<head>
+<title>Are views of memory-mapped files coherent within a single process? (And how this was the wrong question.)</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Are views of memory-mapped files coherent within a single process? (And how this was the wrong question.)</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>December 18, 2015 / year-entry #267</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>13</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Yes.</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+A customer wanted some clarification.
+<a HREF="https://msdn.microsoft.com/en-us/library/ms810613.aspx">
+An MSDN article</a>
+says
+</p>
+<blockquote CLASS="q"><p>
+This means that changes made to a page in the memory-mapped file
+via one process's view are automatically reflected
+in a common view of the memory-mapped file in another process.
+</p>
+</blockquote>
+<p>
+"The above paragraph says that the views are coherent across
+processes, but what about within a single process?"
+</p>
+<p>
+Yes, the views are coherent within a single process, too.
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/aa366761%28v=vs.85%29.aspx">
+The documentation for
+<code>Map&shy;View&shy;Of&shy;File</code></a>
+says
+</p>
+<blockquote CLASS="q"><p>
+... file views derived from any file mapping object
+that is backed by the same [local]
+file are coherent or identical at a specific time.
+Coherency is guaranteed for views within a process
+and for views that are mapped by different processes.
+</p>
+</blockquote>
+<p>
+The customer explained that they had a large file that they
+wanted to update from multiple threads.
+No two threads operate on the same bytes of the file,
+but the pieces are very close together and sometimes are interleaved.
+(As an extreme example: Thread 1 is operating on all the bytes
+at odd file offsets, and thread 2 is operating on all the bytes
+at even file offset.)
+Right now, they are using critical sections to make sure that
+only one thread updates the file at a time.
+They were thinking of using a memory-mapped file
+and letting each of the threads
+<a HREF="http://blogs.msdn.com/b/oldnewthing/archive/2014/02/11/10498299.aspx">
+party</a>
+on the portion of the view
+that corresponds to the work that that thread is doing.
+Since the threads are operating on disjoint portions of the file,
+they wouldn't need to synchronize access with each other.
+They just want to make sure there are no hidden gotchas with
+coherency.
+</p>
+<p>
+If you look at their problem description, you'll see that view
+coherency is totally not the issue at hand.
+They aren't creating multiple views.
+They are using a <i>single</i> view and sharing it
+among multiple threads.
+This is not about view coherency: There is only one view,
+so it is trivially coherent with itself.
+This is really about memory coherency.
+So let's take the view out of the picture.
+The actual question is
+"I have a chunk of memory that multiple threads are updating
+without locking.
+No two threads are updating the same byte of the memory.
+How safe is that?"
+</p>
+<p>
+The answer is "Sort of, but you need to be careful."
+</p>
+<p>
+The solution is to use atomic memory operations.
+But we're not really interested in the atomicity,
+seeing as each byte is operated on by only one thread.
+What we really care about is that one thread's writes
+don't incidentally write to bytes that belong to another thread.
+</p>
+<p>
+In practice, this means operating on objects that can be updated
+atomically by the processor:
+<a HREF="https://msdn.microsoft.com/en-us/library/windows/desktop/ms684122%28v=vs.85%29.aspx">
+Win32 guarantees</a>
+atomic access for properly-aligned 32-bit values
+and properly-aligned pointer-sized values.
+</p>
+<p>
+Therefore, you can slice up the file into chunks so that
+everything you operate on are either properly-aligned
+32-bit values or properly-aligned pointer-sized values
+(though why you are putting pointers in a file eludes me),
+then you can have all the threads access the memory directly,
+and they won't step on each other.
+It's okay if a single slice consists of, say, four 32-bit values
+that are individually aligned, although the slice as a whole
+is not 32-byte aligned.
+The point is that when you access the slice,
+you access in pieces that are
+atomically updatable.
+</p>
+<p>
+But if you are slicing up the file into bytes, like in our
+example above,
+then you cannot just have them all modifying bytes freely
+because byte-granular access is not guaranteed to be atomic.
+Windows can run on systems that do not support byte-granular
+access,
+such as the original Alpha AXP.
+Writing a byte on the original Alpha AXP was a multi-step
+affair:
+Load the eight-byte-aligned chunk of memory surrounding
+the byte into a single 64-bit register,
+update the single byte in that register,
+then write all eight bytes back to memory.
+Observe that this update is not atomic:
+If two threads try to write different bytes that happen
+to reside in the same eight-byte-aligned chunk,
+the writes may collide, and one of the writes will appear
+to be be lost.
+(The Alpha AXP also has a notoriously weak memory model.)
+</p>
+<p>
+<b>Bonus chatter</b>:
+If you wanted to avoid having to rewrite the program too much,
+you could use the
+<code>Write&shy;File</code> function
+with an <code>OVERLAPPED</code> structure that provides the
+explicit offset for each write.
+This avoids having to synchronize the threads so that two threads
+don't try to move the file pointer at the same time.
+On the other hand, you aren't avoiding the synchronization entirely
+because I/O to a synchronous file handle is serialized.
+To get truly parallel writes, you need to open the file in
+<code>FILE_FLAG_OVERLAPPED</code> mode,
+but that is potentially a bigger change to the program.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (13)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment byuser comment-author-scott-brickey even thread-even depth-1" id="comment-1219881">
+				<div id="div-comment-1219881" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Scott+Brickey' rel='external nofollow' class='url'>Scott Brickey</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219881">
+			December 18, 2015 at 9:53 am</a>		</div>
+
+		<p>To me, aside from the emphasis on the View, I would tend to assume that anything which is guaranteed across processes, would also be guaranteed within a process&#8230; which begs a bigger question: what might be guaranteed to work ACROSS processes, that cannot be guaranteed WITHIN a process?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-1219901">
+				<div id="div-comment-1219901" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">pc</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219901">
+			December 18, 2015 at 11:16 am</a>		</div>
+
+		<p>Would the answer be any different if the threads did each use a different view?</p>
+<p>In practice, as long as you aren&#8217;t running your code on Alpha AXP (or a future similar platform), are byte-granular accesses atomic?</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-oldnewthing bypostauthor even depth-2" id="comment-1220053">
+				<div id="div-comment-1220053" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Raymond+Chen+-+MSFT' rel='external nofollow' class='url'>Raymond Chen - MSFT</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1220053">
+			December 21, 2015 at 12:29 pm</a>		</div>
+
+		<p>Oh, you mean like the original ARM, which also didn&#8217;t have byte-granular access? At any rate, it&#8217;s a CPU question, not a Windows question. You&#8217;d have the same issues in any operating system.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-1219921">
+				<div id="div-comment-1219921" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://adamrosenfield.com' rel='external nofollow' class='url'>Adam Rosenfield</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219921">
+			December 18, 2015 at 11:55 am</a>		</div>
+
+		<p>Off-topic: Is something going on with the blog software again today?  <a href="http://blogs.msdn.com/oldnewthing/" rel="nofollow">http://blogs.msdn.com/oldnewthing/</a> has the old style again (yay!) and incidentally redirects back to the /b/ URL, but it&#8217;s missing this week&#8217;s posts from it, and the recent posts it does have are missing some/all comments.  Smells like it&#8217;s connecting to an old backup of the database.  Yet, this week&#8217;s posts, which I still have open, are still displaying in the new white style.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment even depth-2 parent" id="comment-1219942">
+				<div id="div-comment-1219942" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">mikeb</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219942">
+			December 18, 2015 at 1:36 pm</a>		</div>
+
+		<p>The old URL I have for rss.aspx didn&#8217;t update with this article.  There doesn&#8217;t seem to be an RSS feed URL for the new blog page.  I might be jumping the gun, but I hope MS isn&#8217;t abandoning RSS as a way to get updates on MSDN blogs.</p>
+
+		
+				</div>
+		<ol class="children">
+		<li class="comment byuser comment-author-ramon-sola odd alt depth-3" id="comment-1219951">
+				<div id="div-comment-1219951" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Ram%C3%B3n+Sola' rel='external nofollow' class='url'>Ramón Sola</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219951">
+			December 18, 2015 at 5:30 pm</a>		</div>
+
+		<p>You can reach the feed at <a href="https://blogs.msdn.microsoft.com/oldnewthing/feed/" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/feed/</a> (actually an Atom feed, not a RSS feed, but readers usually can parse both). The feed URL is not exposed via &#8220;link&#8221; tags yet.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1219961">
+				<div id="div-comment-1219961" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219961">
+			December 18, 2015 at 8:01 pm</a>		</div>
+
+		<p>Try: <a href="https://blogs.msdn.microsoft.com/oldnewthing/feed" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/feed</a></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt depth-3" id="comment-1219981">
+				<div id="div-comment-1219981" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219981">
+			December 19, 2015 at 2:32 am</a>		</div>
+
+		<p>This blog now appears to be running on WordPress, so I tried the permalink-style feed URL which is simply <a href="https://blogs.msdn.microsoft.com/oldnewthing/feed/" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/feed/</a> and that does appear to work. (I believe the default format is RSS2 but if you prefer e.g. atom, then <a href="https://blogs.msdn.microsoft.com/oldnewthing/feed/atom/" rel="nofollow">https://blogs.msdn.microsoft.com/oldnewthing/feed/atom/</a> works for that.)</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even depth-3" id="comment-1219991">
+				<div id="div-comment-1219991" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Neil</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1219991">
+			December 21, 2015 at 3:12 am</a>		</div>
+
+		<p>The comment I wrote mentioning that the WordPress default URL appeared to work is still pending moderation but since then the original feed URL has started working again so it doesn&#8217;t matter.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-scott-brickey odd alt depth-3" id="comment-1220011">
+				<div id="div-comment-1220011" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://social.msdn.microsoft.com/profile/Scott+Brickey' rel='external nofollow' class='url'>Scott Brickey</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1220011">
+			December 21, 2015 at 9:25 am</a>		</div>
+
+		<p>you are correct that rss.aspx is no longer&#8230; if you open the page in a browser, you&#8217;ll be redirected to /feed, which does work.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+</ol><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1220002">
+				<div id="div-comment-1220002" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">sense</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1220002">
+			December 21, 2015 at 7:18 am</a>		</div>
+
+		<p>Is &#8220;32-byte aligned&#8221; a typo? And if yes, is it a typo of &#8220;32-bit aligned&#8221; or a typo of &#8220;16-byte aligned&#8221; (Because four 32-bit values will be 16-bytes long)? </p>
+<p>Either interpretation of the sentence makes no sense to me:<br />
+1- a 32 or 16 byte alignment is just too much for CPUs I know,<br />
+2- and the slice cannot be &#8220;not 32-bit aligned&#8221;, if all values in it are 32-bit aligned</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1220021">
+				<div id="div-comment-1220021" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Lev</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1220021">
+			December 21, 2015 at 9:43 am</a>		</div>
+
+		<p>There will also be performance issues. Threads won&#8217;t be able to use the cache efficiently because it loads more than 8-byte chunks.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1220041">
+				<div id="div-comment-1220041" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Ben Voigt</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="https://blogs.msdn.microsoft.com/oldnewthing/20151218-00/?p=92672#comment-1220041">
+			December 21, 2015 at 10:49 am</a>		</div>
+
+		<p>@Scott: Some examples of things that work well across processes but are prone to failure within a process: DebugActiveProcess(), MiniDumpWriteDump()</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="https://devblogs.microsoft.com/oldnewthing/">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+
