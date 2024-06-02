@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Old New Thing comments
 // @namespace    https://m417z.com/
-// @version      1.1.2
+// @version      1.1.3
 // @description  Shows archived comments for old pages of The Old New Thing, fixes old links
 // @author       m417z
 // @match        https://devblogs.microsoft.com/oldnewthing/*
@@ -35,7 +35,7 @@
         }
 
         const style = `<style>
-            #comments, #comments *:not(blockquote) {
+            #comments, #comments *:not(blockquote):not(a) {
                 all: revert;
             }
 
@@ -57,10 +57,19 @@
                 margin: 1em;
             }
 
+            html[theme=dark] #comments ol.comment-list > li.comment {
+                background-color: #171717;
+            }
+
             #comments ol.comment-list > li.comment .post {
                 background-color: #f1f1f1;
                 padding: 0px 8px;
                 border: 1px solid #000;
+            }
+
+            html[theme=dark] #comments ol.comment-list > li.comment .post {
+                background-color: #2f2f2f;
+                border: 1px solid #fff;
             }
 
             #comments ol.comment-list > li.comment ol.children > li.comment {
