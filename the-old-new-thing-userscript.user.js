@@ -7,6 +7,7 @@
 // @match        https://devblogs.microsoft.com/oldnewthing/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=microsoft.com
 // @grant        none
+// @license      MIT
 // @noframes
 // ==/UserScript==
 
