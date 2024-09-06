@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         The Old New Thing comments
 // @namespace    https://m417z.com/
-// @version      1.1.3
+// @version      1.1.4
 // @description  Shows archived comments for old pages of The Old New Thing, fixes old links
 // @author       m417z
 // @match        https://devblogs.microsoft.com/oldnewthing/*
@@ -77,7 +77,7 @@
             }
         </style>`;
 
-        const html = await response.text();
+        const html = '<div class="entry-content">' + await response.text() + '</div>';
 
         const commentsElement = document.getElementById('comments');
         commentsElement.innerHTML = style + html;
