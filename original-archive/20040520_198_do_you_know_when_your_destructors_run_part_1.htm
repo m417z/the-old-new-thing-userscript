@@ -1,0 +1,337 @@
+<html>
+<head>
+<title>Do you know when your destructors run? Part 1.</title>
+<link rel="stylesheet" href="page.css">
+</head><body>
+<div class="titlediv"><h2>Do you know when your destructors run? Part 1.</h2></div>
+<div class="hdrdiv"><table class="hdrtable" cellspacing="0" cellpadding="0">
+<tr><td><b>Date:</b></td><td>May 20, 2004 / year-entry #199</td></tr>
+<tr><td><b>Tags:</b></td><td>code</td></tr>
+<tr><td><b>Orig Link:</b></td><td>https://blogs.msdn.microsoft.com/oldnewthing/20040520-00/?p=39243</td></tr>
+
+<tr><td><b>Comments:&nbsp;&nbsp;&nbsp;&nbsp;</b></td><td>11</td></tr>
+<tr><td valign="top"><b>Summary:</b></td><td valign="top">Larry Osterman discussed the importance of knowing when your global destructors run, but this problem is not exclusive to global objects. You need to take care even with local objects. Consider: void Sample() { if (SUCCEEDED(CoInitialize(NULL))) { CComPtr<IXMLDOMDocument> p; if (SUCCEEDED(p.CoCreateInstance(CLSID_IXMLDOMDocument))) { ... } CoUninitialize(); } } Easy as pie. And there's a bug here....</td></tr>
+</table></div>
+<hr/>
+<table class="contenttable" cellspacing="0" cellpadding="0"><tr><td><div class="contentdiv">
+<!-- CONTENT START -->
+<p>
+<a href="/redirect.php?url=http%3A%2F%2Fblogs.msdn.com%2FLarryOsterman%2Farchive%2F2004%2F04%2F22%2F118240.aspx">
+Larry Osterman discussed the importance of knowing when your
+global destructors run</a>, but this problem is not exclusive
+to global objects.  You need to take care even with local
+objects.  Consider:
+</p>
+<pre>
+void Sample()
+{
+  if (SUCCEEDED(CoInitialize(NULL))) {
+    CComPtr&lt;IXMLDOMDocument&gt; p;
+    if (SUCCEEDED(p.CoCreateInstance(CLSID_IXMLDOMDocument))) {
+     ...
+    }
+    CoUninitialize();
+  }
+}
+</pre>
+<p>
+Easy as pie.  And there's a bug here.
+</p>
+<p>
+When does the destructor for that smart-pointer run?
+</p>
+<p>
+Answer: When the object goes out of scope,
+which is at the closing brace of the outer <code>if</code> statement,
+<strong>after</strong> the <code>CoUninitialize</code> call.
+</p>
+<p>
+So you shut down COM, and then try to access a pointer to a COM object.
+This is not good.
+(Or as Larry describes it, "Blam!")
+</p>
+<p>
+To fix this problem, you have to release all your COM pointers
+before the <code>CoUninitialize</code>.  One way would be to insert a
+<code>p.Release()</code> at the end of the inner <code>if</code>.
+(But of course, if you're going to do that, then why bother using
+a smart pointer?)
+</p>
+<p>
+Another fix would be to introduce a seemingly unnecessary scope:
+</p>
+<pre>
+void Sample()
+{
+  if (SUCCEEDED(CoInitialize(NULL))) {
+    {
+      CComPtr&lt;IXMLDOMDocument&gt; p;
+      if (SUCCEEDED(p.CoCreateInstance(CLSID_IXMLDOMDocument))) {
+       ...
+      }
+    } <font COLOR=blue>// ensure p is destructed before the CoUninit</font>
+    CoUninitialize();
+  }
+}
+</pre>
+<p>
+Make sure you leave that comment there or the next person to come
+across this code is going to "clean it up" by removing the
+"redundant" braces.
+</p>
+<p>
+Of course, this is still too subtle.  Here's another solution:
+Put the CoUninitialize inside a destructor of its own!
+</p>
+<pre>
+class CCoInitialize {
+public:
+ CCoInitialize() : m_hr(CoInitialize(NULL)) { }
+ ~CCoInitialize() { if (SUCCEEDED(m_hr)) CoUninitialize(); }
+ operator HRESULT() const { return m_hr; }
+ HRESULT m_hr;
+};
+
+void Sample()
+{
+  CCoInitialize init;
+  if (SUCCEEDED(init)) {
+    CComPtr&lt;IXMLDOMDocument&gt; p;
+    if (SUCCEEDED(p.CoCreateInstance(CLSID_IXMLDOMDocument))) {
+     ...
+    }
+  }
+} <font COLOR=blue>// CoUninitialize happens here</font>
+</pre>
+<p>
+This works even if you put the smart pointer at the same scope,
+as long as you put it <strong>after the CCoInitialize object</strong>:</p>
+<pre>
+void Sample()
+{
+  CCoInitialize init;
+  CComPtr&lt;IXMLDOMDocument&gt; p;
+  if (SUCCEEDED(init) &amp;&amp;
+      SUCCEEDED(p.CoCreateInstance(CLSID_IXMLDOMDocument))) {
+   ...
+  }
+}
+</pre>
+<p>
+This works because objects with automatic storage duration
+are destructed in reverse order of declaration, so the
+object <code>p</code> wil be destructed first, then the
+object <code>init</code>.
+</p>
+<p>
+Mind you, this is basically subtle no matter now you slice it.
+Nobody said programming was easy.
+</p>
+<p>
+Tomorrow, part 2.</p>
+<!-- CONTENT END -->
+</div></td></tr></table>
+<hr/>
+<table class="commenttable" cellspacing="0" cellpadding="0"><tr><td><div class="commentdiv"><div class="commentdivhdr">
+<!-- COMMENTS START -->
+Comments (11)	</div>
+
+	
+			<div class="navigation pagination clear-both">
+					</div>
+
+		<ol class="comment-list">
+					<li class="comment even thread-even depth-1" id="comment-175693">
+				<div id="div-comment-175693" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Stephane Rodriguez</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175693">
+			May 20, 2004 at 7:37 am</a>		</div>
+
+		<p>If the code is made full of implicit construction/destruction that will, because it&#8217;s unmanaged code, cause spectacular GPFs for any reason, then I am not sure there is any improvement here. I wonder if this isn&#8217;t a pledge for managed code.</p>
+<p>Also wonder of next part will cover smart pointers used in class members. Plenty of funny things here.</p>
+<p>Does anyone if a third party ever came with a COM component manager that would insulate developers from these things without being frightened of GPFs. I know that you can switch to managed code today, yet given that the ROT is of no help without explicit monikers &#8211; something that not many people seem to use in the real world &#8211; is there any tool to diagnose internal COM life cycle issues?<br /></p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-175723">
+				<div id="div-comment-175723" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Jack Mathews</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175723">
+			May 20, 2004 at 7:49 am</a>		</div>
+
+		<p>While managed code would stop GPF&#8217;s from happening, there are still PLENTY of logic problems that can and will happen from destruction order issues.  This just happens to be one that crashes, but in managed code or not, you can make objects go to an invalid state and then try to use them to make bad things happen.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-175733">
+				<div id="div-comment-175733" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='/redirect.php?url=http%3A%2F%2Fblogs%2Fgeekdojo.net%2Fpdbartlett%2F' rel='external nofollow' class='url'>Paul Bartlett</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175733">
+			May 20, 2004 at 7:52 am</a>		</div>
+
+		<p>Slight error (I think). Shouldn&#8217;t it be p.Release() and p.CoCreateInstance(&#8230;). The former is a &quot;well known&quot; gotcha with ATL smart pointers.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-175753">
+				<div id="div-comment-175753" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='/redirect.php?url=http%3A%2F%2Fweblogs.asp.net%2Foldnewthing' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175753">
+			May 20, 2004 at 8:28 am</a>		</div>
+
+		<p>Oops, thanks Paul. I guess this reveals that I don&#8217;t use ATL smart pointers much&#8230;</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-175803">
+				<div id="div-comment-175803" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='/redirect.php?url=http%3A%2F%2Fwww.codeproject.com%2Fscript%2Farticles%2Flist_articles.asp%3Fuserid%3D152' rel='external nofollow' class='url'>Mike Dunn</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175803">
+			May 20, 2004 at 10:40 am</a>		</div>
+
+		<p>p-&gt;Release() actually won&#8217;t compile. ATL guards against that incorrect usage by having operator-&gt; return a _NoAddRefReleaseOnCComPtr*. The trick is that that class has the AddRef() and Release() methods private, making them inaccessible by the code trying to do p-&gt;Release().</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-175823">
+				<div id="div-comment-175823" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">Catatonic</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175823">
+			May 20, 2004 at 2:26 pm</a>		</div>
+
+		<p>After I read Larry Osterman&#8217;s post a few weeks ago, I created a class that&#8217;s almost identical to your CCoInitialize example. To me it feels like the natural solution.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-175843">
+				<div id="div-comment-175843" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BeenThere</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175843">
+			May 20, 2004 at 6:01 pm</a>		</div>
+
+		<p>I know this is just an example, but if CoInit was occasionally failing in my code I would want to know why.  Does some unrelated code sometimes set the thread up with a different concurrency model?  An assert might be nice.  Also, shouldn&#8217;t you be using CoInitializeEx?</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-175853">
+				<div id="div-comment-175853" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='/redirect.php?url=http%3A%2F%2Fweblogs.asp.net%2Foldnewthing%2F' rel='external nofollow' class='url'>Raymond Chen</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175853">
+			May 20, 2004 at 6:09 pm</a>		</div>
+
+		<p>CoInitialize(NULL) is the same as CoInitializeEx(NULL, COINIT_APARTMENTTHREADED).</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-175873">
+				<div id="div-comment-175873" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn">BeenThere</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175873">
+			May 20, 2004 at 6:20 pm</a>		</div>
+
+		<p>MSDN says &quot;Applications developed today should call CoInitializeEx rather than CoInitialize,&quot; so that is what I always use.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-175893">
+				<div id="div-comment-175893" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='/redirect.php?url=http%3A%2F%2Fweblogs.asp.net%2Foldnewthing%2Farchive%2F2004%2F05%2F21%2F136701.aspx' rel='external nofollow' class='url'>The Old New Thing</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-175893">
+			May 21, 2004 at 10:02 am</a>		</div>
+
+		<p>Sometimes they don&#8217;t run at all.</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-anonymouscommenter even thread-even depth-1" id="comment-1240386">
+				<div id="div-comment-1240386" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F2012%2F03%2F30%2Fhow-do-i-perform-shell-file-operations-while-avoiding-shell-copy-hooks%2F' rel='external nofollow' class='url'>anonymouscommenter</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="/redirect.php?url=https%3A%2F%2Fblogs.msdn.microsoft.com%2Foldnewthing%2F20040520-00%2F%3Fp%3D39243%23comment-1240386">
+			June 22, 2015 at 7:57 am</a>		</div>
+
+		<p>Pingback from &nbsp;How do I perform shell file operations while avoiding shell copy hooks? | The Old New Thing</p>
+
+		
+				</div>
+		</li><!-- #comment-## -->
+		</ol><!-- .comment-list -->
+
+		<div class="navigation pagination">
+					</div>
+
+	
+			<p class="no-comments">Comments are closed.</p>
+<!-- COMMENTS END -->
+</div></td></tr></table>
+
+</body>
+</html>
+<br/><div class="disclaimer">
+*DISCLAIMER: I DO NOT OWN THIS CONTENT. If you are the owner and would like it removed, please
+<a target="_blank" href="/contact.htm">contact me</a>.
+The content herein is an archived reproduction of entries from
+Raymond Chen's "Old New Thing" Blog (most recent link is <a target="_blank" href="/redirect.php?url=https%3A%2F%2Fdevblogs.microsoft.com%2Foldnewthing%2F">here</a>).
+It may have slight formatting modifications for consistency and to improve readability.
+<br/><br/>
+WHY DID I DUPLICATE THIS CONTENT HERE?
+Let me first say this site has never had anything to sell and has never shown ads of any kind. I have nothing monetarily to gain by duplicating content here.
+Because I had made my own local copy of this content throughout the years, for ease of using tools like grep, I decided to put it online after I discovered
+some of the original content previously and publicly available, had disappeared approximately early to mid 2019.
+At the same time, I present the content in an easily accessible theme-agnostic way.
+<br/><br/>
+The information provided by Raymond's blog is, for all practical purposes, more authoritative on Windows Development than Microsoft's
+own MSDN documentation and should be considered supplemental reading to that documentation. The wealth of missing details
+provided by this blog that Microsoft could not or did not document about Windows over the years is vital enough, many would agree an online "backup" of these details
+is a necessary endeavor. Specifics include:<br/>
+<ul>
+    <li>
+        A "redesign" after 2019 erased thousands of user's comments from previous years. As many have stated, the comments are nearly as important as the postings themselves.
+        The archived copies of the postings contained here retain the original comments.
+    </li>
+    <li>
+        The blog has changed domains many times and the urls have otherwise been under constant change since 2003.
+        Even when proper redirection has been set up for those links, redirection only works for a limited period of time.
+        For example, all of the internal blog links that were valid in early 2019, were broken by 2020 without proper redirection.
+    </li>
+    <li>
+        The blog has been under constant re-design and re-theming since its inception.
+        It is downright irritating to deal with a bogged-down site experience as the result of the latest visual themes designed for cell-phone browsers.
+        As of this writing, it is cumbersome to navigate titles with only 10 entries per page.
+        While it is nice that the official site has a search feature, searching using this index (with all titles on a single page) is much quicker (CTRL-F in most browsers).
+    </li>
+</ul>
+</div><br/>
+&lt;-- Back to <a href="index.htm">Old New Thing Archive Index</a>
+
